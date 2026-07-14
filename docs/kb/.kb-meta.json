@@ -1,0 +1,106 @@
+{
+  "version": "1.0",
+  "initialized_at": "2026-07-14",
+  "git_head": "a62b0f0",
+  "repo_type": "greenfield (pre-code); planned polyglot monorepo (Go engine, TS viz)",
+  "topics": {
+    "domain-simulator-landscape": {
+      "category": "business-domains",
+      "title": "Simulator Landscape",
+      "status": "pending",
+      "key_files": ["docs/VISION.md"],
+      "complexity": "deep",
+      "research_hints": "SUMO, MATSim, CARLA, Aimsun, PTV VISSIM. Compare: time model, network representation, controller/agent APIs (e.g. SUMO's TraCI), replay support, licensing. Goal: steal proven ideas, avoid known pitfalls."
+    },
+    "domain-traffic-flow-models": {
+      "category": "business-domains",
+      "title": "Traffic Flow Models",
+      "status": "pending",
+      "key_files": ["docs/VISION.md"],
+      "complexity": "deep",
+      "research_hints": "Car-following: IDM, Gipps, Krauss (SUMO default). Lane-changing: MOBIL. Gap acceptance at unsignalized intersections and roundabouts. What fidelity is needed for credible congestion metrics at lane-level (not sub-lane) resolution."
+    },
+    "domain-congestion-metrics": {
+      "category": "business-domains",
+      "title": "Congestion Metrics",
+      "status": "pending",
+      "key_files": ["docs/VISION.md"],
+      "complexity": "medium",
+      "research_hints": "HCM level-of-service, control delay, queue length, v/c ratio, travel-time reliability. How DOTs compare infrastructure alternatives. Output: the metric set our observability system must compute per lane/intersection/scenario."
+    },
+    "domain-signal-control": {
+      "category": "business-domains",
+      "title": "Signal Control",
+      "status": "pending",
+      "key_files": ["docs/VISION.md"],
+      "complexity": "medium",
+      "research_hints": "Phases, rings/barriers, fixed vs actuated vs adaptive, coordination and green waves, standard timing plan formats. Needed for signalized intersections and the civic-advocacy replay use case."
+    },
+    "arch-time-model": {
+      "category": "architecture",
+      "title": "Time Model",
+      "status": "pending",
+      "key_files": ["docs/VISION.md", "docs/kb/decisions/ADR-0005-time-model.md"],
+      "complexity": "deep",
+      "research_hints": "Fixed-tick authoritative loop vs discrete-event simulation vs hybrid. Prior art: multiplayer game servers (tick + client input events), SUMO (fixed step), MATSim (event-based). Determinism and replay requirements. Feeds ADR-0005."
+    },
+    "arch-nats-backbone": {
+      "category": "architecture",
+      "title": "NATS Backbone",
+      "status": "pending",
+      "key_files": ["docs/VISION.md", "docs/kb/decisions/ADR-0002-nats-backbone.md"],
+      "complexity": "deep",
+      "research_hints": "Subject taxonomy design; core NATS vs JetStream vs KV division of labor; JetStream replay semantics for deterministic playback; backpressure/slow-consumer handling with many controllers; embedding nats-server in a Go process vs docker-compose."
+    },
+    "arch-road-graph-model": {
+      "category": "architecture",
+      "title": "Road Graph Model",
+      "status": "pending",
+      "key_files": ["docs/VISION.md"],
+      "complexity": "medium",
+      "research_hints": "Lane-level graph: nodes, edges, lanes, lane-to-lane connections, turn restrictions. How SUMO's .net.xml and osm2streets represent this. Geometry (polylines) vs topology separation."
+    },
+    "arch-state-authority": {
+      "category": "architecture",
+      "title": "State Authority",
+      "status": "pending",
+      "key_files": ["docs/VISION.md"],
+      "complexity": "medium",
+      "research_hints": "Authoritative-server patterns: interest management (area-of-interest state fan-out), client-side prediction for human drivers, handling late/dropped controller inputs, snapshot vs delta state publishing."
+    },
+    "concept-vehicle-controller-interface": {
+      "category": "concepts",
+      "title": "Vehicle & Controller Interface",
+      "status": "pending",
+      "key_files": ["docs/VISION.md"],
+      "complexity": "medium",
+      "research_hints": "Separate vehicle capabilities (size, accel profile) from operator/controller (AI policy, scripted, human). What the engine↔controller message contract carries: observations in, intents out. Compare SUMO TraCI and CARLA actor/agent APIs."
+    },
+    "concept-scenario-format": {
+      "category": "concepts",
+      "title": "Scenario Format",
+      "status": "pending",
+      "key_files": ["docs/VISION.md"],
+      "complexity": "medium",
+      "research_hints": "Scenario = network + demand (spawns/routes) + control config + metrics. Must be diffable for upgrade variants. Demand modeling basics (OD matrices, arrival rates). Recording format for replay (JetStream stream export?)."
+    },
+    "integration-osm-extraction": {
+      "category": "integrations",
+      "title": "OSM Extraction",
+      "status": "pending",
+      "key_files": ["docs/VISION.md"],
+      "complexity": "deep",
+      "research_hints": "OSM data model: ways, nodes, relations; lanes/turn:lanes/highway tags; turn restriction relations. Tooling: Overpass API, osmnx, osm2streets (A/B Street), SUMO's netconvert. Pipeline: bbox → clean lane-graph in our format."
+    },
+    "integration-maplibre-realtime": {
+      "category": "integrations",
+      "title": "MapLibre Realtime Viz",
+      "status": "pending",
+      "key_files": ["docs/VISION.md"],
+      "complexity": "medium",
+      "research_hints": "Feeding live vehicle positions into MapLibre (GeoJSON source updates vs custom WebGL layer), congestion heatmaps on road geometry (line-color data-driven styling), update-rate limits, and the criteria for escalating to deck.gl overlay."
+    }
+  },
+  "raw": {},
+  "articles": {}
+}
