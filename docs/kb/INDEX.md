@@ -46,7 +46,7 @@ back to it.
 - [x] [ADR-0002](decisions/ADR-0002-nats-backbone.md) — NATS as the sole inter-service backbone
 - [x] [ADR-0003](decisions/ADR-0003-maplibre-vis.md) — MapLibre-first visualization, no UI frameworks by default
 - [x] [ADR-0004](decisions/ADR-0004-local-first.md) — Local-first deployment via docker-compose
-- [ ] [ADR-0005](decisions/ADR-0005-time-model.md) — Time model (PROPOSED — pending `arch-time-model` research)
+- [x] [ADR-0005](decisions/ADR-0005-time-model.md) — Hybrid time model: fixed-tick authoritative core, event-driven edges, tick-count clock, JetStream snapshot+intent-log replay
 
 ## Cross-Topic Concerns
 (populated by /distill-kb after research)
