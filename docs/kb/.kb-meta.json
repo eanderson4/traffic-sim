@@ -14,11 +14,19 @@
     },
     "domain-traffic-flow-models": {
       "category": "business-domains",
-      "title": "Traffic Flow Models",
+      "title": "Traffic Flow Models (Microscopic)",
       "status": "pending",
       "key_files": ["docs/VISION.md"],
       "complexity": "deep",
-      "research_hints": "Car-following: IDM, Gipps, Krauss (SUMO default). Lane-changing: MOBIL. Gap acceptance at unsignalized intersections and roundabouts. What fidelity is needed for credible congestion metrics at lane-level (not sub-lane) resolution."
+      "research_hints": "Car-following: IDM, Gipps, Krauss (SUMO default). Lane-changing: MOBIL. Gap acceptance at unsignalized intersections and roundabouts. What fidelity is needed for credible congestion metrics at lane-level (not sub-lane) resolution. Note the steady-state fundamental diagram each model implies (bridge to domain-macroscopic-flow-models)."
+    },
+    "domain-macroscopic-flow-models": {
+      "category": "business-domains",
+      "title": "Macroscopic Flow Models",
+      "status": "pending",
+      "key_files": ["docs/VISION.md"],
+      "complexity": "deep",
+      "research_hints": "LWR kinematic-wave model: conservation law + fundamental diagram closure (Greenshields, triangular/Newell). Characteristics, shockwaves (Rankine-Hugoniot), rarefaction fans. Numerics: Godunov scheme = Daganzo's Cell Transmission Model (demand/supply). Extensions: second-order models (Payne, ARZ) and why first-order often suffices. Micro↔macro bridge: fundamental diagram implied by IDM/Newell car-following. Uses for us: engine validation (shockwave speed), fast preview/ranking mode, episode visuals."
     },
     "domain-congestion-metrics": {
       "category": "business-domains",
