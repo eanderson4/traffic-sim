@@ -3,3 +3,5 @@ dist/
 *.log
 .env
 .claude/settings.local.json
+data/
+analysis/ngsim/ngsim-xt
