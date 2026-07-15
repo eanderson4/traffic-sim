@@ -28,7 +28,7 @@ back to it.
 - [ ] [Signal Control](raw/domain-signal-control.md) — phases, fixed vs actuated timing, coordination/green waves; foundation for the civic-advocacy use case
 
 ### Architecture
-- [ ] [Time Model](raw/arch-time-model.md) — tick authority vs discrete-event vs hybrid; game-server prior art; determinism/replay implications → feeds ADR-0005
+- [x] [Time Model](raw/arch-time-model/synthesis.md) — tick authority vs discrete-event vs hybrid; game-server prior art; determinism/replay implications → feeds ADR-0005
 - [ ] [NATS Backbone](raw/arch-nats-backbone.md) — subject taxonomy; core NATS vs JetStream vs KV division of labor; replay via streams; backpressure with many controllers
 - [ ] [Road Graph Model](raw/arch-road-graph-model.md) — lane-level graph representation: nodes/edges/lanes/connections, turn restrictions; how SUMO/OSM represent this
 - [ ] [State Authority](raw/arch-state-authority.md) — authoritative-server patterns from multiplayer games: interest management, prediction, late/dropped controller inputs

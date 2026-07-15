@@ -69,10 +69,17 @@
     "arch-time-model": {
       "category": "architecture",
       "title": "Time Model",
-      "status": "pending",
+      "status": "complete",
+      "researched_at": "2026-07-15",
       "key_files": ["docs/VISION.md", "docs/kb/decisions/ADR-0005-time-model.md"],
       "complexity": "deep",
-      "research_hints": "Fixed-tick authoritative loop vs discrete-event simulation vs hybrid. Prior art: multiplayer game servers (tick + client input events), SUMO (fixed step), MATSim (event-based). Determinism and replay requirements. Feeds ADR-0005."
+      "raw_files": [
+        "raw/arch-time-model/implementation.md",
+        "raw/arch-time-model/competitors.md",
+        "raw/arch-time-model/standards-and-patterns.md",
+        "raw/arch-time-model/synthesis.md"
+      ],
+      "research_hints": "Fixed-tick authoritative loop vs discrete-event simulation vs hybrid. Prior art: multiplayer game servers (tick + client input events), SUMO (fixed step), MATSim (event-based; NOTE research found QSim is actually time-stepped — events are outputs). Determinism and replay requirements. Feeds ADR-0005."
     },
     "arch-nats-backbone": {
       "category": "architecture",
