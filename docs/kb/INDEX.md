@@ -22,7 +22,8 @@ back to it.
 ### Business Domains
 - [ ] [Simulator Landscape](raw/domain-simulator-landscape.md) — SUMO, MATSim, CARLA, VISSIM: architectures, what to steal, what to avoid
 - [ ] [Traffic Flow Models (Microscopic)](raw/domain-traffic-flow-models.md) — car-following (IDM, Gipps), lane-changing (MOBIL), gap acceptance, intersection right-of-way
-- [ ] [Macroscopic Flow Models](raw/domain-macroscopic-flow-models.md) — LWR kinematic-wave PDE, fundamental diagram, shockwaves/rarefactions, Cell Transmission Model; micro↔macro bridge and when macro beats micro
+- [x] [Macroscopic Flow Models](raw/domain-macroscopic-flow-models/synthesis.md) — LWR kinematic-wave PDE, fundamental diagram, shockwaves/rarefactions, Cell Transmission Model; micro↔macro bridge and when macro beats micro
+- [x] [Trajectory Datasets & Overhead Analysis](raw/domain-trajectory-datasets/synthesis.md) — real overhead traffic data (NGSIM, highD/inD/rounD drone sets, pNEUMA, I-24 MOTION, ring-road experiments); DIY capture; computing our own waves/FD from trajectories; sim validation targets for intersections and highways
 - [ ] [Congestion Metrics](raw/domain-congestion-metrics.md) — level-of-service, delay, queue length, throughput, travel-time reliability; how traffic engineers rank alternatives
 - [ ] [Signal Control](raw/domain-signal-control.md) — phases, fixed vs actuated timing, coordination/green waves; foundation for the civic-advocacy use case
 

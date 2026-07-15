@@ -23,10 +23,32 @@
     "domain-macroscopic-flow-models": {
       "category": "business-domains",
       "title": "Macroscopic Flow Models",
-      "status": "pending",
+      "status": "complete",
+      "researched_at": "2026-07-15",
       "key_files": ["docs/VISION.md"],
       "complexity": "deep",
+      "raw_files": [
+        "raw/domain-macroscopic-flow-models/implementation.md",
+        "raw/domain-macroscopic-flow-models/competitors.md",
+        "raw/domain-macroscopic-flow-models/standards-and-patterns.md",
+        "raw/domain-macroscopic-flow-models/synthesis.md"
+      ],
       "research_hints": "LWR kinematic-wave model: conservation law + fundamental diagram closure (Greenshields, triangular/Newell). Characteristics, shockwaves (Rankine-Hugoniot), rarefaction fans. Numerics: Godunov scheme = Daganzo's Cell Transmission Model (demand/supply). Extensions: second-order models (Payne, ARZ) and why first-order often suffices. Micro↔macro bridge: fundamental diagram implied by IDM/Newell car-following. Uses for us: engine validation (shockwave speed), fast preview/ranking mode, episode visuals."
+    },
+    "domain-trajectory-datasets": {
+      "category": "business-domains",
+      "title": "Trajectory Datasets & Overhead Analysis",
+      "status": "complete",
+      "researched_at": "2026-07-15",
+      "raw_files": [
+        "raw/domain-trajectory-datasets/implementation.md",
+        "raw/domain-trajectory-datasets/competitors.md",
+        "raw/domain-trajectory-datasets/standards-and-patterns.md",
+        "raw/domain-trajectory-datasets/synthesis.md"
+      ],
+      "key_files": ["docs/VISION.md", "docs/kb/raw/domain-macroscopic-flow-models/synthesis.md"],
+      "complexity": "medium",
+      "research_hints": "Real overhead traffic data for our own wave/FD analysis and sim validation: NGSIM (+known noise issues), RWTH drone family (highD highways, inD intersections, rounD roundabouts, exiD exits — check non-academic access terms), pNEUMA city-scale, Sugiyama 2008 ring-road phantom-jam experiment + Stern 2018 AV-damping replication. DIY capture: drone/overpass video + YOLO-tracking pipelines, FAA Part 107 constraints. Analysis: Edie's definitions, x-t heatmaps, wave-speed from stripe slopes, adaptive smoothing. Intersection/roundabout footage doubles as validation targets for every intersection type in VISION."
     },
     "domain-congestion-metrics": {
       "category": "business-domains",
