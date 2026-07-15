@@ -51,11 +51,15 @@ event-driven edges.**
    goroutine owns world state; fixed iteration order (sorted slices — never Go
    map iteration in sim logic); seeded stream-per-concern RNG (hash/counter-based
    if parallelized); integer tick clock.
-7. **Tick length is a scenario/config parameter, not a constant.** Provisional
-   default 100 ms (10 Hz), in line with Vissim DOT practice and Aimsun's micro
-   range. The validated default is owned by `domain-traffic-flow-models`
-   (car-following stability analysis); snapshot publish rate and client
-   interpolation are independent knobs (~10 snapshots/s, ~200–300 ms client
+7. **Tick length is a scenario/config parameter, not a constant.** Default
+   100 ms (10 Hz) — **validated** by `domain-traffic-flow-models` research:
+   Kesting & Treiber show Δt = 0.1 s reproduces the exact continuous
+   car-following dynamics, with a finite step acting like a reaction time
+   T′_eff ≈ Δt/2 and stability boundary ≈ Δt + 2T′ = 2 s. Pair with the
+   ballistic integrator + stopping override (Treiber & Kanagaraj: lane changes
+   make all schemes order-1, RK4 worst per cost). 0.2–0.5 s is a defensible
+   performance fallback; never above 1 s. Snapshot publish rate and client
+   interpolation remain independent knobs (~10 snapshots/s, ~200–300 ms client
    buffer to start).
 
 ## Consequences

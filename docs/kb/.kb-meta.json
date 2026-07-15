@@ -15,9 +15,16 @@
     "domain-traffic-flow-models": {
       "category": "business-domains",
       "title": "Traffic Flow Models (Microscopic)",
-      "status": "pending",
-      "key_files": ["docs/VISION.md"],
+      "status": "complete",
+      "researched_at": "2026-07-15",
+      "key_files": ["docs/VISION.md", "docs/kb/decisions/ADR-0005-time-model.md"],
       "complexity": "deep",
+      "raw_files": [
+        "raw/domain-traffic-flow-models/implementation.md",
+        "raw/domain-traffic-flow-models/competitors.md",
+        "raw/domain-traffic-flow-models/standards-and-patterns.md",
+        "raw/domain-traffic-flow-models/synthesis.md"
+      ],
       "research_hints": "Car-following: IDM, Gipps, Krauss (SUMO default). Lane-changing: MOBIL. Gap acceptance at unsignalized intersections and roundabouts. What fidelity is needed for credible congestion metrics at lane-level (not sub-lane) resolution. Note the steady-state fundamental diagram each model implies (bridge to domain-macroscopic-flow-models)."
     },
     "domain-macroscopic-flow-models": {
