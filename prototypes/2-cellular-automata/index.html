@@ -1,0 +1,214 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Prototype 2 — Cellular automata (Nagel-Schreckenberg)</title>
+<style>
+  body{background:#111418;color:#d5dbe3;font:14px/1.45 system-ui,sans-serif;margin:0;padding:20px 24px;max-width:1100px}
+  h1{font-size:20px;margin:0 0 4px} .sub{color:#8b95a3;margin:0 0 14px;font-size:13px}
+  canvas{background:#1a1e24;border-radius:6px;display:block;margin:10px 0}
+  .row{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end;margin:8px 0}
+  .ctl{display:flex;flex-direction:column;font-size:12px;color:#8b95a3;min-width:120px}
+  .ctl output{color:#d5dbe3;font-weight:600}
+  .stats{display:flex;gap:26px;flex-wrap:wrap;font-size:12px;color:#8b95a3;margin:10px 0}
+  .stat b{display:block;font-size:16px;color:#fff;font-weight:600}
+  button{background:#2a3140;color:#d5dbe3;border:0;border-radius:5px;padding:6px 12px;cursor:pointer;font:13px system-ui}
+  button:hover{background:#39435a}
+  .note{background:#1a212c;border-left:3px solid #3b6ea5;padding:10px 14px;border-radius:4px;font-size:13px;color:#aab4c0;margin:14px 0}
+  .warn b{color:#e8b04b}
+</style>
+</head>
+<body>
+<h1>Prototype 2 — Cellular automata: Nagel-Schreckenberg</h1>
+<p class="sub">Same road (1200&nbsp;m, 3 lanes + on-ramp) but the world is a grid: 7.5&nbsp;m cells,
+speeds 0–5 cells/step, <b>timestep locked to 1&nbsp;s by the model itself</b> — model and
+discretization are welded together. Rules: accelerate +1, clamp to gap, dawdle with probability p, move.</p>
+
+<div class="row">
+  <label class="ctl">mainline inflow (veh/h/lane) <output id="o_qMain"></output><input type="range" id="s_qMain" min="0" max="2400" step="50"></label>
+  <label class="ctl">ramp inflow (veh/h) <output id="o_qRamp"></output><input type="range" id="s_qRamp" min="0" max="1200" step="25"></label>
+  <label class="ctl">dawdle probability p <output id="o_p"></output><input type="range" id="s_p" min="0" max="0.5" step="0.01"></label>
+  <label class="ctl">display steps/s <output id="o_speed"></output><input type="range" id="s_speed" min="0" max="4" step="1"></label>
+  <button id="b_pause">pause</button>
+  <button id="b_reset">reset</button>
+  <button id="b_bench">benchmark raw step rate</button>
+</div>
+
+<canvas id="road" width="1040" height="110"></canvas>
+<canvas id="heat" width="1040" height="160"></canvas>
+<p class="sub">bottom: x–t heatmap, same convention as prototype 1 (dark = congested). NaSch famously produces
+correct wave speeds (≈ −1 cell/step ≈ −27 km/h at these parameters) despite the crude vehicle motion.</p>
+
+<div class="stats">
+  <span class="stat"><b id="st_n">0</b>vehicles</span>
+  <span class="stat"><b id="st_v">–</b>mean speed km/h</span>
+  <span class="stat"><b id="st_out">–</b>outflow veh/h</span>
+  <span class="stat warn"><b id="st_stuck">0</b>stuck at lane end</span>
+  <span class="stat"><b id="st_t">0</b>sim time s</span>
+  <span class="stat"><b id="st_bench">–</b>benchmark (steps/s, 480-cell grid)</span>
+</div>
+
+<div class="note"><b>What to look for.</b>
+(1) Motion is honest here — 27 km/h speed quanta, 7.5 m position jumps, 1 s ticks. Imagine steering this as a human player. That's the core argument against CA for our vision.
+(2) But: phantom jams and correct wave physics emerge from three lines of rules, and the benchmark button shows the raw speed ceiling — this is why TRANSIMS simulated entire cities with CA in the 90s.
+(3) The heatmap is qualitatively the same as prototype 1's — macroscopic observables survive the brutal discretization (that's the LWR bridge insight).
+(4) Fork essence: in CA, tick length, cell size, and model are one inseparable choice. Our continuous engine keeps them independent.</div>
+
+<script>
+'use strict';
+function mulberry32(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+let rng=mulberry32(42);
+const clamp=(x,a,b)=>Math.min(b,Math.max(a,x));
+
+// ---------- world ----------
+const LEN=160, NL=3, RAMP=3, R0=67, R1=119, VMAX=5, CELL=7.5; // 160 cells = 1200 m
+const P={qMain:1400,qRamp:500,p:0.25,speed:2};
+const SPEEDS=[1,2,4,10,30];
+
+let grid,vehicles,nextId,stepN,paused=false,benchMode=false;
+let m={out:[],stuck:0,spawnAcc:[0,0,0,0]};
+
+function reset(){
+  grid=[...Array(4)].map(()=>Array(LEN).fill(null));
+  vehicles=[];nextId=1;stepN=0;rng=mulberry32(42);
+  m={out:[],stuck:0,spawnAcc:[0,0,0,0]};
+  hctx.fillStyle='#141821';hctx.fillRect(0,0,HW,HH);
+}
+
+function gapAhead(l,c){for(let d=1;d<=VMAX+1;d++){if(c+d>=LEN)return VMAX+1;if(grid[l][c+d])return d-1}return VMAX+1}
+function gapBehind(l,c){for(let d=1;d<=VMAX+1;d++){if(c-d<0)return VMAX+1;if(grid[l][c-d])return d-1}return VMAX+1}
+
+function step(){
+  stepN++;
+  // ---- lane changes (sequential, front-to-back, deterministic order) ----
+  const order=vehicles.slice().sort((a,b)=>b.c-a.c||a.id-b.id);
+  for(const v of order){
+    if(v.lane===RAMP){ // mandatory merge into lane 0; urgency relaxes back-gap
+      const urg=clamp((v.c-R0)/(R1-R0-4),0,1);
+      const reqBack=Math.round(VMAX*(1-urg));
+      if(!grid[0][v.c]&&gapBehind(0,v.c)>=reqBack&&gapAhead(0,v.c)>=Math.min(v.v,1)){
+        grid[RAMP][v.c]=null;v.lane=0;grid[0][v.c]=v;}
+    }else{ // discretionary (Rickert et al. symmetric rules)
+      const gOwn=gapAhead(v.lane,v.c);
+      if(gOwn>=Math.min(v.v+1,VMAX))continue;
+      for(const t of[v.lane-1,v.lane+1]){
+        if(t<0||t>=NL)continue;
+        if(!grid[t][v.c]&&gapAhead(t,v.c)>gOwn&&gapBehind(t,v.c)>=VMAX&&rng()<0.5){
+          grid[v.lane][v.c]=null;v.lane=t;grid[t][v.c]=v;break;}
+      }
+    }
+  }
+  // ---- NaSch movement (parallel update: velocities from current config, then all move) ----
+  for(const v of vehicles){
+    let g=gapAhead(v.lane,v.c);
+    if(v.lane===RAMP)g=Math.min(g,R1-v.c); // wall at lane end
+    v.v=Math.min(v.v+1,VMAX,g);
+    if(v.v>0&&rng()<P.p)v.v--;
+  }
+  for(const l of grid)l.fill(null);
+  const simT=stepN;
+  for(let i=vehicles.length-1;i>=0;i--){const v=vehicles[i];
+    v.c+=v.v;
+    if(v.c>=LEN){m.out.push(simT);vehicles.splice(i,1);continue}
+    grid[v.lane][v.c]=v;
+    if(v.lane===RAMP&&v.c>=R1-2&&v.v===0){v.stuckT++;if(!v.counted&&v.stuckT>4){m.stuck++;v.counted=true}}
+    else v.stuckT=0;
+  }
+  while(m.out.length&&m.out[0]<simT-300)m.out.shift();
+  // ---- spawning ----
+  const rates=[P.qMain,P.qMain,P.qMain,P.qRamp];
+  for(let ln=0;ln<4;ln++){
+    m.spawnAcc[ln]=Math.min(3,m.spawnAcc[ln]+rates[ln]/3600);
+    if(m.spawnAcc[ln]>=1){
+      const c0=ln===RAMP?R0:0;
+      let free=true;for(let d=0;d<=2;d++)if(grid[ln][c0+d]){free=false;break}
+      if(free){const nv={id:nextId++,lane:ln,c:c0,v:ln===RAMP?2:VMAX,stuckT:0,counted:false};
+        vehicles.push(nv);grid[ln][c0]=nv;m.spawnAcc[ln]-=1;}
+    }
+  }
+  // ---- heatmap column (1 col per step = 1 s) ----
+  if(!benchMode)flushHeatColumn();
+}
+
+// ---------- heatmap ----------
+const heat=document.getElementById('heat'),hctx=heat.getContext('2d');
+const HW=heat.width,HH=heat.height; // HH=160 → 1 row per cell
+function heatColor(t){const r=13+(205-13)*t,g=54+(226-54)*t,b=107+(251-107)*t;
+  return`rgb(${r|0},${g|0},${b|0})`;}
+function flushHeatColumn(){
+  hctx.drawImage(heat,1,0,HW-1,HH,0,0,HW-1,HH);
+  const sum=new Float64Array(LEN),cnt=new Int32Array(LEN);
+  for(const v of vehicles)if(v.lane<NL){sum[v.c]+=v.v*CELL;cnt[v.c]++}
+  for(let r=0;r<LEN;r++){
+    hctx.fillStyle=cnt[r]?heatColor(clamp(sum[r]/cnt[r]/(VMAX*CELL),0,1)):'#141821';
+    hctx.fillRect(HW-1,HH-1-r,1,1);}
+}
+
+// ---------- rendering ----------
+const road=document.getElementById('road'),rctx=road.getContext('2d');
+const RW=road.width,cw=(RW-20)/LEN,X0=10;
+const VCOL=['#d73027','#fc8d59','#fee08b','#d9ef8b','#91cf60','#1a9850'];
+const yLane=l=>l===RAMP?82:16+(NL-1-l)*20;
+function draw(){
+  rctx.fillStyle='#1a1e24';rctx.fillRect(0,0,RW,110);
+  rctx.fillStyle='#22272f';
+  for(let l=0;l<NL;l++)rctx.fillRect(X0,yLane(l),LEN*cw,18);
+  rctx.fillRect(X0+R0*cw,yLane(RAMP),(R1-R0+1)*cw,18);
+  rctx.strokeStyle='#c0392b';rctx.beginPath();
+  rctx.moveTo(X0+(R1+1)*cw,yLane(RAMP)-2);rctx.lineTo(X0+(R1+1)*cw,yLane(RAMP)+20);rctx.stroke();
+  for(const v of vehicles){
+    rctx.fillStyle=VCOL[v.v];
+    rctx.fillRect(X0+v.c*cw+0.5,yLane(v.lane)+3,Math.max(3,cw-1),12);}
+  rctx.fillStyle='#8b95a3';rctx.font='11px system-ui';
+  rctx.fillText('flow →  (one square = one 7.5 m cell; color = speed 0–5)',X0,12);
+}
+
+// ---------- stats ----------
+function stats(){
+  const el=id=>document.getElementById(id);
+  el('st_n').textContent=vehicles.length;
+  const mv=vehicles.length?vehicles.reduce((s,v)=>s+v.v,0)/vehicles.length*CELL*3.6:0;
+  el('st_v').textContent=mv.toFixed(0);
+  const win=Math.min(300,Math.max(30,stepN));
+  el('st_out').textContent=(m.out.filter(t=>t>stepN-win).length/win*3600).toFixed(0);
+  el('st_stuck').textContent=m.stuck;
+  el('st_t').textContent=stepN;
+}
+
+// ---------- benchmark: raw single-thread step rate on this grid size ----------
+document.getElementById('b_bench').onclick=()=>{
+  const saveG=grid,saveV=vehicles,saveR=rng,saveS=stepN,saveM=m;
+  benchMode=true;reset();rng=mulberry32(7);
+  for(let l=0;l<NL;l++)for(let c=0;c<LEN;c++)if(rng()<0.15){
+    const nv={id:nextId++,lane:l,c,v:3,stuckT:0,counted:false};vehicles.push(nv);grid[l][c]=nv;}
+  const N=20000,t0=performance.now();
+  for(let i=0;i<N;i++)step();
+  const dt=(performance.now()-t0)/1000;
+  grid=saveG;vehicles=saveV;rng=saveR;stepN=saveS;m=saveM;benchMode=false;
+  document.getElementById('st_bench').textContent=(N/dt/1000).toFixed(0)+'k';
+};
+
+// ---------- controls ----------
+function bind(key,id,fmt){const s=document.getElementById('s_'+id),o=document.getElementById('o_'+id);
+  s.value=P[key];o.value=fmt(P[key]);
+  s.oninput=()=>{P[key]=+s.value;o.value=fmt(P[key])};}
+bind('qMain','qMain',v=>v);bind('qRamp','qRamp',v=>v);bind('p','p',v=>v.toFixed(2));
+{const s=document.getElementById('s_speed'),o=document.getElementById('o_speed');
+ s.value=1;o.value='2';s.oninput=()=>{P.speed=SPEEDS[+s.value];o.value=P.speed};P.speed=2;}
+document.getElementById('b_pause').onclick=e=>{paused=!paused;e.target.textContent=paused?'resume':'pause'};
+document.getElementById('b_reset').onclick=reset;
+
+// ---------- loop (1 model step = 1 sim second, displayed at chosen rate) ----------
+let last=performance.now(),acc=0;
+function frame(now){
+  requestAnimationFrame(frame);
+  const dt=Math.min(0.25,(now-last)/1000);last=now;
+  if(!paused){acc+=dt*P.speed;let n=0;
+    while(acc>=1&&n<200){step();acc-=1;n++}
+    if(n>=200)acc=0;}
+  draw();stats();
+}
+reset();requestAnimationFrame(frame);
+</script>
+</body>
+</html>

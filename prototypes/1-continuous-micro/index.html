@@ -1,0 +1,273 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Prototype 1 — Continuous micro (IDM + MOBIL)</title>
+<style>
+  body{background:#111418;color:#d5dbe3;font:14px/1.45 system-ui,sans-serif;margin:0;padding:20px 24px;max-width:1100px}
+  h1{font-size:20px;margin:0 0 4px} .sub{color:#8b95a3;margin:0 0 14px;font-size:13px}
+  canvas{background:#1a1e24;border-radius:6px;display:block;margin:10px 0}
+  .row{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end;margin:8px 0}
+  .ctl{display:flex;flex-direction:column;font-size:12px;color:#8b95a3;min-width:120px}
+  .ctl output{color:#d5dbe3;font-weight:600}
+  .stats{display:flex;gap:26px;flex-wrap:wrap;font-size:12px;color:#8b95a3;margin:10px 0}
+  .stat b{display:block;font-size:16px;color:#fff;font-weight:600}
+  button{background:#2a3140;color:#d5dbe3;border:0;border-radius:5px;padding:6px 12px;cursor:pointer;font:13px system-ui}
+  button:hover{background:#39435a}
+  .note{background:#1a212c;border-left:3px solid #3b6ea5;padding:10px 14px;border-radius:4px;font-size:13px;color:#aab4c0;margin:14px 0}
+  .warn b{color:#e8b04b}
+</style>
+</head>
+<body>
+<h1>Prototype 1 — Continuous micro: IDM + MOBIL on a lane graph</h1>
+<p class="sub">The ADR-hypothesis engine: continuous longitudinal position per lane, 100&nbsp;ms tick,
+ballistic integrator + stop override, MOBIL lane changes (instant hop), mandatory merge with urgency,
+<b>no cooperation</b> (mainline never helps the merger — that's the open NATS question).</p>
+
+<div class="row">
+  <label class="ctl">mainline inflow (veh/h/lane) <output id="o_qMain"></output><input type="range" id="s_qMain" min="0" max="2400" step="50"></label>
+  <label class="ctl">ramp inflow (veh/h) <output id="o_qRamp"></output><input type="range" id="s_qRamp" min="0" max="1200" step="25"></label>
+  <label class="ctl">IDM a — accel / stability (m/s²) <output id="o_a"></output><input type="range" id="s_a" min="0.3" max="2.5" step="0.05"></label>
+  <label class="ctl">IDM T — time headway (s) <output id="o_T"></output><input type="range" id="s_T" min="0.6" max="2.4" step="0.05"></label>
+  <label class="ctl">MOBIL politeness p <output id="o_p"></output><input type="range" id="s_p" min="0" max="1" step="0.05"></label>
+  <label class="ctl">sim speed <output id="o_speed"></output><input type="range" id="s_speed" min="0" max="5" step="1"></label>
+  <button id="b_pause">pause</button>
+  <button id="b_reset">reset</button>
+</div>
+
+<canvas id="road" width="1040" height="150"></canvas>
+<canvas id="heat" width="1040" height="160"></canvas>
+<p class="sub">bottom: live x–t heatmap (mean speed over mainline lanes; x up = direction of travel, t right;
+dark = congested — same convention as our NGSIM I-80 plot). Backward-sloping dark stripes = the −15…−20 km/h waves.</p>
+
+<div class="stats">
+  <span class="stat"><b id="st_n">0</b>vehicles</span>
+  <span class="stat"><b id="st_v">–</b>mean speed km/h</span>
+  <span class="stat"><b id="st_out">–</b>outflow veh/h</span>
+  <span class="stat"><b id="st_lc">–</b>lane changes / veh-km</span>
+  <span class="stat warn"><b id="st_stuck">0</b>stuck at lane end</span>
+  <span class="stat warn"><b id="st_coll">0</b>overlaps (model pathology)</span>
+  <span class="stat"><b id="st_t">0</b>sim time s</span>
+</div>
+
+<div class="note"><b>What to look for.</b>
+(1) Defaults produce a merge bottleneck: lane 1 (bottom mainline lane) jams around the ramp and waves roll upstream — check their slope on the heatmap.
+(2) Drop <b>a</b> to 0.6 with inflow ~1700: string instability — phantom jams appear <i>without</i> the ramp (set ramp to 0 first).
+(3) Watch the <b>stuck at lane end</b> counter at high mainline flow: with zero cooperation, mergers run out of acceleration lane. This is the SUMO failure mode we researched, reproduced — and the case for cooperation intents over NATS.
+(4) Lane changes are instant hops — judge for yourself whether that reads OK visually at 100 ms ticks, or whether we need duration-based lateral motion.</div>
+
+<script>
+'use strict';
+// ---------- deterministic RNG ----------
+function mulberry32(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+let rng=mulberry32(42);
+function gauss(){let u=0,v=0;while(u===0)u=rng();while(v===0)v=rng();return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v)}
+const clamp=(x,a,b)=>Math.min(b,Math.max(a,x));
+
+// ---------- world constants ----------
+const DT=0.1, ROAD=1200, NL=3, RAMP=3, RSTART=500, REND=900, VLEN=5;
+// lane 0 = rightmost mainline; ramp (index 3) merges into lane 0.
+const P={qMain:1800,qRamp:700,a:1.0,T:1.2,p:0.25,speed:1,
+         b:2.0,s0:2.0,v0:33.3,bSafe:4,dTh:0.1,bias:0.2};
+const SPEEDS=[0.5,1,2,4,8,16];
+
+let vehicles=[],nextId=1,tick=0,paused=false;
+let m={out:[],lc:0,vkm:0,stuck:0,coll:0,spawnAcc:[0,0,0,0]};
+
+function reset(){vehicles=[];nextId=1;tick=0;rng=mulberry32(42);
+  m={out:[],lc:0,vkm:0,stuck:0,coll:0,spawnAcc:[0,0,0,0]};
+  hctx.fillStyle='#141821';hctx.fillRect(0,0,HW,HH);}
+
+// ---------- IDM (plain IDM + emergency cap; s0 = bumper-to-bumper) ----------
+function idm(veh,s,vl){
+  const v0=P.v0*veh.f, v=veh.v;
+  const free=P.a*(1-Math.pow(v/v0,4));
+  if(s===null)return free;
+  const ss=Math.max(0.1,s);
+  const sStar=P.s0+Math.max(0,v*P.T+v*(v-vl)/(2*Math.sqrt(P.a*P.b)));
+  return Math.max(-9,P.a*(1-Math.pow(v/v0,4)-(sStar/ss)*(sStar/ss)));
+}
+function accWith(veh,lead){ // veh's accel if 'lead' were its leader
+  if(!lead)return idm(veh,null,0);
+  return idm(veh,lead.x-veh.x-lead.len,lead.v);
+}
+
+// ---------- lane bookkeeping ----------
+function buildLanes(){const L=[[],[],[],[]];for(const v of vehicles)L[v.lane].push(v);
+  for(const a of L)a.sort((p,q)=>p.x-q.x);return L;}
+function neighAt(arr,x,skip){let lead=null,foll=null;
+  for(let i=0;i<arr.length;i++){const v=arr[i];if(v===skip)continue;
+    if(v.x>=x){lead=v;break}foll=v;}
+  return{lead,foll};}
+function insertSorted(arr,v){let i=0;while(i<arr.length&&arr[i].x<v.x)i++;arr.splice(i,0,v);}
+function applyChange(v,t,L){const a=L[v.lane];a.splice(a.indexOf(v),1);
+  v.lane=t;insertSorted(L[t],v);v.cool=20;m.lc++;}
+
+// ---------- lane-change logic ----------
+function tryDiscretionary(v,L){
+  const cur=neighAt(L[v.lane],v.x,v);
+  const aSelfOld=accWith(v,cur.lead);
+  const targets=[];
+  if(v.lane>0)targets.push({t:v.lane-1,bias:+P.bias});      // keep-right
+  if(v.lane<NL-1)targets.push({t:v.lane+1,bias:-P.bias});
+  for(const{t,bias}of targets){
+    const nb=neighAt(L[t],v.x,v);
+    if(nb.lead&&nb.lead.x-v.x-nb.lead.len<0.5)continue;
+    if(nb.foll&&v.x-nb.foll.x-v.len<0.5)continue;
+    const aSelfNew=accWith(v,nb.lead);
+    if(aSelfNew<-P.bSafe)continue;
+    let dFoll=0;
+    if(nb.foll){const aFn=accWith(nb.foll,v);
+      if(aFn<-P.bSafe)continue;
+      dFoll=aFn-accWith(nb.foll,nb.lead);}
+    let dOld=0;
+    if(cur.foll)dOld=accWith(cur.foll,cur.lead)-accWith(cur.foll,v);
+    const inc=aSelfNew-aSelfOld+P.p*(dFoll+dOld)+bias;
+    if(inc>P.dTh){applyChange(v,t,L);return;}
+  }
+}
+function tryMerge(v,L){ // mandatory, urgency relaxes accepted deceleration; NO cooperation
+  if(v.x<RSTART+20)return;
+  const urg=clamp((v.x-(RSTART+60))/(REND-RSTART-140),0,1);
+  const bS=P.bSafe+5*urg;
+  const nb=neighAt(L[0],v.x,v);
+  if(nb.lead&&nb.lead.x-v.x-nb.lead.len<0.3)return;
+  if(nb.foll&&v.x-nb.foll.x-v.len<0.3)return;
+  if(accWith(v,nb.lead)<-bS)return;
+  if(nb.foll&&accWith(nb.foll,v)<-bS)return;
+  applyChange(v,0,L);
+}
+
+// ---------- one tick ----------
+function step(){
+  tick++;
+  const L=buildLanes();
+  // 1. lane changes, front-to-back, deterministic
+  const order=vehicles.slice().sort((a,b)=>b.x-a.x||a.id-b.id);
+  for(const v of order){
+    if(v.cool>0){v.cool--;continue}
+    if(v.lane===RAMP)tryMerge(v,L);else tryDiscretionary(v,L);
+  }
+  // 2. accelerations (fresh neighbors after changes)
+  for(let ln=0;ln<=RAMP;ln++){const arr=L[ln];
+    for(let i=0;i<arr.length;i++){const v=arr[i],lead=arr[i+1]||null;
+      let a1=accWith(v,lead);
+      if(ln===RAMP)a1=Math.min(a1,idm(v,REND-v.x,0)); // physical wall at lane end
+      v.acc=a1;}}
+  // 3. ballistic integration + stop override
+  for(const v of vehicles){const a=v.acc;
+    if(v.v+a*DT<0){if(a<0)v.x+=-0.5*v.v*v.v/a;v.v=0;}
+    else{v.x+=v.v*DT+0.5*a*DT*DT;v.v+=a*DT;}
+    m.vkm+=v.v*DT/1000;}
+  // 4. overlap backstop (count = model pathology indicator)
+  for(let ln=0;ln<=RAMP;ln++){const arr=L[ln];arr.sort((p,q)=>p.x-q.x);
+    for(let i=0;i<arr.length-1;i++){const f=arr[i],ld=arr[i+1];
+      if(ld.x-f.x-ld.len<-0.01){m.coll++;f.x=ld.x-ld.len-0.1;f.v=Math.min(f.v,ld.v);}}}
+  // 5. stuck-at-lane-end detection
+  for(const v of vehicles)if(v.lane===RAMP&&v.x>REND-40&&v.v<0.5){
+    v.stuckT+=DT;if(!v.counted&&v.stuckT>4){m.stuck++;v.counted=true;}}
+  // 6. removal
+  const simT=tick*DT;
+  for(let i=vehicles.length-1;i>=0;i--)if(vehicles[i].x>ROAD){
+    m.out.push(simT);vehicles.splice(i,1);}
+  while(m.out.length&&m.out[0]<simT-300)m.out.shift();
+  // 7. spawning (rate accumulators; unmet demand carries over)
+  const rates=[P.qMain,P.qMain,P.qMain,P.qRamp];
+  for(let ln=0;ln<4;ln++){
+    m.spawnAcc[ln]=Math.min(3,m.spawnAcc[ln]+rates[ln]/3600*DT);
+    if(m.spawnAcc[ln]>=1){
+      const x0=ln===RAMP?RSTART:0;
+      const{lead}=neighAt(L[ln],x0,null);
+      const need=8+(lead?lead.v:0)*0.8;
+      if(!lead||lead.x-x0-lead.len>need){
+        const f=clamp(1+0.1*gauss(),0.8,1.3);
+        const vI=ln===RAMP?14:Math.min(P.v0*f,lead?Math.max(8,lead.v+2):P.v0*f);
+        const nv={id:nextId++,lane:ln,x:x0,v:vI,len:VLEN,f,cool:10,acc:0,stuckT:0,counted:false};
+        vehicles.push(nv);insertSorted(L[ln],nv);
+        m.spawnAcc[ln]-=1;}}}
+  // 8. heatmap accumulation
+  for(const v of vehicles)if(v.lane<NL){
+    const r=clamp(Math.floor(v.x/(ROAD/HH)),0,HH-1);hSum[r]+=v.v;hCnt[r]++;}
+  if(tick%5===0)flushHeatColumn();
+}
+
+// ---------- heatmap ----------
+const heat=document.getElementById('heat'),hctx=heat.getContext('2d');
+const HW=heat.width,HH=heat.height;
+let hSum=new Float64Array(HH),hCnt=new Int32Array(HH);
+function heatColor(t){ // t=1 fast(light) → t=0 slow(dark)
+  const r=13+(205-13)*t,g=54+(226-54)*t,b=107+(251-107)*t;
+  return`rgb(${r|0},${g|0},${b|0})`;}
+function flushHeatColumn(){
+  hctx.drawImage(heat,1,0,HW-1,HH,0,0,HW-1,HH);
+  for(let r=0;r<HH;r++){
+    hctx.fillStyle=hCnt[r]?heatColor(clamp(hSum[r]/hCnt[r]/33,0,1)):'#141821';
+    hctx.fillRect(HW-1,HH-1-r,1,1);}
+  hSum.fill(0);hCnt.fill(0);}
+
+// ---------- road rendering ----------
+const road=document.getElementById('road'),rctx=road.getContext('2d');
+const RW=road.width,sc=(RW-20)/ROAD,X0=10;
+const yLane=l=>l===RAMP?96:22+(NL-1-l)*22;
+function draw(){
+  rctx.fillStyle='#1a1e24';rctx.fillRect(0,0,RW,150);
+  rctx.fillStyle='#22272f';
+  for(let l=NL-1;l>=0;l--)rctx.fillRect(X0,yLane(l),ROAD*sc,20);
+  rctx.fillRect(X0+RSTART*sc,yLane(RAMP),(REND-RSTART)*sc,20);
+  rctx.beginPath(); // ramp entry wedge + end taper
+  rctx.moveTo(X0+(RSTART-90)*sc,140);rctx.lineTo(X0+RSTART*sc,yLane(RAMP)+20);
+  rctx.lineTo(X0+RSTART*sc,yLane(RAMP));rctx.closePath();rctx.fill();
+  rctx.beginPath();rctx.moveTo(X0+REND*sc,yLane(RAMP));
+  rctx.lineTo(X0+(REND+35)*sc,yLane(RAMP));rctx.lineTo(X0+REND*sc,yLane(RAMP)+20);
+  rctx.closePath();rctx.fill();
+  rctx.strokeStyle='#3a4250';rctx.setLineDash([6,8]);rctx.beginPath();
+  for(let l=1;l<NL;l++){rctx.moveTo(X0,yLane(l)+21);rctx.lineTo(X0+ROAD*sc,yLane(l)+21);}
+  rctx.stroke();rctx.setLineDash([]);
+  rctx.strokeStyle='#c0392b';rctx.beginPath(); // lane-end wall
+  rctx.moveTo(X0+REND*sc,yLane(RAMP)-2);rctx.lineTo(X0+REND*sc,yLane(RAMP)+22);rctx.stroke();
+  for(const v of vehicles){
+    rctx.fillStyle=`hsl(${120*clamp(v.v/30,0,1)},70%,52%)`;
+    rctx.fillRect(X0+(v.x-v.len)*sc,yLane(v.lane)+4,Math.max(3,v.len*sc),12);}
+  rctx.fillStyle='#8b95a3';rctx.font='11px system-ui';
+  rctx.fillText('flow →',X0,14);rctx.fillText('on-ramp (merges into bottom lane, no cooperation)',X0+RSTART*sc,146);
+}
+
+// ---------- stats ----------
+function stats(){
+  const el=id=>document.getElementById(id);
+  el('st_n').textContent=vehicles.length;
+  const mv=vehicles.length?vehicles.reduce((s,v)=>s+v.v,0)/vehicles.length*3.6:0;
+  el('st_v').textContent=mv.toFixed(0);
+  const simT=tick*DT,win=Math.min(300,Math.max(30,simT));
+  el('st_out').textContent=(m.out.filter(t=>t>simT-win).length/win*3600).toFixed(0);
+  el('st_lc').textContent=m.vkm>0.5?(m.lc/m.vkm).toFixed(2):'–';
+  el('st_stuck').textContent=m.stuck;
+  el('st_coll').textContent=m.coll;
+  el('st_t').textContent=simT.toFixed(0);
+}
+
+// ---------- controls ----------
+function bind(key,id,fmt){const s=document.getElementById('s_'+id),o=document.getElementById('o_'+id);
+  s.value=P[key];o.value=fmt(P[key]);
+  s.oninput=()=>{P[key]=+s.value;o.value=fmt(P[key])};}
+bind('qMain','qMain',v=>v);bind('qRamp','qRamp',v=>v);
+bind('a','a',v=>v.toFixed(2));bind('T','T',v=>v.toFixed(2));bind('p','p',v=>v.toFixed(2));
+{const s=document.getElementById('s_speed'),o=document.getElementById('o_speed');
+ s.value=1;o.value='1×';s.oninput=()=>{P.speed=SPEEDS[+s.value];o.value=P.speed+'×'};P.speed=1;}
+document.getElementById('b_pause').onclick=e=>{paused=!paused;e.target.textContent=paused?'resume':'pause'};
+document.getElementById('b_reset').onclick=reset;
+
+// ---------- loop: fixed 100 ms tick, wall-clock accumulator (ADR-0005 pattern) ----------
+let last=performance.now(),acc=0;
+function frame(now){
+  requestAnimationFrame(frame);
+  const dt=Math.min(0.25,(now-last)/1000);last=now;
+  if(!paused){acc+=dt*P.speed;let n=0;
+    while(acc>=DT&&n<400){step();acc-=DT;n++}
+    if(n>=400)acc=0;}
+  draw();if(tick%3===0)stats();
+}
+reset();requestAnimationFrame(frame);
+</script>
+</body>
+</html>

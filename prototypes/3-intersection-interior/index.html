@@ -1,0 +1,388 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Prototype 3 — Intersection interior: conflict points vs internal occupancy</title>
+<style>
+  body{background:#111418;color:#d5dbe3;font:14px/1.45 system-ui,sans-serif;margin:0;padding:20px 24px;max-width:1100px}
+  h1{font-size:20px;margin:0 0 4px} .sub{color:#8b95a3;margin:0 0 14px;font-size:13px}
+  canvas{background:#1a1e24;border-radius:6px;display:block}
+  .row{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end;margin:8px 0}
+  .ctl{display:flex;flex-direction:column;font-size:12px;color:#8b95a3;min-width:120px}
+  .ctl output{color:#d5dbe3;font-weight:600}
+  .panels{display:flex;gap:18px;flex-wrap:wrap;margin:12px 0}
+  .panel h2{font-size:14px;margin:0 0 6px;color:#d5dbe3}
+  .pstats{display:flex;gap:16px;flex-wrap:wrap;font-size:11px;color:#8b95a3;margin:8px 0}
+  .pstats b{display:block;font-size:14px;color:#fff;font-weight:600}
+  .glock{color:#e05252;font-weight:700;font-size:13px;height:16px}
+  button{background:#2a3140;color:#d5dbe3;border:0;border-radius:5px;padding:6px 12px;cursor:pointer;font:13px system-ui}
+  button:hover{background:#39435a}
+  .note{background:#1a212c;border-left:3px solid #3b6ea5;padding:10px 14px;border-radius:4px;font-size:13px;color:#aab4c0;margin:14px 0}
+</style>
+</head>
+<body>
+<h1>Prototype 3 — What happens <i>inside</i> the intersection box?</h1>
+<p class="sub">Two-way-stop intersection (E–W major has priority, N–S minor stops), single lane per approach,
+HCM critical gaps (major-left 4.1&nbsp;s, minor-right 6.2, minor-through 6.5, minor-left 7.1).
+Both panels consume <b>identical seeded arrivals</b> — every difference you see is the interior model.</p>
+
+<div class="row">
+  <label class="ctl">major road demand (veh/h/dir) <output id="o_qMaj"></output><input type="range" id="s_qMaj" min="0" max="900" step="25"></label>
+  <label class="ctl">minor road demand (veh/h/dir) <output id="o_qMin"></output><input type="range" id="s_qMin" min="0" max="600" step="25"></label>
+  <label class="ctl">sim speed <output id="o_speed"></output><input type="range" id="s_speed" min="0" max="3" step="1"></label>
+  <button id="b_pause">pause</button>
+  <button id="b_reset">reset</button>
+  <button id="b_block">block EAST exit 25 s</button>
+  <label class="ctl"><span><input type="checkbox" id="c_zones"> show conflict zones</span></label>
+</div>
+
+<div class="panels">
+  <div class="panel">
+    <h2>A — conflict-point gap acceptance (interior abstract)</h2>
+    <canvas id="cvA" width="470" height="470"></canvas>
+    <div class="pstats">
+      <span><b id="A_out">0</b>served</span>
+      <span><b id="A_delay">–</b>avg delay s</span>
+      <span><b id="A_q">0</b>queued</span>
+      <span><b id="A_ovl" style="color:#e8b04b">0</b>interior overlaps</span>
+    </div>
+    <div class="glock" id="A_glock"></div>
+  </div>
+  <div class="panel">
+    <h2>B — internal-lane occupancy (interior physical)</h2>
+    <canvas id="cvB" width="470" height="470"></canvas>
+    <div class="pstats">
+      <span><b id="B_out">0</b>served</span>
+      <span><b id="B_delay">–</b>avg delay s</span>
+      <span><b id="B_q">0</b>queued</span>
+      <span><b id="B_ovl" style="color:#e8b04b">0</b>interior overlaps</span>
+    </div>
+    <div class="glock" id="B_glock"></div>
+  </div>
+</div>
+
+<div class="note"><b>What to look for.</b>
+(1) <b>The core trade</b>: A decides everything once, at the stop line, and never yields again inside — fast and permissive, but push the demand sliders up and vehicles drive <i>through</i> each other (overlap counter: the interior has no physics). B never lets a body stop inside a conflict area it hasn't cleared — collision-free by construction, but conservative: throughput is visibly lower and queues grow at demand A handles easily.
+(2) Press <b>block EAST exit</b>: A piles overlapping ghosts; B spills back physically through the box and, at high demand, can <b>gridlock</b> — realism and fragility in one move.
+(3) In A the interior is capacity math; in B it's real estate. The engine's map contract must pick one.
+(4) <b>The finding from building this</b>: model B took four deadlock-trap fixes to survive an hour (vehicles creeping past yield walls, parking inside zones they'd committed to clear, phantom leaders on diverged paths, false merge-followers across the box). Interior-occupancy semantics are where the engineering lives — this is exactly what SUMO's internal-junction machinery is for, and what our foes/response + deterministic tie-break design must nail.</div>
+
+<script>
+'use strict';
+function mulberry32(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+const clamp=(x,a,b)=>Math.min(b,Math.max(a,x));
+
+// ---------- geometry (world: meters, y up; box |x|,|y|<6; lanes at ±2) ----------
+const APP=90,BOXR=6,V0=13.9,VLEN=4.6,DT=0.1;
+function seg(a,b,st=1){const pts=[],dx=b[0]-a[0],dy=b[1]-a[1],d=Math.hypot(dx,dy),n=Math.max(1,Math.round(d/st));
+  for(let i=0;i<=n;i++)pts.push([a[0]+dx*i/n,a[1]+dy*i/n]);return pts}
+function arc(cx,cy,r,t0,t1,st=3){const pts=[],n=Math.max(2,Math.round(Math.abs(t1-t0)/st));
+  for(let i=0;i<=n;i++){const t=(t0+(t1-t0)*i/n)*Math.PI/180;pts.push([cx+r*Math.cos(t),cy+r*Math.sin(t)])}return pts}
+function rotPt(p,k){let[x,y]=p;for(let i=0;i<k;i++){const t=x;x=-y;y=t}return[x,y]}
+
+// EB templates (approach heads +x on lane y=-2); rotate k×90° CCW for NB/WB/SB
+const TMPL={
+  T:{interior:seg([-BOXR,-2],[BOXR,-2]),exit:seg([BOXR,-2],[BOXR+APP,-2]),exitDir:0,r:null},
+  R:{interior:arc(-BOXR,-BOXR,4,90,0),exit:seg([-2,-BOXR],[-2,-BOXR-APP]),exitDir:3,r:4},
+  L:{interior:arc(-BOXR,BOXR,8,-90,0),exit:seg([2,BOXR],[2,BOXR+APP]),exitDir:1,r:8},
+};
+const RANK={ // 0,2 = major (E,W); 1,3 = minor (N,S)
+  major:{T:1,R:1,L:2},minor:{T:4,R:3,L:5}};
+const TC={2:4.1,3:6.2,4:6.5,5:7.1}; // HCM base critical gaps by rank
+
+const paths=[];
+for(let app=0;app<4;app++){
+  const isMajor=app===0||app===2;
+  for(const mv of['T','R','L']){
+    const t=TMPL[mv];
+    const raw=[...seg([-BOXR-APP,-2],[-BOXR,-2]),...t.interior,...t.exit].map(p=>rotPt(p,app));
+    const pts=[raw[0]],cum=[0];
+    for(let i=1;i<raw.length;i++){const d=Math.hypot(raw[i][0]-raw[i-1][0],raw[i][1]-raw[i-1][1]);
+      if(d<1e-6)continue;pts.push(raw[i]);cum.push(cum[cum.length-1]+d)}
+    const len=cum[cum.length-1];
+    const vArc=t.r?Math.sqrt(t.r*5.5):V0; // SUMO turn-speed formula
+    const p={id:paths.length,app,mv,rank:isMajor?RANK.major[mv]:RANK.minor[mv],
+      exitDir:(t.exitDir+app)%4,pts,cum,len,sStop:APP,sExit:len-APP,vArc,zones:[]};
+    p.ffT=p.len/V0+(p.sExit-p.sStop)*(1/p.vArc-1/V0);
+    paths.push(p);
+  }
+}
+function posAt(p,s){const c=p.cum;let lo=0,hi=c.length-1;
+  s=clamp(s,0,p.len);
+  while(lo<hi-1){const m=(lo+hi)>>1;if(c[m]<=s)lo=m;else hi=m}
+  const f=(s-c[lo])/Math.max(1e-9,c[lo+1]-c[lo]);
+  const a=p.pts[lo],b=p.pts[lo+1];
+  return{x:a[0]+(b[0]-a[0])*f,y:a[1]+(b[1]-a[1])*f,
+    hx:(b[0]-a[0]),hy:(b[1]-a[1])};}
+
+// ---------- conflict zones: sample pairs of paths near the box ----------
+for(let i=0;i<paths.length;i++)for(let j=i+1;j<paths.length;j++){
+  const A=paths[i],B=paths[j];
+  if(A.app===B.app)continue; // same approach lane: handled by car-following
+  const hits=[];
+  for(let a=0;a<A.pts.length;a++){const pa=A.pts[a];
+    if(Math.abs(pa[0])>BOXR+2.5||Math.abs(pa[1])>BOXR+2.5)continue;
+    for(let b=0;b<B.pts.length;b++){const pb=B.pts[b];
+      if(Math.hypot(pa[0]-pb[0],pa[1]-pb[1])<2.3)hits.push([A.cum[a],B.cum[b]])}}
+  if(!hits.length)continue;
+  hits.sort((u,v)=>u[0]-v[0]);
+  let z=null;
+  const zs=[];
+  for(const[sa,sb]of hits){
+    if(z&&sa-z.a1<=4){z.a1=Math.max(z.a1,sa);z.b0=Math.min(z.b0,sb);z.b1=Math.max(z.b1,sb)}
+    else{z={a0:sa,a1:sa,b0:sb,b1:sb};zs.push(z)}}
+  for(const zz of zs){
+    A.zones.push({other:B,s0:zz.a0,s1:zz.a1,o0:zz.b0,o1:zz.b1});
+    B.zones.push({other:A,s0:zz.b0,s1:zz.b1,o0:zz.a0,o1:zz.a1});}
+}
+for(const p of paths)p.zones.sort((a,b)=>a.s0-b.s0);
+// Group interleaved zones into clusters. A vehicle only ever waits at a cluster
+// entry — never between zones — so its body can never park inside a conflict
+// area it was supposed to clear (the creeping-deadlock trap).
+for(const p of paths){
+  p.clusters=[];let cur=null;
+  for(const z of p.zones){
+    if(cur&&z.s0<=cur.s1+6){cur.zones.push(z);cur.s1=Math.max(cur.s1,z.s1);}
+    else{cur={s0:z.s0,s1:z.s1,zones:[z]};p.clusters.push(cur);}
+  }
+}
+
+// ---------- IDM along path ----------
+const IP={a:1.5,b:2.5,s0:2.0,T:1.1};
+function idm(v,v0,s,vl){
+  const free=IP.a*(1-Math.pow(v/v0,4));
+  if(s===null)return free;
+  const ss=Math.max(0.1,s);
+  const sStar=IP.s0+Math.max(0,v*IP.T+v*(v-vl)/(2*Math.sqrt(IP.a*IP.b)));
+  return Math.max(-9,IP.a*(1-Math.pow(v/v0,4)-(sStar/ss)*(sStar/ss)));
+}
+
+// ---------- global params ----------
+const P={qMaj:400,qMin:200,speed:1};
+const SPEEDS=[1,2,4,8];
+const MIX_MAJ=[['T',0.70],['L',0.15],['R',0.15]],MIX_MIN=[['T',0.50],['L',0.25],['R',0.25]];
+let blockUntil=-1; // sim time until which east exit is blocked (shared)
+
+// ---------- simulation (one instance per model) ----------
+class Sim{
+  constructor(model,seed){
+    this.model=model;this.t=0;this.veh=[];this.nextId=1;
+    this.done=0;this.delaySum=0;this.overlaps=0;this.seen=new Set();
+    this.lastMove=0;this.gridlocked=false;
+    this.arr=[0,1,2,3].map(a=>({rng:mulberry32(seed+a*7919),next:0,q:[]}));
+    for(let k=0;k<4;k++)this.schedule(k);
+  }
+  schedule(app){const a=this.arr[app];
+    const rate=(app===0||app===2?P.qMaj:P.qMin)/3600;
+    a.next+= rate>0? -Math.log(1-a.rng())/rate : 1e9;
+    const r=a.rng(),mix=(app===0||app===2)?MIX_MAJ:MIX_MIN;
+    let acc=0,mv='T';for(const[m2,w]of mix){acc+=w;if(r<acc){mv=m2;break}}
+    a.q.push({time:a.next,mv});}
+  spawn(){
+    for(let app=0;app<4;app++){const a=this.arr[app];
+      while(a.q.length&&a.q[0].time<=this.t){
+        // keep at most a bounded backlog; spawn when entry clear
+        if(a.q.length>200){a.q.shift();continue}
+        const ev=a.q[0];
+        let blockedEntry=false;
+        for(const o of this.veh)if(o.path.app===app&&o.s<12){blockedEntry=true;break}
+        if(blockedEntry)break;
+        a.q.shift();
+        const path=paths.find(p=>p.app===app&&p.mv===ev.mv);
+        this.veh.push({id:this.nextId++,path,s:0,v:0,sched:ev.time,entered:false,acc:0});
+      }
+      while(a.q.length<3)this.schedule(app);
+    }
+  }
+  canEnter(veh){
+    const p=veh.path;
+    for(const z of p.zones){
+      const fr=z.other.rank;
+      if(fr>p.rank)continue; // they yield to us
+      const tc=fr===p.rank?3.0:TC[p.rank];
+      for(const o of this.veh){
+        if(o.path!==z.other)continue;
+        if(o.s>z.o1+1)continue;                       // already past the zone
+        if(o.s>=z.o0-6)return false;                  // in / at the zone
+        if(!o.entered&&o.s<z.other.sStop-2&&fr>1)continue; // waiting at its own line
+        const d=z.o0-o.s;
+        if(o.v<0.7&&d>8)continue;                     // distant & stopped: not imminent
+        if(d/Math.max(o.v,0.5)<tc)return false;
+      }
+    }
+    return true;
+  }
+  constraints(veh){ // returns array of {s(gap), vl}
+    const p=veh.path,cons=[];
+    // same-approach lane following (shared geometry up to just past the stop line)
+    if(veh.s<p.sStop+6){
+      let best=null;
+      for(const o of this.veh){
+        if(o===veh||o.path.app!==p.app)continue;
+        if(o.s>veh.s&&o.s<p.sStop+5&&o.s-veh.s<40)if(!best||o.s<best.s)best=o;}
+      if(best)cons.push({s:best.s-veh.s-VLEN,vl:best.v});
+    }
+    // same-path following
+    {let best=null;
+      for(const o of this.veh)if(o!==veh&&o.path===p&&o.s>veh.s)if(!best||o.s<best.s)best=o;
+      if(best)cons.push({s:best.s-veh.s-VLEN,vl:best.v});}
+    // shared exit-lane following (only near geometric convergence — comparing
+    // exit coordinates of vehicles still deep on different approach paths is meaningless)
+    const eSelf=veh.s-p.sExit;
+    if(eSelf>-7){
+      let best=null,bestE=1e9;
+      for(const o of this.veh){
+        if(o===veh||o.path.exitDir!==p.exitDir||o.path===p)continue;
+        const eo=o.s-o.path.sExit;
+        if(eo>Math.max(eSelf,-7)&&eo<bestE){bestE=eo;best=o}}
+      if(best)cons.push({s:bestE-eSelf-VLEN,vl:best.v});}
+    // blocked east exit (shared scenario button)
+    if(this.t<blockUntil&&p.exitDir===0&&eSelf>-60)
+      cons.push({s:(35-eSelf),vl:0});
+    // stop line
+    if(!veh.entered)cons.push({s:p.sStop-1.2-veh.s,vl:0});
+    // model B: interior yielding, decided per zone-CLUSTER at the cluster entry
+    if(this.model==='B'&&veh.entered){
+      for(const cl of p.clusters){
+        if(veh.s>cl.s0+0.3)continue; // committed: drive through, never stop for yields inside
+        if(cl.s0-veh.s>45)break;
+        let yieldNow=false;
+        for(const z of cl.zones){
+          for(const o of this.veh){
+            if(o.path!==z.other)continue;
+            const fr=z.other.rank;
+            if(o.s>z.o0+0.3&&o.s<=z.o1+VLEN){yieldNow=true;break}      // physically in the zone
+            const poised=o.s>z.o0-VLEN-2&&o.s<=z.o0+0.3&&o.v<0.7;      // stopped at the zone edge
+            if(poised){ // deterministic tie-break: rank, then vehicle id (the ADR theme)
+              if(fr<p.rank||(fr===p.rank&&o.id<veh.id)){yieldNow=true;break}
+              continue;}
+            if(fr<p.rank&&o.s<z.o0&&o.v>0.7&&o.entered){
+              if((z.o0-o.s)/Math.max(o.v,0.5)<Math.min(TC[p.rank]||3,4)){yieldNow=true;break}}
+          }
+          if(yieldNow)break;
+        }
+        if(yieldNow)cons.push({s:cl.s0-2-veh.s,vl:0});
+      }
+    }
+    return cons;
+  }
+  step(){
+    this.t+=DT;
+    this.spawn();
+    // entry decisions
+    for(const v of this.veh){
+      if(v.entered||v.s<v.path.sStop-20)continue;
+      const rank=v.path.rank;
+      let ok;
+      if(this.model==='A')ok=rank===1?true:this.canEnter(v);
+      else ok=rank<=2?true:this.canEnter(v); // B: major-left enters and waits mid-box
+      if(ok)v.entered=true;
+    }
+    // accelerations
+    for(const v of this.veh){
+      const p=v.path;
+      const vlim=(v.s>p.sStop-3&&v.s<p.sExit)?p.vArc:V0;
+      let a=idm(v.v,vlim,null,0);
+      for(const c of this.constraints(v))a=Math.min(a,idm(v.v,vlim,Math.max(c.s,-0.5),c.vl));
+      v.acc=a;
+    }
+    // ballistic + stop override
+    let moved=false;
+    for(const v of this.veh){
+      const a=v.acc;
+      if(v.v+a*DT<0){if(a<0)v.s+=-0.5*v.v*v.v/a;v.v=0}
+      else{v.s+=v.v*DT+0.5*a*DT*DT;v.v+=a*DT}
+      if(v.v>0.2)moved=true;
+    }
+    if(moved||this.veh.length===0)this.lastMove=this.t;
+    this.gridlocked=this.t-this.lastMove>12&&this.veh.length>3;
+    // removal + delay accounting
+    for(let i=this.veh.length-1;i>=0;i--){const v=this.veh[i];
+      if(v.s>=v.path.len){
+        this.done++;this.delaySum+=Math.max(0,(this.t-v.sched)-v.path.ffT);
+        this.veh.splice(i,1);}}
+    // interior overlap detection (conflicting paths only — the model-A pathology)
+    if(Math.round(this.t/DT)%5===0){
+      for(let i=0;i<this.veh.length;i++){const a=this.veh[i];
+        if(a.s<a.path.sStop||a.s>a.path.sExit)continue;
+        const pa=posAt(a.path,a.s);
+        for(let j=i+1;j<this.veh.length;j++){const b=this.veh[j];
+          if(b.s<b.path.sStop||b.s>b.path.sExit)continue;
+          if(a.path.app===b.path.app||a.path===b.path)continue;
+          const pb=posAt(b.path,b.s);
+          if(Math.hypot(pa.x-pb.x,pa.y-pb.y)<1.8){
+            const key=Math.min(a.id,b.id)+'-'+Math.max(a.id,b.id);
+            if(!this.seen.has(key)){this.seen.add(key);this.overlaps++}}}}
+    }
+  }
+}
+
+// ---------- rendering ----------
+const SC=2.3;
+function drawSim(sim,cv){
+  const ctx=cv.getContext('2d'),W=cv.width,H=cv.height,cx=W/2,cy=H/2;
+  const T=(x,y)=>[cx+x*SC,cy-y*SC];
+  ctx.fillStyle='#1a1e24';ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#22272f'; // roads
+  ctx.fillRect(...T(-BOXR-APP,4),(2*(BOXR+APP))*SC,8*SC);
+  ctx.fillRect(...T(-4,BOXR+APP),8*SC,(2*(BOXR+APP))*SC);
+  ctx.strokeStyle='#3a4250';ctx.strokeRect(...T(-BOXR,BOXR),2*BOXR*SC,2*BOXR*SC);
+  ctx.strokeStyle='#e0e4ea';ctx.lineWidth=1.5;ctx.beginPath(); // stop lines (minor bold)
+  for(let app=0;app<4;app++){
+    const a=rotPt([-BOXR,-4],app),b=rotPt([-BOXR,0],app);
+    ctx.moveTo(...T(a[0],a[1]));ctx.lineTo(...T(b[0],b[1]));}
+  ctx.stroke();ctx.lineWidth=1;
+  if(showZones){ctx.fillStyle='rgba(224,82,82,0.35)';
+    for(const p of paths)for(const z of p.zones){
+      const q=posAt(p,(z.s0+z.s1)/2);const[px,py]=T(q.x,q.y);
+      ctx.beginPath();ctx.arc(px,py,3,0,7);ctx.fill();}}
+  if(sim.t<blockUntil){ctx.fillStyle='#e05252';
+    const[bx,by]=T(BOXR+35,4);ctx.fillRect(bx,by,3,8*SC);}
+  for(const v of sim.veh){
+    const q=posAt(v.path,v.s),[px,py]=T(q.x,q.y);
+    const ang=-Math.atan2(q.hy,q.hx);
+    ctx.save();ctx.translate(px,py);ctx.rotate(ang);
+    ctx.fillStyle=`hsl(${120*clamp(v.v/V0,0,1)},70%,52%)`;
+    ctx.fillRect(-VLEN*SC/2,-1.0*SC,VLEN*SC,2.0*SC);
+    ctx.restore();}
+  ctx.fillStyle='#8b95a3';ctx.font='10px system-ui';
+  ctx.fillText('N',cx-3,14);ctx.fillText('major →',W-52,cy-12);
+}
+
+// ---------- setup / loop ----------
+let simA,simB,paused=false,showZones=false;
+function reset(){blockUntil=-1;simA=new Sim('A',1234);simB=new Sim('B',1234);}
+const cvA=document.getElementById('cvA'),cvB=document.getElementById('cvB');
+function stats(){
+  for(const[sim,id]of[[simA,'A'],[simB,'B']]){
+    document.getElementById(id+'_out').textContent=sim.done;
+    document.getElementById(id+'_delay').textContent=sim.done?(sim.delaySum/sim.done).toFixed(1):'–';
+    document.getElementById(id+'_q').textContent=sim.veh.filter(v=>v.v<0.5).length+sim.arr.reduce((s,a)=>s+a.q.filter(e=>e.time<=sim.t).length,0);
+    document.getElementById(id+'_ovl').textContent=sim.overlaps;
+    document.getElementById(id+'_glock').textContent=sim.gridlocked?'⚠ GRIDLOCK':'';
+  }
+}
+function bind(key,id,fmt){const s=document.getElementById('s_'+id),o=document.getElementById('o_'+id);
+  s.value=P[key];o.value=fmt(P[key]);
+  s.oninput=()=>{P[key]=+s.value;o.value=fmt(P[key])};}
+bind('qMaj','qMaj',v=>v);bind('qMin','qMin',v=>v);
+{const s=document.getElementById('s_speed'),o=document.getElementById('o_speed');
+ s.value=0;o.value='1×';s.oninput=()=>{P.speed=SPEEDS[+s.value];o.value=P.speed+'×'};}
+document.getElementById('b_pause').onclick=e=>{paused=!paused;e.target.textContent=paused?'resume':'pause'};
+document.getElementById('b_reset').onclick=reset;
+document.getElementById('b_block').onclick=()=>{blockUntil=simA.t+25};
+document.getElementById('c_zones').onchange=e=>{showZones=e.target.checked};
+
+let last=performance.now(),acc=0;
+function frame(now){
+  requestAnimationFrame(frame);
+  const dt=Math.min(0.25,(now-last)/1000);last=now;
+  if(!paused){acc+=dt*P.speed;let n=0;
+    while(acc>=DT&&n<200){simA.step();simB.step();acc-=DT;n++}
+    if(n>=200)acc=0;}
+  drawSim(simA,cvA);drawSim(simB,cvB);stats();
+}
+reset();requestAnimationFrame(frame);
+</script>
+</body>
+</html>
