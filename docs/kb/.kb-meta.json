@@ -7,9 +7,16 @@
     "domain-simulator-landscape": {
       "category": "business-domains",
       "title": "Simulator Landscape",
-      "status": "pending",
+      "status": "complete",
+      "researched_at": "2026-07-16",
       "key_files": ["docs/VISION.md"],
       "complexity": "deep",
+      "raw_files": [
+        "raw/domain-simulator-landscape/implementation.md",
+        "raw/domain-simulator-landscape/competitors.md",
+        "raw/domain-simulator-landscape/standards-and-patterns.md",
+        "raw/domain-simulator-landscape/synthesis.md"
+      ],
       "research_hints": "SUMO, MATSim, CARLA, Aimsun, PTV VISSIM. Compare: time model, network representation, controller/agent APIs (e.g. SUMO's TraCI), replay support, licensing. Goal: steal proven ideas, avoid known pitfalls."
     },
     "domain-traffic-flow-models": {
@@ -32,14 +39,14 @@
       "title": "Macroscopic Flow Models",
       "status": "complete",
       "researched_at": "2026-07-15",
-      "key_files": ["docs/VISION.md"],
-      "complexity": "deep",
       "raw_files": [
         "raw/domain-macroscopic-flow-models/implementation.md",
         "raw/domain-macroscopic-flow-models/competitors.md",
         "raw/domain-macroscopic-flow-models/standards-and-patterns.md",
         "raw/domain-macroscopic-flow-models/synthesis.md"
       ],
+      "key_files": ["docs/VISION.md"],
+      "complexity": "deep",
       "research_hints": "LWR kinematic-wave model: conservation law + fundamental diagram closure (Greenshields, triangular/Newell). Characteristics, shockwaves (Rankine-Hugoniot), rarefaction fans. Numerics: Godunov scheme = Daganzo's Cell Transmission Model (demand/supply). Extensions: second-order models (Payne, ARZ) and why first-order often suffices. Micro↔macro bridge: fundamental diagram implied by IDM/Newell car-following. Uses for us: engine validation (shockwave speed), fast preview/ranking mode, episode visuals."
     },
     "domain-trajectory-datasets": {
@@ -60,18 +67,32 @@
     "domain-congestion-metrics": {
       "category": "business-domains",
       "title": "Congestion Metrics",
-      "status": "pending",
+      "status": "complete",
+      "researched_at": "2026-07-16",
       "key_files": ["docs/VISION.md"],
       "complexity": "medium",
+      "raw_files": [
+        "raw/domain-congestion-metrics/implementation.md",
+        "raw/domain-congestion-metrics/competitors.md",
+        "raw/domain-congestion-metrics/standards-and-patterns.md",
+        "raw/domain-congestion-metrics/synthesis.md"
+      ],
       "research_hints": "HCM level-of-service, control delay, queue length, v/c ratio, travel-time reliability. How DOTs compare infrastructure alternatives. Output: the metric set our observability system must compute per lane/intersection/scenario."
     },
     "domain-signal-control": {
       "category": "business-domains",
       "title": "Signal Control",
-      "status": "pending",
+      "status": "complete",
+      "researched_at": "2026-07-16",
       "key_files": ["docs/VISION.md"],
       "complexity": "medium",
-      "research_hints": "Phases, rings/barriers, fixed vs actuated vs adaptive, coordination and green waves, standard timing plan formats. Needed for signalized intersections and the civic-advocacy replay use case."
+      "raw_files": [
+        "raw/domain-signal-control/implementation.md",
+        "raw/domain-signal-control/competitors.md",
+        "raw/domain-signal-control/standards-and-patterns.md",
+        "raw/domain-signal-control/synthesis.md"
+      ],
+      "research_hints": "Phases, rings/barriers, fixed vs actuated timing, coordination and green waves, standard timing plan formats. Needed for signalized intersections and the civic-advocacy replay use case."
     },
     "arch-time-model": {
       "category": "architecture",
@@ -91,17 +112,31 @@
     "arch-nats-backbone": {
       "category": "architecture",
       "title": "NATS Backbone",
-      "status": "pending",
+      "status": "complete",
+      "researched_at": "2026-07-16",
       "key_files": ["docs/VISION.md", "docs/kb/decisions/ADR-0002-nats-backbone.md"],
       "complexity": "deep",
+      "raw_files": [
+        "raw/arch-nats-backbone/implementation.md",
+        "raw/arch-nats-backbone/competitors.md",
+        "raw/arch-nats-backbone/standards-and-patterns.md",
+        "raw/arch-nats-backbone/synthesis.md"
+      ],
       "research_hints": "Subject taxonomy design; core NATS vs JetStream vs KV division of labor; JetStream replay semantics for deterministic playback; backpressure/slow-consumer handling with many controllers; embedding nats-server in a Go process vs docker-compose."
     },
     "arch-road-graph-model": {
       "category": "architecture",
       "title": "Road Graph Model",
-      "status": "pending",
+      "status": "complete",
+      "researched_at": "2026-07-16",
       "key_files": ["docs/VISION.md"],
       "complexity": "medium",
+      "raw_files": [
+        "raw/arch-road-graph-model/implementation.md",
+        "raw/arch-road-graph-model/competitors.md",
+        "raw/arch-road-graph-model/standards-and-patterns.md",
+        "raw/arch-road-graph-model/synthesis.md"
+      ],
       "research_hints": "Lane-level graph: nodes, edges, lanes, lane-to-lane connections, turn restrictions. How SUMO's .net.xml and osm2streets represent this. Geometry (polylines) vs topology separation."
     },
     "arch-state-authority": {
@@ -115,17 +150,31 @@
     "concept-vehicle-controller-interface": {
       "category": "concepts",
       "title": "Vehicle & Controller Interface",
-      "status": "pending",
+      "status": "complete",
+      "researched_at": "2026-07-16",
       "key_files": ["docs/VISION.md"],
       "complexity": "medium",
+      "raw_files": [
+        "raw/concept-vehicle-controller-interface/implementation.md",
+        "raw/concept-vehicle-controller-interface/competitors.md",
+        "raw/concept-vehicle-controller-interface/standards-and-patterns.md",
+        "raw/concept-vehicle-controller-interface/synthesis.md"
+      ],
       "research_hints": "Separate vehicle capabilities (size, accel profile) from operator/controller (AI policy, scripted, human). What the engine↔controller message contract carries: observations in, intents out. Compare SUMO TraCI and CARLA actor/agent APIs."
     },
     "concept-scenario-format": {
       "category": "concepts",
       "title": "Scenario Format",
-      "status": "pending",
+      "status": "complete",
+      "researched_at": "2026-07-16",
       "key_files": ["docs/VISION.md"],
       "complexity": "medium",
+      "raw_files": [
+        "raw/concept-scenario-format/implementation.md",
+        "raw/concept-scenario-format/competitors.md",
+        "raw/concept-scenario-format/standards-and-patterns.md",
+        "raw/concept-scenario-format/synthesis.md"
+      ],
       "research_hints": "Scenario = network + demand (spawns/routes) + control config + metrics. Must be diffable for upgrade variants. Demand modeling basics (OD matrices, arrival rates). Recording format for replay (JetStream stream export?)."
     },
     "integration-osm-extraction": {

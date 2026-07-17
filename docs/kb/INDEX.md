@@ -20,22 +20,22 @@ back to it.
 ## Topic Registry
 
 ### Business Domains
-- [ ] [Simulator Landscape](raw/domain-simulator-landscape.md) — SUMO, MATSim, CARLA, VISSIM: architectures, what to steal, what to avoid
+- [x] [Simulator Landscape](raw/domain-simulator-landscape/synthesis.md) — SUMO, MATSim, CARLA, VISSIM: five camps, licensing map, our niche confirmed; recommends MIT/Apache-2.0 license ADR
 - [x] [Traffic Flow Models (Microscopic)](raw/domain-traffic-flow-models/synthesis.md) — car-following (IDM, Gipps), lane-changing (MOBIL), gap acceptance, intersection right-of-way; validates the 100 ms tick + ballistic integrator
 - [x] [Macroscopic Flow Models](raw/domain-macroscopic-flow-models/synthesis.md) — LWR kinematic-wave PDE, fundamental diagram, shockwaves/rarefactions, Cell Transmission Model; micro↔macro bridge and when macro beats micro
 - [x] [Trajectory Datasets & Overhead Analysis](raw/domain-trajectory-datasets/synthesis.md) — real overhead traffic data (NGSIM, highD/inD/rounD drone sets, pNEUMA, I-24 MOTION, ring-road experiments); DIY capture; computing our own waves/FD from trajectories; sim validation targets for intersections and highways
-- [ ] [Congestion Metrics](raw/domain-congestion-metrics.md) — level-of-service, delay, queue length, throughput, travel-time reliability; how traffic engineers rank alternatives
-- [ ] [Signal Control](raw/domain-signal-control.md) — phases, fixed vs actuated timing, coordination/green waves; foundation for the civic-advocacy use case
+- [x] [Congestion Metrics](raw/domain-congestion-metrics/synthesis.md) — FHWA MOE set + HCM Ch.24 trajectory state machines; recommends trajectory-first metric kernel, LOS as presentation skin, CRN experiment protocol
+- [x] [Signal Control](raw/domain-signal-control/synthesis.md) — NEMA dual-ring as internal model; decisecond cabinet timing maps losslessly onto the 100 ms tick; phase changes are engine events
 
 ### Architecture
 - [x] [Time Model](raw/arch-time-model/synthesis.md) — tick authority vs discrete-event vs hybrid; game-server prior art; determinism/replay implications → feeds ADR-0005
-- [ ] [NATS Backbone](raw/arch-nats-backbone.md) — subject taxonomy; core NATS vs JetStream vs KV division of labor; replay via streams; backpressure with many controllers
-- [ ] [Road Graph Model](raw/arch-road-graph-model.md) — lane-level graph representation: nodes/edges/lanes/connections, turn restrictions; how SUMO/OSM represent this
+- [x] [NATS Backbone](raw/arch-nats-backbone/synthesis.md) — three-plane split (core live / JetStream record / KV config), OCC headers, subject taxonomy → feeds ADR-0006
+- [x] [Road Graph Model](raw/arch-road-graph-model/synthesis.md) — lane-as-atom, compiled junction conflict sets + internal lanes, (laneId, s) occupancy, geometry-by-reference
 - [ ] [State Authority](raw/arch-state-authority.md) — authoritative-server patterns from multiplayer games: interest management, prediction, late/dropped controller inputs
 
 ### Concepts
-- [ ] [Vehicle & Controller Interface](raw/concept-vehicle-controller-interface.md) — vehicle capability model vs operator abstraction; the engine↔controller contract
-- [ ] [Scenario Format](raw/concept-scenario-format.md) — scenario definition, variants/diffs, demand patterns, recording format for replay
+- [x] [Vehicle & Controller Interface](raw/concept-vehicle-controller-interface/synthesis.md) — 4-axis intent vocabulary, SMARTS-style attach handshake, exclusive per-vehicle claims, fallback-to-IDM on disconnect
+- [x] [Scenario Format](raw/concept-scenario-format/synthesis.md) — manifest-of-parts directory, strict YAML, kustomize-style overlay variants, metrics embedded in scenario
 
 ### Integrations
 - [ ] [OSM Extraction](raw/integration-osm-extraction.md) — OSM data model (ways, lane tags, turn restrictions); Overpass/osmnx/osm2streets tooling; geometry → lane-graph conversion
