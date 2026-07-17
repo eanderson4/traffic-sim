@@ -47,6 +47,10 @@ back to it.
 - [x] [ADR-0003](decisions/ADR-0003-maplibre-vis.md) — MapLibre-first visualization, no UI frameworks by default
 - [x] [ADR-0004](decisions/ADR-0004-local-first.md) — Local-first deployment via docker-compose
 - [x] [ADR-0005](decisions/ADR-0005-time-model.md) — Hybrid time model: fixed-tick authoritative core, event-driven edges, tick-count clock, JetStream snapshot+intent-log replay
+- [x] [ADR-0006](decisions/ADR-0006-nats-message-contract.md) — Three-plane message contract: core live (self-sufficient, binary SoA) / JetStream record (sole-writer intent log) / KV config; `{ns}.{run}.{plane}.>` taxonomy; AsyncAPI source of truth
+- [x] [ADR-0007](decisions/ADR-0007-vehicle-model.md) — Position/gap conventions: front-bumper s, bumper-to-bumper gap, s0+length separate; multi-class vehicle types; IDM+MOBIL defaults; per-vehicle seeded RNG
+- [x] [ADR-0008](decisions/ADR-0008-controller-contract.md) — 4-axis intents with per-axis persistence; grants-based roles (driver / default-driver / director / signal); exclusive claims; zero driving logic in engine, fleet failover + pause
+- [x] [ADR-0009](decisions/ADR-0009-osm-import-strategy.md) — netconvert bootstrap + Go importer with permanent diff-test oracle; two-tier identity with guessed flags; ODbL recipe-not-file; delta-patch variants
 
 ## Cross-Topic Concerns
 (populated by /distill-kb after research)
