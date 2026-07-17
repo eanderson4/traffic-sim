@@ -232,12 +232,28 @@ engineering-blog-shaped hole in the literature.
 
 ## Open Questions
 
-- Network-variant patching granularity ("add a lane" as patch vs whole-
-  network replacement in v1) — depends on stable IDs from
-  [[arch-road-graph-model]] / [[integration-osm-extraction]].
-- OD→flows compile step: build-time tool (od2trips-style) vs load-time
-  engine feature; either way its RNG must join the seeded-stream
-  discipline of [[arch-time-model]].
+- ~~Network-variant patching granularity~~ **RESOLVED 2026-07-17 review,
+  revised same-day after owner pushback:** variants are **authored delta
+  patches** against a base import, consistent with the kustomize-style
+  overlays used for demand/control — the patch document is the inspectable,
+  reviewable artifact (in the advocacy use case the delta *is* the proposal).
+  v1 patch grammar is small (add-lane, remove-lane, modify-lane-attrs,
+  modify-connection, modify-junction-control), anchored by durable IDs from
+  our layer, validated fail-loud at apply time; derived artifacts (conflict
+  sets, internal lanes) always recompile from the patched source model. The
+  network-diff tool remains as the **verification layer** (intent vs
+  effective change), not the authoring format; whole-network replacement
+  stays as the degenerate case. Fuzzy anchoring (name/shape selectors that
+  survive re-import) is later work, gated on ID-stability evidence.
+- ~~OD→flows compile step~~ **RESOLVED 2026-07-17 review:** a runtime demand
+  director (elevated-grants client per the director decision) samples
+  OD/arrival definitions at runtime and issues spawn verbs — recorded on the
+  record plane, so replay never re-runs the sampler. RNG joins the ADR-0005
+  seeded-stream discipline, keyed **per vehicle** (failover-invisible, per
+  the fleet decision). The same sampler runs in an **offline mode** emitting
+  a reviewable/diffable spawn table, preserving the build-time benefits
+  (inspect demand, CRN-identical realizations across alternatives) without a
+  static table as the runtime source of truth.
 - Measurement-binding grammar: flat ID lists vs named selections vs
   spatial queries — constrained by the [[domain-congestion-metrics]]
   catalog (concurrent research).

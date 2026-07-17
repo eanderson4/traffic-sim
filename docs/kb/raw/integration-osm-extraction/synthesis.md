@@ -225,10 +225,13 @@ itself an unpublished artifact.
 
 ## Open Questions
 
-- **Import-strategy phasing (owner decision, ADR-worthy):** ship netconvert
-  bootstrap first and write the Go importer incrementally, or invest in the Go
-  importer from the start and delay real-network scenarios? The bootstrap path
-  risks becoming load-bearing; the clean path delays Use Case 2.
+- ~~**Import-strategy phasing (owner decision, ADR-worthy)**~~ **RESOLVED
+  2026-07-17 review:** netconvert bootstrap first (`.net.xml` → our format;
+  unblocks Use Case 2 real-network scenarios now), Go importer built
+  incrementally in parallel, netconvert kept permanently as the
+  differential-testing oracle. Guard against the bootstrap becoming
+  load-bearing: the Go importer stays on the roadmap with the oracle diff
+  suite as its acceptance gate. To be pinned in an import-strategy ADR.
 - **Left-hand traffic:** no reliable per-way OSM tag; global import parameter
   (netconvert `--lefthand` style) vs per-edge override? Needs a decision before
   lane-direction logic is written; no codified country table found in primary

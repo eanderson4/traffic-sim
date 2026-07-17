@@ -184,7 +184,11 @@ Three holes nobody covers:
 
 ## Open Questions
 
-- Our own license choice → needs an ADR (recommendation #5).
+- Our own license choice → ADR **DEFERRED 2026-07-17 review** (owner: not
+  gating anything yet; leaning MIT for maximum adoption simplicity over
+  Apache-2.0's patent grant). The ODbL posture from
+  [[integration-osm-extraction]] (recipe-not-file for compiled networks)
+  stands regardless — it follows from OSM's license, not ours.
 - SUMO `.net.xml` import compatibility: adopt the gravity well or stay clean?
   → [[arch-road-graph-model]] + [[integration-osm-extraction]].
 - Vissim/Aimsun internals remain closed; their public API surfaces (COM, AAPI,

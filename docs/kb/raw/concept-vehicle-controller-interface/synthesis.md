@@ -192,21 +192,69 @@ found for the loop itself. This project gets to write it.
 - AoI window sizing (radius, count, feature set) vs NATS payload and tick budget
   → benchmark with [[arch-nats-backbone]]; interacts with snapshot rate from
   [[arch-state-authority]].
-- Should observations include model introspection (TraCI `getFollowSpeed` /
-  `getSpeedWithoutTraCI` — what the fallback AI *would* do)? Cheap to compute,
-  real debugging value; contract cost of one more optional field.
-- Persistent-vs-one-shot semantics per intent axis (see decision 7) — needs a
-  table in the ADR.
-- How scripted scenarios drive vehicles: same intent channel (uniformity) vs a
-  privileged director channel with teleports/triggers (OpenSCENARIO verbs)?
-  Leaning: both — director is a controller with elevated grants. →
-  [[concept-scenario-format]].
-- Turn-signal semantics: cosmetic, informational (affects other controllers'
-  observations), or binding at junctions? TraCI `setSignals` + CARLA TM's
-  vehicle-lights stage suggest informational; needs [[arch-road-graph-model]]
-  junction representation first.
-- Human multi-vehicle claims (a "traffic god" player)? Contract permits; policy
-  question for the chaos demo.
+- ~~Model introspection in engine observations~~ **RESOLVED 2026-07-17
+  review:** no introspection field in the engine observation contract (the
+  policy no longer lives in-engine after the external-default-driver decision).
+  Instead the default driver exposes an external **introspection interface over
+  NATS** (request/reply, off the hot path): any client asks "given this vehicle
+  state, what would you do?" — a pure function of state + policy, queryable
+  from anywhere; serves debug tooling, RL harnesses, and viz. Optionally log
+  the side channel on the record plane later if replay-side debugging needs it.
+- ~~Persistent-vs-one-shot semantics per intent axis (see decision 7)~~
+  **RESOLVED 2026-07-17 review** — per-axis table for the contract ADR:
+  accel = one-shot per tick (refreshed every tick); speed setpoint = persistent
+  (cruise semantics); lane change = one-shot, expires if infeasible; turn at
+  junction = one-shot, held until consumed; routing = persistent; signals =
+  persistent state. Transport-level hold-last (1–2 ticks on message loss, per
+  [[arch-state-authority]]) is orthogonal to these semantics.
+- **Default controller = external process over NATS (2026-07-17 review, supersedes
+  the in-process sketch above):** the default driver (IDM + MOBIL + router,
+  `destination` parameter) runs as a normal controller process on the NATS
+  contract — dogfoods the contract end-to-end and ships as the reference
+  controller implementation. Jobs: ambient-traffic generator, handoff source
+  when a human claims a vehicle, orphan re-claimer (engine releases claims on
+  disconnect, publishes unclaimed-vehicle events; the default driver re-claims
+  per capacity policy). Seeded from the scenario seed like everything else;
+  replay never runs it (recorded intents come from the JetStream log).
+- **No in-engine driving fallback at all (2026-07-17 review, supersedes the MRM
+  sketch above):** every vehicle is always driven via the contract. Orphans from
+  a dead controller are bridged by transport hold-last (already specified) and
+  re-claimed by the default driver within a few ticks via unclaimed-vehicle
+  events. If the **default driver itself** dies, it is treated as critical
+  infrastructure: engine gates the tick loop on its health (grace of a few
+  ticks, covered by hold-last) and **pauses the run** — supervisor restarts the
+  driver, sim resumes. Pause/resume events are recorded on the JetStream record
+  plane; tick determinism is unaffected (pause is dead wall-clock time between
+  ticks, invisible to sim state). Edge: mass-orphan events beyond the default
+  driver's absorb capacity are re-claimed gradually (hold-last bridges; log the
+  event). The default driver deploys supervised (restart policy, liveness over
+  NATS) alongside the engine.
+- **Default-driver fleet for failover (2026-07-17 review):** run N replicas;
+  partitioning is emergent via exclusive claims (each replica claims from the
+  unclaimed pool up to a cap — no leader election, no assigned shards). One
+  replica's death = a routine mass-orphan event absorbed by peers running with
+  headroom (size for one full peer loss). The pause trigger generalizes to
+  "available claim capacity < demand for T ticks." Constraint this imposes:
+  policy RNG must be seeded **per vehicle** (keyed off vehicle ID, per the
+  ADR-0005 stream discipline), never per process — then which replica drives a
+  vehicle is behaviorally invisible and live-run determinism survives
+  failover. NATS itself is the remaining SPOF → supervised as critical too.
+- ~~How scripted scenarios drive vehicles~~ **RESOLVED 2026-07-17 review:**
+  both. Scripted vehicles are ordinary controllers emitting ordinary 4-axis
+  intents (uniformity, dogfooding). Scenario effects — spawn/despawn, teleport,
+  timed/conditional triggers (the OpenSCENARIO verbs) — go to a **director**
+  client holding elevated grants in the attach handshake; engine-arbitrated,
+  recorded on the record plane for replay. Topology: engine + privileged role
+  clients (director; the elevated-grants pattern extends to other privileged
+  roles later) + ordinary controllers (drivers). The "traffic-god" player is a
+  human director. → [[concept-scenario-format]].
+- ~~Turn-signal semantics~~ **RESOLVED 2026-07-17 review:** informational in v1
+  (turn signals appear in other controllers' observations; not binding at
+  junctions). Binding semantics can be revisited once
+  [[arch-road-graph-model]]'s junction representation lands.
+- ~~Human multi-vehicle claims~~ **RESOLVED 2026-07-17 review:** allowed — one
+  controller may claim many vehicles (the default-driver fleet relies on this
+  already; the "traffic-god" player is the chaos-demo case).
 
 ## Connections to Other Topics
 

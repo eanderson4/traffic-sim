@@ -138,8 +138,11 @@ vehicle-tick is optimal; stop override is mandatory for queue/delay metrics.
   throughput? Simulate both.
 - Emergent vs prescribed AWSC headways — prototype against HCM numbers.
 - Zipper fairness at saturation: strict 1:1 alternation vs demand-weighted.
-- Gap convention: SUMO minGap-outside-length vs IDM bumper-to-bumper s0 —
-  pin in the vehicle-model ADR.
+- ~~Gap convention: SUMO minGap-outside-length vs IDM bumper-to-bumper s0~~
+  **RESOLVED 2026-07-17 review**: bumper-to-bumper gap is the one canonical
+  semantics; position = front-bumper coordinate; one jam-gap parameter `s0`
+  measured bumper-to-bumper with `length` separate; spacing-derived quantities
+  computed, never stored. To be pinned in the vehicle-model ADR.
 - Erdmann's ad-hoc constants (f=10/20, 20/40 m reservations) — calibration
   surface from day one.
 - rounD-derived t_c/t_f distributions (Troutbeck MLM on drone data).

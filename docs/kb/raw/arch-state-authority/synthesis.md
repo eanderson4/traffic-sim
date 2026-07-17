@@ -250,9 +250,10 @@ the principles.
 - Buffer-health feedback (OW sim-speed nudge): unnecessary at 10 Hz v1, or
   cheap insurance for the chaos demo's worst connections? Defer to the
   contract ADR.
-- Intra-tick ordering of competing intents (two controllers, one gap):
-  deterministic tie-break rule — priority list, or CS2-style arrival-time
-  resolution within the tick?
+- ~~Intra-tick ordering of competing intents~~ **RESOLVED 2026-07-17 review:**
+  deterministic tie-break **list** (e.g. grant level, then vehicle ID), not
+  CS2-style arrival-time resolution within the tick — arrival time would leak
+  wall-clock nondeterminism into replay. Belongs to the contract ADR.
 
 ## Connections to Other Topics
 

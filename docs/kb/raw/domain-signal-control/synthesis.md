@@ -221,8 +221,23 @@ Three real ones this time:
 
 ## Open Questions
 
-- Permissive-period and lead-lag fidelity needed for credible corridor
-  bandwidth claims — v2 scope, or required for the first advocacy corridor?
+- ~~Permissive-period and lead-lag fidelity~~ **RESOLVED 2026-07-17 review
+  (interface-first):** the **signal-control contract** must be flexible enough
+  to host *any* real control algorithm — full feature coverage is deferred.
+  Design: signal control is an external client role holding signal-actuation
+  grants (same pattern as the director); engine publishes detector/actuation
+  events + phase state, controller emits the cabinet command vocabulary
+  (call / hold / force-off / omit / next-phase + coordination sync) into which
+  every real algorithm compiles (fixed-time, actuated, max-pressure, RL…).
+  The engine enforces safety invariants regardless of commands — conflict
+  matrix, min greens, clearance intervals (the cabinet MMU pattern; same
+  clamp philosophy as vehicle intents). The internal NEMA dual-ring model
+  already *expresses* lead-lag/permissive (ring sequencing + phase states),
+  and permissive-left behavior largely falls out of vehicle gap acceptance —
+  so "not building out now" means deferring authoring ergonomics and
+  validation, not capability. v1 ships a fixed-time + basic-actuated
+  controller client; full feature/validation work lands when the first
+  advocacy corridor is chosen and its real phasing is known.
 - Detector placement semantics: auto-place stop-bar + advance loops
   (SUMO-style) vs authored placement tied to lane geometry
   ([[arch-road-graph-model]]).
