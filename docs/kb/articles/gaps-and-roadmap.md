@@ -1,0 +1,94 @@
+# Knowledge Base Gaps & Roadmap
+
+> Areas that need more research, measurements that must happen at bring-up, and suggested next work. Everything marked "RESOLVED 2026-07-17 review" in the raw research is excluded here — this is only what remains genuinely open.
+
+## Pending ADRs (research complete, decision unwritten)
+
+| Candidate ADR | Gate | Blocks |
+|---|---|---|
+| Network model | [Road Graph Model](architecture/road-graph-model.md) | Engine world-state schema, compiled network format, importer target |
+| Scenario format | [Scenario Format](concepts/scenario-format.md) | Scenario authoring, variant overlays, metric bindings, run identity |
+| Observability / metric set | [Congestion Metrics](business-domains/congestion-metrics.md) | Metric message schemas, detector layer, experiment protocol |
+| Project license | [Simulator Landscape](business-domains/simulator-landscape.md) | Nothing yet (deferred 2026-07-17, leaning MIT); ODbL posture stands per ADR-0009 regardless |
+
+## Benchmark Queue (measure at engine/viz bring-up — the literature is silent)
+
+| Measurement | Why it matters | From |
+|---|---|---|
+| JetStream puback latency vs the 100 ms tick at high batch multipliers | Sizes faster-than-realtime batch multipliers; the tick depends asynchronously on broker persistence health | [NATS Backbone](architecture/nats-backbone.md), [Time Model](architecture/time-model.md), ADR-0006 |
+| Per-vehicle wire size and payload shape at 10k vehicles (8–16 B derivation) | No published per-vehicle wire sizes exist anywhere; cell-packed vs per-vehicle subjects decision | [State Authority](architecture/state-authority.md), [MapLibre Realtime Viz](integrations/maplibre-realtime.md) |
+| AoI window sizing (radius, neighbor count, features) vs tick budget | The observation window is contract surface; bandwidth grows with fleet size | [Vehicle & Controller Interface](concepts/vehicle-controller-interface.md), [State Authority](architecture/state-authority.md) |
+| Cell geometry/size experiment on a real imported network | Interest management is compiled to cell subjects; needs real network densities | [State Authority](architecture/state-authority.md), [OSM Extraction](integrations/osm-extraction.md) |
+| Keyframe cadence from measured re-sim speed; keyframe chunking curve vs 1 MB `max_payload` | Bounds replay seek depth; chooses manifest-chunking vs Object Store | [NATS Backbone](architecture/nats-backbone.md) |
+| Stream topology at scale: per-run streams vs single stream | Broker asset lifecycle costs are unpublished | [NATS Backbone](architecture/nats-backbone.md) |
+| nats.ws browser throughput for 10 Hz × N-vehicle snapshots | Confirms the WebSocket path for the TS viz; headers-only consumer question | [NATS Backbone](architecture/nats-backbone.md), [MapLibre Realtime Viz](integrations/maplibre-realtime.md) |
+| MapLibre microbenchmark: `updateData` fleet ceiling and feature-state throughput (1k→100k vehicles × 1/10/30 Hz) | Sets the deck.gl escalation rungs numerically; no published numbers at our shape | [MapLibre Realtime Viz](integrations/maplibre-realtime.md) |
+| Metric stream budget: fleet × 100 ms tick × per-vehicle state vs NATS throughput | The trajectory-first metric kernel's stream sizing | [Congestion Metrics](business-domains/congestion-metrics.md) |
+| `b_safe` vs time-gap enforcement as the engine safety backstop | Picks the junction/lane-change safety invariant's implementation | [Traffic Flow Models](business-domains/traffic-flow-models.md), ADR-0007 revisit trigger |
+| Connection-conflict memory footprint at city scale; protobuf vs Go-native compiled network encoding | Sizes the road-graph representation | [Road Graph Model](architecture/road-graph-model.md) |
+| Go GC pause jitter in paced loops | Folklore only; measure before promising smooth 1× pacing | [Time Model](architecture/time-model.md) |
+
+## Prototype Experiments (`prototypes/`)
+
+| Experiment | Question it answers | From |
+|---|---|---|
+| Sugiyama ring acceptance test (22 cars, 230 m ring; 21 must not jam) | Falsifiable string-instability test for the engine — CI scenario; ⚠ needs Nakayama 2016 OV parameters first | [Traffic Flow Models](business-domains/traffic-flow-models.md), [Trajectory Datasets](business-domains/trajectory-datasets.md) |
+| AWSC departure headways (3.9–7.0 s emergent) | Validates the 4-way-stop stop-line model against field measurements | [Traffic Flow Models](business-domains/traffic-flow-models.md) |
+| Zipper/merge cooperation over the bus | MOBIL cooperation as a NATS intent spans ≥1 tick round trip vs SUMO's in-process same-step resolution — measure merge-throughput impact | [Traffic Flow Models](business-domains/traffic-flow-models.md) |
+| LWR oracle suite (red light, lane drop, on-ramp merge; Newell controller vs LTM) | Asserts shock speeds and delay against analytic ground truth in CI | [Macroscopic Flow Models](business-domains/macroscopic-flow-models.md) |
+| CRN stream-assignment granularity | Which concerns share RNG streams across alternatives (spawn times yes; lane-change draws?) — needs the RNG layout to exist first | [Congestion Metrics](business-domains/congestion-metrics.md) |
+| Deadlock prevention + telemetry vs SUMO's 300 s teleport | Prove the prevention mechanisms keep gridlock physical and measurable | [Traffic Flow Models](business-domains/traffic-flow-models.md) |
+
+## External-Data Errands
+
+| Errand | Why | From |
+|---|---|---|
+| levelXdata (inD/rounD) non-commercial terms vs a monetized educational episode — ask | The intersection/roundabout validation targets may need licensing clearance before episode use | [Trajectory Datasets](business-domains/trajectory-datasets.md) |
+| Locate Coifman & Li corrected NGSIM I-80 data; Montanino & Punzo CSV mirrors; triage which NGSIM window / I-24 segment for first analysis | The "do our own calc" exercise needs clean source data | [Trajectory Datasets](business-domains/trajectory-datasets.md) |
+| Obtain one real published timing sheet + ATSPM data for a validation intersection | End-to-end validation of phase-termination distributions; real timing plans are not open data | [Signal Control](business-domains/signal-control.md) |
+| Transcribe IIDM/ACC equations from primary sources (Treiber & Kestor book / movsim) before coding those variants | Secondary-source transcription risk on model equations | [Traffic Flow Models](business-domains/traffic-flow-models.md), ADR-0007 revisit trigger |
+| Verify Daganzo 1995 merge `mid()` formula and Yperman LTM discrete equations against primary texts (⚠-flagged in raw files) | The LTM preview/oracle implementation depends on them | [Macroscopic Flow Models](business-domains/macroscopic-flow-models.md) |
+| Resolve the jam-density discrepancy (100–150 vs 180–200 veh/km/lane) against HCM / Treiber & Kesting | Picks the default fundamental diagram per road class | [Macroscopic Flow Models](business-domains/macroscopic-flow-models.md) |
+| Read SUMO source (or experiment) for the exact `allway_stop` mechanism (arrival ordering, tie-breaking, creep) | The 4-way stop is the least-specified common junction behavior in public docs | [Road Graph Model](architecture/road-graph-model.md) |
+| Calibrate the lane-inference defaults table against drone/dataset geometry (levelX/highD/NGSIM) | netconvert confesses its typemap is unverified; the defaults table *is* most of the network | [OSM Extraction](integrations/osm-extraction.md) |
+
+## Deferred Decisions (consciously parked)
+
+- **In-process controller fast path vs ADR-0002's no-fast-path clarification** — revisit when the RL training use case lands ([Simulator Landscape](business-domains/simulator-landscape.md) vs ADR-0002 2026-07-17 clarification).
+- **Left-hand traffic** — global import parameter chosen (ADR-0009 v1); per-edge override question remains before lane-direction logic is written.
+- **`restriction:conditional` (18.6 k relations)** — ignored-with-flag in v1; possible scenario time-slicing later ([OSM Extraction](integrations/osm-extraction.md)).
+- **Map-edge demand portals** — network-file concept (typed `MapEdge` junction) vs scenario demand concern; touches Road Graph Model + Scenario Format + OSM Extraction.
+- **Binary framing tool** for the SoA vehicle subject — hand-rolled header + typed arrays vs flatbuffers/protobuf ([MapLibre Realtime Viz](integrations/maplibre-realtime.md), ADR-0006 territory).
+- **Cross-architecture determinism upgrade** (fence FMA / vendor math / int64 fixed-point) — only if civic-advocacy partners need heterogeneous replay verification (ADR-0005 revisit trigger).
+- **GPU escape hatch** (MOSS 88.9× precedent) — a separate future ADR with its own determinism research, only if metro scale ever becomes the requirement.
+- **Signal feature coverage** (permissive/lead-lag authoring ergonomics, soft recall, stage-based import for European networks, TSP) — lands when the first advocacy corridor is chosen; the ADR-0008 interface already hosts any algorithm.
+- **Overture GERS adoption timing** — solves ID stability, not lanes; re-evaluate when its lanes redesign lands.
+- **Re-import/edit carry-over** (durable edits across fresher OSM extracts) — fuzzy anchoring is later work, gated on ID-stability evidence (ADR-0009 consequences).
+- **95th-percentile queue estimator, reliability baseline (PTI vs buffer index), PCU conversion in v1** — pick after seeing our own queue time series ([Congestion Metrics](business-domains/congestion-metrics.md)).
+- **Multi-tenancy** (auth callout, `nsc` JWT, account-per-tenant) — only for public multiplayer (ADR-0006 §9).
+
+## Under-Documented Areas
+
+| Area | Why It Matters | Suggested Topic |
+|------|---------------|-----------------|
+| Engine internal architecture (module layout around the world-state goroutine, event list, sweep) | ADR-0005 fixes the time model, not the code structure; the first Go milestone needs it | `arch-engine-internals` |
+| Human-driver client (input devices/sampling, HUD, latency surfacing, prediction UX) | The multiplayer chaos demo's front end; state-authority covers the netcode, not the client product | `concept-human-driver-client` |
+| Multiplayer session management (lobby, run registry UX, claim UI, auth at scale) | The chaos demo needs join/claim flows that no topic covers | `concept-multiplayer-session` |
+| Demand modeling depth (od2trips-style compiler, count-driven demand, NGSIM-calibrated demand import) | Scenario format fixes the container; demand estimation itself is unresearched | `domain-demand-modeling` |
+| Emissions/fuel post-processor (HBEFA-class tables over the trajectory stream) | Explicitly deferred by metrics research; a stated future consumer | fold into observability ADR follow-ups |
+
+## Suggested Next Research
+
+1. **Draft the four pending ADRs** (network model, scenario format, observability, license) — their research gates are closed; drafting is the cheapest unblocking step before engine code.
+2. **`arch-engine-internals`** — engine module decomposition against the 10⁵ vehicle-update/s tier target; would absorb several benchmark-queue items into one bring-up plan.
+3. **`domain-demand-modeling`** — demand estimation and generation tooling (the field's dfrouter/od2trips shape), including calibration from the trajectory corpora.
+4. **`concept-human-driver-client`** — input-to-intent pipeline and HUD, completing the multiplayer story end to end.
+
+## Freshness Notes
+
+- 14 topics researched 2026-07-15 → 2026-07-17 (56 raw files), all status `complete`; distilled 2026-07-17 into 18 articles.
+- Oldest research (2026-07-15): domain-traffic-flow-models, domain-macroscopic-flow-models, domain-trajectory-datasets, arch-time-model — all still current (their open items were ratified by the 2026-07-17 review).
+- Run `/update-kb` to check for stale topics after a gap.
+
+---
+*Generated: 2026-07-17*

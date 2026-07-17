@@ -216,5 +216,97 @@
     }
   },
   "raw": {},
-  "articles": {}
+  "articles": {
+    "articles/business-domains/simulator-landscape.md": {
+      "distilled_at": "2026-07-17",
+      "derived_from": ["raw/domain-simulator-landscape/implementation.md", "raw/domain-simulator-landscape/competitors.md", "raw/domain-simulator-landscape/standards-and-patterns.md", "raw/domain-simulator-landscape/synthesis.md"],
+      "summary": "Survey of 12 traffic simulators across five camps: none combines lane-level dynamics, a live multi-controller bus, decision-grade metrics, and verified replay — traffic-sim's exact target quadrant."
+    },
+    "articles/business-domains/traffic-flow-models.md": {
+      "distilled_at": "2026-07-17",
+      "derived_from": ["raw/domain-traffic-flow-models/implementation.md", "raw/domain-traffic-flow-models/competitors.md", "raw/domain-traffic-flow-models/standards-and-patterns.md", "raw/domain-traffic-flow-models/synthesis.md"],
+      "summary": "The engine's driving-model stack: IDM-family car-following + ballistic integration at 100 ms + MOBIL lane changing under a strategic layer, with Newell as validation oracle."
+    },
+    "articles/business-domains/macroscopic-flow-models.md": {
+      "distilled_at": "2026-07-17",
+      "derived_from": ["raw/domain-macroscopic-flow-models/implementation.md", "raw/domain-macroscopic-flow-models/competitors.md", "raw/domain-macroscopic-flow-models/standards-and-patterns.md", "raw/domain-macroscopic-flow-models/synthesis.md"],
+      "summary": "Macroscopic (LWR) traffic theory is not our engine — it is the engine's analytic examiner, calibrator, and metrics language; no Go CTM/LTM exists, so our tooling is greenfield OSS."
+    },
+    "articles/business-domains/trajectory-datasets.md": {
+      "distilled_at": "2026-07-17",
+      "derived_from": ["raw/domain-trajectory-datasets/implementation.md", "raw/domain-trajectory-datasets/competitors.md", "raw/domain-trajectory-datasets/standards-and-patterns.md", "raw/domain-trajectory-datasets/synthesis.md"],
+      "summary": "Real overhead trajectory data (NGSIM, I-24 MOTION, drone sets, ring-road experiments) is our calibration/validation corpus; Edie's definitions are the shared analytics primitive for real data and sim output."
+    },
+    "articles/business-domains/congestion-metrics.md": {
+      "distilled_at": "2026-07-17",
+      "derived_from": ["raw/domain-congestion-metrics/implementation.md", "raw/domain-congestion-metrics/competitors.md", "raw/domain-congestion-metrics/standards-and-patterns.md", "raw/domain-congestion-metrics/synthesis.md"],
+      "summary": "Observability design: a streaming, trajectory-first metric kernel computing Edie q/k/u and per-vehicle trip records, from which delay, queues, reliability, and LOS derive — with a built-in multi-seed experiment protocol."
+    },
+    "articles/business-domains/signal-control.md": {
+      "distilled_at": "2026-07-17",
+      "derived_from": ["raw/domain-signal-control/implementation.md", "raw/domain-signal-control/competitors.md", "raw/domain-signal-control/standards-and-patterns.md", "raw/domain-signal-control/synthesis.md"],
+      "summary": "Signal control runs as an external grants-based client role over a NEMA dual-ring engine model; the 100 ms tick matches NTCIP decisecond timers exactly, and safety invariants stay engine-side."
+    },
+    "articles/architecture/time-model.md": {
+      "distilled_at": "2026-07-17",
+      "derived_from": ["raw/arch-time-model/implementation.md", "raw/arch-time-model/competitors.md", "raw/arch-time-model/standards-and-patterns.md", "raw/arch-time-model/synthesis.md"],
+      "summary": "How the engine advances time: fixed 100 ms authoritative tick with event-driven edges, async controller intents batch-applied at tick boundaries, and JetStream-backed deterministic replay — ratified by ADR-0005."
+    },
+    "articles/architecture/nats-backbone.md": {
+      "distilled_at": "2026-07-17",
+      "derived_from": ["raw/arch-nats-backbone/implementation.md", "raw/arch-nats-backbone/competitors.md", "raw/arch-nats-backbone/standards-and-patterns.md", "raw/arch-nats-backbone/synthesis.md"],
+      "summary": "How traffic-sim divides live fan-out, durable replay recording, and shared config across core NATS, JetStream, and KV — the three-plane contract ratified by ADR-0002/ADR-0006."
+    },
+    "articles/architecture/road-graph-model.md": {
+      "distilled_at": "2026-07-17",
+      "derived_from": ["raw/arch-road-graph-model/implementation.md", "raw/arch-road-graph-model/competitors.md", "raw/arch-road-graph-model/standards-and-patterns.md", "raw/arch-road-graph-model/synthesis.md"],
+      "summary": "Lane-as-atom directed multigraph: typed junctions with build-time-compiled right-of-way conflict sets, physical internal lanes, `(laneId, s)` vehicle addressing, and diffable-authoring ⇄ compiled-binary format duality."
+    },
+    "articles/architecture/state-authority.md": {
+      "distilled_at": "2026-07-17",
+      "derived_from": ["raw/arch-state-authority/implementation.md", "raw/arch-state-authority/competitors.md", "raw/arch-state-authority/standards-and-patterns.md", "raw/arch-state-authority/synthesis.md"],
+      "summary": "How the authoritative engine distributes world state and accepts control over NATS: self-sufficient per-cell snapshots, declared interest windows, ego prediction, hold-last input buffers, no lag compensation."
+    },
+    "articles/concepts/vehicle-controller-interface.md": {
+      "distilled_at": "2026-07-17",
+      "derived_from": ["raw/concept-vehicle-controller-interface/implementation.md", "raw/concept-vehicle-controller-interface/competitors.md", "raw/concept-vehicle-controller-interface/standards-and-patterns.md", "raw/concept-vehicle-controller-interface/synthesis.md"],
+      "summary": "The engine↔controller contract: one 4-axis intent message, declared observation windows, exclusive per-vehicle claims, always-on engine clamping, and an external default-driver fleet — zero driving logic in the engine."
+    },
+    "articles/concepts/scenario-format.md": {
+      "distilled_at": "2026-07-17",
+      "derived_from": ["raw/concept-scenario-format/implementation.md", "raw/concept-scenario-format/competitors.md", "raw/concept-scenario-format/standards-and-patterns.md", "raw/concept-scenario-format/synthesis.md"],
+      "summary": "A scenario is a directory: a strict-YAML manifest referencing network, demand, control, and metrics parts, with kustomize-style overlay variants and (content-hash, seed) run identity."
+    },
+    "articles/integrations/osm-extraction.md": {
+      "distilled_at": "2026-07-17",
+      "derived_from": ["raw/integration-osm-extraction/implementation.md", "raw/integration-osm-extraction/competitors.md", "raw/integration-osm-extraction/standards-and-patterns.md", "raw/integration-osm-extraction/synthesis.md"],
+      "summary": "How OpenStreetMap becomes our lane-level road graph: a seven-pass Go importer bootstrapped and permanently oracle-checked by SUMO netconvert, with defaults-first lane inference and provenance flags throughout."
+    },
+    "articles/integrations/maplibre-realtime.md": {
+      "distilled_at": "2026-07-17",
+      "derived_from": ["raw/integration-maplibre-realtime/implementation.md", "raw/integration-maplibre-realtime/competitors.md", "raw/integration-maplibre-realtime/standards-and-patterns.md", "raw/integration-maplibre-realtime/synthesis.md"],
+      "summary": "Three rate-split channels (load-once network, 1 Hz feature-state heatmap, 10 Hz `updateData` vehicle diffs) carry live state into MapLibre; binary SoA wire frames and a measured deck.gl escalation ladder cover scale."
+    },
+    "articles/decisions/adrs.md": {
+      "distilled_at": "2026-07-17",
+      "derived_from": ["decisions/ADR-0001-go-engine.md", "decisions/ADR-0002-nats-backbone.md", "decisions/ADR-0003-maplibre-vis.md", "decisions/ADR-0004-local-first.md", "decisions/ADR-0005-time-model.md", "decisions/ADR-0006-nats-message-contract.md", "decisions/ADR-0007-vehicle-model.md", "decisions/ADR-0008-controller-contract.md", "decisions/ADR-0009-osm-import-strategy.md"],
+      "summary": "Index of all nine accepted ADRs with one-line rationales — the decided skeleton of the system; research that feeds each ADR is linked for the full argument."
+    },
+    "articles/cross-topic-concerns.md": {
+      "distilled_at": "2026-07-17",
+      "derived_from": ["raw/domain-simulator-landscape/synthesis.md", "raw/domain-traffic-flow-models/synthesis.md", "raw/domain-macroscopic-flow-models/synthesis.md", "raw/domain-trajectory-datasets/synthesis.md", "raw/domain-congestion-metrics/synthesis.md", "raw/domain-signal-control/synthesis.md", "raw/arch-time-model/synthesis.md", "raw/arch-nats-backbone/synthesis.md", "raw/arch-road-graph-model/synthesis.md", "raw/arch-state-authority/synthesis.md", "raw/concept-vehicle-controller-interface/synthesis.md", "raw/concept-scenario-format/synthesis.md", "raw/integration-osm-extraction/synthesis.md", "raw/integration-maplibre-realtime/synthesis.md"],
+      "summary": "Patterns, invariants, and conventions that span multiple areas of the traffic-sim knowledge base."
+    },
+    "articles/summary.md": {
+      "distilled_at": "2026-07-17",
+      "derived_from": ["raw/domain-simulator-landscape/synthesis.md", "raw/domain-traffic-flow-models/synthesis.md", "raw/domain-macroscopic-flow-models/synthesis.md", "raw/domain-trajectory-datasets/synthesis.md", "raw/domain-congestion-metrics/synthesis.md", "raw/domain-signal-control/synthesis.md", "raw/arch-time-model/synthesis.md", "raw/arch-nats-backbone/synthesis.md", "raw/arch-road-graph-model/synthesis.md", "raw/arch-state-authority/synthesis.md", "raw/concept-vehicle-controller-interface/synthesis.md", "raw/concept-scenario-format/synthesis.md", "raw/integration-osm-extraction/synthesis.md", "raw/integration-maplibre-realtime/synthesis.md"],
+      "summary": "traffic-sim is a standalone, open-source traffic simulation engine — real road networks, heterogeneous vehicle controllers (AI and human), decision-grade congestion metrics, and trustworthy replay — currently in its pre-implementation design phase: 14 research topics and 9 accepted ADRs, no engine code yet."
+    },
+    "articles/gaps-and-roadmap.md": {
+      "distilled_at": "2026-07-17",
+      "derived_from": ["raw/domain-simulator-landscape/synthesis.md", "raw/domain-traffic-flow-models/synthesis.md", "raw/domain-macroscopic-flow-models/synthesis.md", "raw/domain-trajectory-datasets/synthesis.md", "raw/domain-congestion-metrics/synthesis.md", "raw/domain-signal-control/synthesis.md", "raw/arch-time-model/synthesis.md", "raw/arch-nats-backbone/synthesis.md", "raw/arch-road-graph-model/synthesis.md", "raw/arch-state-authority/synthesis.md", "raw/concept-vehicle-controller-interface/synthesis.md", "raw/concept-scenario-format/synthesis.md", "raw/integration-osm-extraction/synthesis.md", "raw/integration-maplibre-realtime/synthesis.md"],
+      "summary": "Areas that need more research, measurements that must happen at bring-up, and suggested next work — only what remains genuinely open after the 2026-07-17 review."
+    }
+  },
+  "last_distilled": "2026-07-17"
 }

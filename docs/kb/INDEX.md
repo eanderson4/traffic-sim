@@ -6,8 +6,8 @@
 ## How to Use This KB
 
 This knowledge base is organized as independently researched topics.
-- **Raw research** (`raw/`) contains deep, source-attributed findings
-- **Articles** (`articles/`) contain distilled, cross-referenced knowledge
+- **Articles** (`articles/`) contain distilled, cross-referenced knowledge — start here
+- **Raw research** (`raw/`) contains deep, source-attributed findings behind every article
 - **Decision records** (`decisions/`) capture consequential choices and rationale
 - Use `/research-topic [name]` to research individual topics
 - Use `/research-topic --all` to research all pending topics
@@ -16,6 +16,46 @@ This knowledge base is organized as independently researched topics.
 
 The founding document is [`docs/VISION.md`](../VISION.md) — every topic here traces
 back to it.
+
+## Start Here
+
+- [Summary](articles/summary.md) — project overview, architecture at a glance, reading paths
+- [Cross-Topic Concerns](articles/cross-topic-concerns.md) — invariants, conventions, and gotchas spanning all topics
+- [ADR Index](articles/decisions/adrs.md) — all nine decisions with one-line rationales
+- [Gaps & Roadmap](articles/gaps-and-roadmap.md) — benchmark queue, prototype experiments, open questions
+
+## Articles
+
+### Business Domains
+- [Simulator Landscape](articles/business-domains/simulator-landscape.md) — 12 simulators in five camps; none combines lane-level dynamics, a live controller bus, decision-grade metrics, and verified replay
+- [Traffic Flow Models (Microscopic)](articles/business-domains/traffic-flow-models.md) — IDM car-following + ballistic integration at 100 ms + MOBIL lane changing under a strategic layer; Newell as validation oracle
+- [Macroscopic Flow Models](articles/business-domains/macroscopic-flow-models.md) — LWR theory as the engine's analytic examiner, calibrator, and metrics language; first Go CTM/LTM is greenfield OSS
+- [Trajectory Datasets & Overhead Analysis](articles/business-domains/trajectory-datasets.md) — NGSIM, I-24 MOTION, drone sets, ring-road experiments as the calibration/validation corpus; Edie's definitions as the shared primitive
+- [Congestion Metrics](articles/business-domains/congestion-metrics.md) — streaming trajectory-first metric kernel (Edie q/k/u + trip records) with a built-in multi-seed experiment protocol
+- [Signal Control](articles/business-domains/signal-control.md) — external grants-based client role over a NEMA dual-ring engine model; the 100 ms tick matches NTCIP decisecond timers exactly
+
+### Architecture
+- [Time Model](articles/architecture/time-model.md) — fixed 100 ms authoritative tick, event-driven edges, async batch-applied intents, JetStream-backed deterministic replay (ADR-0005)
+- [NATS Backbone](articles/architecture/nats-backbone.md) — three-plane split: core live / JetStream record / KV config (ADR-0002, ADR-0006)
+- [Road Graph Model](articles/architecture/road-graph-model.md) — lane-as-atom multigraph, compiled conflict sets, internal lanes, `(laneId, s)` addressing, authoring ⇄ compiled duality
+- [State Authority](articles/architecture/state-authority.md) — self-sufficient per-cell snapshots, declared interest windows, ego prediction, hold-last input buffers, no lag compensation
+
+### Concepts
+- [Vehicle & Controller Interface](articles/concepts/vehicle-controller-interface.md) — one 4-axis intent, declared observation windows, exclusive claims, always-on clamping, external default-driver fleet (ADR-0008)
+- [Scenario Format](articles/concepts/scenario-format.md) — strict-YAML manifest-of-parts directory, kustomize-style overlay variants, (content-hash, seed) run identity
+
+### Integrations
+- [OSM Extraction](articles/integrations/osm-extraction.md) — seven-pass Go importer bootstrapped and oracle-checked by netconvert, defaults-first lane inference, provenance flags (ADR-0009)
+- [MapLibre Realtime Viz](articles/integrations/maplibre-realtime.md) — three rate-split channels into MapLibre, binary SoA wire frames, measured deck.gl escalation ladder (ADR-0003)
+
+### Decisions
+- [ADR Index](articles/decisions/adrs.md) — ADR-0001..0009 table with rationales, research basis, and pending-ADR queue
+
+## Raw Research
+
+All source-attributed research files: [raw/](raw/) — 14 topics × 4 files
+(implementation, competitors, standards-and-patterns, synthesis). Every article
+links its source synthesis for traceability.
 
 ## Topic Registry
 
@@ -52,8 +92,6 @@ back to it.
 - [x] [ADR-0008](decisions/ADR-0008-controller-contract.md) — 4-axis intents with per-axis persistence; grants-based roles (driver / default-driver / director / signal); exclusive claims; zero driving logic in engine, fleet failover + pause
 - [x] [ADR-0009](decisions/ADR-0009-osm-import-strategy.md) — netconvert bootstrap + Go importer with permanent diff-test oracle; two-tier identity with guessed flags; ODbL recipe-not-file; delta-patch variants
 
-## Cross-Topic Concerns
-(populated by /distill-kb after research)
-
-## Summary
-(populated by /distill-kb after research)
+---
+*Last distilled: 2026-07-17 | 18 articles from 56 raw research files*
+*Run `/update-kb` to check freshness*
