@@ -142,9 +142,16 @@
     "arch-state-authority": {
       "category": "architecture",
       "title": "State Authority",
-      "status": "pending",
+      "status": "complete",
+      "researched_at": "2026-07-17",
       "key_files": ["docs/VISION.md"],
       "complexity": "medium",
+      "raw_files": [
+        "raw/arch-state-authority/implementation.md",
+        "raw/arch-state-authority/competitors.md",
+        "raw/arch-state-authority/standards-and-patterns.md",
+        "raw/arch-state-authority/synthesis.md"
+      ],
       "research_hints": "Authoritative-server patterns: interest management (area-of-interest state fan-out), client-side prediction for human drivers, handling late/dropped controller inputs, snapshot vs delta state publishing."
     },
     "concept-vehicle-controller-interface": {
@@ -180,17 +187,31 @@
     "integration-osm-extraction": {
       "category": "integrations",
       "title": "OSM Extraction",
-      "status": "pending",
+      "status": "complete",
+      "researched_at": "2026-07-17",
       "key_files": ["docs/VISION.md"],
       "complexity": "deep",
+      "raw_files": [
+        "raw/integration-osm-extraction/implementation.md",
+        "raw/integration-osm-extraction/competitors.md",
+        "raw/integration-osm-extraction/standards-and-patterns.md",
+        "raw/integration-osm-extraction/synthesis.md"
+      ],
       "research_hints": "OSM data model: ways, nodes, relations; lanes/turn:lanes/highway tags; turn restriction relations. Tooling: Overpass API, osmnx, osm2streets (A/B Street), SUMO's netconvert. Pipeline: bbox → clean lane-graph in our format."
     },
     "integration-maplibre-realtime": {
       "category": "integrations",
       "title": "MapLibre Realtime Viz",
-      "status": "pending",
+      "status": "complete",
+      "researched_at": "2026-07-17",
       "key_files": ["docs/VISION.md"],
       "complexity": "medium",
+      "raw_files": [
+        "raw/integration-maplibre-realtime/implementation.md",
+        "raw/integration-maplibre-realtime/competitors.md",
+        "raw/integration-maplibre-realtime/standards-and-patterns.md",
+        "raw/integration-maplibre-realtime/synthesis.md"
+      ],
       "research_hints": "Feeding live vehicle positions into MapLibre (GeoJSON source updates vs custom WebGL layer), congestion heatmaps on road geometry (line-color data-driven styling), update-rate limits, and the criteria for escalating to deck.gl overlay."
     }
   },

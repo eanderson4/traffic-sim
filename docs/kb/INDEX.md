@@ -31,15 +31,15 @@ back to it.
 - [x] [Time Model](raw/arch-time-model/synthesis.md) — tick authority vs discrete-event vs hybrid; game-server prior art; determinism/replay implications → feeds ADR-0005
 - [x] [NATS Backbone](raw/arch-nats-backbone/synthesis.md) — three-plane split (core live / JetStream record / KV config), OCC headers, subject taxonomy → feeds ADR-0006
 - [x] [Road Graph Model](raw/arch-road-graph-model/synthesis.md) — lane-as-atom, compiled junction conflict sets + internal lanes, (laneId, s) occupancy, geometry-by-reference
-- [ ] [State Authority](raw/arch-state-authority.md) — authoritative-server patterns from multiplayer games: interest management, prediction, late/dropped controller inputs
+- [x] [State Authority](raw/arch-state-authority/synthesis.md) — most-recent-state live plane (deltas on JetStream only), cell-based interest management, ego prediction + hold-last input buffer, no lag comp by the numbers; 8–16 B/vehicle wire anchor
 
 ### Concepts
 - [x] [Vehicle & Controller Interface](raw/concept-vehicle-controller-interface/synthesis.md) — 4-axis intent vocabulary, SMARTS-style attach handshake, exclusive per-vehicle claims, fallback-to-IDM on disconnect
 - [x] [Scenario Format](raw/concept-scenario-format/synthesis.md) — manifest-of-parts directory, strict YAML, kustomize-style overlay variants, metrics embedded in scenario
 
 ### Integrations
-- [ ] [OSM Extraction](raw/integration-osm-extraction.md) — OSM data model (ways, lane tags, turn restrictions); Overpass/osmnx/osm2streets tooling; geometry → lane-graph conversion
-- [ ] [MapLibre Realtime Viz](raw/integration-maplibre-realtime.md) — live vehicle positions + congestion heatmaps in MapLibre; update strategies; deck.gl escalation criteria
+- [x] [OSM Extraction](raw/integration-osm-extraction/synthesis.md) — own Go importer (paulmach/osm) + netconvert bootstrap/diff-test oracle; defaults-first lane inference with `guessed` flags; durable IDs over OSM provenance; ODbL recipe-not-file posture
+- [x] [MapLibre Realtime Viz](raw/integration-maplibre-realtime/synthesis.md) — three channels (load-once network / setFeatureState congestion / updateData vehicles), 4-rung escalation ladder to deck.gl, binary SoA frames over NATS; MapLibre ≥5.21.1 pinned
 
 ### Decisions
 - [x] [ADR-0001](decisions/ADR-0001-go-engine.md) — Go for the engine core, TypeScript for visualization
