@@ -1,0 +1,442 @@
+// Package driver is the external default driver (ADR-0008 §5): the
+// reference controller implementation, running as a normal controller
+// process on the NATS contract. It attaches with the drive grant, claims
+// unclaimed vehicles up to its capacity, and drives them each tick — IDM
+// longitudinal + MOBIL lateral computed CLIENT-SIDE from observations,
+// reusing the kernel's shared policy functions (engine.PolicyCtx), plus a
+// Dijkstra router over the lane graph for destination params. Policy RNG
+// streams are seeded per vehicle, keyed by vehicle ID (ADR-0007) — never
+// per process — so fleet failover and orphan re-claim are behaviorally
+// invisible, and which replica drives a vehicle does not matter.
+//
+// Jobs (concept-vehicle-controller-interface, RESOLVED 2026-07-17):
+// ambient-traffic generator, handoff source when a human claims a vehicle,
+// orphan re-claimer (via unclaimed-vehicle events, with the snapshot diff
+// as backstop), and host of the introspection interface — request/reply on
+// ts.{run}.drive.introspect answering "given this vehicle state, what would
+// you do?" as a pure function of state + policy.
+//
+// Replicas shard emergently via exclusive claims: each replica claims from
+// the unclaimed pool up to its capacity; no leader election, no assigned
+// shards. Replay never runs the driver — recorded intents come from the
+// JetStream log.
+package driver
+
+import (
+	"encoding/json"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/nats-io/nats.go"
+	"traffic-sim/engine"
+	"traffic-sim/engine/natsio"
+)
+
+// Config is one default-driver replica's setup.
+type Config struct {
+	// Run is the run id to attach to (required).
+	Run string
+	// Capacity is the claim capacity: max vehicles this replica holds
+	// (default 1000). Fleets size replicas to absorb one full peer loss.
+	Capacity int
+	// Destination is a lane ID routed toward for every claimed vehicle
+	// (the routing axis' destination parameter; "" = none).
+	Destination string
+	// Type is the controller_type declared at attach (default
+	// "default-driver").
+	Type string
+	// MetaWait bounds how long New waits for the run's registry meta
+	// (default 10 s) — the driver may boot before the engine.
+	MetaWait time.Duration
+}
+
+func (c Config) withDefaults() Config {
+	if c.Capacity <= 0 {
+		c.Capacity = 1000
+	}
+	if c.Type == "" {
+		c.Type = "default-driver"
+	}
+	if c.MetaWait <= 0 {
+		c.MetaWait = 10 * time.Second
+	}
+	return c
+}
+
+// Driver is one default-driver replica: an attached drive-grant controller
+// with a claimed fleet.
+type Driver struct {
+	nc    *nats.Conn
+	cfg   Config
+	id    string
+	spec  engine.RunSpec
+	types []*engine.VehicleType
+	net   *engine.Network
+
+	mu      sync.Mutex
+	fleet   map[uint64]bool // claimed vehicles (reconciled against observations)
+	pending map[uint64]bool // claims in flight
+	routed  map[uint64]bool // route intent already sent (persistent axis)
+	streams map[uint64]*engine.Stream
+
+	subs []*nats.Subscription
+	done chan struct{}
+	once sync.Once
+
+	lastObsTick atomic.Uint64
+	sentIntents atomic.Uint64
+}
+
+// New attaches a default-driver replica to its run: registry meta → hello
+// handshake → subscriptions. The replica starts working as messages arrive
+// (claims from snapshot diffs and unclaimed events; intents from
+// observations).
+func New(nc *nats.Conn, js nats.JetStreamContext, cfg Config) (*Driver, error) {
+	cfg = cfg.withDefaults()
+	if err := nc.Flush(); err != nil {
+		return nil, err
+	}
+
+	// The run's spec comes from the KV run registry (the record plane pairs
+	// registry ↔ log stream): network graph, params, seed, scenario types.
+	meta, err := awaitMeta(js, cfg.Run, cfg.MetaWait)
+	if err != nil {
+		return nil, err
+	}
+	d := &Driver{
+		nc:      nc,
+		cfg:     cfg,
+		spec:    meta.Spec,
+		types:   meta.Spec.Scen.Types,
+		fleet:   map[uint64]bool{},
+		pending: map[uint64]bool{},
+		routed:  map[uint64]bool{},
+		streams: map[uint64]*engine.Stream{},
+		done:    make(chan struct{}),
+	}
+	if len(d.types) == 0 {
+		d.types = []*engine.VehicleType{&engine.Car} // the kernel's own default
+	}
+	if d.net, err = engine.BuildNet(meta.Spec.Net); err != nil {
+		return nil, fmt.Errorf("driver: build net: %w", err)
+	}
+
+	// Attach handshake: contract version, type, cadence, grants, capacity,
+	// AoI window (ADR-0008 §3–§4).
+	hello := natsio.HelloRequest{
+		ContractVersion: natsio.SchemaVersion,
+		ControllerType:  cfg.Type,
+		CadenceTicks:    1,
+		Grants:          []string{"drive"},
+		ClaimCapacity:   cfg.Capacity,
+		Window: natsio.ObsWindow{
+			RadiusM:      250,
+			MaxNeighbors: 0, // the policy ctx carries everything the policy needs
+			Features:     natsio.ObsFeaturePolicyCtx,
+		},
+	}
+	payload, _ := json.Marshal(hello)
+	resp, err := nc.Request(natsio.SubjectCtlHello(cfg.Run), payload, 2*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("driver: hello: %w", err)
+	}
+	var reply natsio.HelloReply
+	if err := json.Unmarshal(resp.Data, &reply); err != nil {
+		return nil, fmt.Errorf("driver: hello reply: %w", err)
+	}
+	if !reply.Accepted {
+		return nil, fmt.Errorf("driver: attach rejected: %s", reply.Reason)
+	}
+	d.id = reply.ControllerID
+
+	bind := func(subject string, h func(*nats.Msg)) error {
+		sub, err := nc.Subscribe(subject, h)
+		if err != nil {
+			return fmt.Errorf("driver: subscribe %s: %w", subject, err)
+		}
+		d.subs = append(d.subs, sub)
+		return nil
+	}
+	if err := bind(natsio.SubjectCtlObs(cfg.Run, d.id), d.onObs); err != nil {
+		return nil, err
+	}
+	if err := bind(natsio.SubjectStateSnap(cfg.Run), d.onSnap); err != nil {
+		return nil, err
+	}
+	if err := bind(natsio.SubjectEventUnclaimed(cfg.Run), d.onUnclaimed); err != nil {
+		return nil, err
+	}
+	if err := bind(natsio.SubjectDriveIntrospect(cfg.Run), d.onIntrospect); err != nil {
+		return nil, err
+	}
+	return d, nc.Flush()
+}
+
+// awaitMeta polls the run registry for the run's meta (the driver may boot
+// before the engine creates the bucket/keys).
+func awaitMeta(js nats.JetStreamContext, run string, wait time.Duration) (*natsio.RunMeta, error) {
+	deadline := time.Now().Add(wait)
+	for {
+		kv, err := js.KeyValue(natsio.RegistryBucket)
+		if err == nil {
+			if entry, err := kv.Get(run + "/meta"); err == nil {
+				var meta natsio.RunMeta
+				if err := json.Unmarshal(entry.Value(), &meta); err != nil {
+					return nil, fmt.Errorf("driver: registry meta corrupt: %w", err)
+				}
+				return &meta, nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("driver: run %q not found in the registry within %s", run, wait)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// ID is the engine-assigned controller id.
+func (d *Driver) ID() string { return d.id }
+
+// FleetSize is the current claim count.
+func (d *Driver) FleetSize() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.fleet)
+}
+
+// LastObsTick is the newest observation tick the driver has worked on.
+func (d *Driver) LastObsTick() uint64 { return d.lastObsTick.Load() }
+
+// SentIntents counts intents published (observability).
+func (d *Driver) SentIntents() uint64 { return d.sentIntents.Load() }
+
+// Wait blocks until the driver stops (Close or Kill).
+func (d *Driver) Wait() { <-d.done }
+
+// Done returns the stop channel (for select loops; closed by Close/Kill).
+func (d *Driver) Done() <-chan struct{} { return d.done }
+
+// Close detaches gracefully: release every claim and end the attachment
+// (the supervisor/shutdown path).
+func (d *Driver) Close() {
+	d.once.Do(func() {
+		req, _ := json.Marshal(natsio.ReleaseRequest{Detach: true})
+		_ = d.nc.Publish(natsio.SubjectCtlRelease(d.cfg.Run, d.id), req)
+		_ = d.nc.Flush()
+		d.stop()
+	})
+}
+
+// Kill stops the driver WITHOUT saying goodbye — claims linger until the
+// engine's liveness timeout detaches it (the failover/chaos path: a dead
+// replica's orphans are re-claimed by peers via unclaimed-vehicle events).
+func (d *Driver) Kill() {
+	d.once.Do(d.stop)
+}
+
+func (d *Driver) stop() {
+	for _, sub := range d.subs {
+		_ = sub.Unsubscribe()
+	}
+	close(d.done)
+}
+
+// stream returns the vehicle's per-ID seeded policy stream (ADR-0007).
+func (d *Driver) stream(vehicleID uint64) *engine.Stream {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	s, ok := d.streams[vehicleID]
+	if !ok {
+		s = engine.DeriveStream(d.spec.Seed, vehicleID)
+		d.streams[vehicleID] = s
+	}
+	return s
+}
+
+// onObs is the driving loop: one observation frame per tick, one intent per
+// claimed vehicle per tick — IDM longitudinal + MOBIL lateral computed
+// client-side from the resolved policy context, with the routing axis
+// (destination param) and informational turn signals.
+func (d *Driver) onObs(msg *nats.Msg) {
+	obs, err := natsio.DecodeObs(msg.Data, d.types)
+	if err != nil {
+		return
+	}
+	d.lastObsTick.Store(obs.Tick)
+	params := d.spec.Params
+	present := map[uint64]bool{}
+	for i := range obs.Egos {
+		ego := &obs.Egos[i]
+		present[ego.ID] = true
+		in := engine.Intent{VehicleID: ego.ID}
+		if ego.Ctx != nil {
+			in.Accel = ego.Ctx.DecideAccel()
+			in.AccelSet = true
+			lane := 0
+			if ego.Cooldown == 0 {
+				lane = ego.Ctx.DecideLaneChange(params, d.stream(ego.ID))
+			}
+			in.LaneDelta = lane
+			in.SignalSet = true
+			in.Signals = signalFor(lane)
+		}
+		// Routing axis: the destination parameter is persistent — send once
+		// per vehicle (plus the junction turn choice when the graph offers
+		// one; M1 networks are single-successor, so usually a no-op).
+		d.mu.Lock()
+		if d.cfg.Destination != "" && !d.routed[ego.ID] {
+			if _, ok := Route(d.net, ego.LaneIdx, d.cfg.Destination); ok {
+				in.RouteSet = true
+				in.Route = d.cfg.Destination
+				if turn := d.turnChoice(ego.LaneIdx); turn != 0 {
+					in.TurnSet = true
+					in.Turn = turn
+				}
+				d.routed[ego.ID] = true
+			}
+		}
+		d.mu.Unlock()
+		if err := d.nc.Publish(natsio.SubjectCtlIntent(d.cfg.Run, d.id), natsio.EncodeIntent(in)); err == nil {
+			d.sentIntents.Add(1)
+		}
+	}
+	// The observation's ego list is the authoritative claim view: dropped
+	// members despawned or were released engine-side.
+	d.mu.Lock()
+	for vid := range d.fleet {
+		if !present[vid] {
+			delete(d.fleet, vid)
+			delete(d.routed, vid)
+		}
+	}
+	idle := len(d.fleet) == 0
+	d.mu.Unlock()
+	if idle {
+		// Liveness without control traffic: heartbeat so the engine's
+		// silence budget does not detach an idle standby replica.
+		_ = d.nc.Publish(natsio.SubjectCtlHeartbeat(d.cfg.Run, d.id), nil)
+	}
+}
+
+// signalFor maps a lane decision to the informational signal axis.
+func signalFor(laneDelta int) int {
+	switch {
+	case laneDelta > 0:
+		return 1 // left
+	case laneDelta < 0:
+		return 2 // right
+	default:
+		return 0
+	}
+}
+
+// turnChoice maps the router's next hop onto the junction turn axis:
+// successors are ordered left-to-right by convention (+1 first/leftmost,
+// −1 last/rightmost). No choice on single-successor lanes.
+func (d *Driver) turnChoice(laneIdx int) int {
+	path, ok := Route(d.net, laneIdx, d.cfg.Destination)
+	if !ok || len(path) < 2 {
+		return 0
+	}
+	lane := d.net.Lanes[laneIdx]
+	if len(lane.Successors) < 2 {
+		return 0
+	}
+	next := path[1]
+	if next == lane.Successors[0].Index {
+		return 1
+	}
+	if next == lane.Successors[len(lane.Successors)-1].Index {
+		return -1
+	}
+	return 0
+}
+
+// onSnap discovers claimable vehicles: the snapshot is the complete id list
+// — the self-healing backstop that makes event loss harmless.
+func (d *Driver) onSnap(msg *nats.Msg) {
+	f, err := natsio.ParseFrame(msg.Data)
+	if err != nil {
+		return
+	}
+	ids := make([]uint64, 0, len(f.Vehicles))
+	for _, v := range f.Vehicles {
+		ids = append(ids, v.ID)
+	}
+	d.tryClaim(ids)
+}
+
+// onUnclaimed reacts to the engine's unclaimed-vehicle events (orphans from
+// disconnects and releases; newly spawned vehicles) — the low-latency
+// re-claim path (ADR-0008 §6).
+func (d *Driver) onUnclaimed(msg *nats.Msg) {
+	var evt natsio.ContractEvent
+	if err := json.Unmarshal(msg.Data, &evt); err != nil {
+		return
+	}
+	d.tryClaim(evt.VehicleIDs)
+}
+
+// tryClaim requests exclusive claims up to remaining capacity. In-flight
+// requests dedupe; the snapshot diff retries whatever fails.
+func (d *Driver) tryClaim(ids []uint64) {
+	d.mu.Lock()
+	var ask []uint64
+	for _, vid := range ids {
+		if d.fleet[vid] || d.pending[vid] {
+			continue
+		}
+		if len(d.fleet)+len(d.pending) >= d.cfg.Capacity {
+			break
+		}
+		d.pending[vid] = true
+		ask = append(ask, vid)
+	}
+	d.mu.Unlock()
+	if len(ask) == 0 {
+		return
+	}
+	req, _ := json.Marshal(natsio.ClaimRequest{VehicleIDs: ask})
+	resp, err := d.nc.Request(natsio.SubjectCtlClaim(d.cfg.Run, d.id), req, 2*time.Second)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, vid := range ask {
+		delete(d.pending, vid)
+	}
+	if err != nil {
+		return // retried from the next snapshot
+	}
+	var rep natsio.ClaimReply
+	if err := json.Unmarshal(resp.Data, &rep); err != nil {
+		return
+	}
+	for _, vid := range rep.Granted {
+		d.fleet[vid] = true
+	}
+}
+
+// onIntrospect serves the introspection side channel: "given this vehicle
+// state, what would you do?" — a pure function of state + policy. The query
+// gets a FRESH per-vehicle stream (no side effects on live policy streams).
+func (d *Driver) onIntrospect(msg *nats.Msg) {
+	var req natsio.IntrospectRequest
+	if err := json.Unmarshal(msg.Data, &req); err != nil || req.SchemaVersion != natsio.SchemaVersion {
+		return
+	}
+	ctx, err := req.ToPolicyCtx(d.net, d.types)
+	if err != nil {
+		return
+	}
+	reply := natsio.IntrospectReply{
+		SchemaVersion: natsio.SchemaVersion,
+		Accel:         ctx.DecideAccel(),
+	}
+	if ctx.Cooldown == 0 {
+		reply.LaneDelta = ctx.DecideLaneChange(d.spec.Params, engine.DeriveStream(d.spec.Seed, req.Vehicle.ID))
+	}
+	reply.Signals = signalFor(reply.LaneDelta)
+	data, _ := json.Marshal(reply)
+	_ = d.nc.Publish(msg.Reply, data)
+}
