@@ -5,3 +5,5 @@ dist/
 .claude/settings.local.json
 data/
 analysis/ngsim/ngsim-xt
+tools/
+viz/public/network.geojson

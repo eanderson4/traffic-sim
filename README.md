@@ -5,7 +5,10 @@ An open-source traffic simulation engine built on NATS. Models real road network
 policies and live human drivers alike — and produces decision-grade congestion
 metrics for comparing infrastructure alternatives.
 
-**Status: pre-scaffold.** Vision and knowledge base first, code second.
+**Status: M-series bring-up complete.** Simulation kernel (Go), NATS message
+contract, external default driver, OSM/netconvert network import, and live
+MapLibre viz are built and tested — see `docs/kb/decisions/` for the 9 ADRs
+they implement.
 
 ## Why
 
@@ -30,11 +33,28 @@ config) are first-class and diffable so alternatives can be ranked on metrics.
 | `docs/VISION.md` | Founding document — read this first |
 | `docs/kb/` | Knowledge base: research, articles, decision records |
 | `AGENTS.md` | Rules for humans and agents working here |
-
-Code layout (engine, controllers, viz, scenarios) will be established after the
-initial KB research pass — see `docs/kb/INDEX.md` for open topics.
+| `engine/` | Go simulation kernel + NATS contract + tools (`simrun`, `serve`, `netimport`, `default-driver`) |
+| `contracts/` | AsyncAPI message contract + network file format v1 |
+| `viz/` | MapLibre realtime client (TypeScript, pnpm, no framework) |
+| `analysis/ngsim/` | NGSIM x-t field tooling + I-80 wave validation |
+| `prototypes/` | Throwaway engine-fork demos (pre-implementation) |
 
 ## Getting Started
 
-Nothing to run yet. NATS will arrive via `docker-compose up` once the engine
-skeleton lands.
+Run the test suites:
+
+```sh
+cd engine && go test ./...
+cd viz && pnpm install && pnpm test
+```
+
+Run the live demo (real I-280 network, external default driver, browser viz):
+
+```sh
+cd engine && go run ./cmd/serve -netfile ../data/networks/i280-woodside/i280.json \
+  -run demo -ws 127.0.0.1:8443 -geojson ../viz/public/network.geojson
+cd viz && pnpm dev   # open http://localhost:5173/?run=demo&ws=ws://127.0.0.1:8443
+```
+
+`data/networks/` is git-ignored per ADR-0009's recipe-not-file posture; the
+bootstrap recipe to regenerate it is in `contracts/network-format-v1.md`.
