@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>traffic-sim viz</title>
+    <style>
+      /* M6 viz chrome — dark navy per the project design tokens (math-900). */
+      html, body, #map { margin: 0; height: 100%; background: #0e1d5c; }
+      .hud {
+        position: absolute;
+        z-index: 1;
+        font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: #d6e1ff;
+        background: rgba(14, 29, 92, 0.82);
+        border: 1px solid #2e5bff;
+        border-radius: 4px;
+        padding: 6px 10px;
+        pointer-events: none;
+        white-space: pre;
+      }
+      #status { top: 10px; left: 10px; }
+      #inspect { top: 10px; right: 10px; display: none; }
+      #status .ok { color: #1e9e6a; }
+      #status .bad { color: #e5484d; }
+    </style>
+  </head>
+  <body>
+    <div id="map"></div>
+    <div id="status" class="hud">connecting…</div>
+    <div id="inspect" class="hud"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

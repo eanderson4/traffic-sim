@@ -1,0 +1,25 @@
+{
+  "name": "traffic-sim-viz",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "MapLibre realtime visualization client for the traffic-sim engine (M6, ADR-0003/ADR-0006)",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "check": "tsc --noEmit",
+    "test": "node --test test/*.test.ts",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "maplibre-gl": "5.24.0",
+    "nats.ws": "1.30.3"
+  },
+  "devDependencies": {
+    "@types/geojson": "^7946.0.16",
+    "@types/node": "^22.15.0",
+    "typescript": "~5.9.3",
+    "vite": "^8.1.5"
+  }
+}
