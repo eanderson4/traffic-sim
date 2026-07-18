@@ -1,0 +1,69 @@
+package engine
+
+import (
+	"encoding/binary"
+	"hash/fnv"
+	"math/rand/v2"
+)
+
+// Stream is a counted PCG (math/rand/v2) random stream. Per ADR-0005's
+// stream-per-concern discipline and ADR-0007, every stochastic draw in the
+// kernel goes through a Stream owned by exactly one vehicle — never a shared
+// global source. The draw count is folded into the state CRC so replay also
+// verifies RNG-consumption parity.
+type Stream struct {
+	r *rand.Rand
+	p *rand.PCG // same generator as r, kept for exact state capture
+	n uint64
+}
+
+// deriveStream hashes (scenarioSeed, vehicleID) into the two PCG seed words
+// via FNV-1a. Deterministic across runs, independent across vehicles.
+func deriveStream(seed, id uint64) *Stream {
+	var b [8]byte
+	h := fnv.New64a()
+	h.Write([]byte("traffic-sim/engine/vehicle-stream"))
+	binary.LittleEndian.PutUint64(b[:], seed)
+	h.Write(b[:])
+	binary.LittleEndian.PutUint64(b[:], id)
+	h.Write(b[:])
+	s1 := h.Sum64()
+	h.Reset()
+	h.Write([]byte("traffic-sim/engine/vehicle-stream/2"))
+	binary.LittleEndian.PutUint64(b[:], s1)
+	h.Write(b[:])
+	p := rand.NewPCG(s1, h.Sum64())
+	return &Stream{r: rand.New(p), p: p}
+}
+
+// DeriveStream is the exported form of deriveStream for external controllers
+// (ADR-0007): policy RNG is seeded per vehicle, keyed off the vehicle ID —
+// never per process — so which controller or replica drives a vehicle is
+// behaviorally invisible and live-run determinism survives failover.
+func DeriveStream(seed, vehicleID uint64) *Stream { return deriveStream(seed, vehicleID) }
+
+// Float64 draws a uniform in [0,1).
+func (s *Stream) Float64() float64 { s.n++; return s.r.Float64() }
+
+// Norm draws a standard normal (Box-Muller inside math/rand/v2).
+func (s *Stream) Norm() float64 { s.n++; return s.r.NormFloat64() }
+
+// Draws reports how many draws this stream has produced (part of the CRC).
+func (s *Stream) Draws() uint64 { return s.n }
+
+// marshalStream captures the exact generator state (PCG words via
+// math/rand/v2's binary form) plus the API draw count. Call-type-agnostic:
+// ziggurat Norm draws consume a variable number of PCG words, so replaying
+// n API calls would NOT reproduce the state — the raw words must travel.
+func (s *Stream) marshalStream() ([]byte, error) {
+	return s.p.MarshalBinary()
+}
+
+// unmarshalStream rebuilds a stream from marshalStream's output.
+func unmarshalStream(state []byte, draws uint64) (*Stream, error) {
+	p := &rand.PCG{}
+	if err := p.UnmarshalBinary(state); err != nil {
+		return nil, err
+	}
+	return &Stream{r: rand.New(p), p: p, n: draws}, nil
+}
