@@ -1,0 +1,320 @@
+package natsio
+
+import (
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"math"
+	"strconv"
+	"time"
+
+	"github.com/nats-io/nats.go"
+	"traffic-sim/engine"
+)
+
+// replay.go — CRC-verified replay from the JetStream record (ADR-0005 §5,
+// ADR-0006 §5): seek = nearest keyframe ≤ target tick, re-simulate forward
+// from a DeliverByStartSequence cursor with the logged intents, verify the
+// logged rolling-CRC sequence. The replayer paces by tick (unpaced here —
+// replay never runs controllers, ADR-0008); broker ReplayOriginal wall-clock
+// pacing is deliberately not used.
+
+// ReplayReport summarizes a verified replay.
+type ReplayReport struct {
+	Run             string
+	KeyframeTick    uint64 // keyframe the seek landed on
+	KeyframeSeq     uint64 // its stream sequence
+	ToTick          uint64 // last re-simulated tick
+	IntentsReplayed int
+	CRCsVerified    int
+	FinalCRC        uint64 // rolling CRC at ToTick
+}
+
+// RunRecord is the materialized record plane of a run: the in-memory RunLog
+// (spec, arbitrated intent log in stream order, per-tick CRCs) plus the
+// control-plane events (pause/resume, ADR-0008 §6) in stream order. The
+// audit/test view of the stream — replay logic consumes Log exactly like
+// the live loop produced it.
+type RunRecord struct {
+	Log    *engine.RunLog
+	Events []ContractEvent
+}
+
+// MaterializeRunRecord rebuilds a run's record from its log stream. meta
+// supplies the run spec (run registry ↔ log stream pairing). Keyframes are
+// skipped (they duplicate state the CRC chain already pins); intents keep
+// stream order, which IS the application order (ADR-0006 §4).
+func MaterializeRunRecord(js nats.JetStreamContext, meta *RunMeta) (*RunRecord, error) {
+	run := meta.RunID
+	msgs, err := fetchFrom(js, StreamName(run), run, 1)
+	if err != nil {
+		return nil, err
+	}
+	rec := &RunRecord{Log: &engine.RunLog{Spec: meta.Spec}}
+	for _, m := range msgs {
+		switch m.Subject {
+		case SubjectLogIntent(run):
+			k, err := decodeLoggedIntent(m.Data)
+			if err != nil {
+				return nil, err
+			}
+			rec.Log.Intents = append(rec.Log.Intents, k)
+		case SubjectLogCRC(run):
+			crc, err := decodeLoggedCRC(m.Data)
+			if err != nil {
+				return nil, err
+			}
+			rec.Log.CRCs = append(rec.Log.CRCs, crc)
+		case SubjectLogEvent(run):
+			var evt ContractEvent
+			if err := json.Unmarshal(m.Data, &evt); err != nil {
+				return nil, fmt.Errorf("log event: %w", err)
+			}
+			rec.Events = append(rec.Events, evt)
+		}
+	}
+	return rec, nil
+}
+
+// ReplayFromStream re-executes run meta.RunID from its log stream up to
+// target tick and verifies every logged CRC on the way. meta supplies the
+// run spec (run registry ↔ log stream pairing; the keyframe does not carry
+// the spec). Consumers are ephemeral pull consumers with AckNone: replay is
+// a read-only audit path and leaves no broker state behind.
+func ReplayFromStream(js nats.JetStreamContext, meta *RunMeta, target uint64) (*ReplayReport, error) {
+	run := meta.RunID
+	stream := StreamName(run)
+
+	kf, err := findKeyframe(js, stream, run, target)
+	if err != nil {
+		return nil, err
+	}
+	e, err := engine.RestoreState(meta.Spec, kf.payload)
+	if err != nil {
+		return nil, fmt.Errorf("restore keyframe tick %d: %w", kf.tick, err)
+	}
+
+	msgs, err := fetchFrom(js, stream, run, kf.seq+1)
+	if err != nil {
+		return nil, err
+	}
+
+	intents := map[uint64][]engine.KeyedIntent{}
+	crcs := map[uint64]uint64{}
+	var lastLoggedTick uint64
+	for _, m := range msgs {
+		tick, err := msgTick(m)
+		if err != nil {
+			return nil, err
+		}
+		if tick > lastLoggedTick {
+			lastLoggedTick = tick
+		}
+		switch m.Subject {
+		case SubjectLogIntent(run):
+			k, err := decodeLoggedIntent(m.Data)
+			if err != nil {
+				return nil, err
+			}
+			intents[k.Tick] = append(intents[k.Tick], k.KeyedIntent)
+		case SubjectLogCRC(run):
+			crc, err := decodeLoggedCRC(m.Data)
+			if err != nil {
+				return nil, err
+			}
+			crcs[tick] = crc
+		case SubjectLogKeyframe(run):
+			// Mid-stream keyframes are for later seeks; the CRC chain
+			// already verifies the state they capture.
+		}
+	}
+	if target > lastLoggedTick {
+		return nil, fmt.Errorf("stream %s ends at tick %d before target %d", stream, lastLoggedTick, target)
+	}
+
+	rep := &ReplayReport{Run: run, KeyframeTick: kf.tick, KeyframeSeq: kf.seq}
+	for e.Tick < target {
+		next := e.Tick + 1
+		for _, k := range intents[next] {
+			e.EnqueueIntent(k)
+			rep.IntentsReplayed++
+		}
+		e.Step()
+		if want, ok := crcs[next]; ok {
+			if e.CRC() != want {
+				return nil, fmt.Errorf("replay divergence at tick %d: crc %016x, logged %016x",
+					next, e.CRC(), want)
+			}
+			rep.CRCsVerified++
+		}
+	}
+	rep.ToTick = e.Tick
+	rep.FinalCRC = e.CRC()
+	return rep, nil
+}
+
+// keyframeRef is one logged keyframe located by the scan.
+type keyframeRef struct {
+	tick    uint64
+	seq     uint64
+	payload []byte
+}
+
+// findKeyframe scans the sparse keyframe subject for the nearest keyframe ≤
+// target (ADR-0006 §5 seek semantics).
+func findKeyframe(js nats.JetStreamContext, stream, run string, target uint64) (*keyframeRef, error) {
+	subj := SubjectLogKeyframe(run)
+	info, err := js.StreamInfo(stream, &nats.StreamInfoRequest{SubjectsFilter: subj})
+	if err != nil {
+		return nil, fmt.Errorf("stream info %s: %w", stream, err)
+	}
+	n := info.State.Subjects[subj]
+	if n == 0 {
+		return nil, fmt.Errorf("stream %s has no keyframes (run not started?)", stream)
+	}
+	msgs, err := fetchAll(js, stream, subj, 0, n)
+	if err != nil {
+		return nil, err
+	}
+	var best *keyframeRef
+	for _, m := range msgs {
+		tick, err := msgTick(m)
+		if err != nil {
+			return nil, err
+		}
+		md, err := m.Metadata()
+		if err != nil {
+			return nil, fmt.Errorf("keyframe metadata: %w", err)
+		}
+		if tick <= target && (best == nil || tick > best.tick) {
+			best = &keyframeRef{tick: tick, seq: md.Sequence.Stream, payload: m.Data}
+		}
+	}
+	if best == nil {
+		return nil, fmt.Errorf("no keyframe ≤ target tick %d in %s", target, stream)
+	}
+	return best, nil
+}
+
+// fetchFrom delivers every log message from stream sequence fromSeq onward
+// (stream order). The caller's tick bookkeeping detects "stream ends before
+// target".
+func fetchFrom(js nats.JetStreamContext, stream, run string, fromSeq uint64) ([]*nats.Msg, error) {
+	subj := SubjectLogAll(run)
+	info, err := js.StreamInfo(stream)
+	if err != nil {
+		return nil, fmt.Errorf("stream info %s: %w", stream, err)
+	}
+	if fromSeq > info.State.LastSeq {
+		return nil, nil
+	}
+	return fetchAll(js, stream, subj, fromSeq, info.State.LastSeq-fromSeq+1)
+}
+
+// fetchAll reads up to n messages through an ephemeral pull consumer, in
+// stream order. When fromSeq > 0 the consumer starts there
+// (DeliverByStartSequence); otherwise it delivers all.
+func fetchAll(js nats.JetStreamContext, stream, subj string, fromSeq, n uint64) ([]*nats.Msg, error) {
+	cfg := &nats.ConsumerConfig{
+		FilterSubject: subj,
+		AckPolicy:     nats.AckNonePolicy,
+		ReplayPolicy:  nats.ReplayInstantPolicy,
+	}
+	if fromSeq > 0 {
+		cfg.DeliverPolicy = nats.DeliverByStartSequencePolicy
+		cfg.OptStartSeq = fromSeq
+	} else {
+		cfg.DeliverPolicy = nats.DeliverAllPolicy
+	}
+	ci, err := js.AddConsumer(stream, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("replay consumer on %s: %w", stream, err)
+	}
+	defer func() { _ = js.DeleteConsumer(stream, ci.Name) }()
+	sub, err := js.PullSubscribe(subj, "", nats.Bind(stream, ci.Name))
+	if err != nil {
+		return nil, fmt.Errorf("bind replay consumer: %w", err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+
+	var out []*nats.Msg
+	for uint64(len(out)) < n {
+		batch := n - uint64(len(out))
+		if batch > 256 {
+			batch = 256
+		}
+		msgs, err := sub.Fetch(int(batch), nats.MaxWait(5*time.Second))
+		if err != nil {
+			return nil, fmt.Errorf("replay fetch %s: %w", subj, err)
+		}
+		out = append(out, msgs...)
+		if uint64(len(msgs)) < batch {
+			break // stream exhausted
+		}
+	}
+	return out, nil
+}
+
+// msgTick reads the tick header (ADR-0006 §3: tick lives in headers/payload,
+// never inferred from stream sequence).
+func msgTick(m *nats.Msg) (uint64, error) {
+	h := m.Header.Get(headerTick)
+	if h == "" {
+		return 0, fmt.Errorf("message on %s without tick header", m.Subject)
+	}
+	tick, err := strconv.ParseUint(h, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("message on %s: bad tick header %q", m.Subject, h)
+	}
+	return tick, nil
+}
+
+// decodeLoggedIntent parses the recorder's v2 intent payload (see
+// recorder.go for the layout and flag bits).
+func decodeLoggedIntent(data []byte) (engine.TickedIntent, error) {
+	var out engine.TickedIntent
+	if len(data) < 8+8+2 {
+		return out, fmt.Errorf("logged intent: %d bytes, too short", len(data))
+	}
+	out.Tick = binary.LittleEndian.Uint64(data[0:])
+	out.Seq = binary.LittleEndian.Uint64(data[8:])
+	ctlLen := int(binary.LittleEndian.Uint16(data[16:]))
+	rest := data[18:]
+	const fixed = 8 + 4 + 4 + 8 + 8 + 4 + 4 + 1 + 2 // through route_len
+	if len(rest) < ctlLen+fixed {
+		return out, fmt.Errorf("logged intent: %d payload bytes, want at least %d", len(data), 18+ctlLen+fixed)
+	}
+	out.Controller = string(rest[:ctlLen])
+	rest = rest[ctlLen:]
+	out.Intent.VehicleID = binary.LittleEndian.Uint64(rest[0:])
+	flags := binary.LittleEndian.Uint32(rest[8:])
+	out.Intent.LaneDelta = int(int32(binary.LittleEndian.Uint32(rest[12:])))
+	out.Intent.Accel = math.Float64frombits(binary.LittleEndian.Uint64(rest[16:]))
+	out.Intent.SpeedSetpoint = math.Float64frombits(binary.LittleEndian.Uint64(rest[24:]))
+	out.Intent.Signals = int(int32(binary.LittleEndian.Uint32(rest[32:])))
+	out.Intent.Turn = int(int32(binary.LittleEndian.Uint32(rest[36:])))
+	out.Grant = rest[40]
+	routeLen := int(binary.LittleEndian.Uint16(rest[41:]))
+	rest = rest[43:]
+	if len(rest) != routeLen {
+		return out, fmt.Errorf("logged intent: route_len %d, %d bytes remain", routeLen, len(rest))
+	}
+	out.Intent.AccelSet = flags&intentFlagAccelSet != 0
+	out.Intent.SpeedSet = flags&intentFlagSpeedSet != 0
+	out.Intent.SignalSet = flags&intentFlagSignalSet != 0
+	out.Intent.TurnSet = flags&intentFlagTurnSet != 0
+	if flags&intentFlagRouteSet != 0 {
+		out.Intent.RouteSet = true
+		out.Intent.Route = string(rest)
+	}
+	out.Held = flags&logFlagHeld != 0
+	out.Superseded = flags&logFlagSuperseded != 0
+	return out, nil
+}
+
+func decodeLoggedCRC(data []byte) (uint64, error) {
+	if len(data) != 16 {
+		return 0, fmt.Errorf("logged crc: %d bytes, want 16", len(data))
+	}
+	return binary.LittleEndian.Uint64(data[8:]), nil
+}

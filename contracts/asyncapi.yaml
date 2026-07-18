@@ -1,0 +1,960 @@
+# AsyncAPI 3.0 — the traffic-sim NATS message contract (ADR-0006).
+#
+# This document is THE SOURCE OF TRUTH for subjects, payloads, and headers
+# (AGENTS.md rule 5; contract changes are ADR-gated). The described
+# application is the ENGINE: "send" = the engine publishes, "receive" = the
+# engine subscribes. Controllers and observers are the opposing clients.
+#
+# Conventions (ADR-0006 §3, §7):
+#   - Taxonomy {ns}.{run}.{plane}.>{ids}: namespace left, run id second
+#     (aggregate boundary), plane third, entity ids last. Run ids and
+#     controller ids are single NATS tokens: [A-Za-z0-9_-].
+#   - Tick numbers, schema versions, and wall-clock live in payload/headers
+#     — never in subjects, never inferred from stream sequence.
+#   - Binary layouts are little-endian, fixed-size integers, versioned by
+#     the schema_version header AND an in-payload magic/version pair.
+#   - Every binary message also declares a JSON schema view (suffix "View")
+#     so tooling (docs, codegen, validators) has a machine-readable shape;
+#     the wire stays binary.
+asyncapi: 3.0.0
+
+info:
+  title: traffic-sim engine contract
+  version: 2.0.0
+  description: |
+    The engine's NATS surface per ADR-0006 (planes, taxonomy, pipelines) and
+    ADR-0008 (the engine↔controller contract — M4, schema_version 2):
+
+    - **Live plane (core NATS, at-most-once):** self-sufficient binary SoA
+      snapshots out (~1/tick), raw controller intents in, per-controller
+      applied_tick echo. Slow consumers are dropped, never blocked
+      (ADR-0006 §6); late joiners resync from the KV state pointer.
+    - **Contract plane (core NATS, ADR-0008):** attach handshake
+      (hello, request/reply: contract version, type, cadence, grants,
+      claim capacity, AoI window), exclusive engine-arbitrated claims,
+      heartbeats, per-controller observation windows (declared radius /
+      max-neighbors / features), and the contract event feed
+      (claim/release/unclaimed/pause/resume).
+    - **Record plane (JetStream, at-least-once):** the arbitrated intent
+      log, full-state keyframes, the rolling state CRC, and control events
+      (pause/resume), one stream per run (LimitsPolicy, R=1 file). The
+      engine is the SOLE WRITER; Nats-Expected-Last-Sequence asserts it
+      broker-side.
+    - **Metadata plane (KV):** the run registry — run spec + status, and
+      the latest-state pointer for late joiners.
+
+    Replay (ADR-0005 §5) is a read-only consumer of the record plane:
+    nearest keyframe ≤ target tick, DeliverByStartSequence, re-simulate
+    with logged intents, verify the logged CRC sequence. Replay never runs
+    controllers (ADR-0008) — recorded intents come from the log.
+
+    **M4 changes (schema_version 1 → 2):** the intent frame grew the
+    routing/signal/speed-setpoint axes (ADR-0008 §1–§2); the logged-intent
+    payload grew grant/held/superseded; keyframes are TSKF v2 (persistent
+    controller axes); same-tick competing intents now resolve by **(grant
+    level, then vehicle ID)** — superseding M3's (controller_id,
+    arrival_seq) application order. The snapshot frame is unchanged (TSSF
+    v1).
+
+servers:
+  embedded:
+    host: in-process
+    protocol: nats
+    description: Embedded DontListen server for tests and single-binary demos (ADR-0006 §8).
+  dev:
+    host: localhost:4222
+    protocol: nats
+    description: docker-compose dev server (ADR-0004). Browsers use its WebSocket listener with binary frames.
+
+channels:
+  stateSnap:
+    address: ts.{run}.state.snap
+    description: |
+      Live state snapshot, published once per tick. Self-sufficient
+      (most-recent-state semantics): a dropped message reduces update rate,
+      never corrupts state — there are no deltas on core NATS.
+    parameters:
+      run: { $ref: '#/components/parameters/runId' }
+    messages:
+      stateSnapshot: { $ref: '#/components/messages/StateSnapshot' }
+
+  ctlIntent:
+    address: ts.{run}.ctl.intent.{controller_id}
+    description: |
+      Raw controller intents, fire-and-forget. A controller publishes only
+      its own subject (v1 auth: ts.*.ctl.intent.{own_id}, ADR-0006 §9).
+      Intents are buffered and batch-applied at the next tick boundary with
+      1-tick minimum latency (ADR-0005 §3); the applied_tick echo is the
+      ack. Claim enforcement (ADR-0008 §3): an attached controller's intent
+      applies only to vehicles IT claims (director-grant intents pass
+      unfiltered); legacy unattached publishers are honored only while the
+      target vehicle is unclaimed (M3 compat). Same-tick competing intents
+      for one vehicle resolve by the deterministic tie-break **(grant
+      level, then vehicle ID)** (ADR-0008 §4) — superseding M3's
+      (controller_id, arrival_seq) ordering; losers are logged as
+      superseded no-ops. Missing expected messages from an attached
+      controller are healed by hold-last: the contract layer re-issues the
+      last intent for ≤ 2 ticks past the cadence due point (logged as
+      held), then zero/default (ADR-0008 §2).
+    parameters:
+      run: { $ref: '#/components/parameters/runId' }
+      controller_id: { $ref: '#/components/parameters/controllerId' }
+    messages:
+      controlIntent: { $ref: '#/components/messages/ControlIntent' }
+
+  ctlHello:
+    address: ts.{run}.ctl.hello
+    description: |
+      The attach handshake (ADR-0008 §4), request/reply: the controller
+      declares contract version, type, decision cadence (ticks), requested
+      grants (drive | director | signal), claim capacity, initial claims,
+      and its area-of-interest observation window. The engine answers
+      accept/reject, the assigned controller_id, granted claims, and the
+      current tick. The drive grant requires claim_capacity ≥ 1; cadence
+      must be below the detach budget. Director and signal are elevated
+      grants (their verbs land M5+; the grants exist now).
+    parameters:
+      run: { $ref: '#/components/parameters/runId' }
+    messages:
+      helloRequest: { $ref: '#/components/messages/HelloRequest' }
+      helloReply: { $ref: '#/components/messages/HelloReply' }
+
+  ctlClaim:
+    address: ts.{run}.ctl.claim.{controller_id}
+    description: |
+      Exclusive per-vehicle claim requests, engine-arbitrated
+      (request/reply). One vehicle has exactly one controller at a time; a
+      controller may hold many vehicles (multi-vehicle claims allowed).
+      Claims on already-claimed vehicles are rejected; re-claiming one's
+      own vehicle is idempotent. Granted claims are also announced on the
+      event feed (ts.{run}.ctl.events.claim).
+    parameters:
+      run: { $ref: '#/components/parameters/runId' }
+      controller_id: { $ref: '#/components/parameters/controllerId' }
+    messages:
+      claimRequest: { $ref: '#/components/messages/ClaimRequest' }
+      claimReply: { $ref: '#/components/messages/ClaimReply' }
+
+  ctlRelease:
+    address: ts.{run}.ctl.release.{controller_id}
+    description: |
+      Claim releases (fire-and-forget): the listed claims drop, release +
+      unclaimed events fire (reason "release"). detach: true also ends the
+      attachment (graceful goodbye; remaining claims release with reason
+      "disconnect").
+    parameters:
+      run: { $ref: '#/components/parameters/runId' }
+      controller_id: { $ref: '#/components/parameters/controllerId' }
+    messages:
+      releaseRequest: { $ref: '#/components/messages/ReleaseRequest' }
+
+  ctlHeartbeat:
+    address: ts.{run}.ctl.heartbeat.{controller_id}
+    description: |
+      Liveness keepalive (ADR-0008 §4, concept synthesis): an attached
+      controller must produce an intent, claim, release, or heartbeat at
+      least every DetachAfterTicks ticks (default 10) or it is detached —
+      claims release and unclaimed-vehicle events fire (reason
+      "disconnect"). Core NATS has no presence primitive; the tick-space
+      timeout is the v1 disconnect signal. Idle standby replicas heartbeat
+      once per tick.
+    parameters:
+      run: { $ref: '#/components/parameters/runId' }
+      controller_id: { $ref: '#/components/parameters/controllerId' }
+    messages:
+      heartbeat: { $ref: '#/components/messages/Heartbeat' }
+
+  ctlObs:
+    address: ts.{run}.ctl.obs.{controller_id}
+    description: |
+      Per-controller observations (ADR-0008 §3), one binary frame per tick
+      — the controller's tick clock even with an empty fleet. Contents
+      follow the declared AoI window: ego exact per claimed vehicle, the
+      resolved reference-policy context per ego (feature PolicyCtx: the
+      same gather the kernel uses — a client's decision from it equals the
+      engine's), and the neighbor list within radius, sorted by (distance,
+      id), capped at max_neighbors (feature Neighbors).
+    parameters:
+      run: { $ref: '#/components/parameters/runId' }
+      controller_id: { $ref: '#/components/parameters/controllerId' }
+    messages:
+      observation: { $ref: '#/components/messages/Observation' }
+
+  ctlEvents:
+    address: ts.{run}.ctl.events.{kind}
+    description: |
+      The contract event feed (JSON, best effort): kind ∈ claim |
+      release | unclaimed | pause. Unclaimed reasons: spawn | release |
+      disconnect — the orphan re-claim trigger for default-driver replicas
+      (ADR-0008 §6), with the snapshot diff as backstop. Pause and resume
+      events also land on the record plane (ts.{run}.log.event).
+    parameters:
+      run: { $ref: '#/components/parameters/runId' }
+      kind:
+        description: Event kind.
+        enum: [claim, release, unclaimed, pause]
+    messages:
+      contractEvent: { $ref: '#/components/messages/ContractEvent' }
+
+  driveIntrospect:
+    address: ts.{run}.drive.introspect
+    description: |
+      The default driver's introspection side channel (ADR-0008 §5),
+      request/reply, off the hot path — deliberately NOT a field in engine
+      observations. Any client asks "given this vehicle state, what would
+      you do?" and gets the reference policy's decision as a pure function
+      of state + policy (a fresh per-vehicle RNG stream per query — no side
+      effects). Serves debug tooling, RL harnesses, and viz.
+    parameters:
+      run: { $ref: '#/components/parameters/runId' }
+    messages:
+      introspectRequest: { $ref: '#/components/messages/IntrospectRequest' }
+      introspectReply: { $ref: '#/components/messages/IntrospectReply' }
+
+  ctlAck:
+    address: ts.{run}.ctl.ack.{controller_id}
+    description: |
+      The engine's per-controller applied_tick echo (ADR-0006 §7): ack
+      channel for ego-prediction reconciliation, control-latency meter, and
+      HUD health signal. One message per tick per controller that has ever
+      had an intent applied, carrying that controller's latest applied tick.
+    parameters:
+      run: { $ref: '#/components/parameters/runId' }
+      controller_id: { $ref: '#/components/parameters/controllerId' }
+    messages:
+      appliedTickAck: { $ref: '#/components/messages/AppliedTickAck' }
+
+  logIntent:
+    address: ts.{run}.log.intent
+    description: |
+      The arbitrated intent log (record plane): one message per applied
+      intent, in application order, each with its applied_tick. Engine sole
+      writer; replay re-applies these instead of running controllers.
+    parameters:
+      run: { $ref: '#/components/parameters/runId' }
+    messages:
+      loggedIntent: { $ref: '#/components/messages/LoggedIntent' }
+    x-nats:
+      stream: TS_LOG_{run}
+      retention: limits
+      storage: file
+      replicas: 1
+
+  logKeyframe:
+    address: ts.{run}.log.keyframe
+    description: |
+      Full-state keyframes at a configurable cadence (default every 100
+      ticks, plus tick 0). Seek anchor for replay: nearest keyframe ≤
+      target tick, then re-simulate with the intent log.
+    parameters:
+      run: { $ref: '#/components/parameters/runId' }
+    messages:
+      keyframe: { $ref: '#/components/messages/Keyframe' }
+    x-nats:
+      stream: TS_LOG_{run}
+
+  logCRC:
+    address: ts.{run}.log.crc
+    description: |
+      The rolling chained state CRC at a configurable cadence (default
+      every tick). The replay oracle (ADR-0005 §5).
+    parameters:
+      run: { $ref: '#/components/parameters/runId' }
+    messages:
+      loggedCRC: { $ref: '#/components/messages/LoggedCRC' }
+    x-nats:
+      stream: TS_LOG_{run}
+
+  logEvent:
+    address: ts.{run}.log.event
+    description: |
+      Control-plane events on the record plane (ADR-0008 §6): pause and
+      resume, as JSON. Pause gates the tick loop when available claim
+      capacity < demand (unclaimed vehicles) for T consecutive ticks
+      (default 5); resume fires on capacity recovery. These are dead-time
+      metadata: they carry no world state, the replayer ignores them, and
+      tick determinism is unaffected — the CRC chain is contiguous across
+      a pause.
+    parameters:
+      run: { $ref: '#/components/parameters/runId' }
+    messages:
+      logEvent: { $ref: '#/components/messages/ContractEvent' }
+    x-nats:
+      stream: TS_LOG_{run}
+
+  runMeta:
+    address: ts.{run}.meta.>
+    description: |
+      Metadata plane (KV): run registry — run spec + status, and the
+      latest-state pointer for late joiners (resync: materialize, attach
+      live, discard live messages with tick ≤ the materialized tick).
+      V1 CONCRETE BINDING: KV bucket `ts_runs`, keys `{run}/meta`
+      (RunMetaView) and `{run}/state` (StatePtrView) — physically stored
+      under the bucket's $KV subjects; the logical `ts.{run}.meta.>`
+      addressing lands when a subject-mapped bucket is introduced.
+    parameters:
+      run: { $ref: '#/components/parameters/runId' }
+    messages:
+      runMeta: { $ref: '#/components/messages/RunMeta' }
+      statePointer: { $ref: '#/components/messages/StatePointer' }
+    x-nats:
+      kvBucket: ts_runs
+      keys: [ '{run}/meta', '{run}/state' ]
+      history: 1
+
+operations:
+  publishSnapshot:
+    title: Engine → snapshot per tick
+    action: send
+    channel: { $ref: '#/channels/stateSnap' }
+  receiveIntents:
+    title: Engine ← raw controller intents
+    action: receive
+    channel: { $ref: '#/channels/ctlIntent' }
+  publishAppliedTick:
+    title: Engine → applied_tick echo per controller
+    action: send
+    channel: { $ref: '#/channels/ctlAck' }
+  attachHandshake:
+    title: Engine ↔ attach handshake (accept/reject + controller_id)
+    action: receive
+    channel: { $ref: '#/channels/ctlHello' }
+  arbitrateClaims:
+    title: Engine ↔ claim arbitration (exclusive, multi-vehicle)
+    action: receive
+    channel: { $ref: '#/channels/ctlClaim' }
+  receiveReleases:
+    title: Engine ← claim releases / graceful detach
+    action: receive
+    channel: { $ref: '#/channels/ctlRelease' }
+  receiveHeartbeats:
+    title: Engine ← liveness keepalives
+    action: receive
+    channel: { $ref: '#/channels/ctlHeartbeat' }
+  publishObservations:
+    title: Engine → per-controller observations per tick
+    action: send
+    channel: { $ref: '#/channels/ctlObs' }
+  publishContractEvents:
+    title: Engine → contract events (claim/release/unclaimed/pause)
+    action: send
+    channel: { $ref: '#/channels/ctlEvents' }
+  serveIntrospection:
+    title: Default driver ↔ introspection ("what would you do with this state?")
+    action: receive
+    channel: { $ref: '#/channels/driveIntrospect' }
+  writeLog:
+    title: Engine → arbitrated record (sole writer; pubacks awaited per tick-batch; failure aborts the run loudly)
+    action: send
+    channel: { $ref: '#/channels/logIntent' }
+  writeKeyframe:
+    title: Engine → keyframe at cadence
+    action: send
+    channel: { $ref: '#/channels/logKeyframe' }
+  writeCRC:
+    title: Engine → rolling CRC at cadence
+    action: send
+    channel: { $ref: '#/channels/logCRC' }
+  writeLogEvent:
+    title: Engine → pause/resume events (dead-time metadata; invisible to tick determinism)
+    action: send
+    channel: { $ref: '#/channels/logEvent' }
+  writeRegistry:
+    title: Engine → run registry (meta at start/finish, state pointer at keyframe cadence)
+    action: send
+    channel: { $ref: '#/channels/runMeta' }
+  readRegistry:
+    title: Late joiners / replay ← run registry
+    action: receive
+    channel: { $ref: '#/channels/runMeta' }
+  replayRecord:
+    title: Replayer ← record plane (read-only; ephemeral pull consumers; paces by tick, never ReplayOriginal)
+    action: receive
+    channel: { $ref: '#/channels/logIntent' }
+
+components:
+  parameters:
+    runId:
+      description: Run id — the aggregate boundary. Single NATS token [A-Za-z0-9_-].
+    controllerId:
+      description: Controller id. Single NATS token [A-Za-z0-9_-]. A controller may publish only its own intent subject.
+
+  messages:
+    StateSnapshot:
+      name: stateSnapshot
+      title: State snapshot (binary SoA frame)
+      summary: Self-sufficient per-tick world state (ADR-0006 §2, §7).
+      headers: { $ref: '#/components/schemas/TickHeaders' }
+      payload:
+        schemaFormat: application/octet-stream
+        $ref: '#/components/schemas/SnapshotFrame'
+      x-json-view: '#/components/schemas/SnapshotView'
+
+    ControlIntent:
+      name: controlIntent
+      title: Controller intent (one vehicle, four orthogonal axes; ADR-0008 §1)
+      summary: |
+        Longitudinal (target accel — canonical primitive, one-shot per tick;
+        optional persistent speed-setpoint cruise variant), lateral (lane
+        hop — one-shot, expires if infeasible; junction turn choice — held
+        until consumed), routing (destination lane id, persistent), signal
+        state (persistent, informational in v1). Absent fields = no change.
+        The engine clamps every intent to the vehicle's physical envelope
+        (MMU pattern, ADR-0008 §5).
+      headers: { $ref: '#/components/schemas/SchemaHeaders' }
+      payload:
+        schemaFormat: application/octet-stream
+        $ref: '#/components/schemas/IntentFrame'
+      x-json-view: '#/components/schemas/IntentView'
+
+    HelloRequest:
+      name: helloRequest
+      title: Attach handshake request (ADR-0008 §4)
+      payload:
+        schemaFormat: application/schema+json;version=draft-07
+        $ref: '#/components/schemas/HelloRequestView'
+
+    HelloReply:
+      name: helloReply
+      title: Attach handshake reply (accept/reject + assigned controller_id)
+      payload:
+        schemaFormat: application/schema+json;version=draft-07
+        $ref: '#/components/schemas/HelloReplyView'
+
+    ClaimRequest:
+      name: claimRequest
+      title: Exclusive claim request (multi-vehicle allowed)
+      payload:
+        schemaFormat: application/schema+json;version=draft-07
+        $ref: '#/components/schemas/ClaimRequestView'
+
+    ClaimReply:
+      name: claimReply
+      title: Claim arbitration result per vehicle
+      payload:
+        schemaFormat: application/schema+json;version=draft-07
+        $ref: '#/components/schemas/ClaimReplyView'
+
+    ReleaseRequest:
+      name: releaseRequest
+      title: 'Claim release (detach: true = graceful goodbye)'
+      payload:
+        schemaFormat: application/schema+json;version=draft-07
+        $ref: '#/components/schemas/ReleaseRequestView'
+
+    Heartbeat:
+      name: heartbeat
+      title: Liveness keepalive (empty payload)
+      headers: { $ref: '#/components/schemas/SchemaHeaders' }
+      payload:
+        schemaFormat: application/octet-stream
+        $ref: '#/components/schemas/EmptyPayload'
+
+    Observation:
+      name: observation
+      title: Per-controller observation frame (AoI window, per tick)
+      headers: { $ref: '#/components/schemas/TickHeaders' }
+      payload:
+        schemaFormat: application/octet-stream
+        $ref: '#/components/schemas/ObsFrame'
+      x-json-view: '#/components/schemas/ObsView'
+
+    ContractEvent:
+      name: contractEvent
+      title: Contract event (claim | release | unclaimed | pause | resume)
+      headers: { $ref: '#/components/schemas/TickHeaders' }
+      payload:
+        schemaFormat: application/schema+json;version=draft-07
+        $ref: '#/components/schemas/ContractEventView'
+
+    IntrospectRequest:
+      name: introspectRequest
+      title: Introspection query ("given this vehicle state, what would you do?")
+      payload:
+        schemaFormat: application/schema+json;version=draft-07
+        $ref: '#/components/schemas/IntrospectRequestView'
+
+    IntrospectReply:
+      name: introspectReply
+      title: The reference policy's decision for the queried state
+      payload:
+        schemaFormat: application/schema+json;version=draft-07
+        $ref: '#/components/schemas/IntrospectReplyView'
+
+    AppliedTickAck:
+      name: appliedTickAck
+      title: applied_tick echo (ack / latency meter / HUD health)
+      headers: { $ref: '#/components/schemas/AckHeaders' }
+      payload:
+        schemaFormat: application/schema+json;version=draft-07
+        $ref: '#/components/schemas/AckView'
+
+    LoggedIntent:
+      name: loggedIntent
+      title: Arbitrated log entry (intent, applied_tick, grant, held/superseded)
+      summary: |
+        Sole-writer write with dedup + OCC headers (ADR-0006 §4). Stream
+        order within a tick IS the application order: grant level desc,
+        then vehicle ID (ADR-0008 §4). held marks contract-layer hold-last
+        re-issues; superseded marks tie-break losers (recorded, not
+        applied). Replay enqueues everything verbatim — the deterministic
+        tie-break reproduces the same outcome.
+      headers: { $ref: '#/components/schemas/LogHeaders' }
+      payload:
+        schemaFormat: application/octet-stream
+        $ref: '#/components/schemas/LoggedIntentFrame'
+      x-json-view: '#/components/schemas/LoggedIntentView'
+
+    Keyframe:
+      name: keyframe
+      title: Full-state keyframe (engine.MarshalState bytes, TSKF v2)
+      summary: |
+        Complete dynamic state: tick, rolling CRC, next vehicle id, every
+        vehicle (id, lane, type, s, v, f, cooldown, RNG words + draw count,
+        persistent controller axes — cruise setpoint, held turn, signals,
+        route), spawner demand state. Layout: engine/keyframe.go ("TSKF",
+        version 2 — v2 adds the controller axes). Payloads stay under the
+        1 MB discipline (ADR-0002 clarification); the vehicle-count/byte
+        curve feeding the chunking decision is in engine/BENCHMARKS.md.
+      headers: { $ref: '#/components/schemas/LogHeaders' }
+      payload:
+        schemaFormat: application/octet-stream
+        $ref: '#/components/schemas/KeyframeFrame'
+
+    LoggedCRC:
+      name: loggedCRC
+      title: Rolling state CRC (FNV-1a 64, chained)
+      headers: { $ref: '#/components/schemas/LogHeaders' }
+      payload:
+        schemaFormat: application/octet-stream
+        $ref: '#/components/schemas/LoggedCRCFrame'
+      x-json-view: '#/components/schemas/LoggedCRCView'
+
+    RunMeta:
+      name: runMeta
+      title: Run registry entry (spec + status)
+      headers: { $ref: '#/components/schemas/SchemaHeaders' }
+      payload:
+        schemaFormat: application/schema+json;version=draft-07
+        $ref: '#/components/schemas/RunMetaView'
+
+    StatePointer:
+      name: statePointer
+      title: Latest-state pointer for late joiners
+      headers: { $ref: '#/components/schemas/SchemaHeaders' }
+      payload:
+        schemaFormat: application/schema+json;version=draft-07
+        $ref: '#/components/schemas/StatePtrView'
+
+  schemas:
+    TickHeaders:
+      type: object
+      required: [tick, schema_version]
+      properties:
+        tick: { type: integer, minimum: 0, description: 'Simulation tick (ADR-0005: the tick count IS the clock).' }
+        schema_version: { type: integer, const: 2 }
+
+    SchemaHeaders:
+      type: object
+      required: [schema_version]
+      properties:
+        schema_version: { type: integer, const: 2 }
+
+    AckHeaders:
+      type: object
+      required: [tick, applied_tick, schema_version]
+      properties:
+        tick: { type: integer, minimum: 0, description: Current engine tick when the echo was sent. }
+        applied_tick: { type: integer, minimum: 0, description: Tick at which this controller's latest intent was applied. }
+        schema_version: { type: integer, const: 2 }
+
+    LogHeaders:
+      type: object
+      required: [tick, schema_version, Nats-Msg-Id, Nats-Expected-Last-Sequence]
+      properties:
+        tick: { type: integer, minimum: 0 }
+        schema_version: { type: integer, const: 2 }
+        Nats-Msg-Id:
+          type: string
+          pattern: '^\{run\}:\{tick\}:\{seq\}$'
+          description: 'Retry-safe dedup id (2-min window). seq is the predicted stream sequence — unique across the whole run, so pause/resume events at a frozen tick cannot collide with the tick’s log batch (M4 fix).'
+        Nats-Expected-Last-Sequence:
+          type: integer
+          minimum: 0
+          description: 'Stream-level OCC — the broker-enforced single-writer assertion. 0 on the first write.'
+
+    SnapshotFrame:
+      type: string
+      format: binary
+      description: |
+        Binary SoA frame, little-endian, magic "TSSF", version 1:
+          header (24 B): magic u32 | schema_version u16 | flags u16 |
+                         tick u64 | vehicle_count u32 | reserved u32
+          per vehicle (24 B): id u64 | x f32 | y f32 | angle f32 | class f32
+        x/y/angle are a placeholder projection (x = chain-offset arc length,
+        y = 3.5 m lateral slot, angle = 0) until the road-graph geometry
+        lands (arch-road-graph-model); schema_version bumps when it does.
+        class is the scenario type index carried as f32 (0 = car, 1 = truck).
+
+    SnapshotView:
+      title: JSON view of the snapshot frame (tooling only; wire is binary)
+      type: object
+      required: [tick, schema_version, vehicles]
+      properties:
+        tick: { type: integer, minimum: 0 }
+        schema_version: { type: integer, const: 2 }
+        vehicles:
+          type: array
+          items:
+            type: object
+            required: [id, x, y, angle, class]
+            properties:
+              id: { type: integer, minimum: 1 }
+              x: { type: number, description: meters (placeholder projection) }
+              y: { type: number, description: meters (3.5 m lateral slot) }
+              angle: { type: number, description: radians }
+              class: { type: integer, minimum: 0, description: scenario type index }
+
+    IntentFrame:
+      type: string
+      format: binary
+      description: |
+        v2, little-endian, 44 B fixed + route bytes (≤ 48):
+          vehicle_id u64 | flags u32 | lane_delta i32 | accel f64 |
+          speed_setpoint f64 | signals u32 | turn i32 | route_len u16 |
+          reserved u16 | route bytes
+        flags: bit0 accel present; bit1 speed setpoint (negative clears
+        cruise); bit2 signals (0 off, 1 left, 2 right, 3 hazard); bit3 turn
+        (+1 left, −1 right, 0 clear — held until consumed at a junction);
+        bit4 route (destination lane id). lane_delta: +1 left, −1 right, 0
+        none. NaN/Inf accel or setpoint is rejected at the engine boundary.
+
+    IntentView:
+      title: JSON view of a control intent (tooling only; wire is binary)
+      type: object
+      required: [vehicle_id]
+      properties:
+        vehicle_id: { type: integer, minimum: 1 }
+        accel: { type: number, description: 'm/s²; one-shot per tick; engine-clamped to [−9, type max accel]' }
+        speed_setpoint: { type: number, description: 'm/s; persistent cruise until replaced; negative clears; clamped to v0eff' }
+        lane_delta: { type: integer, enum: [-1, 0, 1], description: '+1 left, −1 right; one-shot, expires if infeasible' }
+        turn: { type: integer, enum: [-1, 0, 1], description: 'junction choice; held until consumed at the next lane crossing; 0 clears' }
+        route: { type: string, maxLength: 48, description: 'destination lane id; persistent' }
+        signals: { type: integer, enum: [0, 1, 2, 3], description: '0 off, 1 left, 2 right, 3 hazard; persistent, informational in v1' }
+
+    AckView:
+      type: object
+      required: [controller_id, applied_tick]
+      properties:
+        controller_id: { type: string }
+        applied_tick: { type: integer, minimum: 0 }
+
+    LoggedIntentFrame:
+      type: string
+      format: binary
+      description: |
+        v2, little-endian:
+          applied_tick u64 | controller_seq u64 | controller_id_len u16 |
+          controller_id bytes | vehicle_id u64 | flags u32 |
+          lane_delta i32 | accel f64 | speed_setpoint f64 | signals u32 |
+          turn i32 | grant u8 | route_len u16 | route bytes
+        flags: bit0 accel, bit1 speed setpoint, bit2 signals, bit3 turn,
+        bit4 route, bit5 held (hold-last re-issue by the contract layer),
+        bit6 superseded (lost the same-tick tie-break — recorded, not
+        applied). grant: 0 none (legacy) | 1 drive | 2 signal | 3 director.
+        Stream order within a tick IS the application order (grant desc,
+        then vehicle ID — ADR-0008 §4).
+
+    LoggedIntentView:
+      title: JSON view of an arbitrated log entry (tooling only)
+      type: object
+      required: [applied_tick, controller_id, controller_seq, vehicle_id, grant]
+      properties:
+        applied_tick: { type: integer, minimum: 0 }
+        controller_id: { type: string }
+        controller_seq: { type: integer, minimum: 1, description: Per-controller sequence assigned by the engine's contract layer. }
+        vehicle_id: { type: integer, minimum: 1 }
+        grant: { type: integer, enum: [0, 1, 2, 3], description: '0 none | 1 drive | 2 signal | 3 director' }
+        held: { type: boolean, description: 'hold-last re-issue (≤ 2 ticks past cadence due, ADR-0008 §2)' }
+        superseded: { type: boolean, description: 'lost the same-tick tie-break: recorded, not applied' }
+        accel: { type: number }
+        speed_setpoint: { type: number }
+        lane_delta: { type: integer, enum: [-1, 0, 1] }
+        turn: { type: integer, enum: [-1, 0, 1] }
+        route: { type: string }
+        signals: { type: integer, enum: [0, 1, 2, 3] }
+
+    KeyframeFrame:
+      type: string
+      format: binary
+      description: |
+        Magic "TSKF", version 2; canonical layout documented in
+        engine/keyframe.go. Contains the full CRC-covered state plus raw
+        RNG words, spawner demand state, and (since v2) the persistent
+        controller axes (cruise setpoint, held turn, signals, route), so
+        RestoreState resumes the run bit-exactly. Does NOT contain the run
+        spec — that pairs via the run registry (ts.{run}.meta).
+
+    LoggedCRCFrame:
+      type: string
+      format: binary
+      description: '16 B, little-endian: tick u64 | crc u64 (FNV-1a 64 rolling chain).'
+
+    LoggedCRCView:
+      title: JSON view of a logged CRC (tooling only)
+      type: object
+      required: [tick, crc]
+      properties:
+        tick: { type: integer, minimum: 0 }
+        crc: { type: integer, minimum: 0 }
+
+    RunMetaView:
+      type: object
+      required: [run_id, spec, schema_version, status, started_tick, created_unix]
+      properties:
+        run_id: { type: string }
+        spec:
+          type: object
+          description: 'The full RunSpec (network, scenario, params, seed, ticks) — replay needs nothing else.'
+        schema_version: { type: integer, const: 2 }
+        status: { type: string, enum: [running, done, aborted] }
+        error: { type: string, description: 'Abort reason when status = aborted (e.g. record-plane failure).' }
+        started_tick: { type: integer, minimum: 0 }
+        created_unix: { type: integer, description: Wall-clock edge metadata (ADR-0005). }
+        ended_unix: { type: integer }
+
+    StatePtrView:
+      type: object
+      required: [tick, keyframe_seq, crc]
+      properties:
+        tick: { type: integer, minimum: 0, description: Latest keyframed tick. }
+        keyframe_seq: { type: integer, minimum: 0, description: Stream sequence of that keyframe (late-joiner seek anchor). }
+        crc: { type: integer, minimum: 0, description: Rolling CRC at tick. }
+
+    EmptyPayload:
+      type: string
+      format: binary
+      description: Zero bytes (heartbeats carry their meaning in the subject + headers).
+
+    HelloRequestView:
+      title: Attach handshake request (ADR-0008 §4)
+      type: object
+      required: [contract_version, controller_type, cadence_ticks, grants, claim_capacity, obs_window]
+      properties:
+        contract_version: { type: integer, const: 2, description: Must equal the engine's schema_version or the attach is rejected. }
+        controller_type: { type: string, description: 'ai | scripted | human | default-driver' }
+        cadence_ticks: { type: integer, minimum: 0, description: 'Decision cadence in ticks (0 → 1); must be < the detach budget.' }
+        grants:
+          type: array
+          items: { type: string, enum: [drive, director, signal] }
+          description: 'drive: claim vehicles + observations + intents. director | signal: elevated grants (verbs land M5+; the grants exist now).'
+        claim_capacity: { type: integer, minimum: 0, description: 'Max vehicles this controller will hold; ≥ 1 required for drive. Feeds the pause gate (ADR-0008 §6).' }
+        claims:
+          type: array
+          items: { type: integer, minimum: 1 }
+          description: Optional claims requested at attach (exclusive arbitration, best effort).
+        obs_window:
+          type: object
+          required: [radius_m, max_neighbors, features]
+          properties:
+            radius_m: { type: number, minimum: 0, description: Neighbor-list radius around each claimed ego (placeholder projection distance). }
+            max_neighbors: { type: integer, minimum: 0, description: Neighbor-list cap (sorted by (distance, id)); 0 = none. }
+            features: { type: integer, minimum: 0, description: 'Bitmask: 1 = neighbor list, 2 = resolved reference-policy context per ego.' }
+
+    HelloReplyView:
+      title: Attach handshake reply
+      type: object
+      required: [accepted, contract_version, run, tick]
+      properties:
+        accepted: { type: boolean }
+        controller_id: { type: string, description: 'Engine-assigned (ctl-N). Intents/claims/heartbeats publish only on subjects carrying it.' }
+        granted_grants:
+          type: array
+          items: { type: string, enum: [drive, director, signal] }
+        claims:
+          type: array
+          items: { type: integer, minimum: 1 }
+          description: Initial claims granted.
+        contract_version: { type: integer, const: 2 }
+        run: { type: string }
+        tick: { type: integer, minimum: 0, description: Tick at attach (the contract's clock reference). }
+        reason: { type: string, description: Reject reason when accepted = false. }
+
+    ClaimRequestView:
+      title: Exclusive claim request
+      type: object
+      required: [vehicle_ids]
+      properties:
+        vehicle_ids:
+          type: array
+          items: { type: integer, minimum: 1 }
+
+    ClaimReplyView:
+      title: Claim arbitration result
+      type: object
+      required: [granted]
+      properties:
+        granted:
+          type: array
+          items: { type: integer, minimum: 1 }
+        rejected:
+          type: array
+          items: { type: integer, minimum: 1 }
+          description: Already claimed by another controller (exclusivity), or not live.
+        reason: { type: string, description: Request-level failure (not attached, no drive grant, bad payload). }
+
+    ReleaseRequestView:
+      title: Claim release
+      type: object
+      required: [vehicle_ids]
+      properties:
+        vehicle_ids:
+          type: array
+          items: { type: integer, minimum: 1 }
+        detach: { type: boolean, description: 'true also ends the attachment (graceful goodbye); remaining claims release with reason "disconnect".' }
+
+    ObsFrame:
+      type: string
+      format: binary
+      description: |
+        v1, little-endian, magic "TSOB":
+          header (24 B): magic u32 | version u16 =1 | features u16 |
+                         tick u64 | n_ego u32 | n_neighbors u32
+          per ego (75 B + route): id u64 | lane_idx u32 | type_idx u32 |
+            s f64 | v f64 | f f64 | acc f64 | cooldown u64 | signals u32 |
+            held_turn i32 | cruise f64 | cruise_ok u8 | route_len u16 |
+            route bytes
+          per ego, if feature 2 (PolicyCtx, 317 B): cur_limit f64 |
+            cur_len f64 | cur_endwall u8 | cur_lead (17 B) | cur_foll (71 B) |
+            left side (106 B) | right side (106 B)
+          per neighbor (44 B): id u64 | lane_idx u32 | type_idx u32 |
+            s f64 | v f64 | f f64 | signals u32
+        LeaderInfo (17 B): ok u8 | gap f64 | v f64.
+        FollowerCtx (71 B): ok u8 | gap f64 | v f64 | f f64 | type_idx u32 |
+          s f64 | lane_limit f64 | lane_len f64 | lane_endwall u8 |
+          lead_ok u8 | lead_gap f64 | lead_v f64.
+        SideCtx (106 B): present u8 | limit f64 | length f64 | endwall u8 |
+          lead (17 B) | foll (71 B).
+        The PolicyCtx is the exact resolved input of the reference policy
+        (cross-boundary aware): a client evaluating IDM/MOBIL on it with
+        the per-vehicle seeded stream reaches the engine's own decision.
+
+    ObsView:
+      title: JSON view of an observation frame (tooling only; wire is binary)
+      type: object
+      required: [tick, egos, neighbors]
+      properties:
+        tick: { type: integer, minimum: 0 }
+        egos:
+          type: array
+          items:
+            type: object
+            required: [id, lane_idx, type_idx, s, v, f, acc, cooldown, signals, held_turn, cruise, cruise_ok, route]
+            properties:
+              id: { type: integer, minimum: 1 }
+              lane_idx: { type: integer, minimum: 0 }
+              type_idx: { type: integer, minimum: 0 }
+              s: { type: number, description: front-bumper position on lane (m) }
+              v: { type: number, description: speed (m/s) }
+              f: { type: number, description: desired-speed factor }
+              acc: { type: number, description: accel applied this tick (m/s²) }
+              cooldown: { type: integer, minimum: 0 }
+              signals: { type: integer, enum: [0, 1, 2, 3] }
+              held_turn: { type: integer, enum: [-1, 0, 1] }
+              cruise: { type: number }
+              cruise_ok: { type: boolean }
+              route: { type: string }
+              policy_ctx: { type: object, description: 'Resolved reference-policy context (feature 2): leader/follower contexts per lane choice — see ObsFrame layout.' }
+        neighbors:
+          type: array
+          items:
+            type: object
+            required: [id, lane_idx, type_idx, s, v, f, signals]
+            properties:
+              id: { type: integer, minimum: 1 }
+              lane_idx: { type: integer, minimum: 0 }
+              type_idx: { type: integer, minimum: 0 }
+              s: { type: number }
+              v: { type: number }
+              f: { type: number }
+              signals: { type: integer, enum: [0, 1, 2, 3] }
+
+    ContractEventView:
+      title: Contract event (event feed + record plane)
+      type: object
+      required: [type, tick]
+      properties:
+        type: { type: string, enum: [claim, release, unclaimed, pause, resume] }
+        tick: { type: integer, minimum: 0 }
+        controller_id: { type: string }
+        vehicle_ids:
+          type: array
+          items: { type: integer, minimum: 1 }
+        reason: { type: string, enum: [spawn, release, disconnect], description: unclaimed events only }
+        demand: { type: integer, minimum: 0, description: 'pause/resume: unclaimed vehicles at the gate' }
+        available: { type: integer, minimum: 0, description: 'pause/resume: spare claim capacity across attached drive controllers' }
+
+    IntrospectRequestView:
+      title: Introspection query — a JSON view of the reference-policy context
+      type: object
+      required: [schema_version, vehicle, cur]
+      properties:
+        schema_version: { type: integer, const: 2 }
+        vehicle:
+          type: object
+          required: [id, type_idx, lane, s, v, f]
+          properties:
+            id: { type: integer, minimum: 0, description: 'keys the per-vehicle RNG stream for the query (ADR-0007)' }
+            type_idx: { type: integer, minimum: 0 }
+            lane: { type: string, description: lane ID }
+            s: { type: number }
+            v: { type: number }
+            f: { type: number }
+            cooldown: { type: integer, minimum: 0 }
+        cur:
+          type: object
+          properties:
+            lead: { $ref: '#/components/schemas/IntroLeaderView' }
+            foll: { $ref: '#/components/schemas/IntroFollowerView' }
+        left:
+          type: object
+          properties:
+            lane: { type: string }
+            lead: { $ref: '#/components/schemas/IntroLeaderView' }
+            foll: { $ref: '#/components/schemas/IntroFollowerView' }
+        right:
+          type: object
+          properties:
+            lane: { type: string }
+            lead: { $ref: '#/components/schemas/IntroLeaderView' }
+            foll: { $ref: '#/components/schemas/IntroFollowerView' }
+
+    IntroLeaderView:
+      type: object
+      required: [ok, gap, v]
+      properties:
+        ok: { type: boolean, description: 'false = free road (no leader)' }
+        gap: { type: number, description: bumper-to-bumper (m) }
+        v: { type: number, description: leader speed (m/s) }
+
+    IntroFollowerView:
+      type: object
+      required: [ok, gap, v, f, type_idx, s, lead]
+      properties:
+        ok: { type: boolean }
+        gap: { type: number, description: bumper-to-bumper gap to the ego (m) }
+        v: { type: number }
+        f: { type: number }
+        type_idx: { type: integer, minimum: 0 }
+        s: { type: number }
+        lead: { $ref: '#/components/schemas/IntroLeaderView' }
+
+    IntrospectReplyView:
+      title: The reference policy's decision for the queried state
+      type: object
+      required: [schema_version, accel, lane_delta, signals]
+      properties:
+        schema_version: { type: integer, const: 2 }
+        accel: { type: number, description: 'm/s² — IDM longitudinal decision' }
+        lane_delta: { type: integer, enum: [-1, 0, 1], description: 'MOBIL lateral decision (0 when cooldown > 0)' }
+        signals: { type: integer, enum: [0, 1, 2, 3], description: 'consistent with lane_delta' }

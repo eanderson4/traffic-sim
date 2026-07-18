@@ -38,6 +38,10 @@ Rules for anyone (human or agent) working in this repo.
 ## Conventions
 
 - Go: standard library first; justify dependencies. `gofmt` + `go vet` clean.
+  Approved exception (ADR-0006): the two official NATS modules —
+  `github.com/nats-io/nats.go` and `github.com/nats-io/nats-server/v2`
+  (embedded tests) — confined to `engine/natsio/`; the kernel package stays
+  stdlib-only. Justification lives in the `natsio` package doc.
 - TS: no framework by default; pnpm; strict mode.
 - Tests accompany behavior, especially anything affecting determinism/replay.
 - Commit messages: imperative mood, reference ADRs when implementing one.
