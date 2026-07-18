@@ -29,6 +29,7 @@ bootstrap preprocessor and permanent correctness oracle.
 - [Mechanics: what OSM gives you and how the tools compile it](./implementation.md)
 - [Prior art survey: acquisition, graph builders, compilers, routing engines](./competitors.md)
 - [Standards (wiki folksonomy, ODbL, PBF, Overpass QL, Overture), patterns, anti-patterns](./standards-and-patterns.md)
+- [Field notes: netconvert bootstrap in practice (M5)](./netconvert-bootstrap-notes.md) — post-research operational findings (node ordering, `--no-turnarounds` portals, funnel merges)
 
 ## Key Findings → Recommended Decisions (for the import-pipeline ADR)
 

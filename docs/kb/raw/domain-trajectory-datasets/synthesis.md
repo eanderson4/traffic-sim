@@ -55,6 +55,51 @@ sim — including intersections and roundabouts via the German drone datasets.
 - Which specific NGSIM window / I-24 segment for the first analysis — triage on
   download.
 
+## M2 validation outcome (2026-07-17)
+
+The NGSIM I-80 17:00–17:15 window was reproduced in the engine (M2; scenario
+`engine/scenario_i80.go`, write-up `analysis/ngsim/README.md` § Simulation
+validation). Findings that now belong to the knowledge base:
+
+- The M1 kernel (string-stable IDM: a = 1.0, T = 1.5) produces genuine
+  stop-and-go structure (4 crossing stripes, go-state q/k matching the real
+  field) but its wave speed caps at ≈ −12 km/h vs the −15…−20 km/h anchor.
+  Root cause: with the stable calibration, jam troughs creep at the IDM
+  *equilibrium* speed (≈ 3.3 m/s); real troughs are sub-equilibrium
+  (≈ 2.7 m/s). Wave speed = chord slope between go and jam states, so
+  equilibrium troughs structurally bound the slope — closing the gap needs an
+  instability-capable calibration (literature highway IDM: a ≈ 0.73–1.0,
+  T ≈ 1.6–1.7), i.e. physics work, not scenario tuning.
+- Measurement: the variance-scan wave-speed estimator (analysis/ngsim) is
+  hijacked by mass-dominated x–t fields (reports ≈ 0 despite stripes); the
+  real field is stripe-dominated so the anchor is safe. The FD chord-slope
+  estimator is the robust cross-check.
+- The M1 merge model produces multi-metre negative gaps under sustained
+  overload (≈ 3,000 observations/run at merges; caps funnel discharge at
+  ≈ 1,460 vs 1,780 veh/h/lane) — top physics debt for M3.
+
+## M3 update (2026-07-17): physics hardening done
+
+The M3 work closed both debts (details: analysis/ngsim/README.md M3 section;
+calibration note: `domain-traffic-flow-models/standards-and-patterns.md`):
+
+- Merge gap enforcement fixed (kinematic collision-freedom floor +
+  cross-boundary hop checks): negative gaps ≈ 3,000/run → **0** (min gap
+  −11.8 m → +0.39 m); funnel discharge 7,300 → 7,680 veh/h.
+- Car defaults recalibrated to the original IDM paper's highway set
+  (a = 0.73, T = 1.6, b = 1.67): the −12 km/h structural cap is broken —
+  sim wave speed −13.2…−15.4 km/h (scan, seeds 1–5) and −13.7…−15.0 km/h
+  (per-wave leg median, seeds 2–5) vs real −18.1 (scan) / **−15.0 (leg
+  median, same estimator)**. The robust per-wave measurement has the sim
+  matching the real median at the best seeds; residual ≈ 0–1.3 km/h, traced
+  to IDM's discharge headway (τ ≈ 1.8 s vs ≈ 1.4 s real — anticipation gap).
+  Sugiyama ring acceptance test added (engine/sugiyama_test.go): spontaneous
+  jam from noise, −13.7 km/h backward, stable control at lower density.
+- Reference boundary condition re-anchored to the real queue's growth
+  (sustained 1.20× demand ≈ measured tail-creep shortfall ≈ 1,440–1,500
+  veh/h); M2's quasi-stationary window no longer sustains stop-and-go after
+  the discharge fix.
+
 ## Connections to Other Topics
 
 - **Relates to:** `domain-macroscopic-flow-models` (waves to find; Edie definitions;

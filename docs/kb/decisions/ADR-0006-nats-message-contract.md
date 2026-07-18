@@ -81,3 +81,67 @@ needs; Synadia's Cybervet runs embedded NATS + 10 ms tick + KV + WebSocket at
   scale (per-run vs single stream); nats.ws throughput for 10 Hz × N-vehicle
   snapshots; keyframe chunking scheme once the vehicle-count/byte curve is
   measured.
+
+## Addendum (2026-07-17, M3 bring-up)
+
+- **Ack subject added**: `ts.{run}.ctl.ack.{controller_id}` — the engine echoes
+  `applied_tick` here per tick (ack + control-latency meter + HUD health
+  signal). Declared in `contracts/asyncapi.yaml`.
+- **OCC intra-batch rule**: with multi-message per-tick log batches,
+  `Nats-Expected-Last-Sequence` is *predicted* per batch position
+  (lastSeq + i); valid because sole-writer + same-connection ordering holds.
+- **KV binding**: logical `ts.{run}.meta.>` maps to bucket `ts_runs` with keys
+  `{run}/meta`, `{run}/state` (nats.go bucket addressing); recorded as an
+  `x-nats` extension in the AsyncAPI doc.
+- **Measured at bring-up**: puback ≈ 5–12 µs/intent amortized at 1–100
+  intents/tick (~3 orders under the 100 ms budget); SoA snapshots 24 B/veh,
+  keyframes 77 B/veh → keyframes cross the 1 MB discipline at ≈13.6k vehicles
+  (chunking scheme must land before city scale); live fan-out 1.36M msgs/s
+  aggregate to 8 subscribers. Details: `engine/BENCHMARKS.md`.
+- **Open (M4 candidates)**: whether the run spec is also stored as the log
+  stream's head message (today only in the KV registry); the binary frame
+  carries a placeholder lane projection until road-graph geometry lands
+  (schema_version bump when it does).
+
+## Addendum (2026-07-17, M4 contract machinery)
+
+- **Schema v2**: intent/log frames v2, keyframes TSKF v2 (carry controller
+  persistent axes; not v1-readable — no persistent deployments existed), new
+  channels for handshake/claims/observations/events/introspection plus
+  `ts.{run}.log.event`; envelope `schema_version: 2` everywhere.
+- **Dedup id (v2)**: `Nats-Msg-Id` is `{run}:{tick}:{predicted-stream-seq}` —
+  unique run-wide; the per-tick sequence collided when pause/resume events
+  shared a frozen tick.
+- **Disconnect detection is tick-space liveness** (silence > DetachAfterTicks,
+  default 10 ⇒ detach ⇒ unclaimed-vehicle events). Core NATS has no presence
+  primitive; `$SYS` account events deferred until auth/accounts land.
+- **Keyframe ≈ 96 B/vehicle** with controller axes — the 1 MB chunking
+  threshold moves from ≈13.6k to ≈10.9k vehicles (still pre-city-scale).
+
+## Addendum (2026-07-18, M6 browser viz bring-up)
+
+- **§8 confirmed in practice**: the embedded server serves browser clients
+  with `DontListen` (no TCP client port) + `Websocket.Port` set — the two
+  listeners are independent; nats.ws 1.30.x connects from both Chrome and
+  node ≥ 22 (global WebSocket) without a polyfill. `engine/cmd/serve` is the
+  single-binary demo shape.
+- **Contract gaps revealed by the first real viz client** (all tolerable at
+  viz scale, worked around client-side; candidates for the observability /
+  schema-v-next ADRs — no contract change made in M6):
+  1. **TSSF v1 carries no speed and no lane id.** The viz derives speed from
+     inter-snapshot displacement and re-attaches vehicles to lanes by
+     nearest-segment lookup for its (labelled, client-derived) congestion
+     proxy. Authoritative per-section metrics belong to
+     `domain-congestion-metrics`; if consumers keep needing kinematics, a
+     schema bump (speed f32, maybe lane id) is cheaper than every client
+     re-deriving them.
+  2. **Coordinates are the network's local metric frame, and the frame
+     descriptor (projection + netOffset) is not discoverable over NATS.**
+     M6 ships it as a sidecar foreign member of the static network GeoJSON
+     the viz loads out-of-band. A browser client that only has the WS
+     endpoint cannot place vehicles on a map; the run registry
+     (`{run}/meta`) is the natural home for the projection descriptor.
+  3. **Tick length lives only in the run spec.** The client interpolates on
+     wall-clock arrival instead — fine at 1× pacing, wrong for
+     faster-than-realtime serving; dilation signaling is already a §1
+     concern (dilation scalar on the live plane) and remains open.

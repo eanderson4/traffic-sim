@@ -125,6 +125,54 @@ vehicle-tick is optimal; stop override is mandatory for queue/delay metrics.
 - String stability: a ≥ 1 m/s² stable (IDM ref set, small T′);
   Δt + 2T′ ≈ 2 s boundary.
 
+## M3 calibration note (2026-07-17): matching the I-80 wave speed
+
+What the engine learned from reproducing the NGSIM −18.1 km/h backward wave
+(full write-up: `analysis/ngsim/README.md`, M2/M3 sections; scenario:
+`engine/scenario_i80.go`):
+
+- **Chosen calibration: the original IDM paper's highway set** — v0 = 33.3
+  m/s, T = 1.6 s, a = 0.73 m/s², b = 1.67 m/s², s0 = 2 m, δ = 4
+  ([cond-mat/0002177](https://arxiv.org/abs/cond-mat/0002177); the "Wikipedia
+  typical" column of implementation.md §1). The string-stable CACAIE set
+  (a = 1.0, T = 1.5) keeps jam troughs ON the equilibrium curve, which caps
+  the FD chord slope at ≈ −12 km/h (M2 diagnosis). With the
+  instability-capable set, troughs go sub-equilibrium (full stops with
+  hysteresis) and the cap is gone: sim wave speed −13.2…−15.4 km/h (scan,
+  seeds 1–5) / −13.7…−15.0 (per-wave leg median, seeds 2–5) vs real −18.1
+  (scan) / −15.0 (leg median, same estimator). Residual ≈ 0–1.3 km/h by the
+  robust estimator — traced to IDM's discharge headway τ ≈ T + start-up lag
+  ≈ 1.8 s (a = 0.73 is gentle) vs ≈ 1.4 s for real drivers, who anticipate
+  several vehicles ahead; the Sugiyama ring shows the same offset
+  (−13.7 km/h, engine/sugiyama_test.go). Multi-vehicle anticipation (not
+  plain IDM) is the candidate fix if the residual must close.
+- **b_safe alone is NOT a collision guarantee under discrete time.** MOBIL's
+  "collision-freedom inherits from the CF model" holds only because IDM is
+  collision-free as an ODE (implementation.md §1); the −9 m/s² cap + 100 ms
+  steps + instant hops break the inheritance. The engine now enforces a
+  kinematic floor under hop acceptance (Gipps braking branch / Krauss
+  v_safe: gap ≥ (v_f²−v_l²)/(2·b_max) + Δv·Δt, b_max = 9 m/s², never relaxed
+  by merge urgency) AND resolves hop neighbors across lane boundaries
+  (predecessor/successor pairs were invisible to the checks). Merge
+  negative-gap events: ≈3,000/run → 0. This partially answers the open
+  question below ("b_safe vs time-gap enforcement"): acceleration-based
+  b_safe needs a kinematic supplement at merges; a time-gap rule would have
+  rejected the same hops (Δv > 10 m/s into 0.3 m), so the benchmark is now
+  moot for collision-freedom — the floor is the physics backstop either way.
+- **Removing fake merge losses re-anchors boundary conditions.** The 6→5
+  funnel discharge rose from ≈ 7,300 veh/h (overlap resolution throttling
+  it) to ≈ 7,680 — the same marginally-overloaded regime M2 tuned its
+  boundary to must be re-found (here: sustained 1.20× demand = the real
+  queue's measured growth rate). Any scenario whose boundary conditions were
+  calibrated against a defective kernel needs re-validation after a physics
+  fix.
+- **Measure wave speed per wave, not by variance fit.** The variance scan is
+  hijacked by mass-dominated fields and the FD chord is dragged by trough
+  creep; the robust measurement is the per-wave lag between section rows
+  (`XTField.WaveStripeSpeeds`; real field: legs −5.8…−30 ft/s, median
+  −13.6 ft/s = −15.0 km/h — note the REAL field's own per-wave spread is
+  wide; single-number anchors hide realization variance).
+
 ## Open Questions
 
 - IIDM/ACC canonical equations (book Ch. 11) — transcribe before implementing.

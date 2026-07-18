@@ -90,3 +90,24 @@ precedent for engine-enforced safety clamps.
   buffer-health feedback for worst-case connections; dead-reckoning publish
   thresholds; signal feature coverage when the first advocacy corridor is
   chosen.
+
+## Clarification (2026-07-17, M3/M4 bring-up)
+
+- **Headless harness policy**: for physics validation and CI, the engine keeps
+  an optional in-kernel uncontrolled-vehicle policy (the bring-up IDM/MOBIL
+  used by the M1/M2 test suites) behind a world-config flag. It is the
+  reference implementation the external default driver is differentially
+  tested against, and it is **off** in live runs — where uncontrolled vehicles
+  follow item 6 (hold-last → re-claim). This does not reintroduce a fast
+  path: the flag exists only where no bus is attached.
+- **Hold-last is synthesized intents**, flagged `held` in the arbitrated log —
+  replay stays verbatim, no expectation reconstruction.
+- **Shared reference policy** (`engine/policy.go`): kernel and external driver
+  evaluate the same IDM/MOBIL policy code; observations ship the
+  engine-resolved policy context per claimed vehicle, so client decisions
+  cannot drift from engine semantics.
+- **Tie-break implemented** as (grant desc, vehicle asc, controller, seq),
+  first-wins with superseded logging.
+- **v1 stances**: directors pass 4-axis intents unfiltered (privileged verbs
+  land with scenario work); cadence >1 is contract-complete but lightly
+  dogfooded; AoI radius currently measures the placeholder lane projection.
