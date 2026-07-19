@@ -22,6 +22,18 @@ type Lane struct {
 	Exit    bool // network exit: vehicles despawn past Length; no wall
 	EndWall bool // dead-end lane (dropped lane): virtual standing vehicle at Length
 
+	// Junction right-of-way (ADR-0010, compiled networks only). Internal
+	// marks a junction-interior lane; Junction groups it; Row is the
+	// priority class of the approach whose connection it serves; FoesCross
+	// and FoesMerge are the conflicting interior lanes of the same junction
+	// (crossing paths vs. paths merging into the same exit). All empty on
+	// the in-code M1–M3 networks and on unmodeled (signalized) junctions.
+	Internal  bool
+	Junction  string
+	Row       RowState
+	FoesCross []*Lane
+	FoesMerge []*Lane
+
 	// Geometry (compiled networks): per-lane centerline polyline in the
 	// local metric frame plus a constant lateral offset (left-positive).
 	// Display-only — never feeds the dynamics or the CRC. Set via SetShape.

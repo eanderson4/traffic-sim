@@ -49,7 +49,7 @@ back to it.
 - [MapLibre Realtime Viz](articles/integrations/maplibre-realtime.md) — three rate-split channels into MapLibre, binary SoA wire frames, measured deck.gl escalation ladder (ADR-0003)
 
 ### Decisions
-- [ADR Index](articles/decisions/adrs.md) — ADR-0001..0009 table with rationales, research basis, and pending-ADR queue
+- [ADR Index](articles/decisions/adrs.md) — ADR-0001..0010 table with rationales, research basis, and pending-ADR queue
 
 ## Raw Research
 
@@ -91,6 +91,7 @@ links its source synthesis for traceability.
 - [x] [ADR-0007](decisions/ADR-0007-vehicle-model.md) — Position/gap conventions: front-bumper s, bumper-to-bumper gap, s0+length separate; multi-class vehicle types; IDM+MOBIL defaults; per-vehicle seeded RNG
 - [x] [ADR-0008](decisions/ADR-0008-controller-contract.md) — 4-axis intents with per-axis persistence; grants-based roles (driver / default-driver / director / signal); exclusive claims; zero driving logic in engine, fleet failover + pause
 - [x] [ADR-0009](decisions/ADR-0009-osm-import-strategy.md) — netconvert bootstrap + Go importer with permanent diff-test oracle; two-tier identity with guessed flags; ODbL recipe-not-file; delta-patch variants
+- [x] [ADR-0010](decisions/ADR-0010-junction-right-of-way.md) — priority-junction right-of-way: compiled approach classes + conflict foes, kernel stop-line guardrail shared by all controllers; signals still unmodeled
 
 ---
 *Last distilled: 2026-07-17 | 18 articles from 56 raw research files*

@@ -11,9 +11,10 @@ import (
 // (contracts/network-format-v1.md): a flat list of lanes with durable IDs,
 // per-lane geometry, lane→lane successors, and provenance. The netconvert
 // bootstrap (engine/cmd/netimport) writes it; the engine loads it via
-// NetSpec{Kind: "file"}. It migrates into the scenario-format work later —
-// v1 is deliberately lane-centric: junction typing, conflict sets, and
-// right-of-way are NOT here yet (junction traversal is connection-following).
+// NetSpec{Kind: "file"}. It migrates into the scenario-format work later.
+// Junction right-of-way is an optional v1 extension (ADR-0010): internal
+// lanes may carry their junction, approach class, and conflict foes; files
+// without them load with junctions unmodeled (free traversal), unchanged.
 
 // NetFile is the top-level document. Version gates the loader; Provenance
 // records where the network came from (recipe, not just data — ADR-0009 §5).
@@ -55,6 +56,14 @@ type NetLane struct {
 	EndWall    bool         `json:"endWall,omitempty"`    // dead end: virtual standing vehicle at Length
 	Internal   bool         `json:"internal,omitempty"`   // junction-internal lane (intersection interior)
 	Source     *LaneSource  `json:"source,omitempty"`     // provenance
+
+	// Junction right-of-way (ADR-0010, optional v1 extension — absent means
+	// the junction is unmodeled and traversed freely, exactly as before).
+	// Only set on internal lanes.
+	Junction  string   `json:"junction,omitempty"`  // junction this internal lane belongs to
+	Row       string   `json:"row,omitempty"`       // approach class: "major"|"minor"|"stop"
+	FoesCross []string `json:"foesCross,omitempty"` // conflicting internal lanes (crossing paths)
+	FoesMerge []string `json:"foesMerge,omitempty"` // conflicting internal lanes (same exit lane)
 }
 
 // LaneSource is the per-lane provenance: where this lane came from and what
@@ -123,6 +132,7 @@ func CompileNet(nf *NetFile) (*Network, error) {
 			Width:      width,
 			Exit:       nl.Exit,
 			EndWall:    nl.EndWall,
+			Internal:   nl.Internal,
 		}
 		if len(nl.Shape) > 0 {
 			pts := make([]Point, len(nl.Shape))
@@ -159,6 +169,42 @@ func CompileNet(nf *NetFile) (*Network, error) {
 			return nil, fmt.Errorf("lane %s: no successors and neither exit nor endWall (dangling lane)", nl.ID)
 		case l.Exit && l.EndWall:
 			return nil, fmt.Errorf("lane %s: both exit and endWall", nl.ID)
+		}
+	}
+
+	// Junction right-of-way (ADR-0010): annotate internal lanes, resolve
+	// conflict foes. Files predating the extension carry no fields — every
+	// lane keeps RowNone and junctions are traversed freely, unchanged.
+	for i := range nf.Lanes {
+		nl := &nf.Lanes[i]
+		l := n.Lanes[i]
+		row, err := ParseRowState(nl.Row)
+		if err != nil {
+			return nil, fmt.Errorf("lane %s: %w", nl.ID, err)
+		}
+		if !nl.Internal && (nl.Row != "" || nl.Junction != "" || len(nl.FoesCross) > 0 || len(nl.FoesMerge) > 0) {
+			return nil, fmt.Errorf("lane %s: right-of-way fields on a non-internal lane", nl.ID)
+		}
+		l.Junction, l.Row = nl.Junction, row
+		for _, fid := range nl.FoesCross {
+			foe, ok := n.byID[fid]
+			if !ok {
+				return nil, fmt.Errorf("lane %s: unknown foesCross lane %q", nl.ID, fid)
+			}
+			if !foe.Internal {
+				return nil, fmt.Errorf("lane %s: foesCross lane %q is not internal", nl.ID, fid)
+			}
+			l.FoesCross = append(l.FoesCross, foe)
+		}
+		for _, fid := range nl.FoesMerge {
+			foe, ok := n.byID[fid]
+			if !ok {
+				return nil, fmt.Errorf("lane %s: unknown foesMerge lane %q", nl.ID, fid)
+			}
+			if !foe.Internal {
+				return nil, fmt.Errorf("lane %s: foesMerge lane %q is not internal", nl.ID, fid)
+			}
+			l.FoesMerge = append(l.FoesMerge, foe)
 		}
 	}
 

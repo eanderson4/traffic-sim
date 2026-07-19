@@ -75,6 +75,12 @@ type Vehicle struct {
 	reqAcc   float64 // commanded accel override for this tick (reqAccOK)
 	reqAccOK bool
 	reqLane  int // commanded lane hop this tick: +1 left, −1 right, 0 none
+
+	// stopDone records that a stop-approach vehicle has completed its
+	// mandatory full stop at the current junction's line (ADR-0010); set by
+	// the right-of-way gate, reset at every lane crossing. Derived state,
+	// not folded into the CRC (same precedent as HeldTurn/Cruise).
+	stopDone bool
 }
 
 // v0eff is the vehicle's desired speed on the given lane: type desired speed

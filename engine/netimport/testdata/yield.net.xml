@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- Hand-authored fixture for the right-of-way import tests (ADR-0010): a
+     priority junction J1 where the major road E0→E1 (state M) crosses the
+     minor road E2→E3 (state m) and a minor ramp E4 (state m) merges into
+     E1 — one crossing conflict pair and two merge/cross pairs inside the
+     same junction box. Shapes are metric (fake UTM frame). NOT produced by
+     netconvert — it only covers what the converter reads. -->
+<net version="1.16" junctionCornerDetail="5" limit="400" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/net_file.xsd">
+
+    <location netOffset="-100.00,-50.00" convBoundary="0.00,0.00,200.00,200.00" origBoundary="-122.001,37.000,-121.998,37.002" projParameter="+proj=utm +zone=10 +ellps=WGS84 +datum=WGS84 +units=m +no_defs"/>
+
+    <edge id="E0" from="J0" to="J1" priority="3">
+        <lane id="E0_0" index="0" speed="13.89" length="97.00" width="3.50" shape="0.00,100.00 97.00,100.00"/>
+    </edge>
+    <edge id="E1" from="J1" to="J2" priority="3">
+        <lane id="E1_0" index="0" speed="13.89" length="97.00" width="3.50" shape="103.00,100.00 200.00,100.00"/>
+    </edge>
+    <edge id="E2" from="J3" to="J1" priority="1">
+        <lane id="E2_0" index="0" speed="13.89" length="97.00" width="3.50" shape="100.00,0.00 100.00,97.00"/>
+    </edge>
+    <edge id="E3" from="J1" to="J4" priority="1">
+        <lane id="E3_0" index="0" speed="13.89" length="97.00" width="3.50" shape="100.00,103.00 100.00,200.00"/>
+    </edge>
+    <edge id="E4" from="J5" to="J1" priority="1">
+        <lane id="E4_0" index="0" speed="13.89" length="97.25" width="3.50" shape="0.00,90.00 97.00,97.00"/>
+    </edge>
+
+    <junction id="J0" type="dead_end" x="0.00" y="100.00" incLanes="" intLanes="" shape=""/>
+    <junction id="J1" type="priority" x="100.00" y="100.00" incLanes="E0_0 E2_0 E4_0" intLanes=":J1_0_0 :J1_1_0 :J1_2_0" shape="97.00,97.00 103.00,97.00 103.00,103.00 97.00,103.00"/>
+    <junction id="J2" type="dead_end" x="200.00" y="100.00" incLanes="E1_0" intLanes="" shape=""/>
+    <junction id="J3" type="dead_end" x="100.00" y="0.00" incLanes="" intLanes="" shape=""/>
+    <junction id="J4" type="dead_end" x="100.00" y="200.00" incLanes="E3_0" intLanes="" shape=""/>
+    <junction id="J5" type="dead_end" x="0.00" y="90.00" incLanes="" intLanes="" shape=""/>
+
+    <edge id=":J1_0" function="internal">
+        <lane id=":J1_0_0" index="0" speed="13.89" length="6.00" width="3.50" shape="97.00,100.00 103.00,100.00"/>
+    </edge>
+    <edge id=":J1_1" function="internal">
+        <lane id=":J1_1_0" index="0" speed="13.89" length="6.00" width="3.50" shape="100.00,97.00 100.00,103.00"/>
+    </edge>
+    <edge id=":J1_2" function="internal">
+        <lane id=":J1_2_0" index="0" speed="13.89" length="6.71" width="3.50" shape="97.00,97.00 103.00,100.00"/>
+    </edge>
+
+    <connection from="E0" to="E1" fromLane="0" toLane="0" via=":J1_0_0" dir="s" state="M"/>
+    <connection from="E2" to="E3" fromLane="0" toLane="0" via=":J1_1_0" dir="s" state="m"/>
+    <connection from="E4" to="E1" fromLane="0" toLane="0" via=":J1_2_0" dir="L" state="m"/>
+
+</net>

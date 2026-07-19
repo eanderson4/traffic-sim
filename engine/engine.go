@@ -316,6 +316,11 @@ func (e *Engine) computeAccels() {
 		default:
 			v.Acc = 0
 		}
+		// Junction right-of-way guardrail (ADR-0010): caps every control
+		// path, so all controllers inherit it.
+		if w, ok := e.rowGate(v); ok && w < v.Acc {
+			v.Acc = w
+		}
 	}
 }
 
@@ -381,7 +386,8 @@ func (e *Engine) boundaries() {
 			case len(lane.Successors) > 0:
 				v.S -= lane.Length
 				v.Lane = pickSuccessor(lane, v.HeldTurn)
-				v.HeldTurn = 0 // turn-at-junction is held until consumed
+				v.HeldTurn = 0     // turn-at-junction is held until consumed
+				v.stopDone = false // stop-line duty is per approach (ADR-0010)
 			case lane.EndWall:
 				v.S = lane.Length
 				v.V = 0

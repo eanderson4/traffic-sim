@@ -6,11 +6,11 @@
 //
 // Scope (v1, per ADR-0009 §6 and the milestone): edges/lanes with their
 // shape polylines, lane→lane connections (including junction-internal
-// "internal" edges), junctions only for the report. Explicit NON-goals: no
-// conflict sets / right-of-way computation (junction traversal is
-// connection-following only), no signal programs (signalized junctions are
-// reported as unmodeled), no turn-restriction relations beyond what the
-// .net.xml connection elements already encode.
+// "internal" edges), and priority-junction right-of-way (ADR-0010:
+// connection state → approach classes, conflict foes from internal-lane
+// geometry). Explicit NON-goals: no signal programs (signalized junctions
+// are reported as unmodeled and traverse freely), no turn-restriction
+// relations beyond what the .net.xml connection elements already encode.
 package netimport
 
 import (
@@ -46,6 +46,9 @@ type Report struct {
 	SignalizedJunctions  []string `json:"signalizedJunctions,omitempty"` // present but UNMODELED (v1: connection-following)
 	GuessedWidthLanes    []string `json:"guessedWidthLanes,omitempty"`
 	GuessedInternalLanes []string `json:"guessedInternalLanes,omitempty"` // netconvert-generated junction interiors
+	YieldApproaches      int      `json:"yieldApproaches,omitempty"`      // minor-class internal lanes (ADR-0010)
+	StopApproaches       int      `json:"stopApproaches,omitempty"`       // stop-class internal lanes (ADR-0010)
+	ConflictPairs        int      `json:"conflictPairs,omitempty"`        // crossing+merge foe pairs compiled (ADR-0010)
 	Warnings             []string `json:"warnings,omitempty"`
 }
 
@@ -111,6 +114,7 @@ type xmlConn struct {
 	ToLane   int    `xml:"toLane,attr"`
 	Via      string `xml:"via,attr"`
 	Dir      string `xml:"dir,attr"`
+	State    string `xml:"state,attr"`
 	TL       string `xml:"tl,attr"`
 }
 
@@ -148,7 +152,8 @@ func Convert(data []byte, opts Options) (*engine.NetFile, *Report, error) {
 	}
 
 	// Lane pass: build NetLanes, remember SUMO lane id → our id.
-	ourID := map[string]string{} // SUMO lane id (e.g. "E0_0", ":J1_0_0") → durable id
+	ourID := map[string]string{}        // SUMO lane id (e.g. "E0_0", ":J1_0_0") → durable id
+	laneJunction := map[string]string{} // our internal lane id → junction id
 	used := map[string]bool{}
 	for _, e := range edges {
 		internal := e.Function == "internal"
@@ -204,6 +209,7 @@ func Convert(data []byte, opts Options) (*engine.NetFile, *Report, error) {
 			}
 			if internal {
 				nl.Edge = "" // junction interiors never chain laterally
+				laneJunction[id] = junctionOf(e.ID)
 				rep.InternalLanes++
 			} else {
 				rep.Lanes++
@@ -228,6 +234,8 @@ func Convert(data []byte, opts Options) (*engine.NetFile, *Report, error) {
 	for i := range nf.Lanes {
 		laneIdx[nf.Lanes[i].ID] = i
 	}
+	viaState := map[string]string{} // our internal lane id → connection state (M/m/s/w/...)
+	viaTL := map[string]bool{}      // our internal lane id → signal-controlled
 	type succCand struct {
 		to   string
 		rank int
@@ -265,6 +273,10 @@ func Convert(data []byte, opts Options) (*engine.NetFile, *Report, error) {
 				fmt.Sprintf("%s→%s via %s (internal lane missing)", fromLane, toLane, c.Via))
 			continue
 		}
+		viaState[via] = c.State
+		if c.TL != "" {
+			viaTL[via] = true
+		}
 		addSucc(fromLane, via, dirRank(c.Dir))
 		addSucc(via, toLane, 0) // internal lanes have exactly one continuation
 		rep.Connections++
@@ -297,9 +309,55 @@ func Convert(data []byte, opts Options) (*engine.NetFile, *Report, error) {
 
 	// Junctions: signalized ones are PRESENT but unmodeled — the report is
 	// where a reviewer learns the traversal is connection-following only.
+	jtype := map[string]string{}
 	for _, j := range xn.Junctions {
+		jtype[j.ID] = j.Type
 		if strings.Contains(j.Type, "traffic_light") {
 			rep.SignalizedJunctions = append(rep.SignalizedJunctions, j.ID)
+		}
+	}
+
+	// Right-of-way pass (ADR-0010): annotate each internal lane with its
+	// junction, its approach class (from the connection state), and its
+	// conflict foes — internal lanes of the same junction whose paths cross
+	// (shape polylines properly intersect) or merge (share the successor
+	// lane; the junction-exit funnels where overlaps were observed). Merge
+	// takes precedence when both hold. Signal-controlled and state-less
+	// approaches stay unmodeled (row omitted → free traversal).
+	byJunction := map[string][]int{} // junction id → internal lane positions, file order
+	for i := range nf.Lanes {
+		nl := &nf.Lanes[i]
+		if !nl.Internal {
+			continue
+		}
+		jid := laneJunction[nl.ID]
+		nl.Junction = jid
+		nl.Row = rowClass(viaState[nl.ID], jtype[jid], viaTL[nl.ID])
+		switch nl.Row {
+		case "minor":
+			rep.YieldApproaches++
+		case "stop":
+			rep.StopApproaches++
+		}
+		byJunction[jid] = append(byJunction[jid], i)
+	}
+	for _, idxs := range byJunction {
+		for a := 0; a < len(idxs); a++ {
+			for b := a + 1; b < len(idxs); b++ {
+				la, lb := &nf.Lanes[idxs[a]], &nf.Lanes[idxs[b]]
+				merge := len(la.Successors) > 0 && len(lb.Successors) > 0 &&
+					la.Successors[0] == lb.Successors[0]
+				switch {
+				case merge:
+					la.FoesMerge = append(la.FoesMerge, lb.ID)
+					lb.FoesMerge = append(lb.FoesMerge, la.ID)
+					rep.ConflictPairs++
+				case polylinesCross(la.Shape, lb.Shape):
+					la.FoesCross = append(la.FoesCross, lb.ID)
+					lb.FoesCross = append(lb.FoesCross, la.ID)
+					rep.ConflictPairs++
+				}
+			}
 		}
 	}
 	if len(rep.SkippedEdges) > 0 {
@@ -371,6 +429,62 @@ func sectionOf(e xmlEdge, internal bool) string {
 		s = s[:k]
 	}
 	return "j:" + s
+}
+
+// junctionOf extracts the junction id from an internal edge id
+// (":<junction>_<n>"); mirrors sectionOf.
+func junctionOf(internalEdgeID string) string {
+	s := strings.TrimPrefix(internalEdgeID, ":")
+	if k := strings.LastIndex(s, "_"); k > 0 {
+		s = s[:k]
+	}
+	return s
+}
+
+// rowClass maps a SUMO connection state (plus its junction type and signal
+// binding) to our approach class. Signal-controlled (tl) and signalized or
+// state-less approaches stay unmodeled ("" → free traversal, ADR-0010);
+// SUMO's "=" (equal priority) is modeled conservatively as minor, "w"
+// (allway-stop) as a plain stop.
+func rowClass(state, jtype string, tl bool) string {
+	if tl || strings.Contains(jtype, "traffic_light") {
+		return ""
+	}
+	switch state {
+	case "M":
+		return "major"
+	case "m", "=":
+		return "minor"
+	case "s", "w":
+		return "stop"
+	}
+	return ""
+}
+
+// polylinesCross reports whether two lane shape polylines properly cross —
+// any segment pair intersecting in both interiors. Shared endpoints (fork
+// starts, merge ends) do not count; merges are detected via successors.
+func polylinesCross(a, b [][2]float64) bool {
+	for i := 0; i+1 < len(a); i++ {
+		for j := 0; j+1 < len(b); j++ {
+			if segCross(a[i], a[i+1], b[j], b[j+1]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// segCross reports whether segments ab and cd properly cross: c,d strictly
+// on opposite sides of ab and a,b strictly on opposite sides of cd.
+func segCross(a, b, c, d [2]float64) bool {
+	x := func(o, p, q [2]float64) float64 {
+		return (p[0]-o[0])*(q[1]-o[1]) - (p[1]-o[1])*(q[0]-o[0])
+	}
+	d1, d2 := x(a, b, c), x(a, b, d)
+	d3, d4 := x(c, d, a), x(c, d, b)
+	return (d1 > 0) != (d2 > 0) && d1 != 0 && d2 != 0 &&
+		(d3 > 0) != (d4 > 0) && d3 != 0 && d4 != 0
 }
 
 // motorLane reports whether a lane is open to any motor vehicle class.

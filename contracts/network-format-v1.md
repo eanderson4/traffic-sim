@@ -6,8 +6,9 @@
 - **Migration:** this is the *compiled* lane list of the future scenario
   format — when the authoring ⇄ compiled duality of arch-road-graph-model #5
   lands, v1 networks migrate into the scenario's network part. It is
-  deliberately lane-centric: junction typing, conflict sets, and right-of-way
-  are **not** here (see Limitations).
+  lane-centric; junction right-of-way rides as an **optional v1 extension**
+  on internal lanes (ADR-0010): files without it load with junctions
+  unmodeled (free traversal), byte-for-byte compatible.
 - **Licensing:** networks converted from OSM-derived `.net.xml` are ODbL
   Derivative Databases (ADR-0009 §5). The repo distributes the *recipe*
   (below), not the files; `data/` is git-ignored.
@@ -73,6 +74,27 @@ files, not edits.
 | `endWall` | Dead end: virtual standing vehicle at `length` (the lanedrop merge primitive). netimport never sets it; for hand-authored files. |
 | `internal` | Junction-internal lane (intersection interior): geometry through the junction box, exactly one successor, no lateral neighbors, always `guessed: ["internal-geometry"]` (no OSM element underlies it). |
 | `source.guessed` | Every default-filled / heuristic field, by name: `width` (SUMO's 3.2 m default when the attribute is absent), `internal-geometry`. |
+
+### Right-of-way extension (optional, ADR-0010)
+
+Internal lanes may carry the priority-junction right-of-way model. All four
+fields are optional and appear only on `internal` lanes; **their absence
+means the junction is unmodeled and traversed freely** — files written
+before the extension load unchanged, with exactly the pre-extension
+traversal semantics.
+
+| field | semantics |
+|---|---|
+| `junction` | Junction id the internal lane belongs to (from the internal edge id `:<junction>_<n>`). Groups the conflict sets. |
+| `row` | Approach class of the connection this lane serves: `"major"` (SUMO state `M` — right of way), `"minor"` (`m`, and `=` mapped conservatively), `"stop"` (`s`, and allway-stop `w` mapped to a plain stop). Omitted for signal-controlled (`tl` binding) or state-less approaches: signals stay unmodeled. |
+| `foesCross` | Internal lane IDs of the same junction whose paths **cross** this one (shape polylines properly intersect — shared endpoints don't count). |
+| `foesMerge` | Internal lane IDs of the same junction **merging into the same exit lane** (shared successor; the junction-exit funnels). Merge takes precedence over crossing when both hold. |
+
+Foe lists are symmetric (a lane lists every lane that lists it) and ordered
+by lane index. The kernel semantics — when each class must hold at the
+stop line — are defined in ADR-0010 and implemented in
+`engine/rightofway.go`; the import report counts `yieldApproaches`,
+`stopApproaches`, and `conflictPairs`.
 
 End-of-lane contract (loader-enforced, fail-loud): exactly one of
 successors / `exit` / `endWall` per lane; no `exit`+`endWall`; no
@@ -141,23 +163,26 @@ NC=tools/sumo-venv/lib/python3.12/site-packages/sumo/bin/netconvert
 
 Reference import: `data/networks/i280-woodside/` (I-280 @ Woodside Rd,
 bbox `37.42,-122.30,37.45,-122.25`, OSM base 2026-07-18): 187 lanes + 188
-internal lanes, 375 connections, 15 origins, 24 exits, 12.4 lane-km, 2
-signalized junctions (unmodeled, see below). Files kept: `i280.osm`
-(pinned extract), `i280.net.xml`, `i280.json`, `import-report.json` (all
-< 2 MB; `data/` is git-ignored — the recipe above regenerates everything).
+internal lanes, 375 connections, 15 origins, 24 exits, 12.4 lane-km, 18
+yield approaches, 33 conflict pairs, 2 signalized junctions (unmodeled, see
+below). Files kept: `i280.osm` (pinned extract), `i280.net.xml`, `i280.json`,
+`import-report.json` (all < 2 MB; `data/` is git-ignored — the recipe above
+regenerates everything).
 
 ## Limitations (explicit NON-goals for v1)
 
-- **No right-of-way / conflict sets.** Junction traversal is
-  connection-following only; the connection `state` attribute (SUMO's
-  major/minor `M`/`m`) is parsed-and-ignored. Where two lanes merge into
-  one (junction-exit funnels, ramp merges), simultaneous arrivals can
-  overlap — the reference import measures a handful of such collision
-  observations at priority junctions at corridor demand. This is *the* gap
-  the arch-road-graph-model conflict-set work must close (compiled
-  response/foes per connection).
-- **Signals unmodeled.** Signalized junctions are traversed freely;
-  `netimport` lists them in the import report (`signalizedJunctions`).
+- **Signals unmodeled.** Signalized junctions are traversed freely (their
+  internal lanes carry no `row`), exactly as before; `netimport` lists them
+  in the import report (`signalizedJunctions`).
+- **Priority right-of-way is a guardrail, not a gospel** (ADR-0010): the
+  kernel enforces hold-at-the-line for minor/stop approaches, box-occupancy,
+  and box-exit room — it does not model SUMO's exact gap-acceptance, the
+  `right_before_left` nuance (mapped to the same M/m classes its connection
+  states carry), or allway-stop arrival ordering (`w` compiles to `stop`).
+  Residual pathology: sub-meter, low-speed same-path overlaps can still
+  appear in queue-release transients at a congested box exit (ordinary IDM
+  queue-compression overshoot, not conflicting-path collisions — the
+  reference import measures single digits at corridor demand).
 - **No turn-restriction relations** beyond what `.net.xml` connections
   already encode (netconvert applied them at build time).
 - **Right-hand traffic assumed** in successor ordering; left-hand is a
@@ -180,4 +205,6 @@ version; empty network; empty/duplicate IDs; non-positive
 `length`/`speedLimit`; negative `width`; shapes with < 2 points; unknown or
 self successors; successors on `exit`/`endWall` lanes; dangling lanes (no
 successors and neither flag); `exit`+`endWall`; duplicate `edgeIndex`
-within an edge; lateral neighbors of unequal length.
+within an edge; lateral neighbors of unequal length; unknown `row` values;
+right-of-way fields on non-internal lanes; unknown or non-internal foe
+references.

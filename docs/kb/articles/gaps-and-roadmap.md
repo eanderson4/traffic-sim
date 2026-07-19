@@ -49,7 +49,7 @@
 | Transcribe IIDM/ACC equations from primary sources (Treiber & Kestor book / movsim) before coding those variants | Secondary-source transcription risk on model equations | [Traffic Flow Models](business-domains/traffic-flow-models.md), ADR-0007 revisit trigger |
 | Verify Daganzo 1995 merge `mid()` formula and Yperman LTM discrete equations against primary texts (⚠-flagged in raw files) | The LTM preview/oracle implementation depends on them | [Macroscopic Flow Models](business-domains/macroscopic-flow-models.md) |
 | Resolve the jam-density discrepancy (100–150 vs 180–200 veh/km/lane) against HCM / Treiber & Kesting | Picks the default fundamental diagram per road class | [Macroscopic Flow Models](business-domains/macroscopic-flow-models.md) |
-| Read SUMO source (or experiment) for the exact `allway_stop` mechanism (arrival ordering, tie-breaking, creep) | The 4-way stop is the least-specified common junction behavior in public docs | [Road Graph Model](architecture/road-graph-model.md) |
+| Read SUMO source (or experiment) for the exact `allway_stop` mechanism (arrival ordering, tie-breaking, creep) | The 4-way stop is the least-specified common junction behavior in public docs. **Downgraded 2026-07-18:** ADR-0010 compiles `w` → plain stop by fiat; this errand now only gates upgrading beyond that mapping | [Road Graph Model](architecture/road-graph-model.md), ADR-0010 |
 | Calibrate the lane-inference defaults table against drone/dataset geometry (levelX/highD/NGSIM) | netconvert confesses its typemap is unverified; the defaults table *is* most of the network | [OSM Extraction](integrations/osm-extraction.md) |
 
 ## Deferred Decisions (consciously parked)
@@ -86,6 +86,7 @@
 
 ## Freshness Notes
 
+- 2026-07-18: M7 junction right-of-way landed (ADR-0010) — priority model (major/minor/stop) compiled by netimport from SUMO connection states, enforced kernel-side in the shared accel path so all controllers inherit it. Conflicting-path (funnel/crossing) collisions eliminated on the I-280 reference import at every tested demand; residual same-path queue-release overlaps at one `right_before_left` junction documented in ADR-0010 Consequences. Junction right-of-way is off the follow-up list; signal controllers move to the top.
 - 14 topics researched 2026-07-15 → 2026-07-17 (56 raw files), all status `complete`; distilled 2026-07-17 into 18 articles.
 - Oldest research (2026-07-15): domain-traffic-flow-models, domain-macroscopic-flow-models, domain-trajectory-datasets, arch-time-model — all still current (their open items were ratified by the 2026-07-17 review).
 - Run `/update-kb` to check for stale topics after a gap.

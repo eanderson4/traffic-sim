@@ -24,6 +24,7 @@ closed (2026-07-15..17).
 | [ADR-0007](../../decisions/ADR-0007-vehicle-model.md) | Position = front-bumper `s`; gap = bumper-to-bumper everywhere; multi-class types; IDM+MOBIL defaults; per-vehicle seeded RNG | Unpinned position/gap conventions drift by a vehicle length (~5 m) across models, metrics, and importers; matching the IDM literature's convention lets calibrated parameters transfer without conversion | [Traffic Flow Models](../business-domains/traffic-flow-models.md), [Road Graph Model](../architecture/road-graph-model.md) |
 | [ADR-0008](../../decisions/ADR-0008-controller-contract.md) | Controller contract: one 4-axis Intent with per-axis persistence; grants-based roles (driver / default-driver / director / signal); exclusive claims; zero driving logic in the engine | TraCI's blocking barrier and CARLA's sticky commands are the measured failure modes; failover is operational (external default-driver fleet + pause), never a hidden in-engine model | [Vehicle & Controller Interface](../concepts/vehicle-controller-interface.md), [State Authority](../architecture/state-authority.md), [Signal Control](../business-domains/signal-control.md) |
 | [ADR-0009](../../decisions/ADR-0009-osm-import-strategy.md) | netconvert bootstrap + own Go importer with netconvert as permanent diff-test oracle; two-tier identity with `guessed` flags; ODbL recipe-not-file; delta-patch variants | Only three codebases do full OSM→lane-graph compilation and none is Go or reusable; lane tagging is too sparse (~0.7% `turn:lanes`) to be a foundation, so the oracle guards a 20-year re-implementation gap | [OSM Extraction](../integrations/osm-extraction.md) |
+| [ADR-0010](../../decisions/ADR-0010-junction-right-of-way.md) | Priority-junction right-of-way: netimport compiles approach classes (major/minor/stop) and conflict foes (merge/crossing) from connection states + internal-lane geometry; the kernel enforces a stop-line guardrail in the shared accel path; signals stay unmodeled | Junction traversal was connection-following only and simultaneous arrivals overlapped at exit funnels (160+ collision observations on I-280 at corridor demand); enforcement belongs in the kernel so every controller inherits it | M7 implementation (engine/rightofway.go, netimport), [Road Graph Model](../architecture/road-graph-model.md) |
 
 ## Research Complete, ADR Pending
 
@@ -49,4 +50,4 @@ These areas have finished research (the gate) but no drafted ADR yet — see
   [VISION.md](../../../VISION.md).
 
 ---
-*Derived from: [decisions/](../../decisions/) ADR-0001..0009 and the raw research syntheses linked above*
+*Derived from: [decisions/](../../decisions/) ADR-0001..0010 and the raw research syntheses linked above*
