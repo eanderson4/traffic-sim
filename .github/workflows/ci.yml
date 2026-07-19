@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  engine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: engine/go.sum
+      - name: gofmt
+        working-directory: engine
+        run: test -z "$(gofmt -l .)"
+      - name: vet
+        working-directory: engine
+        run: go vet ./...
+      - name: test
+        working-directory: engine
+        run: go test ./... -count=1
+
+  viz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: viz/pnpm-lock.yaml
+      - name: install
+        working-directory: viz
+        run: pnpm install --frozen-lockfile
+      - name: typecheck
+        working-directory: viz
+        run: pnpm check
+      - name: test
+        working-directory: viz
+        run: pnpm test
