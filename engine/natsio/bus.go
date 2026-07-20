@@ -228,6 +228,21 @@ func (b *Bus) PublishSnapshot(e *engine.Engine) {
 	b.snapsOut.Add(1)
 }
 
+// PublishSignals sends the signal-program table (TSSG v1) on
+// ts.{run}.state.sig, fire-and-forget like the snapshot path. The table is
+// self-sufficient: with the tick (header + payload) a client derives every
+// light state by pure integer math (ADR-0011 §1), so republication at the
+// keyframe cadence is the whole late-joiner catch-up story.
+func (b *Bus) PublishSignals(e *engine.Engine) {
+	msg := nats.NewMsg(SubjectStateSig(b.run))
+	msg.Data = SignalFrame(e)
+	msg.Header.Set(headerTick, strconv.FormatUint(e.Tick, 10))
+	msg.Header.Set(headerSchemaVersion, strconv.Itoa(SchemaVersion))
+	if err := b.nc.PublishMsg(msg); err != nil {
+		b.pubErrs.Add(1)
+	}
+}
+
 // AckPayload is the JSON body of the applied_tick echo (small; the headers
 // carry the same numbers for header-only consumers).
 type AckPayload struct {

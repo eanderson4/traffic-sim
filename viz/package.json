@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "check": "tsc --noEmit",
     "test": "node --test test/*.test.ts",
-    "smoke": "node scripts/smoke.mjs"
+    "smoke": "node scripts/smoke.mjs",
+    "sigsmoke": "node scripts/sigsmoke.mjs"
   },
   "dependencies": {
     "maplibre-gl": "5.24.0",

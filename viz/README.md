@@ -1,4 +1,4 @@
-# traffic-sim viz (M6)
+# traffic-sim viz (M6, M9)
 
 MapLibre GL realtime client for the engine's live plane (ADR-0003: MapLibre-first,
 vanilla TypeScript, no UI framework; ADR-0006 §8: browsers over the server's
@@ -6,8 +6,10 @@ WebSocket listener with binary frames).
 
 Renders the I-280 @ Woodside corridor live: static lane network, animated
 vehicles from TSSF v1 binary snapshots at 10 Hz (interpolated to 60 fps behind
-a ~250 ms buffer), and a clearly-labelled **client-derived** congestion proxy
-(per-lane mean speed) painted onto the lanes via feature-state.
+a ~250 ms buffer), a clearly-labelled **client-derived** congestion proxy
+(per-lane mean speed) painted onto the lanes via feature-state, and the two
+signalized junctions' lights (TSSG v1 program table, states derived from the
+snapshot tick — ADR-0006 M9 addendum) as stop-line circles.
 
 ## Prerequisites
 
@@ -55,8 +57,11 @@ driver, default on), `-capacity`.
 - Lanes with traffic tint green→gold→red by mean speed / speed limit
   (feature-state); untravelled lanes stay blue ("no data"). HUD top-left:
   connection, tick, vehicle count.
+- Small circles at the two metered junctions' stop lines cycle
+  green → amber → red in step with their fixed-time programs (82 s / 3 s /
+  5 s on I-280); nothing renders where a signal is off.
 
-## Architecture (three channels, per docs/kb/raw/integration-maplibre-realtime)
+## Architecture (four channels, per docs/kb/raw/integration-maplibre-realtime)
 
 1. **Static network** — `network.geojson` (exported by `engine/cmd/serve
    -geojson`; engine/geojson.go) loaded once with `promoteId: "id"`.
@@ -71,20 +76,33 @@ driver, default on), `-capacity`.
    grid spatial index (TSSF v1 carries no lane id), per-lane mean
    speed/limit → `setFeatureState` at ~1 Hz. Client-derived estimate; the
    future observability ADR replaces it with authoritative metrics.
+4. **Signals** (M9) — TSSG v1 program table off `ts.{run}.state.sig`,
+   decoded in `src/tssg.ts` (mirror of engine/natsio/sigframe.go). The wire
+   carries the fixed-time PROGRAMS, never states: light state is a pure
+   function of the tick (ADR-0011 §1), so `src/signals.ts` derives per-lane
+   colors at each render tick and paints stop-line circles (first point of
+   each signal-bound internal lane) on a tiny dedicated source via
+   `setFeatureState` — setData only when a table's lane binding changes.
+   Late joiners converge on the table's keyframe-cadence republication.
 
 ## Verification
 
 ```sh
 pnpm check      # tsc --noEmit, strict
-pnpm test       # node --test: decoder (Go-golden fixtures), projection
-                # (PROJ reference), interpolation, diffs, congestion index
+pnpm test       # node --test: decoders (Go-golden fixtures), projection
+                # (PROJ reference), interpolation, diffs, congestion index,
+                # signal derivation
 pnpm smoke      # no browser: builds cmd/serve, runs i280 live, connects via
                 # nats.ws from node, asserts decodable in-bounds frames
+pnpm sigsmoke   # M9: asserts the TSSG table, derived junction states flipping
+                # at ticks 820/850/900, and late-joiner convergence (~2 min)
 node scripts/screenshot.mjs   # headless-Chrome screenshot + HUD readback
                               # (needs google-chrome/chromium; env CHROME=)
+node scripts/sigshot.mjs      # M9 headless-Chrome render proof: stop-line
+                              # feature-state flips green→amber→red + shots
 ```
 
-Verified: type-check, 20 unit tests, the node smoke test, and a headless-
+Verified: type-check, 34 unit tests, the node smoke test, and a headless-
 Chrome end-to-end render (live ticks, vehicles, congestion tint, click
 inspect). Not covered: visual cross-browser testing, fleet sizes beyond a
 few hundred (the escalation ladder's microbenchmark remains an open task).

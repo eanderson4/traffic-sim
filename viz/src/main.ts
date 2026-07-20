@@ -1,5 +1,5 @@
 // main.ts — M6 MapLibre realtime viz (ADR-0003: MapLibre-first, vanilla
-// TS). Three data channels per docs/kb/raw/integration-maplibre-realtime:
+// TS). Four data channels per docs/kb/raw/integration-maplibre-realtime:
 //
 //   1. static network — network.geojson loaded ONCE with promoteId; only
 //      feature-state ever changes on it (never setData);
@@ -8,17 +8,22 @@
 //      (snapshots.ts), applied as updateData diffs on a dedicated small
 //      source (vehicles.ts);
 //   3. congestion — CLIENT-DERIVED per-lane mean speed (congestion.ts) onto
-//      the network source via setFeatureState at ~1 Hz.
+//      the network source via setFeatureState at ~1 Hz;
+//   4. signals — TSSG v1 program table off ts.{run}.state.sig (tssg.ts,
+//      ADR-0006 M9 addendum): light states DERIVE from the snapshot tick
+//      (signals.ts), painted as stop-line circles via feature-state.
 //
 // The wire/network coordinates are the engine's local metric frame; proj.ts
 // projects to WGS84 (network once at load, vehicles per render frame).
 
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import type { Feature, FeatureCollection, LineString } from "geojson";
+import type { Feature, FeatureCollection, LineString, Point } from "geojson";
 
 import { loadConfig } from "./config.ts";
 import { decodeFrame } from "./tssf.ts";
+import { decodeSignalFrame, type SigColor, type SignalTable } from "./tssg.ts";
+import { laneStatesAtTick, signalStopLines } from "./signals.ts";
 import { makeProjector, type LocalFrame } from "./proj.ts";
 import { SnapshotBuffer } from "./snapshots.ts";
 import { diffVehicles, type RenderedVehicle, type SourceDiff } from "./vehicles.ts";
@@ -86,6 +91,11 @@ async function main(): Promise<void> {
   for (const f of net.features) {
     speedLimitByLane.set(String(f.id ?? f.properties?.["id"]), Number(f.properties?.["speedLimit"]));
   }
+  // Signal stop-lines resolve against the static geometry (local frame).
+  const shapeByLane = new Map<string, Array<[number, number]>>();
+  for (const f of net.features) {
+    shapeByLane.set(String(f.id ?? f.properties?.["id"]), f.geometry.coordinates as Array<[number, number]>);
+  }
 
   const map = new maplibregl.Map({
     container: "map",
@@ -99,6 +109,53 @@ async function main(): Promise<void> {
   const buffer = new SnapshotBuffer(cfg.bufferMs);
   const applied = new Map<number, RenderedVehicle>();
   let mapReady = false;
+
+  // Signal channel state: the latest TSSG table, the stop-line set applied
+  // to the "signals" source (keyed by binding signature so a republished
+  // table costs no setData), and the last-applied per-lane colors.
+  let sigTable: SignalTable | null = null;
+  let sigSourceKey = "";
+  const prevSigStates = new Map<string, SigColor>();
+  const sigPoints: Array<[number, number]> = []; // debug handle (headless proof)
+  const sigDebug = { seen: 0, ok: 0, err: "", pts: -1 }; // debug handle: onSignals counters
+
+  // ensureSignalSource (re)builds the stop-line point features when the
+  // table's binding changes — the ONLY setData on this source; per-tick
+  // color changes ride feature-state below.
+  function ensureSignalSource(): void {
+    if (!mapReady || sigTable === null) return;
+    const pts = signalStopLines(sigTable, shapeByLane);
+    sigDebug.pts = pts.length;
+    const key = pts.map((p) => p.laneId).join(",");
+    if (key === sigSourceKey) return;
+    sigSourceKey = key;
+    prevSigStates.clear(); // re-apply every state on the next render pass
+    const features: Feature<Point>[] = pts.map((p) => ({
+      type: "Feature",
+      id: p.laneId,
+      properties: { id: p.laneId },
+      geometry: { type: "Point", coordinates: project(p.x, p.y) },
+    }));
+    (map.getSource("signals") as maplibregl.GeoJSONSource).setData({
+      type: "FeatureCollection",
+      features,
+    });
+    sigPoints.length = 0;
+    for (const f of features) sigPoints.push(f.geometry.coordinates as [number, number]);
+  }
+
+  // updateSignals derives per-lane light colors at the render tick (the
+  // sim tick of the interpolated sample, not wall clock) and applies only
+  // the changes — a phase flip is a handful of setFeatureState calls.
+  function updateSignals(tick: number): void {
+    if (!mapReady || sigTable === null || sigSourceKey === "") return;
+    for (const [laneId, color] of laneStatesAtTick(sigTable, tick)) {
+      if (prevSigStates.get(laneId) !== color) {
+        map.setFeatureState({ source: "signals", id: laneId }, { sig: color });
+        prevSigStates.set(laneId, color);
+      }
+    }
+  }
 
   map.on("load", () => {
     map.addSource("network", { type: "geojson", data: networkFC, promoteId: "id" });
@@ -145,6 +202,31 @@ async function main(): Promise<void> {
         "circle-stroke-width": 1,
       },
     });
+    // Signal lights (M9): one circle per signal-bound internal lane at its
+    // stop-line entry; color rides feature-state "sig" (off = invisible).
+    map.addSource("signals", { type: "geojson", data: EMPTY_FC, promoteId: "id" });
+    map.addLayer({
+      id: "signals",
+      type: "circle",
+      source: "signals",
+      paint: {
+        "circle-color": [
+          "match",
+          ["coalesce", ["feature-state", "sig"], "off"],
+          "green",
+          "#2ecc71",
+          "amber",
+          "#f5b301",
+          "red",
+          "#e5484d",
+          "#0e1d5c",
+        ],
+        "circle-opacity": ["match", ["coalesce", ["feature-state", "sig"], "off"], "off", 0, 1],
+        "circle-radius": ["interpolate", ["linear"], ["zoom"], 11, 3, 14, 5, 17, 8],
+        "circle-stroke-color": "#0e1d5c",
+        "circle-stroke-width": 1,
+      },
+    });
     map.on("click", (e) => {
       const feats = map.queryRenderedFeatures(e.point, { layers: ["vehicles"] });
       const f = feats[0];
@@ -163,6 +245,7 @@ async function main(): Promise<void> {
       map.getCanvas().style.cursor = feats.length > 0 ? "pointer" : "";
     });
     mapReady = true;
+    ensureSignalSource(); // a table may have arrived before the style
   });
 
   hud.setConnection(false, `connecting to ${cfg.ws} …`);
@@ -173,6 +256,17 @@ async function main(): Promise<void> {
       try {
         buffer.push(decodeFrame(data), performance.now());
       } catch (err) {
+        hud.setConnection(false, String(err));
+      }
+    },
+    (data) => {
+      sigDebug.seen++;
+      try {
+        sigTable = decodeSignalFrame(data);
+        sigDebug.ok++;
+        ensureSignalSource();
+      } catch (err) {
+        sigDebug.err = String(err);
         hud.setConnection(false, String(err));
       }
     },
@@ -228,6 +322,7 @@ async function main(): Promise<void> {
         }
         hud.setFrame(sample.tick, sample.vehicles.length, sample.starved);
         updateCongestion(nowMs);
+        updateSignals(sample.tick);
       }
     }
     requestAnimationFrame(frame);
@@ -236,7 +331,7 @@ async function main(): Promise<void> {
 
   // Debug/testing handle: lets headless verification (scripts/screenshot.mjs
   // and friends) and the browser console reach the live map + render set.
-  (window as unknown as { __viz: unknown }).__viz = { map, applied };
+  (window as unknown as { __viz: unknown }).__viz = { map, applied, signals: prevSigStates, sigPoints, sigDebug };
 }
 
 main().catch((err) => {

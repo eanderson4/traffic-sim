@@ -106,6 +106,9 @@ func RunLive(nc *nats.Conn, js nats.JetStreamContext, run string, spec engine.Ru
 	if err := rec.LogStart(e); err != nil {
 		return finish(err)
 	}
+	// Publish the signal-program table at run start (ADR-0006 M9 addendum);
+	// the loop republishes it at the keyframe cadence for late joiners.
+	bus.PublishSignals(e)
 
 	for e.Tick < spec.Ticks {
 		tickStart := time.Now()
@@ -129,6 +132,9 @@ func RunLive(nc *nats.Conn, js nats.JetStreamContext, run string, spec engine.Ru
 			return finish(err)
 		}
 		if e.Tick%rec.cfg.KeyframeEvery == 0 {
+			// Signal table catch-up rides the keyframe cadence (the
+			// late-joiner resync rhythm, ADR-0006 §6 + M9 addendum).
+			bus.PublishSignals(e)
 			if err := reg.UpdateState(run, e.Tick, rec.lastSeq, e.CRC()); err != nil {
 				return finish(fmt.Errorf("registry state update at tick %d: %w", e.Tick, err))
 			}

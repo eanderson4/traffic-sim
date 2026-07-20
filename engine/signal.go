@@ -126,6 +126,21 @@ func (p *SignalProgram) phaseAt(tick uint64) int {
 	return len(p.phaseTicks) - 1 // unreachable (x < cycle), kept total
 }
 
+// PhaseAt exposes the phase-index derivation (phaseAt) for wire encoders:
+// engine/natsio publishes the program TABLE (definitions, not states) on
+// ts.{run}.state.sig and clients derive any tick's light states themselves
+// (ADR-0006, 2026-07-20 M9 addendum). Same pure integer function.
+func (p *SignalProgram) PhaseAt(tick uint64) int { return p.phaseAt(tick) }
+
+// CompiledTicks exposes the tick-grid compilation for wire encoders:
+// per-phase durations in ticks (Σ = cycle) and the program offset in ticks.
+// The returned slice is a copy; programs stay kernel-owned.
+func (p *SignalProgram) CompiledTicks() (phaseTicks []uint64, offsetTicks uint64) {
+	out := make([]uint64, len(p.phaseTicks))
+	copy(out, p.phaseTicks)
+	return out, p.offsetTicks
+}
+
 // compileSignalTicks compiles every program of the network onto the tick
 // grid; called once by NewEngine after BuildNet. No-op without programs.
 func (n *Network) compileSignalTicks(dt float64) error {

@@ -145,3 +145,42 @@ needs; Synadia's Cybervet runs embedded NATS + 10 ms tick + KV + WebSocket at
      wall-clock arrival instead — fine at 1× pacing, wrong for
      faster-than-realtime serving; dilation signaling is already a §1
      concern (dilation scalar on the live plane) and remains open.
+
+## Addendum (2026-07-20, M9 signal state on the live plane)
+
+- **New live-plane channel `ts.{run}.state.sig` (TSSG v1)** publishes the
+  fixed-time signal-program table (ADR-0011): program ids, junctions,
+  offsets, per-phase durations in ticks + tlLogic state strings, and the
+  link→internal-lane binding (the stop-line geometry stays client-local in
+  the static network GeoJSON). Declared in `contracts/asyncapi.yaml`
+  (info version 2.1.0).
+- **Why a new subject and not a TSSF signal block:** both shipped TSSF v1
+  decoders (Go `ParseFrame`, TS `decodeFrame`) hard-reject on exact-length
+  AND exact-version checks, so any in-frame extension — and any TSSF
+  version bump — makes old clients error on every 10 Hz snapshot. A
+  separate subject is the only strictly-additive shape. **Migration note:
+  additive; old clients ignore `ts.{run}.state.sig` entirely — they never
+  subscribe it, and TSSF v1 / TSKF v2 payloads are byte-identical.** (The
+  M6 addendum's TSSF schema-bump candidates — speed, lane id — remain
+  open and unaffected.)
+- **Light STATES are derived, never shipped (ADR-0011 §1).** Phase state
+  is a pure function of the tick count and the compiled program, so the
+  frame carries the program TABLE plus the publish tick and clients
+  evaluate the kernel's own integer math (cycle = Σ phase ticks; half-open
+  phase windows; phase 0 begins at offset_ticks; the cycle wraps). Phase
+  changes need zero messages — the tick already rides every TSSF header.
+  Per-tick cost on the vehicle path: unchanged (zero bytes).
+- **Late joiners:** the table publishes at run start and republishes at
+  the keyframe cadence (the §6 resync rhythm); convergence ≤
+  `KeyframeEvery` ticks (default 100 = 10 s at 1×) — never waiting for a
+  phase change (the I-280 cycle is 90 s). Tested in
+  `engine/natsio/sigframe_test.go`: a subscriber attaching mid-run
+  receives the next cadence table and its derivation matches the kernel's
+  `PhaseAt` over a full-cycle sweep; an old (snapshots-only) client
+  decodes the whole live stream without error.
+- **An empty table is explicit:** runs without signalized junctions
+  publish `program_count 0` — distinguishable from "no table yet".
+- **Seam for external signal control (ADR-0011 D1):** when commanded
+  states replace fixed-time derivation, light state ceases to be
+  tick-derivable; this subject is the natural carrier for that evolution,
+  which is its own contract ADR.

@@ -20,7 +20,7 @@ asyncapi: 3.0.0
 
 info:
   title: traffic-sim engine contract
-  version: 2.0.0
+  version: 2.1.0
   description: |
     The engine's NATS surface per ADR-0006 (planes, taxonomy, pipelines) and
     ADR-0008 (the engine↔controller contract — M4, schema_version 2):
@@ -56,6 +56,15 @@ info:
     arrival_seq) application order. The snapshot frame is unchanged (TSSF
     v1).
 
+    **M9 changes (additive; info version 2.1.0):** new live-plane channel
+    `ts.{run}.state.sig` carrying the fixed-time signal-program table
+    (TSSG v1) at run start and at the keyframe cadence (ADR-0006
+    2026-07-20 addendum; ADR-0011). Light STATE stays off the wire — it
+    derives from the tick count by the kernel's own integer math, and the
+    tick already rides every TSSF header. TSSF v1 and TSKF v2 are
+    byte-unchanged: old clients decode new streams without error (they
+    simply never subscribe the new subject).
+
 servers:
   embedded:
     host: in-process
@@ -77,6 +86,29 @@ channels:
       run: { $ref: '#/components/parameters/runId' }
     messages:
       stateSnapshot: { $ref: '#/components/messages/StateSnapshot' }
+
+  stateSig:
+    address: ts.{run}.state.sig
+    description: |
+      Fixed-time signal-program table (TSSG v1, ADR-0011), published once
+      at run start and republished at the keyframe cadence. The light
+      STATE of an approach is never on the wire: it is a pure function of
+      the tick count and the compiled program (ADR-0011 §1), so the table
+      plus the tick (the header here, the payload header, and every TSSF
+      snapshot's tick) lets a client derive any tick's per-link states by
+      the kernel's own integer math (half-open phase windows on the tick
+      grid, the cycle wraps, phase 0 begins at offset_ticks). Core NATS
+      has no retention; the keyframe-cadence republication is the entire
+      late-joiner catch-up — convergence ≤ KeyframeEvery ticks (default
+      100), never waiting for a phase change. Self-sufficient like every
+      live-plane message: a drop only delays a table-less client's
+      convergence, never corrupts state. An empty program_count means the
+      run has no signalized junctions (explicit — distinguishable from
+      "no table received yet").
+    parameters:
+      run: { $ref: '#/components/parameters/runId' }
+    messages:
+      signalTable: { $ref: '#/components/messages/SignalTable' }
 
   ctlIntent:
     address: ts.{run}.ctl.intent.{controller_id}
@@ -307,6 +339,10 @@ operations:
     title: Engine → snapshot per tick
     action: send
     channel: { $ref: '#/channels/stateSnap' }
+  publishSignalTable:
+    title: Engine → signal-program table at run start + keyframe cadence
+    action: send
+    channel: { $ref: '#/channels/stateSig' }
   receiveIntents:
     title: Engine ← raw controller intents
     action: receive
@@ -389,6 +425,21 @@ components:
         schemaFormat: application/octet-stream
         $ref: '#/components/schemas/SnapshotFrame'
       x-json-view: '#/components/schemas/SnapshotView'
+
+    SignalTable:
+      name: signalTable
+      title: Fixed-time signal-program table (binary TSSG frame)
+      summary: |
+        Program definitions — per-phase durations in ticks, per-link
+        tlLogic state strings, program offset, and the link→internal-lane
+        binding — the derivation inputs for light states, NOT the states
+        themselves (ADR-0011 §1; ADR-0006 2026-07-20 M9 addendum). Layout:
+        engine/natsio/sigframe.go ("TSSG", version 1).
+      headers: { $ref: '#/components/schemas/TickHeaders' }
+      payload:
+        schemaFormat: application/octet-stream
+        $ref: '#/components/schemas/SignalFrame'
+      x-json-view: '#/components/schemas/SignalView'
 
     ControlIntent:
       name: controlIntent
@@ -614,6 +665,66 @@ components:
               y: { type: number, description: meters (3.5 m lateral slot) }
               angle: { type: number, description: radians }
               class: { type: integer, minimum: 0, description: scenario type index }
+
+    SignalFrame:
+      type: string
+      format: binary
+      description: |
+        Binary frame, little-endian, magic "TSSG", version 1:
+          header (24 B): magic u32 | schema_version u16 | flags u16 |
+                         tick u64 | program_count u32 | reserved u32
+          per program: id_len u8 | id bytes | junction_len u8 |
+            junction bytes | offset_ticks u64 | phase_count u16 |
+            link_count u16 |
+            per phase: duration_ticks u32 | state_len u8 | state bytes
+              (ASCII, SUMO tlLogic alphabet: g/G go, y amber, r red —
+              every other char exerts no control, ADR-0011 §2)
+            per link: link_idx u16 | lane_id_len u8 | lane id bytes
+              (the signal-bound internal lanes, link-index order — binds
+              state-string indices to the static network's lane ids)
+        Derivation (mirrors engine/signal.go exactly): cycle = Σ
+        duration_ticks; x = (tick mod cycle + cycle − offset_ticks mod
+        cycle) mod cycle; the phase in force is the first whose duration
+        window contains x (half-open windows, file order); a link's state
+        char at that phase governs its lane's light; a link index without
+        a state char is uncontrolled (off). Zero-duration phases are
+        rejected (unrepresentable on the tick grid, ADR-0011 §1). The
+        tick header/payload field pins the derivation reference; per-tick
+        freshness rides the TSSF snapshot ticks.
+
+    SignalView:
+      title: JSON view of the signal-program table (tooling only; wire is binary)
+      type: object
+      required: [tick, schema_version, programs]
+      properties:
+        tick: { type: integer, minimum: 0, description: Publish tick (derivation reference). }
+        schema_version: { type: integer, const: 2 }
+        programs:
+          type: array
+          items:
+            type: object
+            required: [id, junction, offset_ticks, phases, links]
+            properties:
+              id: { type: string, description: Program id (the tlLogic id). }
+              junction: { type: string, description: Junction the program serves. }
+              offset_ticks: { type: integer, minimum: 0, description: Phase 0 begins at this tick (SUMO offset semantics; the cycle wraps before it). }
+              phases:
+                type: array
+                minItems: 1
+                items:
+                  type: object
+                  required: [duration_ticks, state]
+                  properties:
+                    duration_ticks: { type: integer, minimum: 1 }
+                    state: { type: string, description: 'Per-link tlLogic chars (g/G go, y amber, r red, else off); all phases of a program share the length.' }
+              links:
+                type: array
+                items:
+                  type: object
+                  required: [link_idx, lane_id]
+                  properties:
+                    link_idx: { type: integer, minimum: 0, description: Index into the phase state strings. }
+                    lane_id: { type: string, description: Signal-bound internal lane id (matches the static network GeoJSON feature id). }
 
     IntentFrame:
       type: string

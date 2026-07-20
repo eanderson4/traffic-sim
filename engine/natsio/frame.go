@@ -1,15 +1,18 @@
 // Package natsio connects the deterministic engine kernel to the NATS
 // backbone per ADR-0006: the live plane (core NATS: self-sufficient binary
-// snapshots out, raw controller intents in), the record plane (JetStream:
-// arbitrated intent log + keyframes + rolling CRC + control events, engine
-// sole writer), and the run registry (KV), plus CRC-verified replay from
-// the JetStream record. On top of those planes it implements the ADR-0008
-// engine↔controller contract (contract.go): the attach handshake with
-// grants, exclusive engine-arbitrated claims, per-controller observation
-// windows, per-axis intent persistence with hold-last healing, the
-// (grant, vehicle ID) tie-break, liveness detachment with unclaimed-vehicle
-// events, and the capacity pause gate. The external default driver (the
-// reference controller) lives in the subpackage engine/natsio/driver.
+// snapshots out, raw controller intents in, plus the M9 signal-program
+// table on ts.{run}.state.sig — program definitions from which clients
+// derive light states by the tick, ADR-0011 §1), the record plane
+// (JetStream: arbitrated intent log + keyframes + rolling CRC + control
+// events, engine sole writer), and the run registry (KV), plus CRC-verified
+// replay from the JetStream record. On top of those planes it implements
+// the ADR-0008 engine↔controller contract (contract.go): the attach
+// handshake with grants, exclusive engine-arbitrated claims, per-controller
+// observation windows, per-axis intent persistence with hold-last healing,
+// the (grant, vehicle ID) tie-break, liveness detachment with
+// unclaimed-vehicle events, and the capacity pause gate. The external
+// default driver (the reference controller) lives in the subpackage
+// engine/natsio/driver.
 //
 // Dependency justification (AGENTS.md "standard library first; justify
 // dependencies"): these are the first non-stdlib dependencies of the Go
