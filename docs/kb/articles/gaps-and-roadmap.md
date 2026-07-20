@@ -86,6 +86,7 @@
 
 ## Freshness Notes
 
+- 2026-07-19: M8 fixed-time signals landed (ADR-0011) — static tlLogic compiles to kernel-run programs; phase state is a pure function of the tick count (no CRC/keyframe coverage needed); enforcement composes with the ADR-0010 stop-line guardrail (red hold, amber stop-if-able, green + box checks). I-280: 0 collisions at rate 600, the 8 known right_before_left residuals at 2400 unchanged. The data-driven phase seam (D1) leaves external signal controllers as the next signal milestone — a message-contract change needing its own ADR.
 - 2026-07-18: M7 junction right-of-way landed (ADR-0010) — priority model (major/minor/stop) compiled by netimport from SUMO connection states, enforced kernel-side in the shared accel path so all controllers inherit it. Conflicting-path (funnel/crossing) collisions eliminated on the I-280 reference import at every tested demand; residual same-path queue-release overlaps at one `right_before_left` junction documented in ADR-0010 Consequences. Junction right-of-way is off the follow-up list; signal controllers move to the top.
 - 14 topics researched 2026-07-15 → 2026-07-17 (56 raw files), all status `complete`; distilled 2026-07-17 into 18 articles.
 - Oldest research (2026-07-15): domain-traffic-flow-models, domain-macroscopic-flow-models, domain-trajectory-datasets, arch-time-model — all still current (their open items were ratified by the 2026-07-17 review).

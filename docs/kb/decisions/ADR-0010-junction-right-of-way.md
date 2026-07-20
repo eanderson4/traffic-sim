@@ -65,6 +65,9 @@ was throwing it away: the connection `state` attribute (SUMO's major/minor
 5. **Signals stay UNMODELED.** `traffic_light` junctions and `tl`-bound or
    state-less connections compile to no `row` and traverse freely, as
    before; the import report keeps listing them.
+   *(Superseded by ADR-0011, 2026-07-19: static tlLogic programs now
+   compile into the signal extension and the kernel gates their approaches;
+   only junctions without a usable program remain unmodeled.)*
 
 ## Explicitly NOT modeled (revisit triggers)
 

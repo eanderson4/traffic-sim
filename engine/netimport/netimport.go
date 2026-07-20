@@ -6,11 +6,13 @@
 //
 // Scope (v1, per ADR-0009 §6 and the milestone): edges/lanes with their
 // shape polylines, lane→lane connections (including junction-internal
-// "internal" edges), and priority-junction right-of-way (ADR-0010:
-// connection state → approach classes, conflict foes from internal-lane
-// geometry). Explicit NON-goals: no signal programs (signalized junctions
-// are reported as unmodeled and traverse freely), no turn-restriction
-// relations beyond what the .net.xml connection elements already encode.
+// "internal" edges), priority-junction right-of-way (ADR-0010: connection
+// state → approach classes, conflict foes from internal-lane geometry),
+// and fixed-time signal programs (ADR-0011: static tlLogic → phase lists,
+// connections → per-lane link bindings). Explicit NON-goals: non-static
+// programs (actuated/NEMA — reported, approaches stay unsignalized), no
+// turn-restriction relations beyond what the .net.xml connection elements
+// already encode.
 package netimport
 
 import (
@@ -43,7 +45,9 @@ type Report struct {
 	SkippedEdges         []string `json:"skippedEdges,omitempty"` // non-motor edges (rail-only etc.)
 	SkippedLanes         []string `json:"skippedLanes,omitempty"` // non-motor lanes on kept edges (sidewalks, bike lanes)
 	DroppedConnections   []string `json:"droppedConnections,omitempty"`
-	SignalizedJunctions  []string `json:"signalizedJunctions,omitempty"` // present but UNMODELED (v1: connection-following)
+	SignalizedJunctions  []string `json:"signalizedJunctions,omitempty"` // signal-type junctions WITHOUT a usable program (unmodeled)
+	SignalPrograms       int      `json:"signalPrograms,omitempty"`      // fixed-time programs compiled (ADR-0011)
+	SignalLinks          int      `json:"signalLinks,omitempty"`         // internal lanes bound to a program link
 	GuessedWidthLanes    []string `json:"guessedWidthLanes,omitempty"`
 	GuessedInternalLanes []string `json:"guessedInternalLanes,omitempty"` // netconvert-generated junction interiors
 	YieldApproaches      int      `json:"yieldApproaches,omitempty"`      // minor-class internal lanes (ADR-0010)
@@ -73,6 +77,7 @@ type xmlNet struct {
 	Edges     []xmlEdge     `xml:"edge"`
 	Junctions []xmlJunction `xml:"junction"`
 	Conns     []xmlConn     `xml:"connection"`
+	TLLogics  []xmlTLL      `xml:"tlLogic"`
 }
 
 type xmlLocation struct {
@@ -108,14 +113,30 @@ type xmlJunction struct {
 }
 
 type xmlConn struct {
-	From     string `xml:"from,attr"`
-	To       string `xml:"to,attr"`
-	FromLane int    `xml:"fromLane,attr"`
-	ToLane   int    `xml:"toLane,attr"`
-	Via      string `xml:"via,attr"`
-	Dir      string `xml:"dir,attr"`
-	State    string `xml:"state,attr"`
-	TL       string `xml:"tl,attr"`
+	From      string `xml:"from,attr"`
+	To        string `xml:"to,attr"`
+	FromLane  int    `xml:"fromLane,attr"`
+	ToLane    int    `xml:"toLane,attr"`
+	Via       string `xml:"via,attr"`
+	Dir       string `xml:"dir,attr"`
+	State     string `xml:"state,attr"`
+	TL        string `xml:"tl,attr"`
+	LinkIndex int    `xml:"linkIndex,attr"`
+}
+
+// xmlTLL is a SUMO tlLogic element. v1 models only type="static" (fixed-time);
+// actuated/other programs are reported and their junctions stay unmodeled.
+type xmlTLL struct {
+	ID        string     `xml:"id,attr"`
+	Type      string     `xml:"type,attr"`
+	ProgramID string     `xml:"programID,attr"`
+	Offset    float64    `xml:"offset,attr"`
+	Phases    []xmlPhase `xml:"phase"`
+}
+
+type xmlPhase struct {
+	Duration float64 `xml:"duration,attr"`
+	State    string  `xml:"state,attr"`
 }
 
 // Convert parses .net.xml bytes and compiles the NetFile plus the import
@@ -235,7 +256,8 @@ func Convert(data []byte, opts Options) (*engine.NetFile, *Report, error) {
 		laneIdx[nf.Lanes[i].ID] = i
 	}
 	viaState := map[string]string{} // our internal lane id → connection state (M/m/s/w/...)
-	viaTL := map[string]bool{}      // our internal lane id → signal-controlled
+	viaTL := map[string]string{}    // our internal lane id → tlLogic program id (signal-controlled)
+	viaLink := map[string]int{}     // our internal lane id → linkIndex into the program's state strings
 	type succCand struct {
 		to   string
 		rank int
@@ -257,11 +279,6 @@ func Convert(data []byte, opts Options) (*engine.NetFile, *Report, error) {
 				fmt.Sprintf("%s_%d→%s_%d (endpoint lane skipped)", c.From, c.FromLane, c.To, c.ToLane))
 			continue
 		}
-		if c.TL != "" {
-			// Signal binding noted on the junction, not per connection.
-			rep.DroppedConnections = append(rep.DroppedConnections,
-				fmt.Sprintf("%s→%s signal binding tl=%s (signals unmodeled in v1)", fromLane, toLane, c.TL))
-		}
 		if c.Via == "" {
 			addSucc(fromLane, toLane, dirRank(c.Dir))
 			rep.Connections++
@@ -275,7 +292,8 @@ func Convert(data []byte, opts Options) (*engine.NetFile, *Report, error) {
 		}
 		viaState[via] = c.State
 		if c.TL != "" {
-			viaTL[via] = true
+			viaTL[via] = c.TL
+			viaLink[via] = c.LinkIndex
 		}
 		addSucc(fromLane, via, dirRank(c.Dir))
 		addSucc(via, toLane, 0) // internal lanes have exactly one continuation
@@ -307,14 +325,12 @@ func Convert(data []byte, opts Options) (*engine.NetFile, *Report, error) {
 		}
 	}
 
-	// Junctions: signalized ones are PRESENT but unmodeled — the report is
-	// where a reviewer learns the traversal is connection-following only.
+	// Junctions: signalized ones get fixed-time programs below when the
+	// .net.xml carries a usable (static) tlLogic; the rest stay unmodeled
+	// and are listed in the report.
 	jtype := map[string]string{}
 	for _, j := range xn.Junctions {
 		jtype[j.ID] = j.Type
-		if strings.Contains(j.Type, "traffic_light") {
-			rep.SignalizedJunctions = append(rep.SignalizedJunctions, j.ID)
-		}
 	}
 
 	// Right-of-way pass (ADR-0010): annotate each internal lane with its
@@ -323,7 +339,8 @@ func Convert(data []byte, opts Options) (*engine.NetFile, *Report, error) {
 	// (shape polylines properly intersect) or merge (share the successor
 	// lane; the junction-exit funnels where overlaps were observed). Merge
 	// takes precedence when both hold. Signal-controlled and state-less
-	// approaches stay unmodeled (row omitted → free traversal).
+	// approaches carry no row class: their entry is governed by the light
+	// (ADR-0011), with the off/blinking fallback to free traversal.
 	byJunction := map[string][]int{} // junction id → internal lane positions, file order
 	for i := range nf.Lanes {
 		nl := &nf.Lanes[i]
@@ -332,7 +349,7 @@ func Convert(data []byte, opts Options) (*engine.NetFile, *Report, error) {
 		}
 		jid := laneJunction[nl.ID]
 		nl.Junction = jid
-		nl.Row = rowClass(viaState[nl.ID], jtype[jid], viaTL[nl.ID])
+		nl.Row = rowClass(viaState[nl.ID], jtype[jid], viaTL[nl.ID] != "")
 		switch nl.Row {
 		case "minor":
 			rep.YieldApproaches++
@@ -360,12 +377,99 @@ func Convert(data []byte, opts Options) (*engine.NetFile, *Report, error) {
 			}
 		}
 	}
+	// Signal pass (ADR-0011): compile static tlLogic elements into
+	// fixed-time programs and bind each tl-referencing internal lane to its
+	// (program, linkIndex). Only programs with at least one bound lane are
+	// emitted. Non-static programs, missing tlLogic elements, and
+	// out-of-range link indices leave the approach unsignalized (the
+	// pre-signal semantics) and are reported.
+	tllByID := map[string]*xmlTLL{}
+	for i := range xn.TLLogics {
+		tllByID[xn.TLLogics[i].ID] = &xn.TLLogics[i]
+	}
+	usable := map[string]bool{} // program id → static with phases
+	for i := range xn.TLLogics {
+		tll := &xn.TLLogics[i]
+		switch {
+		case tll.Type != "static":
+			rep.Warnings = append(rep.Warnings,
+				fmt.Sprintf("tlLogic %s: type %q unsupported (fixed-time static only); approaches stay unsignalized", tll.ID, tll.Type))
+		case len(tll.Phases) == 0:
+			rep.Warnings = append(rep.Warnings,
+				fmt.Sprintf("tlLogic %s: no phases; approaches stay unsignalized", tll.ID))
+		default:
+			usable[tll.ID] = true
+		}
+	}
+	usedPrograms := map[string]bool{}    // program id → at least one bound lane
+	servedJunctions := map[string]bool{} // junctions with ≥1 bound lane
+	missingTLL := map[string]bool{}      // tl ids referenced but not defined (warn once)
+	for i := range nf.Lanes {
+		nl := &nf.Lanes[i]
+		if !nl.Internal {
+			continue
+		}
+		tl, bound := viaTL[nl.ID]
+		if !bound {
+			continue
+		}
+		tll, defined := tllByID[tl]
+		if !defined {
+			if !missingTLL[tl] {
+				missingTLL[tl] = true
+				rep.Warnings = append(rep.Warnings,
+					fmt.Sprintf("connections reference tlLogic %s but none is defined; approaches stay unsignalized", tl))
+			}
+			continue
+		}
+		if !usable[tl] {
+			continue // warned above
+		}
+		link := viaLink[nl.ID]
+		if link < 0 || link >= len(tll.Phases[0].State) {
+			rep.Warnings = append(rep.Warnings,
+				fmt.Sprintf("lane %s: linkIndex %d out of range for tlLogic %s (%d links); approach stays unsignalized",
+					nl.ID, link, tl, len(tll.Phases[0].State)))
+			continue
+		}
+		nl.TL = tl
+		nl.TLLink = new(int)
+		*nl.TLLink = link
+		usedPrograms[tl] = true
+		servedJunctions[nl.Junction] = true
+		rep.SignalLinks++
+	}
+	for i := range xn.TLLogics {
+		tll := &xn.TLLogics[i]
+		if !usedPrograms[tll.ID] {
+			continue
+		}
+		phases := make([]engine.NetSignalPhase, len(tll.Phases))
+		for j, ph := range tll.Phases {
+			phases[j] = engine.NetSignalPhase{Duration: ph.Duration, State: ph.State}
+		}
+		nf.Signals = append(nf.Signals, engine.NetSignal{
+			ID:       tll.ID,
+			Junction: tll.ID, // SUMO names a single-junction program after its junction
+			Offset:   tll.Offset,
+			Phases:   phases,
+		})
+		rep.SignalPrograms++
+	}
+
+	// Signalized junctions WITHOUT a usable program stay unmodeled — the
+	// report is where a reviewer learns their traversal is unmodeled.
+	for _, j := range xn.Junctions {
+		if strings.Contains(j.Type, "traffic_light") && !servedJunctions[j.ID] {
+			rep.SignalizedJunctions = append(rep.SignalizedJunctions, j.ID)
+		}
+	}
 	if len(rep.SkippedEdges) > 0 {
 		rep.Warnings = append(rep.Warnings, "non-motor edges skipped: "+strings.Join(rep.SkippedEdges, ", "))
 	}
 	if len(rep.SignalizedJunctions) > 0 {
 		rep.Warnings = append(rep.Warnings,
-			fmt.Sprintf("%d signalized junction(s) traversed WITHOUT right-of-way (connection-following only): %s",
+			fmt.Sprintf("%d signalized junction(s) WITHOUT a usable fixed-time program — traversed unmodeled (free traversal): %s",
 				len(rep.SignalizedJunctions), strings.Join(rep.SignalizedJunctions, ", ")))
 	}
 	return nf, rep, nil

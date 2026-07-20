@@ -7,8 +7,10 @@
   format — when the authoring ⇄ compiled duality of arch-road-graph-model #5
   lands, v1 networks migrate into the scenario's network part. It is
   lane-centric; junction right-of-way rides as an **optional v1 extension**
-  on internal lanes (ADR-0010): files without it load with junctions
-  unmodeled (free traversal), byte-for-byte compatible.
+  on internal lanes (ADR-0010) and fixed-time signal programs as a second
+  **optional v1 extension** (ADR-0011): files without them load with
+  junctions unmodeled (free traversal) and unsignalized, byte-for-byte
+  compatible.
 - **Licensing:** networks converted from OSM-derived `.net.xml` are ODbL
   Derivative Databases (ADR-0009 §5). The repo distributes the *recipe*
   (below), not the files; `data/` is git-ignored.
@@ -86,7 +88,7 @@ traversal semantics.
 | field | semantics |
 |---|---|
 | `junction` | Junction id the internal lane belongs to (from the internal edge id `:<junction>_<n>`). Groups the conflict sets. |
-| `row` | Approach class of the connection this lane serves: `"major"` (SUMO state `M` — right of way), `"minor"` (`m`, and `=` mapped conservatively), `"stop"` (`s`, and allway-stop `w` mapped to a plain stop). Omitted for signal-controlled (`tl` binding) or state-less approaches: signals stay unmodeled. |
+| `row` | Approach class of the connection this lane serves: `"major"` (SUMO state `M` — right of way), `"minor"` (`m`, and `=` mapped conservatively), `"stop"` (`s`, and allway-stop `w` mapped to a plain stop). Omitted for signal-controlled (`tl` binding) or state-less approaches: signal-governed lanes bind a program instead (below). |
 | `foesCross` | Internal lane IDs of the same junction whose paths **cross** this one (shape polylines properly intersect — shared endpoints don't count). |
 | `foesMerge` | Internal lane IDs of the same junction **merging into the same exit lane** (shared successor; the junction-exit funnels). Merge takes precedence over crossing when both hold. |
 
@@ -95,6 +97,50 @@ by lane index. The kernel semantics — when each class must hold at the
 stop line — are defined in ADR-0010 and implemented in
 `engine/rightofway.go`; the import report counts `yieldApproaches`,
 `stopApproaches`, and `conflictPairs`.
+
+### Fixed-time signal extension (optional, ADR-0011)
+
+A signalized junction is described by a top-level `signals` list plus a
+binding on each signal-controlled internal lane. **Absence of both means
+every junction is unsignalized and behaves exactly as before** — files
+written before the extension load unchanged.
+
+```json
+"signals": [
+  {
+    "id": "5464972060",
+    "junction": "5464972060",
+    "offset": 0,
+    "phases": [
+      { "duration": 82, "state": "GGG" },
+      { "duration": 3,  "state": "yyy" },
+      { "duration": 5,  "state": "rrr" }
+    ]
+  }
+]
+```
+
+| field | semantics |
+|---|---|
+| `signals[].id` | Program id, unique per file (the SUMO tlLogic id; for single-junction programs this is the junction id). |
+| `signals[].junction` | Junction the program serves (informational grouping; enforcement binds per lane). |
+| `signals[].offset` | s, default 0. SUMO semantics: phase 0 begins at this sim time; earlier times wrap into the previous cycle. |
+| `signals[].phases` | ≥ 1, cycled in order. `duration` s > 0 (rounded onto the tick grid at engine build; a phase rounding to 0 ticks is a load error). `state` is one char per signal link — the SUMO tlLogic alphabet; all phases of a program share the string length. |
+| `tl` (internal lane) | Program id from `signals` controlling this lane's approach. |
+| `tlLink` (internal lane) | Link index into the program's state strings. `tl` and `tlLink` appear together or not at all; internal lanes only. |
+
+State-char mapping (conservative): `g`/`G` go, `y` amber, `r` red.
+Everything else (`o`/`O` off/blinking, `u` red-yellow, unknown chars, a
+missing link char) means the signal exerts **no control** and the approach
+falls back to its ADR-0010 priority behavior (`row` class; tl-bound
+approaches carry none, so `RowNone` = free traversal). The kernel
+semantics — red holds at the stop line, amber holds only if the vehicle
+can stop comfortably, green flows but the box checks still gate — are
+defined in ADR-0011 and implemented in `engine/signal.go`; the phase in
+force derives deterministically from the tick count, so keyframe save/load
+preserves the lights with no extra state. The import report counts
+`signalPrograms` and `signalLinks`; signalized junctions without a usable
+program remain on `signalizedJunctions` (unmodeled).
 
 End-of-lane contract (loader-enforced, fail-loud): exactly one of
 successors / `exit` / `endWall` per lane; no `exit`+`endWall`; no
@@ -164,16 +210,18 @@ NC=tools/sumo-venv/lib/python3.12/site-packages/sumo/bin/netconvert
 Reference import: `data/networks/i280-woodside/` (I-280 @ Woodside Rd,
 bbox `37.42,-122.30,37.45,-122.25`, OSM base 2026-07-18): 187 lanes + 188
 internal lanes, 375 connections, 15 origins, 24 exits, 12.4 lane-km, 18
-yield approaches, 33 conflict pairs, 2 signalized junctions (unmodeled, see
-below). Files kept: `i280.osm` (pinned extract), `i280.net.xml`, `i280.json`,
-`import-report.json` (all < 2 MB; `data/` is git-ignored — the recipe above
-regenerates everything).
+yield approaches, 33 conflict pairs, 2 signalized junctions with compiled
+fixed-time programs (6 signal links). Files kept: `i280.osm` (pinned
+extract), `i280.net.xml`, `i280.json`, `import-report.json` (all < 2 MB;
+`data/` is git-ignored — the recipe above regenerates everything).
 
 ## Limitations (explicit NON-goals for v1)
 
-- **Signals unmodeled.** Signalized junctions are traversed freely (their
-  internal lanes carry no `row`), exactly as before; `netimport` lists them
-  in the import report (`signalizedJunctions`).
+- **Fixed-time signals only.** Static tlLogic programs compile into the
+  signal extension (ADR-0011); non-static programs (actuated, NEMA) are
+  reported and their approaches stay unsignalized (free traversal).
+  Signal command subjects, actuated/adaptive control, and light rendering
+  are follow-ups (see ADR-0011's non-goals).
 - **Priority right-of-way is a guardrail, not a gospel** (ADR-0010): the
   kernel enforces hold-at-the-line for minor/stop approaches, box-occupancy,
   and box-exit room — it does not model SUMO's exact gap-acceptance, the
@@ -207,4 +255,7 @@ self successors; successors on `exit`/`endWall` lanes; dangling lanes (no
 successors and neither flag); `exit`+`endWall`; duplicate `edgeIndex`
 within an edge; lateral neighbors of unequal length; unknown `row` values;
 right-of-way fields on non-internal lanes; unknown or non-internal foe
-references.
+references; duplicate or malformed signal programs (no phases, non-positive
+durations, ragged state strings); `tl`/`tlLink` on non-internal lanes, not
+appearing together, referencing an unknown program, out of link range, or
+present without any `signals` list.

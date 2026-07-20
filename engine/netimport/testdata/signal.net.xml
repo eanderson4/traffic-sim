@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- Hand-authored fixture for the netimport signal tests (ADR-0011): a
+     two-lane arterial E0 feeding a signalized junction J1 with a STATIC
+     tlLogic (fixed-time program compiled), then a second signalized
+     junction J2 whose tlLogic is ACTUATED (unsupported → reported, its
+     approaches stay unsignalized). Shapes are metric (fake UTM frame).
+     NOT produced by netconvert — it only covers what the converter reads. -->
+<net version="1.16" junctionCornerDetail="5" limit="400" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/net_file.xsd">
+
+    <location netOffset="-100.00,-50.00" convBoundary="0.00,0.00,550.00,25.00" origBoundary="-122.001,37.000,-121.998,37.002" projParameter="+proj=utm +zone=10 +ellps=WGS84 +datum=WGS84 +units=m +no_defs"/>
+
+    <edge id="E0" from="J0" to="J1" priority="3">
+        <lane id="E0_0" index="0" speed="13.89" length="197.00" width="3.50" shape="0.00,3.25 197.00,3.25"/>
+        <lane id="E0_1" index="1" speed="13.89" length="197.00" width="3.50" shape="0.00,6.75 197.00,6.75"/>
+    </edge>
+    <edge id="E1" from="J1" to="J2" priority="3">
+        <lane id="E1_0" index="0" speed="13.89" length="297.00" width="3.50" shape="203.00,3.25 500.00,3.25"/>
+        <lane id="E1_1" index="1" speed="13.89" length="297.00" width="3.50" shape="203.00,6.75 500.00,6.75"/>
+    </edge>
+    <edge id="E2" from="J2" to="J3" priority="3">
+        <lane id="E2_0" index="0" speed="13.89" length="47.00" width="3.50" shape="503.00,3.25 550.00,3.25"/>
+        <lane id="E2_1" index="1" speed="13.89" length="47.00" width="3.50" shape="503.00,6.75 550.00,6.75"/>
+    </edge>
+
+    <junction id="J0" type="dead_end" x="0.00" y="5.00" incLanes="" intLanes="" shape=""/>
+    <junction id="J1" type="traffic_light" x="200.00" y="5.00" incLanes="E0_0 E0_1" intLanes=":J1_0_0 :J1_1_0" shape="197.00,1.50 203.00,1.50 203.00,8.50 197.00,8.50"/>
+    <junction id="J2" type="traffic_light" x="500.00" y="5.00" incLanes="E1_0 E1_1" intLanes=":J2_0_0 :J2_1_0" shape="500.00,1.50 503.00,1.50 503.00,8.50 500.00,8.50"/>
+    <junction id="J3" type="dead_end" x="550.00" y="5.00" incLanes="E2_0 E2_1" intLanes="" shape=""/>
+
+    <edge id=":J1_0" function="internal">
+        <lane id=":J1_0_0" index="0" speed="13.89" length="6.00" width="3.50" shape="197.00,3.25 203.00,3.25"/>
+    </edge>
+    <edge id=":J1_1" function="internal">
+        <lane id=":J1_1_0" index="0" speed="13.89" length="6.00" width="3.50" shape="197.00,6.75 203.00,6.75"/>
+    </edge>
+    <edge id=":J2_0" function="internal">
+        <lane id=":J2_0_0" index="0" speed="13.89" length="3.00" width="3.50" shape="500.00,3.25 503.00,3.25"/>
+    </edge>
+    <edge id=":J2_1" function="internal">
+        <lane id=":J2_1_0" index="0" speed="13.89" length="3.00" width="3.50" shape="500.00,6.75 503.00,6.75"/>
+    </edge>
+
+    <tlLogic id="J1" type="static" programID="0" offset="5">
+        <phase duration="40" state="GG"/>
+        <phase duration="4"  state="yy"/>
+        <phase duration="6"  state="rr"/>
+    </tlLogic>
+    <tlLogic id="J2" type="actuated" programID="0" offset="0">
+        <phase duration="30" state="G" minDur="10" maxDur="50"/>
+    </tlLogic>
+
+    <connection from="E0" to="E1" fromLane="0" toLane="0" via=":J1_0_0" tl="J1" linkIndex="0" dir="s" state="O"/>
+    <connection from="E0" to="E1" fromLane="1" toLane="1" via=":J1_1_0" tl="J1" linkIndex="1" dir="s" state="O"/>
+    <connection from="E1" to="E2" fromLane="0" toLane="0" via=":J2_0_0" tl="J2" linkIndex="0" dir="s" state="O"/>
+    <connection from="E1" to="E2" fromLane="1" toLane="1" via=":J2_1_0" tl="J2" linkIndex="0" dir="s" state="O"/>
+
+</net>

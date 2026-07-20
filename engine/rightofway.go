@@ -27,10 +27,12 @@ import "fmt"
 //	       acts as minor.
 //
 // Mutual holds (both vehicles stopped at their lines) resolve by priority
-// class, ties by lower vehicle ID — deterministic, no RNG. Signals stay
-// UNMODELED: traffic_light approaches compile to RowNone and traverse
-// freely, exactly as before. Determinism: the gate iterates only slices in
-// fixed order, reads no wall clock, draws no randomness.
+// class, ties by lower vehicle ID — deterministic, no RNG. Signalized
+// approaches (internal lanes carrying a Signal program) are gated by the
+// light instead (ADR-0011, engine/signal.go), composing with this same
+// gate; an off/blinking light falls back to the priority model here.
+// Determinism: the gate iterates only slices in fixed order, reads no wall
+// clock, draws no randomness.
 
 // RowState is the right-of-way class of a junction approach (the SUMO
 // connection state of the internal lane serving it).
@@ -64,14 +66,24 @@ func ParseRowState(s string) (RowState, error) {
 // returned accel is the virtual stop-line wall (IDM toward a standing
 // vehicle at the lane end), applied by the caller as a cap on v.Acc.
 // Approaching an unmodeled junction (RowNone) or a non-internal successor
-// is never gated.
+// is never gated. Signal-controlled approaches (next.Signal) are gated by
+// the light first (ADR-0011); an off/blinking light exerts no control and
+// falls through to the priority model below.
 func (e *Engine) rowGate(v *Vehicle) (float64, bool) {
 	lane := v.Lane
 	if lane == nil || lane.Internal || len(lane.Successors) == 0 {
 		return 0, false
 	}
 	next := pickSuccessor(lane, v.HeldTurn)
-	if !next.Internal || next.Row == RowNone {
+	if !next.Internal {
+		return 0, false
+	}
+	if next.Signal != nil {
+		if w, gated := e.sigGate(v, next); gated {
+			return w, true
+		}
+	}
+	if next.Row == RowNone {
 		return 0, false
 	}
 	hold := true
@@ -96,6 +108,32 @@ func (e *Engine) rowGate(v *Vehicle) (float64, bool) {
 // conflict: a foe vehicle is inside the box, the exit lane has no room for
 // v to clear the box, or an approaching foe is committed to entering.
 func (e *Engine) rowConflict(v *Vehicle, next *Lane) bool {
+	if e.boxBlocked(v, next) {
+		return true
+	}
+	// Approaching foes: minor approaches check every conflict; major
+	// approaches check only same-exit (merge) foes — crossing foes of a
+	// major approach are minor themselves and do the yielding.
+	minor := next.Row != RowMajor
+	for _, f := range next.FoesCross {
+		if minor && foeApproachBlocks(v, f, minor) {
+			return true
+		}
+	}
+	for _, f := range next.FoesMerge {
+		if foeApproachBlocks(v, f, minor) {
+			return true
+		}
+	}
+	return false
+}
+
+// boxBlocked reports whether entering the internal lane next is physically
+// unsafe regardless of right-of-way: a conflicting vehicle is inside the
+// box, or the box exit has no room for v. Shared by the priority model
+// (ADR-0010) and the signal guardrail (ADR-0011 — green never means enter
+// a box you cannot exit).
+func (e *Engine) boxBlocked(v *Vehicle, next *Lane) bool {
 	// Box occupancy: never enter against conflicting traffic already inside
 	// (any class — a vehicle physically in the conflict zone owns it).
 	for _, f := range next.FoesCross {
@@ -121,20 +159,6 @@ func (e *Engine) rowConflict(v *Vehicle, next *Lane) bool {
 			free = first.S - first.Type.Length
 		}
 		if free < v.Type.Length+v.Type.S0 {
-			return true
-		}
-	}
-	// Approaching foes: minor approaches check every conflict; major
-	// approaches check only same-exit (merge) foes — crossing foes of a
-	// major approach are minor themselves and do the yielding.
-	minor := next.Row != RowMajor
-	for _, f := range next.FoesCross {
-		if minor && foeApproachBlocks(v, f, minor) {
-			return true
-		}
-	}
-	for _, f := range next.FoesMerge {
-		if foeApproachBlocks(v, f, minor) {
 			return true
 		}
 	}

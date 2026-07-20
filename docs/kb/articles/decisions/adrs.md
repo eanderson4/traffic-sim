@@ -1,6 +1,6 @@
 # Architecture Decision Records
 
-> Index of all nine accepted ADRs with one-line rationales — the decided skeleton of the system; research that feeds each ADR is linked for the full argument.
+> Index of the accepted ADRs with one-line rationales — the decided skeleton of the system; research that feeds each ADR is linked for the full argument.
 
 ## How to Read
 
@@ -25,6 +25,7 @@ closed (2026-07-15..17).
 | [ADR-0008](../../decisions/ADR-0008-controller-contract.md) | Controller contract: one 4-axis Intent with per-axis persistence; grants-based roles (driver / default-driver / director / signal); exclusive claims; zero driving logic in the engine | TraCI's blocking barrier and CARLA's sticky commands are the measured failure modes; failover is operational (external default-driver fleet + pause), never a hidden in-engine model | [Vehicle & Controller Interface](../concepts/vehicle-controller-interface.md), [State Authority](../architecture/state-authority.md), [Signal Control](../business-domains/signal-control.md) |
 | [ADR-0009](../../decisions/ADR-0009-osm-import-strategy.md) | netconvert bootstrap + own Go importer with netconvert as permanent diff-test oracle; two-tier identity with `guessed` flags; ODbL recipe-not-file; delta-patch variants | Only three codebases do full OSM→lane-graph compilation and none is Go or reusable; lane tagging is too sparse (~0.7% `turn:lanes`) to be a foundation, so the oracle guards a 20-year re-implementation gap | [OSM Extraction](../integrations/osm-extraction.md) |
 | [ADR-0010](../../decisions/ADR-0010-junction-right-of-way.md) | Priority-junction right-of-way: netimport compiles approach classes (major/minor/stop) and conflict foes (merge/crossing) from connection states + internal-lane geometry; the kernel enforces a stop-line guardrail in the shared accel path; signals stay unmodeled | Junction traversal was connection-following only and simultaneous arrivals overlapped at exit funnels (160+ collision observations on I-280 at corridor demand); enforcement belongs in the kernel so every controller inherits it | M7 implementation (engine/rightofway.go, netimport), [Road Graph Model](../architecture/road-graph-model.md) |
+| [ADR-0011](../../decisions/ADR-0011-fixed-time-signals.md) | Fixed-time signal control: netimport compiles static tlLogic into data-driven programs (phases + per-link states); the light derives purely from the tick count; enforcement composes with the ADR-0010 stop-line guardrail (red holds, amber stops-if-able, green flows but box-checked); external command interface deferred | Signalized junctions were the last free-traversal gap; the phase representation must let external algorithms (ADR-0008 §5 cabinet vocabulary) command it later, so the program is data and the gate reads only `(program, link, tick)` | M8 implementation (engine/signal.go, netimport), [Signal Control](../business-domains/signal-control.md) |
 
 ## Research Complete, ADR Pending
 
@@ -50,4 +51,4 @@ These areas have finished research (the gate) but no drafted ADR yet — see
   [VISION.md](../../../VISION.md).
 
 ---
-*Derived from: [decisions/](../../decisions/) ADR-0001..0010 and the raw research syntheses linked above*
+*Derived from: [decisions/](../../decisions/) ADR-0001..0011 and the raw research syntheses linked above*

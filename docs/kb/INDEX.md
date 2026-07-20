@@ -21,7 +21,7 @@ back to it.
 
 - [Summary](articles/summary.md) — project overview, architecture at a glance, reading paths
 - [Cross-Topic Concerns](articles/cross-topic-concerns.md) — invariants, conventions, and gotchas spanning all topics
-- [ADR Index](articles/decisions/adrs.md) — all nine decisions with one-line rationales
+- [ADR Index](articles/decisions/adrs.md) — all accepted decisions with one-line rationales
 - [Gaps & Roadmap](articles/gaps-and-roadmap.md) — benchmark queue, prototype experiments, open questions
 
 ## Articles
@@ -49,7 +49,7 @@ back to it.
 - [MapLibre Realtime Viz](articles/integrations/maplibre-realtime.md) — three rate-split channels into MapLibre, binary SoA wire frames, measured deck.gl escalation ladder (ADR-0003)
 
 ### Decisions
-- [ADR Index](articles/decisions/adrs.md) — ADR-0001..0010 table with rationales, research basis, and pending-ADR queue
+- [ADR Index](articles/decisions/adrs.md) — ADR-0001..0011 table with rationales, research basis, and pending-ADR queue
 
 ## Raw Research
 
@@ -92,6 +92,7 @@ links its source synthesis for traceability.
 - [x] [ADR-0008](decisions/ADR-0008-controller-contract.md) — 4-axis intents with per-axis persistence; grants-based roles (driver / default-driver / director / signal); exclusive claims; zero driving logic in engine, fleet failover + pause
 - [x] [ADR-0009](decisions/ADR-0009-osm-import-strategy.md) — netconvert bootstrap + Go importer with permanent diff-test oracle; two-tier identity with guessed flags; ODbL recipe-not-file; delta-patch variants
 - [x] [ADR-0010](decisions/ADR-0010-junction-right-of-way.md) — priority-junction right-of-way: compiled approach classes + conflict foes, kernel stop-line guardrail shared by all controllers; signals still unmodeled
+- [x] [ADR-0011](decisions/ADR-0011-fixed-time-signals.md) — fixed-time signal control: kernel-run programs compiled from tlLogic, phase state as a pure function of the tick count, enforcement composed with the stop-line guardrail; external command interface deferred
 
 ---
 *Last distilled: 2026-07-17 | 18 articles from 56 raw research files*

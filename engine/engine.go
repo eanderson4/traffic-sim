@@ -87,6 +87,11 @@ func NewEngine(spec RunSpec) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Fixed-time signal programs (ADR-0011): durations ride in seconds in
+	// the file; the tick grid is known only here. No-op without programs.
+	if err := net.compileSignalTicks(spec.Params.Dt); err != nil {
+		return nil, err
+	}
 	e := &Engine{
 		Params: spec.Params,
 		Seed:   spec.Seed,

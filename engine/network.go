@@ -27,12 +27,19 @@ type Lane struct {
 	// priority class of the approach whose connection it serves; FoesCross
 	// and FoesMerge are the conflicting interior lanes of the same junction
 	// (crossing paths vs. paths merging into the same exit). All empty on
-	// the in-code M1–M3 networks and on unmodeled (signalized) junctions.
+	// the in-code M1–M3 networks and on unmodeled junctions.
 	Internal  bool
 	Junction  string
 	Row       RowState
 	FoesCross []*Lane
 	FoesMerge []*Lane
+
+	// Fixed-time signal control (ADR-0011, compiled networks only): the
+	// program of the junction this internal lane serves and the lane's link
+	// index into its phase state strings. Nil on approach lanes, in-code
+	// networks, and unsignalized junctions.
+	Signal  *SignalProgram
+	LinkIdx int
 
 	// Geometry (compiled networks): per-lane centerline polyline in the
 	// local metric frame plus a constant lateral offset (left-positive).
@@ -49,6 +56,9 @@ type Lane struct {
 type Network struct {
 	Lanes   []*Lane
 	Origins []*Lane
+	// Signals holds the fixed-time signal programs (ADR-0011) in file
+	// order; nil on networks without signalized junctions.
+	Signals []*SignalProgram
 	byID    map[string]*Lane
 }
 

@@ -15,6 +15,10 @@ import (
 // Junction right-of-way is an optional v1 extension (ADR-0010): internal
 // lanes may carry their junction, approach class, and conflict foes; files
 // without them load with junctions unmodeled (free traversal), unchanged.
+// Fixed-time signal programs are a second optional v1 extension
+// (ADR-0011): a top-level "signals" list plus per-internal-lane tl/tlLink
+// bindings; files without them load with all junctions unsignalized,
+// unchanged.
 
 // NetFile is the top-level document. Version gates the loader; Provenance
 // records where the network came from (recipe, not just data — ADR-0009 §5).
@@ -23,6 +27,7 @@ type NetFile struct {
 	Name       string         `json:"name,omitempty"`
 	Provenance *NetProvenance `json:"provenance,omitempty"`
 	Lanes      []NetLane      `json:"lanes"`
+	Signals    []NetSignal    `json:"signals,omitempty"` // fixed-time signal programs (ADR-0011)
 }
 
 // NetProvenance is the network-level import recipe and source geometry frame.
@@ -64,6 +69,32 @@ type NetLane struct {
 	Row       string   `json:"row,omitempty"`       // approach class: "major"|"minor"|"stop"
 	FoesCross []string `json:"foesCross,omitempty"` // conflicting internal lanes (crossing paths)
 	FoesMerge []string `json:"foesMerge,omitempty"` // conflicting internal lanes (same exit lane)
+
+	// Fixed-time signal binding (ADR-0011, optional v1 extension): TL names
+	// the program in NetFile.Signals, TLLink is this lane's index into its
+	// phase state strings. Both or neither; internal lanes only. Absent
+	// means the approach is unsignalized (pre-extension semantics).
+	TL     string `json:"tl,omitempty"`
+	TLLink *int   `json:"tlLink,omitempty"`
+}
+
+// NetSignal is one fixed-time signal program (ADR-0011): the junction's
+// phase list in practitioner form (durations in seconds, per-link state
+// strings in the SUMO tlLogic alphabet: g/G go, y amber, r red, o/O/u
+// off/blinking). The kernel compiles durations onto the tick grid at engine
+// build and derives the phase in force from the tick count.
+type NetSignal struct {
+	ID       string           `json:"id"`               // program id (the tlLogic id); unique per file
+	Junction string           `json:"junction"`         // junction it serves
+	Offset   float64          `json:"offset,omitempty"` // s; phase 0 begins at this sim time
+	Phases   []NetSignalPhase `json:"phases"`           // in cycle order; ≥ 1
+}
+
+// NetSignalPhase is one phase: a duration (s, > 0) and the per-link state
+// string. All phases of a program share the state-string length.
+type NetSignalPhase struct {
+	Duration float64 `json:"duration"` // s
+	State    string  `json:"state"`    // per-link states, one char per link
 }
 
 // LaneSource is the per-lane provenance: where this lane came from and what
@@ -205,6 +236,57 @@ func CompileNet(nf *NetFile) (*Network, error) {
 				return nil, fmt.Errorf("lane %s: foesMerge lane %q is not internal", nl.ID, fid)
 			}
 			l.FoesMerge = append(l.FoesMerge, foe)
+		}
+	}
+
+	// Fixed-time signal programs (ADR-0011): build the runtime programs,
+	// then bind internal lanes to (program, link index). Files predating
+	// the extension carry no "signals" and no tl fields — every lane keeps
+	// a nil Signal and junctions behave exactly as before.
+	if len(nf.Signals) > 0 {
+		programs := make(map[string]*SignalProgram, len(nf.Signals))
+		for i := range nf.Signals {
+			ns := &nf.Signals[i]
+			if _, dup := programs[ns.ID]; dup {
+				return nil, fmt.Errorf("signal program %s: duplicate id", ns.ID)
+			}
+			phases := make([]SignalPhase, len(ns.Phases))
+			for j, ph := range ns.Phases {
+				phases[j] = SignalPhase{Duration: ph.Duration, State: ph.State}
+			}
+			p, err := newSignalProgram(ns.ID, ns.Junction, ns.Offset, phases)
+			if err != nil {
+				return nil, err
+			}
+			programs[p.ID] = p
+			n.Signals = append(n.Signals, p)
+		}
+		for i := range nf.Lanes {
+			nl := &nf.Lanes[i]
+			l := n.Lanes[i]
+			if nl.TL == "" && nl.TLLink == nil {
+				continue
+			}
+			if !nl.Internal {
+				return nil, fmt.Errorf("lane %s: signal binding (tl/tlLink) on a non-internal lane", nl.ID)
+			}
+			if nl.TL == "" || nl.TLLink == nil {
+				return nil, fmt.Errorf("lane %s: tl and tlLink must appear together", nl.ID)
+			}
+			p, ok := programs[nl.TL]
+			if !ok {
+				return nil, fmt.Errorf("lane %s: unknown signal program %q", nl.ID, nl.TL)
+			}
+			if *nl.TLLink < 0 || *nl.TLLink >= len(p.Phases[0].State) {
+				return nil, fmt.Errorf("lane %s: tlLink %d out of range (program %s has %d links)", nl.ID, *nl.TLLink, nl.TL, len(p.Phases[0].State))
+			}
+			l.Signal, l.LinkIdx = p, *nl.TLLink
+		}
+	} else {
+		for i := range nf.Lanes {
+			if nf.Lanes[i].TL != "" || nf.Lanes[i].TLLink != nil {
+				return nil, fmt.Errorf("lane %s: signal binding (tl/tlLink) without any signals program", nf.Lanes[i].ID)
+			}
 		}
 	}
 

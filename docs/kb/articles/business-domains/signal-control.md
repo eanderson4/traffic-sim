@@ -95,7 +95,10 @@ gap-out, red revert (~2 s) layer on top. NTCIP 1202 defines all these timers **i
 seconds** — exactly the 100 ms tick, zero rounding loss.
 
 v1 scope (per the 2026-07-17 review): ship a **fixed-time + basic-actuated** controller
-client. Max-pressure is the first adaptive module — O(#movements) per decision, a pure
+client. Status 2026-07-19: fixed-time landed kernel-side as
+[ADR-0011](../../decisions/ADR-0011-fixed-time-signals.md) — programs are network data, the
+light derives from the tick count (item 4 below), and the enforcement seam waits for the
+external cabinet client; actuated remains follow-up. Max-pressure is the first adaptive module — O(#movements) per decision, a pure
 function of engine state (deterministic, replay-safe), provably throughput-stabilizing;
 InSync's state-machine success (900+ intersections across 18 US states by 2012) validates
 cycle-free adaptive control as operationally legitimate. Variable initial, gap reduction,
