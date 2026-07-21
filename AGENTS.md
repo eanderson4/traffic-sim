@@ -35,6 +35,17 @@ Rules for anyone (human or agent) working in this repo.
 - `/distill-kb` — synthesize raw research into `docs/kb/articles/`
 - `/update-kb` — freshness check; run when returning after a gap
 
+## Review Workflow
+
+- `/external-review <scope>` — multi-model external review (Claude Fable,
+  GPT-5.6-sol, Gemini) of a milestone or ADR. **Run it after every
+  ADR-implementing milestone, before anything durable binds the result**
+  (recordings, content hashes, published contract consumers). Findings are
+  triaged against the code (verify, don't trust), fixed with regression
+  tests, and archived in `docs/kb/raw/reviews/` with provenance in the ADR
+  addendum. First run: M11 (2026-07-21) — caught the seed-in-hash identity
+  bug and unexecuted demand parts before either could ship.
+
 ## Conventions
 
 - Go: standard library first; justify dependencies. `gofmt` + `go vet` clean.
