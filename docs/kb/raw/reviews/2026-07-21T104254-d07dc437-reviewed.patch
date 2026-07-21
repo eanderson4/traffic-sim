@@ -1,0 +1,325 @@
+diff --git a/.kimi-code/skills/external-review/SKILL.md b/.kimi-code/skills/external-review/SKILL.md
+index 0807093..0814015 100644
+--- a/.kimi-code/skills/external-review/SKILL.md
++++ b/.kimi-code/skills/external-review/SKILL.md
+@@ -7,6 +7,17 @@ whenToUse: After landing an ADR-implementing milestone, before any durable bindi
+ 
+ # External Review
+ 
++Two tiers (see AGENTS.md "Review Workflow"):
++
++- **Per-commit gate** — mechanical: `scripts/external-review.sh` runs Claude
++  Fable + GPT-5.6-sol over the staged diff and stamps it; the pre-commit
++  hook enforces. You don't need this skill for that — just run the script
++  before any code commit and triage what it prints.
++- **Milestone round** (this skill) — the deeper pass below: all three
++  models, a hand-written brief, ADR-level triage, archived round,
++  hardening commit. Run it after ADR-implementing milestones, before
++  durable bindings.
++
+ Get independent design+code review from the three external model CLIs, triage their findings against the actual code, fix what's real, and archive the round in the KB.
+ 
+ ## Scope
+diff --git a/AGENTS.md b/AGENTS.md
+index 97c380b..757660b 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -37,14 +37,23 @@ Rules for anyone (human or agent) working in this repo.
+ 
+ ## Review Workflow
+ 
+-- `/external-review <scope>` — multi-model external review (Claude Fable,
+-  GPT-5.6-sol, Gemini) of a milestone or ADR. **Run it after every
+-  ADR-implementing milestone, before anything durable binds the result**
+-  (recordings, content hashes, published contract consumers). Findings are
+-  triaged against the code (verify, don't trust), fixed with regression
+-  tests, and archived in `docs/kb/raw/reviews/` with provenance in the ADR
+-  addendum. First run: M11 (2026-07-21) — caught the seed-in-hash identity
+-  bug and unexecuted demand parts before either could ship.
++- **Every code commit is externally reviewed.** A pre-commit hook
++  (`hooks/`, enabled via `git config core.hooksPath hooks` — set once per
++  clone) blocks commits touching `engine/`, `viz/src`, `viz/test`,
++  `viz/scripts`, `contracts/`, `analysis/`, `scripts/`, `hooks/`, or
++  `.kimi-code/skills/` unless the exact staged diff was reviewed by Claude
++  Fable and GPT-5.6-sol. `scripts/external-review.sh` runs both over the
++  staged diff, archives the round to `docs/kb/raw/reviews/`, and stamps
++  the REVIEWED snapshot; staging anything afterwards fails the gate, so
++  review always covers what ships. The gate proves review *happened* —
++  triaging findings is the committer's job. Docs/KB-only commits pass
++  ungated. Escape hatch: `EXTERNAL_REVIEW_SKIP=1` (noisy on purpose).
++- `/external-review <scope>` — the deeper milestone round (all three
++  models incl. Gemini, richer brief, ADR-level design questions). Run it
++  after every ADR-implementing milestone, before anything durable binds
++  the result (recordings, content hashes, published contract consumers).
++  First run: M11 (2026-07-21) — caught the seed-in-hash identity bug and
++  unexecuted demand parts before either could ship.
+ 
+ ## Conventions
+ 
+diff --git a/docs/kb/decisions/ADR-0013-external-review-gate.md b/docs/kb/decisions/ADR-0013-external-review-gate.md
+new file mode 100644
+index 0000000..388e701
+--- /dev/null
++++ b/docs/kb/decisions/ADR-0013-external-review-gate.md
+@@ -0,0 +1,75 @@
++# ADR-0013: External multi-model review as a commit gate
++
++- **Status:** ACCEPTED (ratifies the M11 review round and the gate tooling
++  that grew out of it)
++- **Date:** 2026-07-21
++
++## Context
++
++M11 (scenario directories) was reviewed after implementation by three
++external models (Claude Fable, GPT-5.6-sol, Gemini — archived in
++`docs/kb/raw/reviews/`). The round caught two design-level defects before
++anything durable bound them — the seed-in-hash run-identity incoherence
++and validated-but-never-executed scenario demand — plus a dozen
++correctness bugs none of the authors' own tests had. The repo's own
++evidence is that external review catches what self-review misses,
++particularly around identity semantics and "tested but not wired" gaps.
++
++Making proprietary external CLIs a *mandatory* step for every code commit
++is itself a decision of consequence (AGENTS.md rule 3): it adds a cost, a
++network dependency, and a trust boundary. This ADR records it instead of
++letting it accrete in tooling.
++
++## Decision
++
++1. **Every commit touching code, contracts, or tooling is externally
++   reviewed before it lands.** A pre-commit hook (`hooks/pre-commit`,
++   enabled per clone via `git config core.hooksPath hooks`) blocks such
++   commits unless the staged index tree carries a review stamp.
++   `scripts/external-review.sh` produces the stamp: it runs **Claude
++   Fable** and **GPT-5.6-sol** over the staged diff, requires both to
++   complete, archives the reviews *and the reviewed patch* to
++   `docs/kb/raw/reviews/`, and stamps the tree hash captured before the
++   reviewers ran (staging anything afterwards fails the gate — review
++   always covers what ships). Docs/KB-only commits are ungated.
++2. **Two required reviewers, not consensus.** Two independent model
++   families (Anthropic, OpenAI) are the gate; Gemini joins milestone
++   rounds (`--gemini`) where the design surface is larger. The M11 round
++   showed the value is diversity — each model caught bugs the others
++   missed — not unanimity.
++3. **The gate proves review *happened*, not that it was *clean*.** The
++   stamp does not encode findings. Triage — verify every claim against
++   the code, fix with regression tests, document defensible-but-surprising
++   semantics in ADR addenda — remains the committer's job, per the
++   `/external-review` skill. This is the deliberate trust boundary: the
++   hook enforces process, judgment stays human/agent-side.
++4. **Failure policy is fail-closed with a loud escape hatch.** A reviewer
++   that fails, empties out, or misses its completion marker = no stamp =
++   no commit. CLI/network unavailability does not silently waive review;
++   `EXTERNAL_REVIEW_SKIP=1` bypasses, prints a warning, and is expected to
++   be rare and self-justifying in the commit message. Partial commits
++   (`git commit -- <paths>`, `-p`) always fail the gate; stage explicitly.
++5. **The mechanism reviews itself.** `hooks/` and `scripts/` are inside
++   the gated path set, so changes to the gate go through the gate. The
++   bootstrap commit used the documented skip exactly once.
++6. **Milestone rounds are the deeper tier.** After ADR-implementing
++   milestones — before durable bindings (recordings, content hashes,
++   published contract consumers) — the `/external-review` skill runs all
++   three models with a hand-written brief, and the round gets provenance
++   in the ADR addendum plus a KB freshness note.
++
++## Consequences
++
++- Every code commit costs two external review calls (minutes of wall
++  time, API quota). Accepted: the M11 round's catch rate justifies it,
++  and the reviews double as an audit archive in the KB.
++- The workflow depends on three proprietary CLIs being installed and
++  authenticated on the dev machine; a machine without them can only
++  commit via the skip hatch, which is visible in the terminal log.
++- Reviews are archived per commit in `docs/kb/raw/reviews/` (untracked at
++  review time; committed separately, docs-only, ungated). Repo growth is
++  bounded by review size; prune by policy later if it matters.
++- Revisit when: review latency measurably slows iteration (batching
++  policy), a reviewer CLI disappears (substitute a model family — keep
++  two families), or the gate starts rubber-stamping (strengthen the
++  completion marker into structured verdicts).
+diff --git a/hooks/pre-commit b/hooks/pre-commit
+new file mode 100755
+index 0000000..b00bd23
+--- /dev/null
++++ b/hooks/pre-commit
+@@ -0,0 +1,48 @@
++#!/bin/sh
++# External-review gate (AGENTS.md "Review Workflow", ADR-0013).
++#
++# Commits touching code, contracts, tooling, or the review mechanism
++# itself (engine/, viz/ minus generated content, contracts/, analysis/,
++# scripts/, hooks/, .kimi-code/skills/) require an external-review stamp
++# matching the EXACT staged tree — proof that what is about to be
++# committed is what Claude Fable and GPT-5.6-sol reviewed (Gemini joins
++# milestone rounds). Docs/KB-only commits pass.
++#
++# The stamp is the index tree hash written by
++# scripts/external-review.sh after both reviewers complete: byte-complete
++# (binaries, renames), immune to diff-config drift, and captured before
++# the reviews run, so anything staged afterwards fails the gate. The gate
++# proves review happened; triaging findings stays the committer's job.
++set -u
++gitdir=$(git rev-parse --git-dir) # per-worktree; .git may be a file
++
++gated=$(git -c core.quotePath=false diff --cached --name-only --no-renames --diff-filter=ACMRDT \
++  | grep -E '^(engine/|viz/|contracts/|analysis/|scripts/|hooks/|\.kimi-code/skills/)' \
++  | grep -vE '^viz/(dist|node_modules|public)/' || true)
++[ -z "$gated" ] && exit 0 # docs/KB-only (or generated-content-only) commit: no gate
++
++tree=$(git write-tree)
++stamp="$gitdir/external-review-stamp"
++if [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$tree" ]; then
++  exit 0
++fi
++
++if [ "${EXTERNAL_REVIEW_SKIP:-}" = "1" ]; then
++  echo "pre-commit: external-review gate SKIPPED (EXTERNAL_REVIEW_SKIP=1) — do not push this batch unreviewed" >&2
++  exit 0
++fi
++
++cat >&2 <<'EOF'
++pre-commit: staged changes touch code/contracts/tooling but have no
++matching external-review stamp. Run the gate:
++
++  scripts/external-review.sh            # Fable + Sol review the staged diff, then stamp it
++  scripts/external-review.sh --gemini   # milestone rounds: include Gemini
++
++Fix what they find, re-stage, re-run, then commit. The stamp covers the
++exact reviewed tree, so review must precede staging. (Partial commits —
++git commit -- <paths> / -p — use a temporary index and always fail this
++gate; stage explicitly instead.)
++Escape hatch (noisy on purpose): EXTERNAL_REVIEW_SKIP=1 git commit ...
++EOF
++exit 1
+diff --git a/scripts/external-review.sh b/scripts/external-review.sh
+new file mode 100755
+index 0000000..49b114e
+--- /dev/null
++++ b/scripts/external-review.sh
+@@ -0,0 +1,126 @@
++#!/bin/bash
++# external-review — the per-commit review gate (AGENTS.md "Review
++# Workflow", ADR-0013): run Claude Fable and GPT-5.6-sol over the STAGED
++# diff, archive their reviews AND the reviewed patch in
++# docs/kb/raw/reviews/, and stamp the staged tree so the pre-commit hook
++# lets exactly that content through.
++#
++# Usage:
++#   scripts/external-review.sh            # review the staged diff
++#   scripts/external-review.sh --gemini   # also run Gemini (milestone rounds)
++#
++# The stamp is the index tree hash captured BEFORE the reviewers run
++# (byte-complete — covers binaries, renames, everything — and immune to
++# diff-config drift): anything staged afterwards fails the gate. The gate
++# proves review HAPPENED; triaging findings stays the committer's job
++# (ADR-0013). Escape hatch: EXTERNAL_REVIEW_SKIP=1 git commit ...
++set -eu
++root=$(git rev-parse --show-toplevel)
++gitdir=$(git rev-parse --git-dir) # per-worktree; .git may be a file
++cd "$root"
++
++if git diff --cached --quiet; then
++  echo "external-review: nothing staged — stage the change under review first" >&2
++  exit 1
++fi
++if [ "$(git config core.hooksPath || true)" != "hooks" ]; then
++  echo "external-review: WARNING — core.hooksPath is not 'hooks' in this clone; the gate is not enforced here (git config core.hooksPath hooks)" >&2
++fi
++# Reviewers read the live tree for context while the patch is the authority;
++# warn when staged files also have unstaged edits (context != what ships).
++stale=$(comm -12 <(git -c core.quotePath=false diff --cached --name-only | sort) \
++                 <(git -c core.quotePath=false diff --name-only | sort) || true)
++if [ -n "$stale" ]; then
++  echo "external-review: WARNING — staged files with further unstaged edits (reviewers see the live file, the gate sees the staged one):" >&2
++  echo "$stale" | sed 's/^/  /' >&2
++fi
++
++with_gemini=0
++[ "${1:-}" = "--gemini" ] && with_gemini=1
++
++tree=$(git write-tree) # the staged content, captured before the reviews run
++ts=$(date +%Y-%m-%dT%H%M%S)
++work=$(mktemp -d /tmp/external-review-XXXXXX)
++keep=0 # failure: keep the workdir for debugging
++cleanup() { [ "$keep" = 0 ] && rm -rf "$work" || echo "external-review: artifacts kept in $work" >&2; }
++trap cleanup EXIT
++git diff --cached > "$work/diff.patch"
++git diff --cached --stat > "$work/diffstat.txt"
++dh=$(git hash-object "$work/diff.patch" | cut -c1-8)
++
++cat > "$work/brief.md" <<EOF
++You are reviewing a staged, UNCOMMITTED change in a traffic-simulation repo
++(deterministic Go engine, NATS contract, ADR-driven; project rules in
++AGENTS.md — determinism discipline ADR-0005, message contract ADR-0006,
++message contracts are sacred).
++
++The exact staged diff is at $work/diff.patch (stat: $work/diffstat.txt).
++Read the diff first, then whatever repo files you need for context (the
++patch — not the working tree — is what ships).
++
++Report findings cited file:line, ranked: blocker / should-fix / nit /
++question. Focus: correctness bugs; determinism risks (Go map iteration in
++sampled paths, non-associative float accumulation, wall clock, RNG
++discipline); contract/consistency issues (subject or payload changes need
++an ADR note); design weaknesses relative to the repo's own ADRs. Review
++only — DO NOT modify files. Be terse; padding wastes the committer's time.
++End your review with a line containing exactly: REVIEW-COMPLETE
++EOF
++
++echo "external-review: reviewing $(wc -l < "$work/diffstat.txt") stat lines of staged diff..."
++
++claude -p --model fable --allowedTools "Read,Grep,Glob,Bash(git show:*),Bash(git log:*),Bash(git diff:*),Bash(cat:*)" \
++  < "$work/brief.md" > "$work/fable.md" 2> "$work/fable.err" &
++pid_fable=$!
++codex exec -m gpt-5.6-sol --sandbox read-only "$(cat "$work/brief.md")" \
++  > "$work/sol.md" 2> "$work/sol.err" &
++pid_sol=$!
++if [ "$with_gemini" = 1 ]; then
++  gemini -p "$(cat "$work/brief.md")" > "$work/gemini.md" 2> "$work/gemini.err" &
++  pid_gemini=$!
++fi
++
++rc=0
++wait $pid_fable || rc=1
++wait $pid_sol || rc=1
++[ "$with_gemini" = 1 ] && { wait $pid_gemini || rc=1; }
++
++reviewers="fable sol"
++[ "$with_gemini" = 1 ] && reviewers="$reviewers gemini"
++for r in $reviewers; do
++  if ! grep -q "REVIEW-COMPLETE" "$work/$r.md" 2>/dev/null; then
++    echo "external-review: $r did not complete a review (missing marker; see $work/$r.err) — NOT stamping" >&2
++    rc=1
++  fi
++done
++if [ "$rc" != 0 ]; then
++  keep=1
++  echo "external-review: a reviewer failed; not stamping" >&2
++  exit 1
++fi
++
++keep=1 # reviews complete: never lose them to a late archive failure
++
++# Drift check: the stamp covers the tree captured BEFORE the reviews ran.
++if ! git diff --cached | cmp -s "$work/diff.patch" -; then
++  echo "external-review: the staged diff CHANGED while the reviewers ran — re-stage and re-run; not stamping" >&2
++  exit 1
++fi
++
++archive="$root/docs/kb/raw/reviews"
++mkdir -p "$archive"
++cp "$work/diff.patch" "$archive/$ts-$dh-reviewed.patch"
++cp "$work/diffstat.txt" "$archive/$ts-$dh-diffstat.txt"
++cp "$work/brief.md" "$archive/$ts-$dh-brief.md"
++cp "$work/fable.md" "$archive/$ts-$dh-claude-fable.md"
++cp "$work/sol.md" "$archive/$ts-$dh-gpt-5.6-sol.md"
++[ "$with_gemini" = 1 ] && cp "$work/gemini.md" "$archive/$ts-$dh-gemini.md"
++
++echo "$tree" > "$gitdir/external-review-stamp"
++
++echo "external-review: reviews + reviewed patch archived to docs/kb/raw/reviews/$ts-$dh-*; staged tree stamped."
++echo "(Archive files are untracked — commit them separately; docs-only commits pass the gate.)"
++echo "--- Fable ---"; cat "$work/fable.md"
++echo "--- Sol ---"; cat "$work/sol.md"
++if [ "$with_gemini" = 1 ]; then echo "--- Gemini ---"; cat "$work/gemini.md"; fi
++echo "external-review: if the reviews are clean (or findings fixed AND re-staged AND re-run), commit now."

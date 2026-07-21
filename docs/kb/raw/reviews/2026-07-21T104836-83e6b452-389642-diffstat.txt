@@ -1,0 +1,6 @@
+ .kimi-code/skills/external-review/SKILL.md         |  11 ++
+ AGENTS.md                                          |  25 ++--
+ docs/kb/decisions/ADR-0013-external-review-gate.md |  82 +++++++++++++
+ hooks/pre-commit                                   |  53 ++++++++
+ scripts/external-review.sh                         | 135 +++++++++++++++++++++
+ 5 files changed, 298 insertions(+), 8 deletions(-)

@@ -34,7 +34,11 @@ letting it accrete in tooling.
    cannot slip past by omission. A `pre-merge-commit` hook applies the
    same gate to auto-merges; rebase/cherry-pick create commits outside
    both hooks and are an accepted gap (their content was reviewed on its
-   original branch). A message-only `git commit --amend` likewise fails
+   original branch — rebasing onto new surrounding code can change
+   behavior unreviewed; accepted asymmetry under the honest-actor
+   boundary, since the gate is a process guard, not a security control).
+   `git am` is the same class: it invokes `pre-applypatch`, which is not
+   hooked. A message-only `git commit --amend` likewise fails
    the gate (the base HEAD moved); re-run the review or use the hatch.
    `scripts/external-review.sh` produces the stamp: it runs **Claude
    Fable** and **GPT-5.6-sol** over the staged diff, requires both to
