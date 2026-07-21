@@ -283,3 +283,79 @@ IDs (ADR-0009). This ADR fixes the container those decisions live in.
 - **Not in M11** (per the ADR's deferred list): overlays/variant.yaml,
   control/metrics binding grammars (parts are existence-checked and hashed
   raw), pack format, offline spawn-table export.
+
+## Addendum (2026-07-21, M12 overlay design — decided before implementation)
+
+§4 fixed the overlay approach; this addendum fixes the concrete grammar
+the M11 addendum left open (flow-id namespacing, patch granularity) and
+the scoping choices. Written design-first per the milestone plan.
+
+1. **A variant directory contains `variant.yaml` INSTEAD of
+   `scenario.yaml`** (both present = hard error), plus any added part
+   files. One manifest per directory, so a directory's kind is
+   unambiguous and cycles are structurally impossible.
+2. **`variant.yaml` schema** (strict YAML, `format_version: 1`):
+   - `id` (required) — the materialized scenario's identity.
+   - `base` (required) — a clean relative path (may use `../`; never
+     absolute, never backslash) to a directory containing `scenario.yaml`.
+     **Single-level composition only**: the base must not itself be a
+     variant — chaining is deferred (the advocacy use case is baseline +
+     N variants, one level); fail loud, don't guess.
+   - Optional **manifest overrides**: any manifest field except the part
+     lists and `format_version` — present fields replace the base's
+     wholesale (`seed`/`ticks` are run coordinates anyway; `types`,
+     `params`, `spawner` replace, not merge). Overrides are named-field
+     replacement, which §4's addition-only rule does not constrain — the
+     rule forbids removal *directives*, and none exist here.
+   - `network` (optional) — variant-relative path, whole-network
+     replacement (§4's degenerate case). The ADR-0009 fine-grained delta
+     grammar is NOT in M12 (it needs the network-model ADR).
+   - `demand` / `control` / `metrics` (optional lists) — variant-relative
+     paths of ADDED part files, appended to the base's lists. An added
+     path colliding with a base part's path is a hard error.
+   - `patches` (optional list) — each entry: `part` (a base-relative
+     demand part path), `flow` (the anchor id), `set` (a partial flow
+     mapping).
+3. **Patch semantics — node-level recursive merge, modify-only.**
+   Patches apply to the base part's parsed YAML node tree: locate the
+   flow mapping whose `id` equals the anchor — missing anchor, anchor on
+   an id-less flow, or a duplicate id are all hard errors (a typo'd
+   anchor must never silently add or no-op). `set` merges recursively:
+   mappings merge key-wise, sequences and scalars REPLACE wholesale (so a
+   flow's `slices` rate program patches as one entity — this resolves the
+   M11 open question: wholesale array replacement is the documented
+   semantic, not a surprise). `null` anywhere in `set` is a hard error —
+   no deletion, per §4's permanent refusal. The patched document is then
+   strict-decoded and semantically validated exactly like a hand-authored
+   file: unknown keys, scalar coercions, and bad references all fail loud
+   at apply time. **Anchor namespacing is (part path, flow id)** — flow
+   ids stay unique-per-file as in M11, and the part path disambiguates
+   across files (resolves the M11 namespacing question). Patches MODIFY
+   only; new flows arrive via added part files. Control/metrics parts
+   are untyped raw bytes until their grammars land (§5) — they accept
+   added parts only, never patches.
+4. **Materialization and identity.** Loading a variant = resolve the
+   effective network (variant's `network` or the base's) → load base
+   parts → apply patches → append added parts → apply manifest overrides.
+   ALL demand validation runs against the EFFECTIVE network's origins and
+   the effective type list (a network replacement can invalidate base
+   demand — that must fail at variant load, not at spawn time). The
+   result is a `Scenario` indistinguishable from a hand-authored one:
+   same hash protocol (patched parts hash as their patched canonical form
+   under their base-relative paths; added parts under variant-relative
+   paths — the conceptual merged directory), same `RunSpec`, same
+   `(content-hash, seed)` run key. The base directory is never modified.
+   `scenario validate`/`hash` work on variant dirs unchanged;
+   `scenario fmt` formats only the variant's own files (`variant.yaml`,
+   added demand parts), never the base's.
+5. **Acceptance shape:** a variant that patches nothing and adds nothing
+   hashes identically to its base (modulo `id`); a patched variant hashes
+   identically to the equivalent hand-written scenario; both run
+   bit-identical (the M11 CRC-equivalence test pattern). Golden-vector
+   test pins a variant hash; all failure modes above get fixture tests.
+6. **Still deferred (unchanged):** ADR-0009 network delta grammar,
+   variant chaining, vtype definition parts (`vtypes/*.yaml` — open since
+   M11), control/metrics binding grammars, pack format, offline
+   spawn-table export, and a possible `scenario materialize` export
+   (write the flattened scenario for intent-vs-effective review —
+   candidate at implementation time, not required by this design).
