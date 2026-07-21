@@ -1,0 +1,17 @@
+# M10/M11 demo demand for the I-280 Woodside network (ADR-0012 strict YAML;
+# the demand-director's -demand input). Origins are network origin lanes;
+# times are sim seconds (ADR-0005).
+format_version: 1
+flows:
+  - origin: n27945469_0
+    veh_per_h: 600
+    spacing: poisson
+    vtypes:
+      car: 0.9
+      truck: 0.1
+  - origin: n27945469_1
+    veh_per_h: 600
+    spacing: poisson
+    vtypes:
+      car: 0.9
+      truck: 0.1

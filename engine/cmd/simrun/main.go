@@ -12,11 +12,13 @@ import (
 	"sort"
 
 	"traffic-sim/engine"
+	"traffic-sim/engine/scenario"
 )
 
 func main() {
 	net := flag.String("net", "ring", "network: ring|lanedrop|straight|i80")
 	netfile := flag.String("netfile", "", "compiled network JSON (network-format v1); overrides -net")
+	scenarioDir := flag.String("scenario", "", "ADR-0012 scenario directory (overrides -net/-netfile/-rate/-density; explicit -seed/-ticks override the manifest)")
 	rate := flag.Float64("rate", 600, "netfile runs: spawn rate per origin lane (veh/h)")
 	density := flag.Float64("density", 80, "netfile runs: density cap (veh/lane-km)")
 	ticks := flag.Uint64("ticks", 600, "ticks to simulate (default tick = 100 ms)")
@@ -27,7 +29,36 @@ func main() {
 	var spec engine.RunSpec
 	var err error
 	name := *net
-	if *netfile != "" {
+	switch {
+	case *scenarioDir != "":
+		if *netfile != "" {
+			fmt.Fprintln(os.Stderr, "simrun: -scenario and -netfile are mutually exclusive (the scenario names its network)")
+			os.Exit(2)
+		}
+		sc, lerr := scenario.Load(*scenarioDir)
+		if lerr != nil {
+			fmt.Fprintln(os.Stderr, "simrun:", lerr)
+			os.Exit(1)
+		}
+		spec, err = sc.RunSpec(map[string]*engine.VehicleType{"car": &engine.Car, "truck": &engine.Truck})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "simrun:", err)
+			os.Exit(1)
+		}
+		// Explicit -seed/-ticks override the manifest (the content hash is
+		// unchanged — run key = (hash, seed), ADR-0012 §6).
+		flag.Visit(func(f *flag.Flag) {
+			switch f.Name {
+			case "seed":
+				spec.Seed = *seed
+			case "ticks":
+				spec.Ticks = *ticks
+			}
+		})
+		name = *scenarioDir
+		*ticks = spec.Ticks
+		*seed = spec.Seed
+	case *netfile != "":
 		name = *netfile
 		spec = engine.RunSpec{
 			Net:    engine.NetSpec{Kind: "file", Path: *netfile},
@@ -36,7 +67,7 @@ func main() {
 			Seed:   *seed,
 			Ticks:  *ticks,
 		}
-	} else {
+	default:
 		spec, err = engine.DefaultSpec(*net, *ticks, *seed)
 	}
 	if err != nil {

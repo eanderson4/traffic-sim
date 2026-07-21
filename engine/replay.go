@@ -11,6 +11,11 @@ type RunSpec struct {
 	Params Params
 	Seed   uint64
 	Ticks  uint64
+	// Hash is the scenario content hash (ADR-0012 §6) when the run was
+	// loaded from a scenario directory; empty for flag-built specs. The run
+	// registry records it so (content-hash, seed) is the run key. The
+	// kernel never reads it — it is not part of the CRC'd world state.
+	Hash string `json:",omitempty"`
 }
 
 // RunLog is the in-memory intent/event log of ADR-0005's replay model: the

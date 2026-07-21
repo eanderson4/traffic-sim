@@ -1,5 +1,6 @@
 // demand-director is the M10 reference runtime demand director
-// (scenario-format §3, ADR-0008 §5): it reads a small demand definition —
+// (scenario-format §3, ADR-0008 §5): it reads a demand definition
+// (ADR-0012 strict YAML — the M10 strict-JSON files parse unchanged) —
 // flows with constant or Poisson spacing, piecewise-constant time slices in
 // SIM SECONDS, a vehicle-type mix per flow — samples arrivals with
 // per-vehicle keyed RNG (ADR-0005/ADR-0007 discipline: the sampler's draws
@@ -35,36 +36,12 @@ import (
 	"github.com/nats-io/nats.go"
 	"traffic-sim/engine"
 	"traffic-sim/engine/natsio"
+	"traffic-sim/engine/scenario"
 )
 
-// DemandFile is the strict JSON demand definition (stdlib encoding/json —
-// no YAML dependency, AGENTS.md stdlib-first; the format is deliberately
-// small: flows, spacing, slices, type weights).
-type DemandFile struct {
-	Flows []Flow `json:"flows"`
-}
-
-// Flow is one origin's demand program. Times are SIM SECONDS (never wall
-// clock, ADR-0005). With Slices, the rate is piecewise-constant (0 outside
-// any slice); without, VehPerH holds for the whole run.
-type Flow struct {
-	Origin  string             `json:"origin"`            // origin lane id
-	VehPerH float64            `json:"veh_per_h"`         // base rate (ignored when slices present)
-	Spacing string             `json:"spacing"`           // "poisson" | "constant"
-	VTypes  map[string]float64 `json:"vtypes"`            // type name → weight
-	Slices  []Slice            `json:"slices,omitempty"`  // piecewise-constant overrides
-	UntilS  float64            `json:"until_s,omitempty"` // stop sampling after t (0 = run end)
-}
-
-// Slice is one piecewise-constant demand window [StartS, EndS) in sim
-// seconds.
-type Slice struct {
-	StartS  float64 `json:"start_s"`
-	EndS    float64 `json:"end_s"`
-	VehPerH float64 `json:"veh_per_h"`
-}
-
-func (f *Flow) rateAt(tS float64) float64 {
+// rateAt is the flow's rate at sim-second t: piecewise-constant with
+// slices (0 outside any window), VehPerH for the whole run without.
+func rateAt(f *scenario.Flow, tS float64) float64 {
 	if len(f.Slices) == 0 {
 		return f.VehPerH
 	}
@@ -81,13 +58,13 @@ func (f *Flow) rateAt(tS float64) float64 {
 // supplies the type-mix draw and (for Poisson) the gap draw, mirroring the
 // kernel Spawner's "jitter from the incoming vehicle's own stream" rule.
 type flowSampler struct {
-	flow    Flow
+	flow    scenario.Flow
 	key     uint64
 	ordinal uint64
 	nextS   float64 // next arrival, sim seconds
 }
 
-func newFlowSampler(f Flow, seed uint64, idx int) *flowSampler {
+func newFlowSampler(f scenario.Flow, seed uint64, idx int) *flowSampler {
 	h := fnv.New64a()
 	h.Write([]byte("traffic-sim/demand-director/flow"))
 	h.Write([]byte(f.Origin))
@@ -110,7 +87,7 @@ func (fs *flowSampler) next(dt float64) (atS float64, vtype string, ok bool) {
 	if f.UntilS > 0 && fs.nextS >= f.UntilS {
 		return 0, "", false
 	}
-	rate := f.rateAt(fs.nextS)
+	rate := rateAt(&f, fs.nextS)
 	if rate <= 0 {
 		if len(f.Slices) == 0 {
 			return 0, "", false
@@ -126,7 +103,7 @@ func (fs *flowSampler) next(dt float64) (atS float64, vtype string, ok bool) {
 			return 0, "", false
 		}
 		fs.nextS = best
-		rate = f.rateAt(fs.nextS)
+		rate = rateAt(&f, fs.nextS)
 		if rate <= 0 {
 			return 0, "", false
 		}
@@ -175,7 +152,7 @@ var seedGlobal uint64
 func main() {
 	url := flag.String("nats", "ws://127.0.0.1:8443", "NATS server URL (serve's WebSocket listener)")
 	run := flag.String("run", "", "run id to attach to (required)")
-	demand := flag.String("demand", "", "demand definition JSON (required)")
+	demand := flag.String("demand", "", "demand definition (ADR-0012 strict YAML; M10 JSON files parse unchanged) (required)")
 	seed := flag.Uint64("seed", 1, "sampler seed (keys every per-vehicle stream)")
 	lead := flag.Uint64("lead", 30, "send verbs this many ticks ahead of their earliest tick")
 	flag.Parse()
@@ -185,13 +162,8 @@ func main() {
 	}
 	seedGlobal = *seed
 
-	data, err := os.ReadFile(*demand)
+	df, err := scenario.LoadDemandFile(*demand)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "demand-director:", err)
-		os.Exit(1)
-	}
-	var df DemandFile
-	if err := json.Unmarshal(data, &df); err != nil {
 		fmt.Fprintf(os.Stderr, "demand-director: demand %s: %v\n", *demand, err)
 		os.Exit(1)
 	}

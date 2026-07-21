@@ -5,10 +5,11 @@ An open-source traffic simulation engine built on NATS. Models real road network
 policies and live human drivers alike — and produces decision-grade congestion
 metrics for comparing infrastructure alternatives.
 
-**Status: M-series bring-up complete.** Simulation kernel (Go), NATS message
-contract, external default driver, OSM/netconvert network import, and live
-MapLibre viz are built and tested — see `docs/kb/decisions/` for the 9 ADRs
-they implement.
+**Status: M11 — scenario directories.** Simulation kernel (Go), NATS message
+contract, external default driver, OSM/netconvert network import, junction
+right-of-way, fixed-time signals, runtime demand director, live MapLibre viz,
+and ADR-0012 scenario loading are built and tested — see
+`docs/kb/decisions/` for the 12 ADRs they implement.
 
 ## Why
 
@@ -33,7 +34,7 @@ config) are first-class and diffable so alternatives can be ranked on metrics.
 | `docs/VISION.md` | Founding document — read this first |
 | `docs/kb/` | Knowledge base: research, articles, decision records |
 | `AGENTS.md` | Rules for humans and agents working here |
-| `engine/` | Go simulation kernel + NATS contract + tools (`simrun`, `serve`, `netimport`, `default-driver`) |
+| `engine/` | Go simulation kernel + NATS contract + tools (`simrun`, `serve`, `netimport`, `scenario`, `default-driver`, `demand-director`) |
 | `contracts/` | AsyncAPI message contract + network file format v1 |
 | `viz/` | MapLibre realtime client (TypeScript, pnpm, no framework) |
 | `analysis/ngsim/` | NGSIM x-t field tooling + I-80 wave validation |
@@ -54,6 +55,14 @@ Run the live demo (real I-280 network, external default driver, browser viz):
 cd engine && go run ./cmd/serve -netfile ../data/networks/i280-woodside/i280.json \
   -run demo -ws 127.0.0.1:8443 -geojson ../viz/public/network.geojson
 cd viz && pnpm dev   # open http://localhost:5173/?run=demo&ws=ws://127.0.0.1:8443
+```
+
+Or run from an ADR-0012 scenario directory (manifest + demand parts; explicit
+`-seed`/`-ticks` override the manifest for sweeps):
+
+```sh
+cd engine && go run ./cmd/scenario validate path/to/scenario && go run ./cmd/scenario hash path/to/scenario
+go run ./cmd/simrun -scenario path/to/scenario -seed 2
 ```
 
 `data/networks/` is git-ignored per ADR-0009's recipe-not-file posture; the

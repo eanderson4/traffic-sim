@@ -31,10 +31,12 @@ import (
 	"traffic-sim/engine"
 	"traffic-sim/engine/natsio"
 	"traffic-sim/engine/natsio/driver"
+	"traffic-sim/engine/scenario"
 )
 
 func main() {
-	netfile := flag.String("netfile", "", "compiled network JSON (network-format v1); required")
+	netfile := flag.String("netfile", "", "compiled network JSON (network-format v1); required unless -scenario")
+	scenarioDir := flag.String("scenario", "", "ADR-0012 scenario directory (supplies network, demand, types, seed, ticks); explicit -seed/-ticks override the manifest")
 	wsAddr := flag.String("ws", "127.0.0.1:8443", "WebSocket listen address for browser clients (host:port)")
 	run := flag.String("run", "demo", "run id (single NATS token)")
 	ticks := flag.Uint64("ticks", 36000, "ticks to simulate (100 ms tick; 36000 = 1 h)")
@@ -47,8 +49,12 @@ func main() {
 	capacity := flag.Int("capacity", 1000, "driver claim capacity")
 	flag.Parse()
 
-	if *netfile == "" {
-		fmt.Fprintln(os.Stderr, "serve: -netfile is required")
+	if *scenarioDir != "" && *netfile != "" {
+		fmt.Fprintln(os.Stderr, "serve: -scenario and -netfile are mutually exclusive (the scenario names its network)")
+		os.Exit(2)
+	}
+	if *scenarioDir == "" && *netfile == "" {
+		fmt.Fprintln(os.Stderr, "serve: -scenario or -netfile is required")
 		os.Exit(2)
 	}
 	host, portStr, err := net.SplitHostPort(*wsAddr)
@@ -62,16 +68,65 @@ func main() {
 		os.Exit(2)
 	}
 
+	// The scenario type list is what director spawn verbs resolve vtype
+	// against; the default ("car") is byte-identical to the pre-flag
+	// behavior (NewEngine's [Car] default).
+	typeReg := map[string]*engine.VehicleType{"car": &engine.Car, "truck": &engine.Truck}
+
+	// Build the run spec: an ADR-0012 scenario directory, or the flag-era
+	// surface (which is a generated-default scenario conceptually).
+	var spec engine.RunSpec
+	if *scenarioDir != "" {
+		sc, err := scenario.Load(*scenarioDir)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "serve:", err)
+			os.Exit(1)
+		}
+		spec, err = sc.RunSpec(typeReg)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "serve:", err)
+			os.Exit(1)
+		}
+		// Explicit -seed/-ticks override the manifest (seed sweeps derive
+		// runs; the content hash is unchanged — ADR-0012 §6).
+		flag.Visit(func(f *flag.Flag) {
+			switch f.Name {
+			case "seed":
+				spec.Seed = *seed
+			case "ticks":
+				spec.Ticks = *ticks
+			}
+		})
+		fmt.Printf("serve: scenario %s (hash %s)\n", sc.Manifest.ID, sc.Hash())
+	} else {
+		var typeList []*engine.VehicleType
+		for _, name := range strings.Split(*types, ",") {
+			t, ok := typeReg[strings.TrimSpace(name)]
+			if !ok {
+				fmt.Fprintf(os.Stderr, "serve: unknown vehicle type %q (known: car, truck)\n", name)
+				os.Exit(2)
+			}
+			typeList = append(typeList, t)
+		}
+		spec = engine.RunSpec{
+			Net:    engine.NetSpec{Kind: "file", Path: *netfile},
+			Scen:   engine.Scenario{SpawnRatePerLaneHour: *rate, DensityTargetPerKm: *density, Types: typeList},
+			Params: engine.DefaultParams(),
+			Seed:   *seed,
+			Ticks:  *ticks,
+		}
+	}
+
 	// GeoJSON export first: fail loud on a bad network file before serving.
 	if *geojson != "" {
-		data, err := os.ReadFile(*netfile)
+		data, err := os.ReadFile(spec.Net.Path)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "serve:", err)
 			os.Exit(1)
 		}
 		var nf engine.NetFile
 		if err := json.Unmarshal(data, &nf); err != nil {
-			fmt.Fprintf(os.Stderr, "serve: netfile %s: %v\n", *netfile, err)
+			fmt.Fprintf(os.Stderr, "serve: netfile %s: %v\n", spec.Net.Path, err)
 			os.Exit(1)
 		}
 		f, err := os.Create(*geojson)
@@ -126,27 +181,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// The scenario type list is what director spawn verbs resolve vtype
-	// against; the default ("car") is byte-identical to the pre-flag
-	// behavior (NewEngine's [Car] default).
-	typeReg := map[string]*engine.VehicleType{"car": &engine.Car, "truck": &engine.Truck}
-	var typeList []*engine.VehicleType
-	for _, name := range strings.Split(*types, ",") {
-		t, ok := typeReg[strings.TrimSpace(name)]
-		if !ok {
-			fmt.Fprintf(os.Stderr, "serve: unknown vehicle type %q (known: car, truck)\n", name)
-			os.Exit(2)
-		}
-		typeList = append(typeList, t)
-	}
-
-	spec := engine.RunSpec{
-		Net:    engine.NetSpec{Kind: "file", Path: *netfile},
-		Scen:   engine.Scenario{SpawnRatePerLaneHour: *rate, DensityTargetPerKm: *density, Types: typeList},
-		Params: engine.DefaultParams(),
-		Seed:   *seed,
-		Ticks:  *ticks,
-	}
 	runErr := make(chan error, 1)
 	go func() {
 		// PaceFloor = one tick of wall time: 1× realtime (ADR-0005 §4 — pacing

@@ -197,3 +197,31 @@ IDs (ADR-0009). This ADR fixes the container those decisions live in.
   excepted); no wall-clock times in demand; no compression of primary source
   files (a pack/transport concern only — MATSim's `.xml.gz` habit makes
   demand ungreppable and undiffable).
+
+## Addendum (2026-07-21, M11 implementation notes)
+
+- **Schema validation is realized as strict decoding + semantic checks, not
+  a JSON-Schema library.** yaml.v3's KnownFields makes unknown fields hard
+  errors; the semantic layer (versions, enums, slice windows, type-list and
+  origin-lane references, path confinement) is hand-written and fail-loud.
+  This keeps the dependency footprint at the one approved YAML library —
+  a JSON-Schema engine would have been a second. If cross-field constraints
+  outgrow hand-written checks, the CUE upgrade path (§2) is the answer, not
+  a schema library bolt-on.
+- **RunSpec carries the content hash** (`engine.RunSpec.Hash`, additive JSON
+  field, never read by the kernel, not CRC'd): the run registry's meta entry
+  records (content-hash, seed) with zero message-contract change, as §6
+  intended.
+- **The demand-director migrated to the scenario demand schema** (its
+  strict-JSON files parse unchanged — JSON is a YAML subset); the demo flow
+  file is now `cmd/demand-director/demo-i280.yaml`. The `-demand` flag stays
+  a file path; scenario-directory demand wiring (one flag for all flows +
+  manifest seed) lands with overlays.
+- **Verified:** scenario-loaded and flag-built runs are bit-identical
+  (I-280, rate 600/density 80/seed 1/3000 ticks → crc `e92229c4a89d3709`
+  both ways, matching the M8 acceptance value); `scenario fmt` is idempotent
+  and hash-stable; the strict fence rejects anchors, custom tags, multiple
+  documents, unknown fields, and `..`/absolute part paths.
+- **Not in M11** (per the ADR's deferred list): overlays/variant.yaml,
+  control/metrics binding grammars (parts are existence-checked and hashed
+  only), pack format, offline spawn-table export.
