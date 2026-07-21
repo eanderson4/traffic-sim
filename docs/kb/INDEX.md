@@ -49,7 +49,7 @@ back to it.
 - [MapLibre Realtime Viz](articles/integrations/maplibre-realtime.md) — three rate-split channels into MapLibre, binary SoA wire frames, measured deck.gl escalation ladder (ADR-0003)
 
 ### Decisions
-- [ADR Index](articles/decisions/adrs.md) — ADR-0001..0011 table with rationales, research basis, and pending-ADR queue
+- [ADR Index](articles/decisions/adrs.md) — ADR-0001..0014 table with rationales, research basis, and pending-ADR queue
 
 ## Raw Research
 
@@ -95,9 +95,11 @@ links its source synthesis for traceability.
 - [x] [ADR-0011](decisions/ADR-0011-fixed-time-signals.md) — fixed-time signal control: kernel-run programs compiled from tlLogic, phase state as a pure function of the tick count, enforcement composed with the stop-line guardrail; external command interface deferred
 - [x] [ADR-0012](decisions/ADR-0012-scenario-format.md) — scenario format: manifest-of-parts directory in strict YAML, runtime director demand sampling (M10 contract), kustomize-style overlay variants, (content-hash, seed) run identity, format_version migrations
 - [x] [ADR-0013](decisions/ADR-0013-external-review-gate.md) — external multi-model review (Claude Fable + GPT-5.6-sol) as a pre-commit gate: tree-hash stamp proves review happened, triage stays the committer's job, fail-closed with a loud skip hatch
+- [x] [ADR-0014](decisions/ADR-0014-observability-metrics.md) — observability: trajectory-first metric kernel (trip records incl. horizon partials, lane-interval Edie q/k/u), contract-pinned definitions, dedicated metrics JetStream stream + simrun file sink, scenario metrics bindings, paired-seed sweep protocol, LOS as presentation skin
 
 ---
 *Last distilled: 2026-07-17 | 18 articles from 56 raw research files*
 *ADR-0012 ratified 2026-07-21 (design; M11 implementation + review round landed same day)*
 *ADR-0013 ratified 2026-07-21 (external-review workflow, following the M11 round)*
+*ADR-0014 ratified 2026-07-21 (observability design; Fable+Sol review round, M13 implementation next)*
 *Run `/update-kb` to check freshness*

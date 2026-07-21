@@ -28,6 +28,7 @@ closed (2026-07-15..17).
 | [ADR-0011](../../decisions/ADR-0011-fixed-time-signals.md) | Fixed-time signal control: netimport compiles static tlLogic into data-driven programs (phases + per-link states); the light derives purely from the tick count; enforcement composes with the ADR-0010 stop-line guardrail (red holds, amber stops-if-able, green flows but box-checked); external command interface deferred | Signalized junctions were the last free-traversal gap; the phase representation must let external algorithms (ADR-0008 §5 cabinet vocabulary) command it later, so the program is data and the gate reads only `(program, link, tick)` | M8 implementation (engine/signal.go, netimport), [Signal Control](../business-domains/signal-control.md) |
 | [ADR-0012](../../decisions/ADR-0012-scenario-format.md) | Scenario format: a directory with a strict-YAML manifest referencing network/demand/control/metrics parts; demand is layered primitives in sim seconds sampled at runtime by the M10 director; variants are kustomize-style overlays (addition-only, no templating, ADR-0009 network delta patches); run identity = (content-hash, seed); per-file `format_version` with the Kubernetes round-trip rule | Flags can't be diffed, overlaid, content-addressed, or bound to a recording — and the founding use case is baseline + N variants ranked by metrics; every surveyed sim has pieces of this, none has all of it | [Scenario Format](../concepts/scenario-format.md) (research gate closed 2026-07-17); design ratified 2026-07-21, M11 + review round landed same day |
 | [ADR-0013](../../decisions/ADR-0013-external-review-gate.md) | External multi-model review as a pre-commit gate: Claude Fable + GPT-5.6-sol review every staged code diff; a tree-hash stamp proves review happened (fail-closed, loud skip hatch); Gemini joins milestone rounds; the gate reviews itself | The M11 post-implementation round caught two design-level defects and a dozen bugs self-review missed — the evidence that external review diversity earns its keep before durable bindings ship | M11 implementation + the 2026-07-21 review round ([reviews](../../raw/reviews/)) |
+| [ADR-0014](../../decisions/ADR-0014-observability-metrics.md) | Observability: in-process trajectory-first metric kernel emitting two primitives (trip records incl. horizon partials; lane-interval Edie q/k/u + occupancy/stops/time-loss with contract-pinned definitions); metrics on a dedicated JetStream stream (`ts-{run}-metrics`, never the OCC-sequenced log stream) plus a simrun file sink; scenario `metrics/*.yaml` bindings with a zero-authoring default set; paired-seed sweep tooling reports the CI of the DIFFERENCE, showcase seed picked once on the baseline; LOS is a pinned-edition skin, never the ranking metric | Single-run and completed-trips-only numbers are noise and survivorship bias respectively — the two failure modes the protocol and horizon-partial rules are built against; nobody ships Ch.24-grade measures as a documented streaming contract | [Congestion Metrics](../business-domains/congestion-metrics.md); design reviewed 2026-07-21 (Fable + Sol, [reviews](../../raw/reviews/)) |
 
 ## Research Complete, ADR Pending
 
@@ -37,7 +38,6 @@ These areas have finished research (the gate) but no drafted ADR yet — see
 | Candidate ADR | Research basis | What it will pin |
 |---|---|---|
 | Network model | [Road Graph Model](../architecture/road-graph-model.md) | Lane-as-atom schema, compiled conflict sets, internal lanes, geometry-by-reference, file format duality |
-| Observability / metric set | [Congestion Metrics](../business-domains/congestion-metrics.md) | Trajectory-first metric kernel, canonical MOE set, detector layer, experiment protocol (warmup, CRN, CIs) |
 | Project license | [Simulator Landscape](../business-domains/simulator-landscape.md) | Permissive license choice (deferred 2026-07-17, leaning MIT); ODbL layering per ADR-0009 stands regardless |
 
 ## Consequences That Reach Across ADRs
@@ -52,4 +52,4 @@ These areas have finished research (the gate) but no drafted ADR yet — see
   [VISION.md](../../../VISION.md).
 
 ---
-*Derived from: [decisions/](../../decisions/) ADR-0001..0013 and the raw research syntheses linked above*
+*Derived from: [decisions/](../../decisions/) ADR-0001..0014 and the raw research syntheses linked above*
