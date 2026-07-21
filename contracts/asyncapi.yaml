@@ -921,7 +921,7 @@ components:
         run_id: { type: string }
         spec:
           type: object
-          description: 'The full RunSpec (network, scenario, params, seed, ticks) — replay needs nothing else.'
+          description: 'The full RunSpec (network, scenario, params, seed, ticks) — replay needs nothing else. M11 addendum (ADR-0012 §6): spec may carry Hash — the ADR-0012 scenario content hash, present when the run was loaded from a scenario directory; additive and omitempty, never read by the kernel, and not part of the CRC''d world state. (content-hash, seed) is the run key for scenario-driven runs.'
         schema_version: { type: integer, const: 2 }
         status: { type: string, enum: [running, done, aborted] }
         error: { type: string, description: 'Abort reason when status = aborted (e.g. record-plane failure).' }

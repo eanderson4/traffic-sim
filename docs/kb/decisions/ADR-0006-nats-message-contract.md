@@ -248,3 +248,14 @@ needs; Synadia's Cybervet runs embedded NATS + 10 ms tick + KV + WebSocket at
   discipline; deterministic request ids make director failover
   invisible), heartbeats between sparse verbs (the liveness budget
   detaches silent controllers — measured in bring-up).
+
+## Addendum (2026-07-21, M11 scenario content hash in run meta)
+
+- **RunMeta's embedded `spec` may carry `Hash`** — the ADR-0012 scenario
+  content hash, present when the run was loaded from a scenario directory.
+  Additive and omitempty (old readers decode unchanged; flag-built runs
+  emit nothing new), never read by the kernel, not part of the CRC'd world
+  state, and `schema_version` stays 2 — this is the metadata plane doing
+  its job: (content-hash, seed) is recorded so two runs of "the same
+  scenario" are comparable across machines and checkouts. Documented in
+  `contracts/asyncapi.yaml` (RunMetaView).

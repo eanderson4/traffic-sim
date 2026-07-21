@@ -151,6 +151,175 @@ network: network.json
 	}
 }
 
+func TestHashExcludesRunCoordinates(t *testing.T) {
+	dir := goodScenario(t)
+	s1, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h1 := s1.Hash()
+
+	// Seed and ticks are run coordinates, not content: changing them (in
+	// the file OR by sweep override) must not move the content hash.
+	writeFile(t, dir, ManifestFile, strings.NewReplacer("seed: 7", "seed: 99", "ticks: 3000", "ticks: 72000").Replace(goodManifest))
+	s2, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h1 != s2.Hash() {
+		t.Errorf("hash moved with seed/ticks: %s → %s", h1, s2.Hash())
+	}
+	if s2.Manifest.Seed != 99 || s2.Manifest.Ticks != 72000 {
+		t.Errorf("manifest values not loaded: %+v", s2.Manifest)
+	}
+}
+
+// The golden vector is the canary for the hash protocol
+// (traffic-sim/scenario-hash/v1): if this breaks after a dependency or Go
+// upgrade, canonicalization changed — a format event, never silent
+// (ADR-0012 §8 addendum).
+func TestGoldenHash(t *testing.T) {
+	dir := goodScenario(t)
+	s, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "a09f7f6848ac6dd273bebf24081d4375beedf8f46be2b6e1e89e885fe11ebff2"
+	if s.Hash() != want {
+		t.Fatalf("hash = %s, want golden %s", s.Hash(), want)
+	}
+}
+
+func TestFormatPreservesComments(t *testing.T) {
+	dir := goodScenario(t)
+	writeFile(t, dir, "demand/main.yaml", `# I-280 AM peak, metered approach.
+# Rates from the 2026-07 count study.
+format_version: 1
+flows:
+  - origin: a_0  # the only origin
+    veh_per_h: 900
+    spacing: poisson
+    vtypes:
+      truck: 0.1
+      car: 0.9
+`)
+	before, _ := Load(dir)
+	if err := Format(dir); err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	data, _ := os.ReadFile(filepath.Join(dir, "demand/main.yaml"))
+	for _, want := range []string{"# I-280 AM peak", "# Rates from", "# the only origin"} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("fmt lost comment %q:\n%s", want, data)
+		}
+	}
+	// Keys are canonically sorted (vtypes: car before truck).
+	ci, ti := strings.Index(string(data), "car: 0.9"), strings.Index(string(data), "truck: 0.1")
+	if ci < 0 || ti < 0 || ci > ti {
+		t.Errorf("vtypes not sorted in fmt output:\n%s", data)
+	}
+	after, _ := Load(dir)
+	if before.Hash() != after.Hash() {
+		t.Error("hash moved across comment-preserving fmt")
+	}
+}
+
+func TestScalarCoercionRejected(t *testing.T) {
+	cases := []struct {
+		name     string
+		manifest string
+		want     string
+	}{
+		{"float into int", strings.Replace(goodManifest, "ticks: 3000", "ticks: 1.9", 1), "wants !!int"},
+		{"bool into string", strings.Replace(goodManifest, "id: test-baseline", "id: true", 1), "wants !!str"},
+		{"string into uint", strings.Replace(goodManifest, "seed: 7", "seed: lots", 1), "wants !!int"},
+		{"nan dt", strings.Replace(goodManifest, "ticks: 3000", "ticks: 3000\nparams: {dt: .nan}", 1), "not a finite number"},
+		{"dt too large", strings.Replace(goodManifest, "ticks: 3000", "ticks: 3000\nparams: {dt: 2.5}", 1), "params.dt"},
+		{"duplicate types", strings.Replace(goodManifest, "types: [car, truck]", "types: [car, car]", 1), "duplicate"},
+		{"whitespace type", strings.Replace(goodManifest, "types: [car, truck]", "types: [' car', truck]", 1), "whitespace"},
+		{"zero-rate spawner only", "format_version: 1\nid: x\nseed: 1\nticks: 10\nnetwork: network.json\nspawner: {rate_per_lane_h: 0}\n", "no demand"},
+		{"backslash ref", strings.Replace(goodManifest, "demand/main.yaml", `demand\main.yaml`, 1), "forward slashes"},
+		{"unclean ref", strings.Replace(goodManifest, "demand/main.yaml", "demand/../demand/main.yaml", 1), "clean relative"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeNet(t, dir)
+			writeFile(t, dir, ManifestFile, tc.manifest)
+			writeFile(t, dir, "demand/main.yaml", goodDemand)
+			_, err := Load(dir)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestDemandCoercionRejected(t *testing.T) {
+	cases := []struct {
+		name   string
+		demand string
+		want   string
+	}{
+		{"nan rate", strings.Replace(goodDemand, "veh_per_h: 900", "veh_per_h: .nan", 1), "not a finite number"},
+		{"inf weight", strings.Replace(goodDemand, "car: 0.9", "car: .inf", 1), "not a finite number"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeNet(t, dir)
+			writeFile(t, dir, ManifestFile, goodManifest)
+			writeFile(t, dir, "demand/main.yaml", tc.demand)
+			if _, err := Load(dir); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+	// veh_per_h alongside slices is dead config — fail loud.
+	dir := t.TempDir()
+	writeNet(t, dir)
+	writeFile(t, dir, ManifestFile, goodManifest)
+	writeFile(t, dir, "demand/main.yaml", `format_version: 1
+flows:
+  - origin: a_0
+    veh_per_h: 600
+    spacing: constant
+    slices:
+      - {start_s: 0, end_s: 100, veh_per_h: 600}
+`)
+	if _, err := Load(dir); err == nil || !strings.Contains(err.Error(), "dead config") {
+		t.Fatalf("veh_per_h+slices: err = %v", err)
+	}
+	// A flow with no vtypes where "car" is not a scenario type.
+	writeFile(t, dir, ManifestFile, strings.Replace(goodManifest, "types: [car, truck]", "types: [truck]", 1))
+	writeFile(t, dir, "demand/main.yaml", `format_version: 1
+flows:
+  - origin: a_0
+    veh_per_h: 600
+    spacing: constant
+`)
+	if _, err := Load(dir); err == nil || !strings.Contains(err.Error(), "default \"car\"") {
+		t.Fatalf("implicit car: err = %v", err)
+	}
+}
+
+func TestSymlinkEscapeRejected(t *testing.T) {
+	dir := t.TempDir()
+	writeNet(t, dir)
+	writeFile(t, dir, ManifestFile, goodManifest)
+	writeFile(t, dir, "demand/main.yaml", goodDemand)
+	outside := filepath.Join(t.TempDir(), "outside.yaml")
+	writeFile(t, filepath.Dir(outside), filepath.Base(outside), goodDemand)
+	link := filepath.Join(dir, "demand", "link.yaml")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	writeFile(t, dir, ManifestFile, strings.Replace(goodManifest, "demand/main.yaml", "demand/link.yaml", 1))
+	if _, err := Load(dir); err == nil || !strings.Contains(err.Error(), "symlink escapes") {
+		t.Fatalf("err = %v, want symlink escape rejection", err)
+	}
+}
+
 func TestFormatIdempotent(t *testing.T) {
 	dir := goodScenario(t)
 	if err := Format(dir); err != nil {

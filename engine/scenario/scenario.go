@@ -7,24 +7,32 @@
 // Dependency note (AGENTS.md "standard library first"): gopkg.in/yaml.v3 is
 // the ADR-0012 §2 approved exception, confined to this package exactly like
 // the NATS modules are confined to engine/natsio (ADR-0006). The engine
-// kernel consumes only the loaded model and stays stdlib-only.
+// kernel consumes only the loaded model and stays stdlib-only. Bumping the
+// YAML library is a format event: the canonical byte format and the content
+// hash both ride on its encoder, and the golden-hash test is the canary.
 //
 // Validation note (ADR-0012 §2 implementation refinement): the "JSON-Schema
 // validation at load" is realized as strict decoding (KnownFields — unknown
-// fields are hard errors) plus semantic checks, with no JSON-Schema library
-// dependency; the canonical formatter doubles as the schema's human face.
+// fields are hard errors) plus a schema-aware node-type check (a !!float
+// never silently truncates into an int field, a !!bool never coerces into a
+// string) plus hand-written semantic checks — no JSON-Schema library
+// dependency.
 package scenario
 
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
+	"path"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -40,6 +48,11 @@ const FormatVersion = 1
 
 // ManifestFile is the required manifest name at the scenario directory root.
 const ManifestFile = "scenario.yaml"
+
+// hashDomain separates the content-hash protocol from every other sha256 in
+// the project and versions it: changing the canonicalization or framing is
+// a protocol bump, never a silent rebrand of every scenario (ADR-0012 §6).
+const hashDomain = "traffic-sim/scenario-hash/v1\n"
 
 // Manifest is scenario.yaml — identity, engine params, and relative-path
 // references to the part files. The directory, never the manifest alone, is
@@ -65,8 +78,8 @@ type Params struct {
 }
 
 // Spawner configures the kernel's built-in deterministic spawner — the
-// flag-era uniform demand made declarative. Absent = director-driven demand
-// only (rate 0 disables the spawner, exactly like -rate 0).
+// flag-era uniform demand made declarative. Absent (or rate 0) = the
+// built-in spawner is disabled and demand arrives as director verbs.
 type Spawner struct {
 	RatePerLaneHour float64 `yaml:"rate_per_lane_h"`
 	DensityPerKm    float64 `yaml:"density_per_km,omitempty"`
@@ -75,8 +88,9 @@ type Spawner struct {
 // DemandFile is one demand/*.yaml part: the director flow definitions the
 // M10 runtime demand director samples (ADR-0012 §3 — a demand file IS a
 // director configuration). Times are SIM SECONDS (never wall clock,
-// ADR-0005). The M10 strict-JSON flow files parse unchanged (JSON is a YAML
-// subset).
+// ADR-0005). M10-era strict-JSON flow files parse once a
+// `"format_version": 1` key is added (JSON is a YAML subset; the version
+// key is required — strictness is the point).
 type DemandFile struct {
 	FormatVersion int    `yaml:"format_version"`
 	Flows         []Flow `yaml:"flows"`
@@ -84,8 +98,11 @@ type DemandFile struct {
 
 // Flow is one origin's demand program. With Slices, the rate is
 // piecewise-constant (0 outside any slice); without, VehPerH holds for the
-// whole run.
+// whole run. ID is optional today and becomes the overlay-patch anchor
+// (ADR-0012 §4) — additive and omitempty, so adding it later never moves an
+// existing hash.
 type Flow struct {
+	ID      string             `yaml:"id,omitempty"`
 	Origin  string             `yaml:"origin"`
 	VehPerH float64            `yaml:"veh_per_h,omitempty"`
 	Spacing string             `yaml:"spacing"`
@@ -95,7 +112,7 @@ type Flow struct {
 }
 
 // Slice is one piecewise-constant demand window [StartS, EndS) in sim
-// seconds.
+// seconds; adjacent windows (EndS == the next StartS) are permitted.
 type Slice struct {
 	StartS  float64 `yaml:"start_s"`
 	EndS    float64 `yaml:"end_s"`
@@ -112,9 +129,11 @@ type Scenario struct {
 	parts    []hashPart // everything the content hash covers
 }
 
-// hashPart is one hashed input: rel is the scenario-relative path; data is
-// canonical YAML for the manifest and demand parts (post-fmt, so the hash
-// is formatting-independent), raw file bytes for network/control/metrics.
+// hashPart is one hashed input: rel is the scenario-relative path (forward
+// slashes, cleaned); data is canonical YAML for the manifest and demand
+// parts and canonical JSON for the network part (so the hash is
+// formatting- and checkout-independent), raw bytes for the not-yet-typed
+// control/metrics parts.
 type hashPart struct {
 	rel  string
 	data []byte
@@ -137,11 +156,21 @@ func Load(dir string) (*Scenario, error) {
 		return nil, fmt.Errorf("scenario %s: %w", ManifestFile, err)
 	}
 	s.Manifest = m
-	s.parts = append(s.parts, hashPart{rel: ManifestFile, data: canonicalYAML(&m)})
+	// The hashed manifest strips the run coordinates (seed, ticks): the run
+	// key is (content-hash, seed), so the seed cannot also be content, and
+	// determinism makes a longer run of the same scenario a strict
+	// trajectory superset of a shorter one — ticks is recorded metadata,
+	// not identity (ADR-0012 §6 addendum). Note the hash covers the
+	// DEFAULTED model (e.g. types: [car]) — loader defaults are part of
+	// the format, versioned by format_version.
+	hm := m
+	hm.Seed, hm.Ticks = 0, 0
+	s.parts = append(s.parts, hashPart{rel: ManifestFile, data: canonicalYAML(&hm)})
 
-	// Network: raw bytes ride into the hash (the netimport JSON is the
-	// importer's artifact, not ours to reformat); the compile validates the
-	// file itself and supplies the origin set for demand validation.
+	// Network: parsed and re-emitted as canonical JSON for the hash (git
+	// autocrlf/eol rewrites and netimport formatting choices must not move
+	// identity); the compile validates the file itself and supplies the
+	// origin set for demand validation.
 	netPath, err := resolvePart(dir, m.Network)
 	if err != nil {
 		return nil, fmt.Errorf("scenario %s: network: %w", ManifestFile, err)
@@ -163,7 +192,7 @@ func Load(dir string) (*Scenario, error) {
 	for _, l := range net.Origins {
 		s.origins[l.ID] = true
 	}
-	s.parts = append(s.parts, hashPart{rel: m.Network, data: rawNet})
+	s.parts = append(s.parts, hashPart{rel: m.Network, data: canonicalJSON(rawNet, m.Network)})
 
 	typeSet := make(map[string]bool, len(m.Types))
 	for _, t := range m.Types {
@@ -182,9 +211,10 @@ func Load(dir string) (*Scenario, error) {
 		s.parts = append(s.parts, hashPart{rel: ref, data: canonical})
 	}
 	// Control and metrics parts are v1 pass-through: existence-checked and
-	// hashed (ADR-0012 §5 — the binding grammar lands with the
-	// observability ADR; a variant that forgets one is already a broken
-	// diff because the hash moves).
+	// hashed as raw bytes (ADR-0012 §5 — the binding grammar lands with the
+	// observability ADR; the parts then move to typed canonical hashing
+	// under a format_version bump). A variant that forgets one is already a
+	// broken diff because the hash moves.
 	for _, ref := range append(append([]string{}, m.Control...), m.Metrics...) {
 		p, err := resolvePart(dir, ref)
 		if err != nil {
@@ -196,8 +226,8 @@ func Load(dir string) (*Scenario, error) {
 		}
 		s.parts = append(s.parts, hashPart{rel: ref, data: raw})
 	}
-	if m.Spawner == nil && len(m.Demand) == 0 {
-		return nil, fmt.Errorf("scenario %s: no demand — set spawner: or demand: (an empty run is not a scenario)", ManifestFile)
+	if (m.Spawner == nil || m.Spawner.RatePerLaneHour == 0) && len(m.Demand) == 0 {
+		return nil, fmt.Errorf("scenario %s: no demand — set spawner.rate_per_lane_h > 0 or demand: (an empty run is not a scenario)", ManifestFile)
 	}
 	return s, nil
 }
@@ -261,59 +291,122 @@ func (s *Scenario) RunSpec(typeReg map[string]*engine.VehicleType) (engine.RunSp
 	return spec, nil
 }
 
-// Hash is the scenario's content identity (ADR-0012 §6): sha256 over the
-// canonical manifest and demand bytes plus the raw network/control/metrics
-// bytes, each framed by its scenario-relative path. Formatting-independent
-// for the YAML parts; stable across copies, renames, and checkouts.
+// Hash is the scenario's content identity (ADR-0012 §6): a domain-separated
+// sha256 over the canonical manifest (run coordinates stripped) and demand
+// bytes, the canonical network JSON, and the raw control/metrics bytes,
+// each framed by its length-prefixed, slash-normalized scenario-relative
+// path. Formatting- and checkout-independent for the typed parts; stable
+// across copies, renames, and machines.
 func (s *Scenario) Hash() string {
 	parts := append([]hashPart{}, s.parts...)
 	sort.Slice(parts, func(i, j int) bool { return parts[i].rel < parts[j].rel })
 	h := sha256.New()
+	io.WriteString(h, hashDomain)
+	var lenBuf [8]byte
+	frame := func(b []byte) {
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(b)))
+		h.Write(lenBuf[:])
+		h.Write(b)
+	}
 	for _, p := range parts {
-		io.WriteString(h, p.rel)
-		h.Write([]byte{0})
-		h.Write(p.data)
-		h.Write([]byte{0})
+		frame([]byte(p.rel))
+		frame(p.data)
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// Format rewrites the manifest and demand parts in canonical form
-// (ADR-0012 §2: diffs stay semantic, the hash stays stable). The scenario
-// must validate first — fmt never canonicalizes a broken scenario. Network,
-// control, and metrics parts are untouched (not our formats).
+// Format rewrites the manifest and demand parts in canonical form —
+// alphabetically sorted mapping keys, 2-space indent — operating on the
+// parsed node tree so COMMENTS SURVIVE (ADR-0012 §2 chose YAML for
+// comments; a formatter that deletes them defeats the choice). Files
+// already canonical are left untouched; rewrites are staged to temp files
+// and renamed, so a failure never leaves a partially formatted directory.
+// Network, control, and metrics parts are untouched (not our formats).
 func Format(dir string) error {
-	s, err := Load(dir)
+	if _, err := Load(dir); err != nil {
+		return err // fmt never canonicalizes a broken scenario
+	}
+	targets := []string{ManifestFile}
+	m, err := readManifest(dir)
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(dir, ManifestFile), canonicalYAML(&s.Manifest), 0o644); err != nil {
-		return err
+	targets = append(targets, m.Demand...)
+	type staged struct {
+		final string
+		tmp   string
 	}
-	for i, ref := range s.Manifest.Demand {
-		p, _ := resolvePart(dir, ref) // Load already validated
-		if err := os.WriteFile(p, canonicalYAML(s.Demands[i]), 0o644); err != nil {
+	var files []staged
+	for _, rel := range targets {
+		final, err := resolvePart(dir, rel)
+		if err != nil {
+			return err
+		}
+		data, err := os.ReadFile(final)
+		if err != nil {
+			return err
+		}
+		canonical, err := canonicalizePreservingComments(data)
+		if err != nil {
+			return fmt.Errorf("fmt %s: %w", rel, err)
+		}
+		if bytes.Equal(data, canonical) {
+			continue
+		}
+		tmp := final + ".fmt-tmp"
+		if err := os.WriteFile(tmp, canonical, 0o644); err != nil {
+			return err
+		}
+		files = append(files, staged{final: final, tmp: tmp})
+	}
+	for _, f := range files {
+		if err := os.Rename(f.tmp, f.final); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// resolvePart joins a scenario-relative part reference to the directory,
-// rejecting absolute paths and parent escapes (parts live INSIDE the
-// scenario directory — the directory is the unit, ADR-0012 §1).
+func readManifest(dir string) (*Manifest, error) {
+	data, err := os.ReadFile(filepath.Join(dir, ManifestFile))
+	if err != nil {
+		return nil, err
+	}
+	var m Manifest
+	if err := strictDecode(data, &m); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+// resolvePart joins a scenario-relative part reference to the directory.
+// References must be relative, slash-separated, already-clean paths that
+// stay inside the directory — lexically (no "..", no absolute, no
+// backslashes) AND physically (symlinks may not escape; the directory is
+// the unit of sharing, ADR-0012 §1).
 func resolvePart(dir, ref string) (string, error) {
 	if ref == "" {
 		return "", errors.New("empty part reference")
 	}
-	if filepath.IsAbs(ref) {
-		return "", fmt.Errorf("part %q: absolute paths are not allowed", ref)
+	if strings.ContainsRune(ref, '\\') {
+		return "", fmt.Errorf("part %q: use forward slashes (portable refs)", ref)
 	}
-	clean := filepath.Clean(ref)
-	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("part %q: escapes the scenario directory", ref)
+	if path.IsAbs(ref) || path.Clean(ref) != ref || ref == ".." || strings.HasPrefix(ref, "../") {
+		return "", fmt.Errorf("part %q: must be a clean relative path inside the scenario directory", ref)
 	}
-	return filepath.Join(dir, clean), nil
+	final := filepath.Join(dir, filepath.FromSlash(ref))
+	realDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", err
+	}
+	realPart, err := filepath.EvalSymlinks(final)
+	if err != nil {
+		return "", err
+	}
+	if realPart != realDir && !strings.HasPrefix(realPart, realDir+string(filepath.Separator)) {
+		return "", fmt.Errorf("part %q: symlink escapes the scenario directory", ref)
+	}
+	return final, nil
 }
 
 func validateManifest(m *Manifest) error {
@@ -329,18 +422,32 @@ func validateManifest(m *Manifest) error {
 	if m.Network == "" {
 		return errors.New("missing network")
 	}
-	if m.Params.Dt < 0 {
-		return errors.New("params.dt must be > 0")
+	if err := finite("params.dt", m.Params.Dt); err != nil {
+		return err
+	}
+	if m.Params.Dt < 0 || m.Params.Dt > 1.0 {
+		return errors.New("params.dt must be in (0, 1.0] seconds (0 = engine default 0.1; ADR-0005 bounds the tick at 1 s)")
 	}
 	if len(m.Types) == 0 {
 		m.Types = []string{"car"}
 	}
+	seen := make(map[string]bool, len(m.Types))
 	for _, t := range m.Types {
-		if t = strings.TrimSpace(t); t == "" {
-			return errors.New("types: empty type name")
+		if t == "" || t != strings.TrimSpace(t) {
+			return fmt.Errorf("types: %q is not a canonical type name (no surrounding whitespace)", t)
 		}
+		if seen[t] {
+			return fmt.Errorf("types: duplicate %q", t)
+		}
+		seen[t] = true
 	}
 	if m.Spawner != nil {
+		if err := finite("spawner.rate_per_lane_h", m.Spawner.RatePerLaneHour); err != nil {
+			return err
+		}
+		if err := finite("spawner.density_per_km", m.Spawner.DensityPerKm); err != nil {
+			return err
+		}
 		if m.Spawner.RatePerLaneHour < 0 {
 			return errors.New("spawner.rate_per_lane_h must be >= 0 (0 = spawner disabled, director-driven)")
 		}
@@ -358,8 +465,15 @@ func validateDemand(df *DemandFile, origins, typeSet map[string]bool) error {
 	if len(df.Flows) == 0 {
 		return errors.New("no flows")
 	}
+	flowIDs := make(map[string]bool, len(df.Flows))
 	for i, f := range df.Flows {
 		where := fmt.Sprintf("flow %d (%s)", i, f.Origin)
+		if f.ID != "" {
+			if flowIDs[f.ID] {
+				return fmt.Errorf("%s: duplicate flow id %q", where, f.ID)
+			}
+			flowIDs[f.ID] = true
+		}
 		if f.Origin == "" {
 			return fmt.Errorf("flow %d: missing origin", i)
 		}
@@ -369,16 +483,31 @@ func validateDemand(df *DemandFile, origins, typeSet map[string]bool) error {
 		if f.Spacing != "constant" && f.Spacing != "poisson" {
 			return fmt.Errorf("%s: spacing %q (want constant|poisson)", where, f.Spacing)
 		}
-		if len(f.Slices) == 0 && f.VehPerH <= 0 {
-			return fmt.Errorf("%s: veh_per_h must be > 0 without slices", where)
+		if err := finite(where+" veh_per_h", f.VehPerH); err != nil {
+			return err
+		}
+		if err := finite(where+" until_s", f.UntilS); err != nil {
+			return err
+		}
+		if len(f.Slices) == 0 {
+			if f.VehPerH <= 0 {
+				return fmt.Errorf("%s: veh_per_h must be > 0 without slices", where)
+			}
+		} else {
+			if f.VehPerH != 0 {
+				return fmt.Errorf("%s: veh_per_h is dead config alongside slices (slices define the whole rate program) — remove it", where)
+			}
 		}
 		prevEnd := 0.0
 		for j, sl := range f.Slices {
+			if err := finite(fmt.Sprintf("%s slice %d", where, j), sl.StartS, sl.EndS, sl.VehPerH); err != nil {
+				return err
+			}
 			if sl.StartS < 0 || sl.EndS <= sl.StartS {
 				return fmt.Errorf("%s slice %d: need 0 <= start_s < end_s", where, j)
 			}
 			if j > 0 && sl.StartS < prevEnd {
-				return fmt.Errorf("%s slice %d: overlaps the previous slice (slices are sorted, non-overlapping windows)", where, j)
+				return fmt.Errorf("%s slice %d: overlaps the previous slice (sorted, non-overlapping windows; adjacency is fine)", where, j)
 			}
 			if sl.VehPerH < 0 {
 				return fmt.Errorf("%s slice %d: veh_per_h must be >= 0", where, j)
@@ -388,7 +517,13 @@ func validateDemand(df *DemandFile, origins, typeSet map[string]bool) error {
 		if f.UntilS < 0 {
 			return fmt.Errorf("%s: until_s must be >= 0", where)
 		}
+		if len(f.VTypes) == 0 && typeSet != nil && !typeSet["car"] {
+			return fmt.Errorf("%s: no vtypes given, so the sampler would emit the default \"car\" — not in the scenario type list", where)
+		}
 		for name, w := range f.VTypes {
+			if err := finite(where+" vtype "+name, w); err != nil {
+				return err
+			}
 			if w <= 0 {
 				return fmt.Errorf("%s: vtype %q weight must be > 0", where, name)
 			}
@@ -400,13 +535,29 @@ func validateDemand(df *DemandFile, origins, typeSet map[string]bool) error {
 	return nil
 }
 
+// finite rejects NaN and ±Inf — plain !!float scalars that sail through
+// every ordered comparison (IEEE's sharpest footgun in a fail-loud loader).
+func finite(name string, vs ...float64) error {
+	for _, v := range vs {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return fmt.Errorf("%s: %v is not a finite number", name, v)
+		}
+	}
+	return nil
+}
+
 // strictDecode parses the ADR-0012 strict-YAML subset into v: exactly one
-// document, no anchors/aliases/merge keys/custom tags, no unknown fields.
-// (Duplicate mapping keys are already a yaml.v3 parse error.)
+// document, no anchors/aliases/merge keys/custom tags, no unknown fields,
+// and no silent scalar coercions (a !!float never truncates into an int
+// field, a !!bool never becomes a string — checked against the destination
+// schema, because yaml.v3's decoder does both silently).
 func strictDecode(data []byte, v any) error {
 	var root yaml.Node
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	if err := dec.Decode(&root); err != nil {
+		if err == io.EOF {
+			return errors.New("empty file")
+		}
 		return err
 	}
 	var extra yaml.Node
@@ -414,6 +565,9 @@ func strictDecode(data []byte, v any) error {
 		return errors.New("one document per file (strict YAML)")
 	}
 	if err := rejectNonStrict(&root); err != nil {
+		return err
+	}
+	if err := checkNodeTypes(&root, reflect.TypeOf(v)); err != nil {
 		return err
 	}
 	kf := yaml.NewDecoder(bytes.NewReader(data))
@@ -427,7 +581,8 @@ func strictDecode(data []byte, v any) error {
 // rejectNonStrict walks the node tree refusing the YAML features the
 // strict subset fences out (ADR-0012 §2): anchors/aliases create invisible
 // long-range coupling; merge keys are alias-adjacent; custom tags are
-// invisible typing.
+// invisible typing. (Duplicate mapping keys are already a yaml.v3 parse
+// error.)
 func rejectNonStrict(n *yaml.Node) error {
 	if n.Kind == yaml.DocumentNode {
 		for _, c := range n.Content {
@@ -440,13 +595,15 @@ func rejectNonStrict(n *yaml.Node) error {
 	if n.Alias != nil {
 		return fmt.Errorf("line %d: aliases are not strict YAML", n.Line)
 	}
-	switch n.Tag {
-	case "!!str", "!!int", "!!float", "!!bool", "!!null", "!!map", "!!seq":
-	default:
-		return fmt.Errorf("line %d: tag %s is not strict YAML (custom tags and merge keys are forbidden)", n.Line, n.Tag)
-	}
 	if n.Anchor != "" {
 		return fmt.Errorf("line %d: anchors are not strict YAML", n.Line)
+	}
+	switch n.Tag {
+	case "!!str", "!!int", "!!float", "!!bool", "!!null", "!!map", "!!seq":
+	case "!!timestamp":
+		return fmt.Errorf("line %d: unquoted %q resolves to a timestamp — quote it (strict YAML admits no implicit typing)", n.Line, n.Value)
+	default:
+		return fmt.Errorf("line %d: tag %s is not strict YAML (custom tags and merge keys are forbidden)", n.Line, n.Tag)
 	}
 	for _, c := range n.Content {
 		if err := rejectNonStrict(c); err != nil {
@@ -456,10 +613,157 @@ func rejectNonStrict(n *yaml.Node) error {
 	return nil
 }
 
-// canonicalYAML renders a decoded model in the canonical form: struct
-// fields in declaration order, map keys sorted (yaml.v3), 2-space indent.
-// Formatting-independent content hashing and semantic diffs both build on
-// this.
+// checkNodeTypes verifies scalar node tags against the destination Go type
+// BEFORE decoding: yaml.v3 silently truncates 1.9 → 1 into int fields and
+// stringifies true → "true" into string fields, both of which the strict
+// subset classifies as implicit typing. Int destinations require !!int;
+// float destinations accept !!int or !!float (a YAML int IS a float);
+// string destinations require !!str; bool destinations require !!bool.
+func checkNodeTypes(n *yaml.Node, t reflect.Type) error {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	switch n.Kind {
+	case yaml.DocumentNode:
+		if len(n.Content) == 0 {
+			return nil
+		}
+		return checkNodeTypes(n.Content[0], t)
+	case yaml.MappingNode:
+		if t.Kind() == reflect.Map {
+			vt := t.Elem()
+			for i := 0; i+1 < len(n.Content); i += 2 {
+				if err := scalarTag(n.Content[i], reflect.TypeOf("")); err != nil {
+					return err
+				}
+				if err := checkNodeTypes(n.Content[i+1], vt); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		if t.Kind() != reflect.Struct {
+			return nil
+		}
+		fields := yamlFields(t)
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			ft, ok := fields[n.Content[i].Value]
+			if !ok {
+				continue // unknown field: KnownFields decode reports it
+			}
+			if err := checkNodeTypes(n.Content[i+1], ft); err != nil {
+				return err
+			}
+		}
+		return nil
+	case yaml.SequenceNode:
+		if t.Kind() == reflect.Slice {
+			for _, c := range n.Content {
+				if err := checkNodeTypes(c, t.Elem()); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	case yaml.ScalarNode:
+		return scalarTag(n, t)
+	}
+	return nil
+}
+
+// yamlFields indexes a struct's YAML-visible fields by their resolved key
+// (explicit tag, else the lowercased field name — yaml.v3's rule).
+func yamlFields(t reflect.Type) map[string]reflect.Type {
+	out := make(map[string]reflect.Type, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if f.PkgPath != "" {
+			continue // unexported
+		}
+		name, _, _ := strings.Cut(f.Tag.Get("yaml"), ",")
+		if name == "-" {
+			continue
+		}
+		if name == "" {
+			name = strings.ToLower(f.Name)
+		}
+		out[name] = f.Type
+	}
+	return out
+}
+
+func scalarTag(n *yaml.Node, t reflect.Type) error {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if n.Tag == "!!null" {
+		return nil // null into anything omitempty-shaped is the author's business
+	}
+	want := ""
+	switch t.Kind() {
+	case reflect.String:
+		want = "!!str"
+	case reflect.Bool:
+		want = "!!bool"
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		want = "!!int"
+	case reflect.Float32, reflect.Float64:
+		if n.Tag == "!!int" || n.Tag == "!!float" {
+			return nil
+		}
+		want = "!!float"
+	default:
+		return nil // maps/slices are structural; interface{} accepts anything
+	}
+	if n.Tag != want {
+		return fmt.Errorf("line %d: %q is %s but the schema wants %s here (strict YAML admits no implicit typing — quote strings, use exact numbers)", n.Line, n.Value, n.Tag, want)
+	}
+	return nil
+}
+
+// canonicalizePreservingComments re-emits a YAML document with mapping keys
+// sorted alphabetically at every level and 2-space indent, operating on the
+// parsed node tree so comments and sequence order survive. This is fmt's
+// canonical form; the content hash does NOT depend on it (it hashes the
+// struct re-encode).
+func canonicalizePreservingComments(data []byte) ([]byte, error) {
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return nil, err
+	}
+	sortMappingKeys(&root)
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(&root); err != nil {
+		return nil, err
+	}
+	if err := enc.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func sortMappingKeys(n *yaml.Node) {
+	if n.Kind == yaml.MappingNode {
+		type kv struct{ k, v *yaml.Node }
+		pairs := make([]kv, 0, len(n.Content)/2)
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			pairs = append(pairs, kv{n.Content[i], n.Content[i+1]})
+		}
+		sort.SliceStable(pairs, func(i, j int) bool { return pairs[i].k.Value < pairs[j].k.Value })
+		for i, p := range pairs {
+			n.Content[2*i], n.Content[2*i+1] = p.k, p.v
+		}
+	}
+	for _, c := range n.Content {
+		sortMappingKeys(c)
+	}
+}
+
+// canonicalYAML renders a decoded model for the content hash: struct fields
+// in declaration order, map keys sorted (yaml.v3), 2-space indent.
 func canonicalYAML(v any) []byte {
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)
@@ -471,4 +775,21 @@ func canonicalYAML(v any) []byte {
 		panic(fmt.Sprintf("scenario: canonical encode: %v", err))
 	}
 	return buf.Bytes()
+}
+
+// canonicalJSON re-emits parsed JSON compactly (Go's encoding/json sorts
+// map keys and never emits whitespace), so the network part's hash is
+// independent of the importer's formatting and of checkout EOL rewrites.
+func canonicalJSON(raw []byte, name string) []byte {
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		// Load already parsed the file as a NetFile; unreachable in
+		// practice — but never panic on author input.
+		return raw
+	}
+	out, err := json.Marshal(v)
+	if err != nil {
+		panic(fmt.Sprintf("scenario: canonical JSON encode of %s: %v", name, err))
+	}
+	return out
 }

@@ -200,28 +200,86 @@ IDs (ADR-0009). This ADR fixes the container those decisions live in.
 
 ## Addendum (2026-07-21, M11 implementation notes)
 
-- **Schema validation is realized as strict decoding + semantic checks, not
-  a JSON-Schema library.** yaml.v3's KnownFields makes unknown fields hard
-  errors; the semantic layer (versions, enums, slice windows, type-list and
-  origin-lane references, path confinement) is hand-written and fail-loud.
-  This keeps the dependency footprint at the one approved YAML library —
-  a JSON-Schema engine would have been a second. If cross-field constraints
-  outgrow hand-written checks, the CUE upgrade path (§2) is the answer, not
-  a schema library bolt-on.
-- **RunSpec carries the content hash** (`engine.RunSpec.Hash`, additive JSON
-  field, never read by the kernel, not CRC'd): the run registry's meta entry
-  records (content-hash, seed) with zero message-contract change, as §6
-  intended.
-- **The demand-director migrated to the scenario demand schema** (its
-  strict-JSON files parse unchanged — JSON is a YAML subset); the demo flow
-  file is now `cmd/demand-director/demo-i280.yaml`. The `-demand` flag stays
-  a file path; scenario-directory demand wiring (one flag for all flows +
-  manifest seed) lands with overlays.
+- **Schema validation is realized as strict decoding + a schema-aware
+  node-type check + semantic checks, not a JSON-Schema library.** yaml.v3's
+  KnownFields makes unknown fields hard errors; the node-type check closes
+  the decoder's silent coercions (a `1.9` truncating into an int field, a
+  `true` stringifying into a string field — both verified yaml.v3
+  behaviors); the semantic layer (versions, enums, finite-number checks,
+  slice windows, type-list and origin-lane references, lexical AND physical
+  path confinement) is hand-written and fail-loud. This keeps the
+  dependency footprint at the one approved YAML library — a JSON-Schema
+  engine would have been a second. If cross-field constraints outgrow
+  hand-written checks, the CUE upgrade path (§2) is the answer, not a
+  schema library bolt-on.
+- **The content hash strips the run coordinates (seed, ticks).** The first
+  M11 cut hashed the full manifest, which made the seed both content and
+  run-key coordinate — incoherent with §6, caught in external review before
+  anything durable bound hashes. The hashed manifest zeroes seed and ticks:
+  seed is the second run-key coordinate, and determinism makes a longer run
+  of the same scenario a strict trajectory superset of a shorter one, so
+  ticks is recorded metadata, not identity. The hash is a domain-separated
+  protocol (`traffic-sim/scenario-hash/v1`, length-prefixed slash-normalized
+  path framing) with a pinned golden-vector test; bumping the YAML library
+  or the canonicalization is a format event under §8, never silent.
+  Network parts hash as canonical JSON (checkout EOL rewrites must not move
+  identity); control/metrics stay raw bytes until their grammars land
+  (§5's deferral) and then move to typed canonical hashing under a
+  format_version bump.
+- **RunSpec carries the content hash** (`engine.RunSpec.Hash`, additive
+  omitempty JSON field, never read by the kernel, not CRC'd): the run
+  registry's meta entry records (content-hash, seed). Documented in
+  asyncapi RunMetaView and ADR-0006 (2026-07-21 addendum) — the contract
+  rule is that additive metadata gets written down, not that it needs a
+  schema bump.
+- **Scenario demand EXECUTES in serve.** The reference demand director
+  moved to `engine/natsio/demand` (library) with `cmd/demand-director` as
+  the standalone wrapper; serve embeds it whenever the scenario declares
+  demand parts, seeded with the RUN seed (respecting sweep overrides), so
+  the recorded (hash, seed) covers the demand realization. simrun refuses
+  demand-bearing scenarios (headless runs have no bus for verbs; the
+  offline spawn-table mode remains the ADR's deferred answer). Multi-file
+  demand shares one flow-index space, so request ids and RNG keys cannot
+  collide across files. The flow RNG key now mixes the full 8-byte index
+  (the M10 low byte collided at 256 flows per origin — this resamples
+  director streams, safe because no pinned realization predates it).
+  `pickType` accumulates weights in sorted-key order (float addition is
+  non-associative; ADR-0005). First-arrival-at-window-start matches SUMO's
+  flow-begin convention and is documented, not changed.
+- **fmt preserves comments** (operates on the parsed node tree, sorts
+  mapping keys, atomic temp-and-rename) — a formatter that deletes comments
+  would defeat §2's reason for choosing YAML. The hash does not depend on
+  fmt (it hashes the struct re-encode; comments are correctly invisible to
+  identity).
+- **The demand-director migrated to the scenario demand schema**; M10-era
+  strict-JSON files parse once a `"format_version": 1` key is added (the
+  version key is required — strictness is the point; an earlier draft of
+  this note said "unchanged", which was wrong). The demo flow file is
+  `cmd/demand-director/demo-i280.yaml`. Flows gained an optional
+  `id` (omitempty — additive, never moves an existing hash) as the future
+  overlay-patch anchor; duplicate ids within a file are rejected.
+- **Flag discipline:** `-scenario` refuses scenario-owned flags
+  (`-rate`/`-density`/`-types`/`-net`/`-netfile`); only `-seed`/`-ticks`
+  override, per §6's sweep model.
 - **Verified:** scenario-loaded and flag-built runs are bit-identical
   (I-280, rate 600/density 80/seed 1/3000 ticks → crc `e92229c4a89d3709`
-  both ways, matching the M8 acceptance value); `scenario fmt` is idempotent
-  and hash-stable; the strict fence rejects anchors, custom tags, multiple
-  documents, unknown fields, and `..`/absolute part paths.
+  both ways, matching the M8 acceptance value); `scenario fmt` is
+  idempotent, hash-stable, and comment-preserving; the strict fence rejects
+  anchors, custom tags, implicit timestamps, multiple documents, unknown
+  fields, scalar coercions, non-finite floats, `..`/absolute/backslash/unclean
+  part paths, and escaping symlinks; serve with a demand-only scenario
+  attaches the embedded director (verbs accepted, run-seeded).
+- **Review provenance:** the post-implementation review by three external
+  models (Claude Fable, GPT-5.6-sol, Gemini) caught the seed-in-hash
+  incoherence, the unexecuted demand parts, the yaml.v3 scalar coercions,
+  the non-finite float holes, the `pickType` map-order sum, the low-byte
+  flow key, comment-destroying fmt, symlink escape, and the false
+  JSON-compat claim — all fixed above before the first durable hash
+  binding. Open for overlay time: flow-id namespacing across files,
+  patchable entity granularity (JSON Merge Patch replaces arrays wholesale),
+  vehicle-type DEFINITIONS as part files (`vtypes/*.yaml` — the hash
+  currently covers type names, and the IDM parameters behind them ride on
+  the engine version).
 - **Not in M11** (per the ADR's deferred list): overlays/variant.yaml,
   control/metrics binding grammars (parts are existence-checked and hashed
-  only), pack format, offline spawn-table export.
+  raw), pack format, offline spawn-table export.

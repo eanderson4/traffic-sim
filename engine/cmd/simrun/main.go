@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 
 	"traffic-sim/engine"
 	"traffic-sim/engine/scenario"
@@ -35,10 +36,26 @@ func main() {
 			fmt.Fprintln(os.Stderr, "simrun: -scenario and -netfile are mutually exclusive (the scenario names its network)")
 			os.Exit(2)
 		}
+		conflicting := []string{}
+		flag.Visit(func(f *flag.Flag) {
+			switch f.Name {
+			case "rate", "density", "net":
+				conflicting = append(conflicting, "-"+f.Name)
+			}
+		})
+		if len(conflicting) > 0 {
+			fmt.Fprintf(os.Stderr, "simrun: %s are scenario-owned when -scenario is set (only -seed/-ticks override)\n",
+				strings.Join(conflicting, ", "))
+			os.Exit(2)
+		}
 		sc, lerr := scenario.Load(*scenarioDir)
 		if lerr != nil {
 			fmt.Fprintln(os.Stderr, "simrun:", lerr)
 			os.Exit(1)
+		}
+		if len(sc.Demands) > 0 {
+			fmt.Fprintln(os.Stderr, "simrun: scenario declares demand parts — headless runs have no bus for director verbs; use serve (it embeds the demand director, run-seeded)")
+			os.Exit(2)
 		}
 		spec, err = sc.RunSpec(map[string]*engine.VehicleType{"car": &engine.Car, "truck": &engine.Truck})
 		if err != nil {

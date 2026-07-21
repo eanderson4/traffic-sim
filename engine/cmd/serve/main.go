@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/signal"
@@ -30,6 +31,7 @@ import (
 
 	"traffic-sim/engine"
 	"traffic-sim/engine/natsio"
+	"traffic-sim/engine/natsio/demand"
 	"traffic-sim/engine/natsio/driver"
 	"traffic-sim/engine/scenario"
 )
@@ -76,12 +78,29 @@ func main() {
 	// Build the run spec: an ADR-0012 scenario directory, or the flag-era
 	// surface (which is a generated-default scenario conceptually).
 	var spec engine.RunSpec
+	var scen *scenario.Scenario
 	if *scenarioDir != "" {
+		// The scenario owns network, demand, and the type list; the
+		// deliberate sweep overrides (-seed/-ticks) are the only flags
+		// allowed beside it.
+		conflicting := []string{}
+		flag.Visit(func(f *flag.Flag) {
+			switch f.Name {
+			case "rate", "density", "types":
+				conflicting = append(conflicting, "-"+f.Name)
+			}
+		})
+		if len(conflicting) > 0 {
+			fmt.Fprintf(os.Stderr, "serve: %s are scenario-owned when -scenario is set (only -seed/-ticks override)\n",
+				strings.Join(conflicting, ", "))
+			os.Exit(2)
+		}
 		sc, err := scenario.Load(*scenarioDir)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "serve:", err)
 			os.Exit(1)
 		}
+		scen = sc
 		spec, err = sc.RunSpec(typeReg)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "serve:", err)
@@ -211,11 +230,37 @@ func main() {
 		fmt.Printf("serve: default driver attached as %s (capacity %d)\n", d.ID(), *capacity)
 	}
 
+	// Scenario demand parts run through the embedded reference demand
+	// director (engine/natsio/demand): sampled with the RUN seed, so the
+	// recorded (content-hash, seed) run key covers the demand realization
+	// and a same-seed rerun re-issues the identical verb program.
+	if scen != nil && len(scen.Demands) > 0 {
+		dnc, err := nats.Connect(nats.DefaultURL, nats.InProcessServer(ns), nats.Name("demand-director"))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "serve: demand director connect:", err)
+			os.Exit(1)
+		}
+		defer dnc.Close()
+		djs, err := dnc.JetStream()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "serve: demand director JetStream:", err)
+			os.Exit(1)
+		}
+		lg := log.New(os.Stderr, "", 0)
+		dd, err := demand.Attach(dnc, djs, demand.Config{Run: *run, Seed: spec.Seed, Log: lg}, scen.Demands)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "serve: demand director:", err)
+			os.Exit(1)
+		}
+		defer dd.Close()
+		fmt.Printf("serve: demand director attached (%d demand file(s), run-seeded)\n", len(scen.Demands))
+	}
+
 	wsURL := fmt.Sprintf("ws://%s:%d", host, port)
 	if host == "" || host == "0.0.0.0" {
 		wsURL = fmt.Sprintf("ws://127.0.0.1:%d", port)
 	}
-	fmt.Printf("serve: run %q on %s (%d ticks @ 1× wall time)\n", *run, wsURL, *ticks)
+	fmt.Printf("serve: run %q on %s (%d ticks @ 1× wall time)\n", *run, wsURL, spec.Ticks)
 	fmt.Printf("serve: snapshots on %s — point the viz at it (?run=%s&ws=%s)\n",
 		natsio.SubjectStateSnap(*run), *run, wsURL)
 
