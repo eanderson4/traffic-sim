@@ -7,6 +7,17 @@ whenToUse: After landing an ADR-implementing milestone, before any durable bindi
 
 # External Review
 
+Two tiers (see AGENTS.md "Review Workflow"):
+
+- **Per-commit gate** — mechanical: `scripts/external-review.sh` runs Claude
+  Fable + GPT-5.6-sol over the staged diff and stamps it; the pre-commit
+  hook enforces. You don't need this skill for that — just run the script
+  before any code commit and triage what it prints.
+- **Milestone round** (this skill) — the deeper pass below: all three
+  models, a hand-written brief, ADR-level triage, archived round,
+  hardening commit. Run it after ADR-implementing milestones, before
+  durable bindings.
+
 Get independent design+code review from the three external model CLIs, triage their findings against the actual code, fix what's real, and archive the round in the KB.
 
 ## Scope
@@ -50,6 +61,7 @@ For every finding, confirm it against the actual code/behavior before acting:
 - Reproduce claims with a small probe when cheap (precedent: the "yaml.v3 silently truncates 1.9→1 into int fields" claim was verified with a 20-line program before the fence was rewritten).
 - Classify: **fix now** (correctness, determinism, contract) / **document** (defensible-but-surprising semantics → ADR addendum or code comment) / **defer** (next milestone's scope — record it in the ADR's open list) / **reject** (wrong premise — say why in the commit or addendum).
 - Findings that contradict each other get a decision, not a compromise.
+- **Triage bar (AGENTS.md "Review Workflow"): blockers only, one round.** Should-fixes get recorded and deferred, nits ignored, and hardening against hypotheticals (error handling for cases that can't yet occur) is reject-by-default at this stage. Do not run fix-and-re-review loops for polish — one round per commit.
 
 ### 4. Fix and verify
 

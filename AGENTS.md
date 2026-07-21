@@ -37,14 +37,32 @@ Rules for anyone (human or agent) working in this repo.
 
 ## Review Workflow
 
-- `/external-review <scope>` — multi-model external review (Claude Fable,
-  GPT-5.6-sol, Gemini) of a milestone or ADR. **Run it after every
-  ADR-implementing milestone, before anything durable binds the result**
-  (recordings, content hashes, published contract consumers). Findings are
-  triaged against the code (verify, don't trust), fixed with regression
-  tests, and archived in `docs/kb/raw/reviews/` with provenance in the ADR
-  addendum. First run: M11 (2026-07-21) — caught the seed-in-hash identity
-  bug and unexecuted demand parts before either could ship.
+- **Every code commit is externally reviewed.** A pre-commit hook
+  (`hooks/`, enabled via `git config core.hooksPath hooks` — set once per
+  clone) gates EVERY commit except documentation and generated content
+  (`docs/`, `data/`, `viz` dist/node_modules/public, root
+  Markdown, LICENSE, root `.gitignore`/`.gitattributes` — subdirectory
+  ones are gated). Anything else — engine,
+  viz sources, contracts, CI, analysis, prototypes, or the gate mechanism
+  itself — requires the exact staged diff to have been reviewed by Claude
+  Fable and GPT-5.6-sol. `scripts/external-review.sh` runs both over the
+  staged diff, archives the round to `docs/kb/raw/reviews/`, and stamps
+  the REVIEWED snapshot; staging anything afterwards fails the gate, so
+  review always covers what ships. The gate proves review *happened* —
+  triaging findings is the committer's job. Docs/KB-only commits pass
+  ungated. Escape hatch: `EXTERNAL_REVIEW_SKIP=1` (noisy on purpose).
+- **Triage bar: blockers only, one round.** Fix blockers before
+  committing; record should-fixes in the commit message or KB and defer
+  them; ignore nits. Reviewers will always find one more edge case — at
+  this stage "too early to need this" is a valid triage outcome, and
+  hardening against hypotheticals is a reject-by-default. One review
+  round per commit, not a fix-and-re-review loop for polish.
+- `/external-review <scope>` — the deeper milestone round (all three
+  models incl. Gemini, richer brief, ADR-level design questions). Run it
+  after every ADR-implementing milestone, before anything durable binds
+  the result (recordings, content hashes, published contract consumers).
+  First run: M11 (2026-07-21) — caught the seed-in-hash identity bug and
+  unexecuted demand parts before either could ship.
 
 ## Conventions
 

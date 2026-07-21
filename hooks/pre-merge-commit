@@ -1,0 +1,4 @@
+#!/bin/sh
+# Auto-merge commits (non-conflicting `git merge`) run pre-merge-commit,
+# not pre-commit — same gate applies (ADR-0013 §4: no merge waiver).
+exec "$(dirname "$0")/pre-commit"

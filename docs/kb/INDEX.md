@@ -94,8 +94,10 @@ links its source synthesis for traceability.
 - [x] [ADR-0010](decisions/ADR-0010-junction-right-of-way.md) — priority-junction right-of-way: compiled approach classes + conflict foes, kernel stop-line guardrail shared by all controllers; signals still unmodeled
 - [x] [ADR-0011](decisions/ADR-0011-fixed-time-signals.md) — fixed-time signal control: kernel-run programs compiled from tlLogic, phase state as a pure function of the tick count, enforcement composed with the stop-line guardrail; external command interface deferred
 - [x] [ADR-0012](decisions/ADR-0012-scenario-format.md) — scenario format: manifest-of-parts directory in strict YAML, runtime director demand sampling (M10 contract), kustomize-style overlay variants, (content-hash, seed) run identity, format_version migrations
+- [x] [ADR-0013](decisions/ADR-0013-external-review-gate.md) — external multi-model review (Claude Fable + GPT-5.6-sol) as a pre-commit gate: tree-hash stamp proves review happened, triage stays the committer's job, fail-closed with a loud skip hatch
 
 ---
 *Last distilled: 2026-07-17 | 18 articles from 56 raw research files*
-*ADR-0012 ratified 2026-07-21 (design; implementation pending)*
+*ADR-0012 ratified 2026-07-21 (design; M11 implementation + review round landed same day)*
+*ADR-0013 ratified 2026-07-21 (external-review workflow, following the M11 round)*
 *Run `/update-kb` to check freshness*
