@@ -1,0 +1,1366 @@
+diff --git a/engine/scenario/scenario.go b/engine/scenario/scenario.go
+index 9463fd9a896ce457cf96bdec5ee416e747934b7e..f57754a59c63b270d3dbc5cc39a0c6cb74a7b887 100644
+--- a/engine/scenario/scenario.go
++++ b/engine/scenario/scenario.go
+@@ -1,6 +1,7 @@
+ // Package scenario loads ADR-0012 scenario directories: a strict-YAML
+ // manifest (scenario.yaml) referencing network, demand, control, and metrics
+-// part files, materialized into an engine.RunSpec plus director demand
++// part files — or a variant.yaml overlay materialized against its base
++// (ADR-0012 §4, M12) — into an engine.RunSpec plus director demand
+ // definitions. It also provides the canonical formatter and the content
+ // hash — the run key is (content-hash, seed).
+ //
+@@ -28,6 +29,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"io/fs"
+ 	"math"
+ 	"os"
+ 	"path"
+@@ -141,8 +143,27 @@ type hashPart struct {
+ 
+ // Load reads, validates, and materializes a scenario directory (ADR-0012:
+ // fail-loud everywhere — unknown fields, bad references, and semantic
+-// errors are all load-time errors).
++// errors are all load-time errors). A directory holding variant.yaml
++// instead of scenario.yaml is an overlay (ADR-0012 §4, M12): it is
++// materialized against its base and then treated exactly like a
++// hand-authored scenario.
+ func Load(dir string) (*Scenario, error) {
++	_, mErr := os.Stat(filepath.Join(dir, ManifestFile))
++	_, vErr := os.Stat(filepath.Join(dir, VariantManifest))
++	if mErr == nil && vErr == nil {
++		return nil, fmt.Errorf("scenario %s: both %s and %s present — a directory is either a scenario or a variant (ADR-0012 §4)", dir, ManifestFile, VariantManifest)
++	}
++	// Only not-exist means "absent" — an I/O or permission error must not
++	// silently reroute manifest dispatch (fail loud, ADR-0012 §2).
++	if mErr != nil && !errors.Is(mErr, fs.ErrNotExist) {
++		return nil, fmt.Errorf("scenario %s: %w", filepath.Join(dir, ManifestFile), mErr)
++	}
++	if vErr != nil && !errors.Is(vErr, fs.ErrNotExist) {
++		return nil, fmt.Errorf("scenario %s: %w", filepath.Join(dir, VariantManifest), vErr)
++	}
++	if vErr == nil {
++		return loadVariant(dir)
++	}
+ 	s := &Scenario{Dir: dir}
+ 	mdata, err := os.ReadFile(filepath.Join(dir, ManifestFile))
+ 	if err != nil {
+@@ -246,6 +267,12 @@ func loadDemandFile(path string, origins, typeSet map[string]bool) (*DemandFile,
+ 	if err != nil {
+ 		return nil, nil, err
+ 	}
++	return parseDemand(data, origins, typeSet)
++}
++
++// parseDemand is the byte-level core of loadDemandFile — variant loading
++// feeds it patched documents without touching the base's files on disk.
++func parseDemand(data []byte, origins, typeSet map[string]bool) (*DemandFile, []byte, error) {
+ 	var df DemandFile
+ 	if err := strictDecode(data, &df); err != nil {
+ 		return nil, nil, err
+@@ -322,16 +349,32 @@ func (s *Scenario) Hash() string {
+ // already canonical are left untouched; rewrites are staged to temp files
+ // and renamed, so a failure never leaves a partially formatted directory.
+ // Network, control, and metrics parts are untouched (not our formats).
++// On a variant directory only the variant's OWN files are formatted
++// (variant.yaml and its added demand parts) — never the base's.
+ func Format(dir string) error {
+ 	if _, err := Load(dir); err != nil {
+ 		return err // fmt never canonicalizes a broken scenario
+ 	}
+ 	targets := []string{ManifestFile}
+-	m, err := readManifest(dir)
+-	if err != nil {
+-		return err
++	_, vErr := os.Stat(filepath.Join(dir, VariantManifest))
++	switch {
++	case vErr == nil:
++		v, err := readVariant(dir)
++		if err != nil {
++			return err
++		}
++		targets = append([]string{VariantManifest}, v.Demand...)
++	case !errors.Is(vErr, fs.ErrNotExist):
++		// Same fail-loud dispatch discipline as Load: only not-exist
++		// means "not a variant".
++		return fmt.Errorf("scenario %s: %w", filepath.Join(dir, VariantManifest), vErr)
++	default:
++		m, err := readManifest(dir)
++		if err != nil {
++			return err
++		}
++		targets = append(targets, m.Demand...)
+ 	}
+-	targets = append(targets, m.Demand...)
+ 	type staged struct {
+ 		final string
+ 		tmp   string
+@@ -379,6 +422,18 @@ func readManifest(dir string) (*Manifest, error) {
+ 	return &m, nil
+ }
+ 
++func readVariant(dir string) (*Variant, error) {
++	data, err := os.ReadFile(filepath.Join(dir, VariantManifest))
++	if err != nil {
++		return nil, err
++	}
++	var v Variant
++	if err := strictDecode(data, &v); err != nil {
++		return nil, err
++	}
++	return &v, nil
++}
++
+ // resolvePart joins a scenario-relative part reference to the directory.
+ // References must be relative, slash-separated, already-clean paths that
+ // stay inside the directory — lexically (no "..", no absolute, no
+@@ -391,6 +446,9 @@ func resolvePart(dir, ref string) (string, error) {
+ 	if strings.ContainsRune(ref, '\\') {
+ 		return "", fmt.Errorf("part %q: use forward slashes (portable refs)", ref)
+ 	}
++	if len(ref) > 1 && ref[1] == ':' {
++		return "", fmt.Errorf("part %q: drive-qualified paths are not portable refs", ref)
++	}
+ 	if path.IsAbs(ref) || path.Clean(ref) != ref || ref == ".." || strings.HasPrefix(ref, "../") {
+ 		return "", fmt.Errorf("part %q: must be a clean relative path inside the scenario directory", ref)
+ 	}
+@@ -455,6 +513,22 @@ func validateManifest(m *Manifest) error {
+ 			return errors.New("spawner.density_per_km must be >= 0 (0 = uncapped)")
+ 		}
+ 	}
++	// Part refs are hash frames: duplicates would silently double flows
++	// (and under an overlay, patch the first copy only), and a ref naming
++	// a manifest would hash the run coordinates as content — both break
++	// the directory-as-identity rule (ADR-0012 §1/§6).
++	refs := append(append(append([]string{}, m.Demand...), m.Control...), m.Metrics...)
++	seenRefs := make(map[string]bool, len(refs)+1)
++	seenRefs[m.Network] = true // the network is a hash frame too
++	for _, r := range refs {
++		if r == ManifestFile || r == VariantManifest {
++			return fmt.Errorf("part %q names a manifest file — not a part", r)
++		}
++		if seenRefs[r] {
++			return fmt.Errorf("duplicate part reference %q", r)
++		}
++		seenRefs[r] = true
++	}
+ 	return nil
+ }
+ 
+@@ -581,8 +655,9 @@ func strictDecode(data []byte, v any) error {
+ // rejectNonStrict walks the node tree refusing the YAML features the
+ // strict subset fences out (ADR-0012 §2): anchors/aliases create invisible
+ // long-range coupling; merge keys are alias-adjacent; custom tags are
+-// invisible typing. (Duplicate mapping keys are already a yaml.v3 parse
+-// error.)
++// invisible typing. (Duplicate mapping keys are a yaml.v3 parse error for
++// map/struct destinations; yaml.Node destinations — patch sets — are
++// covered by rejectDupKeys in variant.go.)
+ func rejectNonStrict(n *yaml.Node) error {
+ 	if n.Kind == yaml.DocumentNode {
+ 		for _, c := range n.Content {
+@@ -623,6 +698,13 @@ func checkNodeTypes(n *yaml.Node, t reflect.Type) error {
+ 	for t.Kind() == reflect.Pointer {
+ 		t = t.Elem()
+ 	}
++	// A yaml.Node destination (a patch's set) takes the subtree raw —
++	// checking it against Node's own struct schema would misreport patch
++	// keys that collide with Node field names; the merged document gets
++	// the real schema check at apply time.
++	if t == reflect.TypeOf(yaml.Node{}) {
++		return nil
++	}
+ 	switch n.Kind {
+ 	case yaml.DocumentNode:
+ 		if len(n.Content) == 0 {
+diff --git a/engine/scenario/scenario_test.go b/engine/scenario/scenario_test.go
+index 764e54c728a095ad147a8a740089b68acf8a90b9..c9c520b131ca13856e955c7ad9b8c4c1ab1a7310 100644
+--- a/engine/scenario/scenario_test.go
++++ b/engine/scenario/scenario_test.go
+@@ -352,6 +352,9 @@ func TestStrictYAMLFence(t *testing.T) {
+ 		{"anchor+alias", "format_version: 1\nid: &x test\nseed: 7\nticks: 3000\nnetwork: network.json\nspawner: {rate_per_lane_h: 600}\nmetrics: [*x]\n", "not strict YAML"},
+ 		{"custom tag", "format_version: 1\nid: !foo test\nseed: 7\nticks: 3000\nnetwork: network.json\nspawner: {rate_per_lane_h: 600}\n", "not strict YAML"},
+ 		{"two documents", goodManifest + "---\nformat_version: 1\n", "one document"},
++		{"duplicate part refs", strings.Replace(goodManifest, "demand:\n  - demand/main.yaml\n", "demand:\n  - demand/main.yaml\n  - demand/main.yaml\n", 1), "duplicate part reference"},
++		{"demand ref names the manifest", strings.Replace(goodManifest, "demand/main.yaml", ManifestFile, 1), "names a manifest file"},
++		{"control ref shadows the network", strings.Replace(goodManifest, "demand:\n  - demand/main.yaml\n", "demand:\n  - demand/main.yaml\ncontrol: [network.json]\n", 1), "duplicate part reference"},
+ 		{"newer version", strings.Replace(goodManifest, "format_version: 1", "format_version: 2", 1), "unsupported format_version 2"},
+ 		{"no demand", "format_version: 1\nid: x\nseed: 1\nticks: 10\nnetwork: network.json\n", "no demand"},
+ 	}
+diff --git a/engine/scenario/variant.go b/engine/scenario/variant.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..8cc8d55d0dc27c1533674af35728d5b857a2c180
+--- /dev/null
++++ b/engine/scenario/variant.go
+@@ -0,0 +1,473 @@
++package scenario
++
++// variant.go — ADR-0012 §4 overlays (M12 addendum "M12 overlay design").
++// A variant directory holds variant.yaml INSTEAD of scenario.yaml, naming
++// its base scenario plus manifest overrides, added part files, and patches
++// anchored to base demand flows by (part path, flow id). Loading
++// materializes the overlay into a Scenario indistinguishable from a
++// hand-authored one — same hash protocol, same RunSpec, same
++// (content-hash, seed) run key. The base directory is never modified.
++
++import (
++	"bytes"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io/fs"
++	"os"
++	"path"
++	"path/filepath"
++	"sort"
++	"strings"
++
++	"gopkg.in/yaml.v3"
++
++	"traffic-sim/engine"
++)
++
++// VariantManifest is the manifest name of a variant directory. A directory
++// holds scenario.yaml OR variant.yaml, never both — one manifest per
++// directory, so a directory's kind is unambiguous and composition cycles
++// are structurally impossible.
++const VariantManifest = "variant.yaml"
++
++// Variant is variant.yaml (strict YAML, format_version 1): identity, the
++// base reference, manifest overrides (present fields REPLACE the base's
++// wholesale — named-field replacement, not a removal directive), added
++// part files, and patches. Single-level composition only: the base must
++// not itself be a variant.
++type Variant struct {
++	FormatVersion int      `yaml:"format_version"`
++	ID            string   `yaml:"id"`
++	Base          string   `yaml:"base"`
++	Seed          *uint64  `yaml:"seed,omitempty"`
++	Ticks         *uint64  `yaml:"ticks,omitempty"`
++	Params        *Params  `yaml:"params,omitempty"`
++	Types         []string `yaml:"types,omitempty"`
++	Spawner       *Spawner `yaml:"spawner,omitempty"`
++	Network       string   `yaml:"network,omitempty"`
++	Demand        []string `yaml:"demand,omitempty"`
++	Control       []string `yaml:"control,omitempty"`
++	Metrics       []string `yaml:"metrics,omitempty"`
++	Patches       []Patch  `yaml:"patches,omitempty"`
++}
++
++// Patch modifies one base demand flow, anchored by (part path, flow id) —
++// the part path disambiguates flow ids across files. Set merges into the
++// flow at the YAML node level: mappings key-wise recursively, sequences
++// and scalars wholesale (a slices rate program patches as one entity).
++// Nulls are forbidden (no deletion — addition-only composition), and
++// patches MODIFY only: new flows arrive via added part files.
++type Patch struct {
++	Part string    `yaml:"part"`
++	Flow string    `yaml:"flow"`
++	Set  yaml.Node `yaml:"set"`
++}
++
++// loadVariant materializes a variant directory (see the package doc and
++// the ADR-0012 M12 addendum for the semantics this implements).
++func loadVariant(dir string) (*Scenario, error) {
++	vdata, err := os.ReadFile(filepath.Join(dir, VariantManifest))
++	if err != nil {
++		return nil, fmt.Errorf("scenario: %w", err)
++	}
++	var v Variant
++	if err := strictDecode(vdata, &v); err != nil {
++		return nil, fmt.Errorf("variant %s: %w", VariantManifest, err)
++	}
++	// Nulls are forbidden everywhere in variant.yaml, not just in patch
++	// sets: pointer/slice override fields decode a null to nil, which
++	// reads as ABSENT — a silent removal directive (ADR-0012 §4 forbids
++	// them; present fields replace, nothing removes).
++	var vdoc yaml.Node
++	if err := yaml.Unmarshal(vdata, &vdoc); err != nil {
++		return nil, fmt.Errorf("variant %s: %w", VariantManifest, err)
++	}
++	if err := rejectNull(&vdoc); err != nil {
++		return nil, fmt.Errorf("variant %s: %w", VariantManifest, err)
++	}
++	// An explicit empty-string network decodes identically to an omitted
++	// one — catch it at the node level, same discipline as the empty
++	// types/params/spawner overrides.
++	if n := mappingValue(docRoot(&vdoc), "network"); n != nil && n.Kind == yaml.ScalarNode && n.Value == "" {
++		return nil, fmt.Errorf("variant %s: network: %q is an empty override — omit the field to inherit the base's network", VariantManifest, "")
++	}
++	if err := validateVariant(&v); err != nil {
++		return nil, fmt.Errorf("variant %s: %w", VariantManifest, err)
++	}
++	// Single-level composition: the base must be a plain scenario.
++	baseDir := filepath.Join(dir, filepath.FromSlash(v.Base))
++	if _, err := os.Stat(filepath.Join(baseDir, VariantManifest)); err == nil {
++		return nil, fmt.Errorf("variant %s: base %q is itself a variant — chaining is deferred (single-level composition, ADR-0012 M12 addendum)", VariantManifest, v.Base)
++	} else if !errors.Is(err, fs.ErrNotExist) {
++		return nil, fmt.Errorf("variant base %q: %w", v.Base, err)
++	}
++	base, err := Load(baseDir)
++	if err != nil {
++		return nil, fmt.Errorf("variant base %q: %w", v.Base, err)
++	}
++
++	// Effective manifest: base fields, variant overrides, merged part
++	// lists. An added part path colliding with a base part path is a hard
++	// error — the merged directory is the hash's frame of reference.
++	eff := base.Manifest
++	eff.ID = v.ID
++	if v.Seed != nil {
++		eff.Seed = *v.Seed
++	}
++	if v.Ticks != nil {
++		eff.Ticks = *v.Ticks
++	}
++	if v.Params != nil {
++		eff.Params = *v.Params
++	}
++	if v.Types != nil {
++		eff.Types = v.Types
++	}
++	if v.Spawner != nil {
++		eff.Spawner = v.Spawner
++	}
++	if v.Network != "" {
++		// Set BEFORE validateManifest so its checks (duplicate frames,
++		// manifest-name refs) see the effective network, and the
++		// materialized manifest names it — the variant hashes
++		// identically to its hand-written equivalent (M12 addendum §5).
++		eff.Network = v.Network
++	}
++	baseRefs := make(map[string]bool)
++	baseRefs[base.Manifest.Network] = true
++	for _, r := range append(append(append([]string{}, base.Manifest.Demand...), base.Manifest.Control...), base.Manifest.Metrics...) {
++		baseRefs[r] = true
++	}
++	seen := make(map[string]bool)
++	for _, r := range append(append(append([]string{}, v.Demand...), v.Control...), v.Metrics...) {
++		if baseRefs[r] {
++			return nil, fmt.Errorf("variant %s: added part %q collides with a base part path", VariantManifest, r)
++		}
++		if seen[r] {
++			return nil, fmt.Errorf("variant %s: duplicate added part %q", VariantManifest, r)
++		}
++		seen[r] = true
++	}
++	eff.Demand = append(append([]string{}, base.Manifest.Demand...), v.Demand...)
++	eff.Control = append(append([]string{}, base.Manifest.Control...), v.Control...)
++	eff.Metrics = append(append([]string{}, base.Manifest.Metrics...), v.Metrics...)
++	if err := validateManifest(&eff); err != nil {
++		return nil, fmt.Errorf("variant %s (materialized manifest): %w", VariantManifest, err)
++	}
++
++	// The base's captured hash snapshot is the ONLY source for inherited
++	// part bytes — re-reading the base directory after Load could hash
++	// bytes that were never compiled or validated (a concurrent edit
++	// would move content under a validated identity).
++	baseParts := make(map[string][]byte, len(base.parts))
++	for _, p := range base.parts {
++		baseParts[p.rel] = p.data
++	}
++
++	// Effective network: the variant's whole-network replacement (§4's
++	// degenerate case) or the base's. ALL demand validation below runs
++	// against the EFFECTIVE network's origins and the effective type
++	// list — a replacement that invalidates base demand fails HERE, at
++	// variant load, not at spawn time.
++	netPath, netRel := base.NetPath, base.Manifest.Network
++	origins := base.origins
++	rawNet := baseParts[base.Manifest.Network] // already canonical JSON
++	if v.Network != "" {
++		// The replacement joins the conceptual merged directory. Shadowing
++		// the BASE network's own rel path is the conventional layout (a
++		// variant carrying its own network.json) — only the effective
++		// network occupies that frame. Any OTHER part path (base or
++		// added) is a hard error: one hash frame per rel path.
++		if v.Network != base.Manifest.Network && (baseRefs[v.Network] || seen[v.Network]) {
++			return nil, fmt.Errorf("variant %s: network %q collides with a part path in the merged directory", VariantManifest, v.Network)
++		}
++		p, err := resolvePart(dir, v.Network)
++		if err != nil {
++			return nil, fmt.Errorf("variant %s: network: %w", VariantManifest, err)
++		}
++		raw, err := os.ReadFile(p)
++		if err != nil {
++			return nil, fmt.Errorf("variant network: %w", err)
++		}
++		var nf engine.NetFile
++		if err := json.Unmarshal(raw, &nf); err != nil {
++			return nil, fmt.Errorf("variant network %s: %w", v.Network, err)
++		}
++		net, err := engine.CompileNet(&nf)
++		if err != nil {
++			return nil, fmt.Errorf("variant network %s: %w", v.Network, err)
++		}
++		origins = make(map[string]bool, len(net.Origins))
++		for _, l := range net.Origins {
++			origins[l.ID] = true
++		}
++		netPath, netRel, rawNet = p, v.Network, canonicalJSON(raw, v.Network)
++	}
++	typeSet := make(map[string]bool, len(eff.Types))
++	for _, t := range eff.Types {
++		typeSet[t] = true
++	}
++
++	s := &Scenario{Dir: dir, Manifest: eff, NetPath: netPath, origins: origins}
++	hm := eff
++	hm.Seed, hm.Ticks = 0, 0 // run coordinates stripped (see Load)
++	s.parts = append(s.parts, hashPart{rel: ManifestFile, data: canonicalYAML(&hm)})
++	s.parts = append(s.parts, hashPart{rel: netRel, data: rawNet})
++
++	patchesByPart := make(map[string][]Patch)
++	for _, p := range v.Patches {
++		patchesByPart[p.Part] = append(patchesByPart[p.Part], p)
++	}
++	for i, ref := range base.Manifest.Demand {
++		raw := baseParts[ref] // canonical bytes captured by the base Load
++		if ps, ok := patchesByPart[ref]; ok {
++			patched, err := patchDemandPart(raw, ref, ps)
++			if err != nil {
++				return nil, err
++			}
++			delete(patchesByPart, ref)
++			df, canonical, err := parseDemand(patched, origins, typeSet)
++			if err != nil {
++				return nil, fmt.Errorf("variant demand %s (after patching — line numbers cite the patched document, not the base file): %w", ref, err)
++			}
++			s.Demands = append(s.Demands, df)
++			s.parts = append(s.parts, hashPart{rel: ref, data: canonical})
++			continue
++		}
++		// Unpatched: reuse the base's loaded model and captured canonical
++		// bytes, re-validated against the EFFECTIVE origins and types.
++		df := base.Demands[i]
++		if err := validateDemand(df, origins, typeSet); err != nil {
++			return nil, fmt.Errorf("variant demand %s: %w", ref, err)
++		}
++		s.Demands = append(s.Demands, df)
++		s.parts = append(s.parts, hashPart{rel: ref, data: raw})
++	}
++	if len(patchesByPart) > 0 {
++		leftover := make([]string, 0, len(patchesByPart))
++		for ref := range patchesByPart {
++			leftover = append(leftover, ref)
++		}
++		sort.Strings(leftover)
++		return nil, fmt.Errorf("variant %s: patch targets [%s]: not a demand part of the base (patches modify base demand parts only)", VariantManifest, strings.Join(leftover, ", "))
++	}
++	for _, ref := range v.Demand {
++		pth, err := resolvePart(dir, ref)
++		if err != nil {
++			return nil, fmt.Errorf("variant demand: %w", err)
++		}
++		df, canonical, err := loadDemandFile(pth, origins, typeSet)
++		if err != nil {
++			return nil, fmt.Errorf("variant demand %s: %w", ref, err)
++		}
++		s.Demands = append(s.Demands, df)
++		s.parts = append(s.parts, hashPart{rel: ref, data: canonical})
++	}
++	// Control/metrics stay raw pass-through (their grammars land with the
++	// observability ADR): base parts come from the captured snapshot,
++	// added parts from the variant; patches never target them.
++	for _, ref := range append(append([]string{}, base.Manifest.Control...), base.Manifest.Metrics...) {
++		s.parts = append(s.parts, hashPart{rel: ref, data: baseParts[ref]})
++	}
++	for _, ref := range append(append([]string{}, v.Control...), v.Metrics...) {
++		pth, err := resolvePart(dir, ref)
++		if err != nil {
++			return nil, fmt.Errorf("variant part: %w", err)
++		}
++		raw, err := os.ReadFile(pth)
++		if err != nil {
++			return nil, fmt.Errorf("variant part %s: %w", ref, err)
++		}
++		s.parts = append(s.parts, hashPart{rel: ref, data: raw})
++	}
++	if (eff.Spawner == nil || eff.Spawner.RatePerLaneHour == 0) && len(eff.Demand) == 0 {
++		return nil, fmt.Errorf("variant %s (materialized): no demand — the overlay disabled the base's spawner without adding demand", VariantManifest)
++	}
++	return s, nil
++}
++
++func validateVariant(v *Variant) error {
++	if v.FormatVersion != FormatVersion {
++		return fmt.Errorf("unsupported format_version %d (loader supports %d)", v.FormatVersion, FormatVersion)
++	}
++	if v.ID == "" {
++		return errors.New("missing id")
++	}
++	if v.Base == "" {
++		return errors.New("missing base")
++	}
++	if strings.ContainsRune(v.Base, '\\') {
++		return fmt.Errorf("base %q: use forward slashes (portable refs)", v.Base)
++	}
++	if len(v.Base) > 1 && v.Base[1] == ':' {
++		return fmt.Errorf("base %q: drive-qualified paths are not portable refs", v.Base)
++	}
++	if path.IsAbs(v.Base) || path.Clean(v.Base) != v.Base {
++		return fmt.Errorf("base %q: must be a clean relative path to the base scenario directory (../ allowed)", v.Base)
++	}
++	if v.Types != nil && len(v.Types) == 0 {
++		return errors.New("types: [] is an empty override — omit the field to inherit the base's list (fail loud, no implicit re-default)")
++	}
++	if v.Params != nil && *v.Params == (Params{}) {
++		return errors.New("params: {} is an empty override — omit the field to inherit (fail loud, no silent reset to engine defaults)")
++	}
++	if v.Spawner != nil && *v.Spawner == (Spawner{}) {
++		return errors.New("spawner: {} is an empty override — omit the field to inherit (fail loud, no silent disable)")
++	}
++	anchors := make(map[string]bool, len(v.Patches))
++	for i, p := range v.Patches {
++		if p.Part == "" || p.Flow == "" {
++			return fmt.Errorf("patch %d: part and flow are required", i)
++		}
++		anchor := p.Part + "\x00" + p.Flow
++		if anchors[anchor] {
++			return fmt.Errorf("patch %d: duplicate anchor (part %q, flow %q) — one patch per flow; later entries would silently overwrite earlier ones", i, p.Part, p.Flow)
++		}
++		anchors[anchor] = true
++		if strings.ContainsRune(p.Part, '\\') || path.IsAbs(p.Part) || path.Clean(p.Part) != p.Part ||
++			p.Part == ".." || strings.HasPrefix(p.Part, "../") ||
++			(len(p.Part) > 1 && p.Part[1] == ':') {
++			return fmt.Errorf("patch %d: part %q must be a clean relative path of a base demand part", i, p.Part)
++		}
++		if p.Set.Kind != yaml.MappingNode || len(p.Set.Content) == 0 {
++			return fmt.Errorf("patch %d (flow %q): set must be a non-empty mapping", i, p.Flow)
++		}
++		if err := rejectDupKeys(&p.Set); err != nil {
++			return fmt.Errorf("patch %d (flow %q): %w", i, p.Flow, err)
++		}
++		if mappingValue(&p.Set, "id") != nil {
++			return fmt.Errorf("patch %d (flow %q): set may not patch id — the anchor is immutable (a rename could silently re-target a later patch)", i, p.Flow)
++		}
++		if err := rejectNull(&p.Set); err != nil {
++			return fmt.Errorf("patch %d (flow %q): %w", i, p.Flow, err)
++		}
++	}
++	return nil
++}
++
++// rejectDupKeys closes the one gap yaml.v3 leaves in the strict subset:
++// duplicate mapping keys are a decode error only for map/struct
++// destinations — a yaml.Node destination (a patch's set) preserves both
++// pairs silently, and mergeMapping would apply them last-wins.
++func rejectDupKeys(n *yaml.Node) error {
++	if n.Kind == yaml.MappingNode {
++		seen := make(map[string]bool, len(n.Content)/2)
++		for i := 0; i+1 < len(n.Content); i += 2 {
++			k := n.Content[i].Value
++			if seen[k] {
++				return fmt.Errorf("line %d: duplicate mapping key %q (strict YAML admits no duplicates)", n.Content[i].Line, k)
++			}
++			seen[k] = true
++		}
++	}
++	for _, c := range n.Content {
++		if err := rejectDupKeys(c); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// rejectNull fences deletion out of patches: null is JSON-Merge-Patch's
++// remove, and overlays compose by addition only (ADR-0012 §4 permanent
++// refusal — split files instead).
++func rejectNull(n *yaml.Node) error {
++	if n.Kind == yaml.ScalarNode && n.Tag == "!!null" {
++		return fmt.Errorf("line %d: null values are deletion, and overlays compose by addition only (ADR-0012 §4)", n.Line)
++	}
++	for _, c := range n.Content {
++		if err := rejectNull(c); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// patchDemandPart applies patches to a base demand part at the YAML node
++// level and re-encodes. The result is strict-decoded and semantically
++// validated by the caller exactly like a hand-authored file — unknown
++// keys, scalar coercions, and bad references all fail loud at apply time.
++func patchDemandPart(data []byte, rel string, patches []Patch) ([]byte, error) {
++	var root yaml.Node
++	if err := yaml.Unmarshal(data, &root); err != nil {
++		return nil, fmt.Errorf("patch %s: %w", rel, err)
++	}
++	flows := mappingValue(docRoot(&root), "flows")
++	if flows == nil || flows.Kind != yaml.SequenceNode {
++		return nil, fmt.Errorf("patch %s: no flows sequence", rel)
++	}
++	for _, p := range patches {
++		target := findFlow(flows, p.Flow)
++		if target == nil {
++			return nil, fmt.Errorf("patch %s: no flow with id %q (a typo'd anchor must never silently add — new flows arrive via added part files)", rel, p.Flow)
++		}
++		mergeMapping(target, &p.Set)
++	}
++	var buf bytes.Buffer
++	enc := yaml.NewEncoder(&buf)
++	enc.SetIndent(2)
++	if err := enc.Encode(&root); err != nil {
++		return nil, fmt.Errorf("patch %s: re-encode: %w", rel, err)
++	}
++	if err := enc.Close(); err != nil {
++		return nil, fmt.Errorf("patch %s: re-encode: %w", rel, err)
++	}
++	return buf.Bytes(), nil
++}
++
++func docRoot(n *yaml.Node) *yaml.Node {
++	if n.Kind == yaml.DocumentNode && len(n.Content) > 0 {
++		return n.Content[0]
++	}
++	return n
++}
++
++// mappingValue returns m's value node for key, or nil (m not a mapping or
++// key absent).
++func mappingValue(m *yaml.Node, key string) *yaml.Node {
++	if m == nil || m.Kind != yaml.MappingNode {
++		return nil
++	}
++	for i := 0; i+1 < len(m.Content); i += 2 {
++		if m.Content[i].Value == key {
++			return m.Content[i+1]
++		}
++	}
++	return nil
++}
++
++// findFlow locates the flow mapping whose id scalar equals the anchor.
++// Duplicate anchors can't occur — the base validated duplicate flow ids
++// out at load.
++func findFlow(flows *yaml.Node, id string) *yaml.Node {
++	for _, f := range flows.Content {
++		if idNode := mappingValue(f, "id"); idNode != nil && idNode.Kind == yaml.ScalarNode && idNode.Value == id {
++			return f
++		}
++	}
++	return nil
++}
++
++// mergeMapping merges src into dst key-wise: where both values are
++// mappings it recurses; sequences and scalars replace wholesale (the
++// documented M12 patch semantic). Nulls were fenced by validateVariant.
++func mergeMapping(dst, src *yaml.Node) {
++	for i := 0; i+1 < len(src.Content); i += 2 {
++		k, sv := src.Content[i], src.Content[i+1]
++		dv := mappingValue(dst, k.Value)
++		if dv != nil && dv.Kind == yaml.MappingNode && sv.Kind == yaml.MappingNode {
++			mergeMapping(dv, sv)
++			continue
++		}
++		if dv != nil {
++			for j := 0; j+1 < len(dst.Content); j += 2 {
++				if dst.Content[j].Value == k.Value {
++					dst.Content[j+1] = sv
++				}
++			}
++		} else {
++			dst.Content = append(dst.Content, k, sv)
++		}
++	}
++}
+diff --git a/engine/scenario/variant_test.go b/engine/scenario/variant_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..1b3cb62e6ccce68ca79524a1972e629650a182bc
+--- /dev/null
++++ b/engine/scenario/variant_test.go
+@@ -0,0 +1,689 @@
++package scenario
++
++import (
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"traffic-sim/engine"
++)
++
++// writeNetAlt emits a second minimal network whose origin lane is c_0, not
++// a_0 — the whole-network replacement fixture.
++func writeNetAlt(t *testing.T, dir, rel string) {
++	t.Helper()
++	nf := engine.NetFile{
++		Version: 1,
++		Name:    "test-alt",
++		Lanes: []engine.NetLane{
++			{ID: "c_0", Section: "c", Length: 500, SpeedLimit: 15, Width: 3.2,
++				Shape: [][2]float64{{0, 0}, {500, 0}}, Successors: []string{"d_0"}, Origin: true},
++			{ID: "d_0", Section: "d", Length: 500, SpeedLimit: 15, Width: 3.2,
++				Shape: [][2]float64{{500, 0}, {1000, 0}}, Exit: true},
++		},
++	}
++	data, err := json.Marshal(nf)
++	if err != nil {
++		t.Fatal(err)
++	}
++	writeFile(t, dir, rel, string(data))
++}
++
++const variantDemand = `format_version: 1
++flows:
++  - id: wb-commute
++    origin: a_0
++    veh_per_h: 900
++    spacing: poisson
++    vtypes:
++      car: 0.9
++      truck: 0.1
++`
++
++// variantPair builds base/ and variants/x/ side by side under one temp
++// root; the base carries one id-anchored flow.
++func variantPair(t *testing.T, variantYAML string) (baseDir, variantDir string) {
++	t.Helper()
++	root := t.TempDir()
++	baseDir = filepath.Join(root, "base")
++	variantDir = filepath.Join(root, "variants", "x")
++	if err := os.MkdirAll(baseDir, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	writeNet(t, baseDir)
++	writeFile(t, baseDir, ManifestFile, goodManifest)
++	writeFile(t, baseDir, "demand/main.yaml", variantDemand)
++	writeFile(t, variantDir, VariantManifest, variantYAML)
++	return baseDir, variantDir
++}
++
++const identityVariant = `format_version: 1
++id: test-baseline
++base: ../../base
++`
++
++// A variant that overrides nothing and adds nothing materializes to the
++// base itself — identical content hash (ADR-0012 M12 acceptance shape).
++func TestVariantIdentityHash(t *testing.T) {
++	baseDir, variantDir := variantPair(t, identityVariant)
++	base, err := Load(baseDir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	v, err := Load(variantDir)
++	if err != nil {
++		t.Fatalf("Load variant: %v", err)
++	}
++	if v.Hash() != base.Hash() {
++		t.Errorf("identity variant hash %s != base %s", v.Hash(), base.Hash())
++	}
++	if v.Manifest.ID != "test-baseline" || len(v.Demands) != 1 {
++		t.Errorf("materialized: %+v demands %d", v.Manifest, len(v.Demands))
++	}
++}
++
++const patchVariant = `format_version: 1
++id: test-peak-x2
++base: ../../base
++seed: 99
++patches:
++  - part: demand/main.yaml
++    flow: wb-commute
++    set:
++      veh_per_h: 1800
++      vtypes:
++        car: 0.8
++`
++
++// handWrittenPeak writes the hand-authored equivalent of patchVariant.
++func handWrittenPeak(t *testing.T) string {
++	t.Helper()
++	hand := t.TempDir()
++	writeNet(t, hand)
++	writeFile(t, hand, ManifestFile, strings.Replace(goodManifest, "id: test-baseline", "id: test-peak-x2", 1))
++	writeFile(t, hand, "demand/main.yaml", `format_version: 1
++flows:
++  - id: wb-commute
++    origin: a_0
++    veh_per_h: 1800
++    spacing: poisson
++    vtypes:
++      car: 0.8
++      truck: 0.1
++`)
++	return hand
++}
++
++// A patched variant hashes identically to the equivalent hand-written
++// scenario: the overlay is authorship, not identity. Nested mapping merge
++// keeps the unmentioned truck weight; seed is a run coordinate, not
++// content — the variant's seed: 99 must not move the hash.
++func TestVariantPatchEquivalence(t *testing.T) {
++	_, variantDir := variantPair(t, patchVariant)
++	v, err := Load(variantDir)
++	if err != nil {
++		t.Fatalf("Load variant: %v", err)
++	}
++	f := v.Demands[0].Flows[0]
++	if f.VehPerH != 1800 {
++		t.Errorf("veh_per_h = %v, want 1800 (patched)", f.VehPerH)
++	}
++	if f.VTypes["car"] != 0.8 || f.VTypes["truck"] != 0.1 {
++		t.Errorf("vtypes = %v, want car 0.8 (patched) + truck 0.1 (merged)", f.VTypes)
++	}
++	if v.Manifest.Seed != 99 {
++		t.Errorf("seed override = %d, want 99", v.Manifest.Seed)
++	}
++
++	h, err := Load(handWrittenPeak(t))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if v.Hash() != h.Hash() {
++		t.Errorf("patched variant hash %s != hand-written equivalent %s", v.Hash(), h.Hash())
++	}
++
++	// The materialized variant builds a run like any scenario.
++	spec, err := v.RunSpec(map[string]*engine.VehicleType{"car": &engine.Car, "truck": &engine.Truck})
++	if err != nil {
++		t.Fatalf("RunSpec: %v", err)
++	}
++	if _, err := engine.NewEngine(spec); err != nil {
++		t.Fatalf("materialized variant spec does not build an engine: %v", err)
++	}
++}
++
++// Patched variant and hand-written equivalent are the same RUN, not just
++// the same hash (M12 addendum §5 acceptance: the M11 CRC pattern). The
++// seed override is a run coordinate — both runs use the variant's seed.
++func TestVariantRunBitIdentity(t *testing.T) {
++	_, variantDir := variantPair(t, patchVariant)
++	v, err := Load(variantDir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	h, err := Load(handWrittenPeak(t))
++	if err != nil {
++		t.Fatal(err)
++	}
++	reg := map[string]*engine.VehicleType{"car": &engine.Car, "truck": &engine.Truck}
++	specs := [2]engine.RunSpec{}
++	for i, s := range []*Scenario{v, h} {
++		spec, err := s.RunSpec(reg)
++		if err != nil {
++			t.Fatal(err)
++		}
++		spec.Seed = v.Manifest.Seed // the override coordinate for both
++		specs[i] = spec
++	}
++	ev, err := engine.NewEngine(specs[0])
++	if err != nil {
++		t.Fatal(err)
++	}
++	eh, err := engine.NewEngine(specs[1])
++	if err != nil {
++		t.Fatal(err)
++	}
++	for tick := uint64(1); tick <= 500; tick++ {
++		ev.Step()
++		eh.Step()
++		if tick%100 == 0 && ev.CRC() != eh.CRC() {
++			t.Fatalf("tick %d: variant crc %016x != hand-written crc %016x", tick, ev.CRC(), eh.CRC())
++		}
++	}
++	if ev.CRC() != eh.CRC() {
++		t.Fatalf("final crc %016x != %016x", ev.CRC(), eh.CRC())
++	}
++}
++
++// The golden variant vector pins the overlay path of the hash protocol:
++// same canary role as TestGoldenHash (a canonicalization change is a
++// format event, never silent).
++func TestGoldenVariantHash(t *testing.T) {
++	_, variantDir := variantPair(t, patchVariant)
++	v, err := Load(variantDir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	const want = "642ec5aa0b61d24a9337eee98c4dc31d6023511b056b12db3861c365a494bad2"
++	if v.Hash() != want {
++		t.Fatalf("variant hash = %s, want golden %s", v.Hash(), want)
++	}
++}
++
++// Sequences replace wholesale: a patched slices program is one entity —
++// the base's slices do not survive a set that carries its own.
++func TestVariantSequenceReplace(t *testing.T) {
++	_, variantDir := variantPair(t, `format_version: 1
++id: sliced
++base: ../../base
++patches:
++  - part: demand/main.yaml
++    flow: wb-commute
++    set:
++      veh_per_h: 0
++      slices:
++        - {start_s: 0, end_s: 100, veh_per_h: 300}
++`)
++	// veh_per_h alongside slices is dead config; the base flow has
++	// veh_per_h: 900, so the patch must zero it to be valid — and setting
++	// slices must not leave a stale rate behind. Zeroing via set is
++	// scalar replacement, not deletion.
++	v, err := Load(variantDir)
++	if err != nil {
++		t.Fatalf("Load: %v", err)
++	}
++	f := v.Demands[0].Flows[0]
++	if len(f.Slices) != 1 || f.Slices[0].VehPerH != 300 {
++		t.Errorf("slices = %+v, want the patch's single slice only", f.Slices)
++	}
++	if f.VehPerH != 0 {
++		t.Errorf("veh_per_h = %v, want 0 (replaced)", f.VehPerH)
++	}
++}
++
++// The patch anchor is (part path, flow id): two base demand parts may both
++// carry a flow with the same id — a patch names its part and touches only
++// that part's flow (the M12 addendum's namespacing resolution).
++func TestVariantAnchorNamespacing(t *testing.T) {
++	root := t.TempDir()
++	baseDir := filepath.Join(root, "base")
++	if err := os.MkdirAll(baseDir, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	writeNet(t, baseDir)
++	writeFile(t, baseDir, ManifestFile, `format_version: 1
++id: two-parts
++seed: 1
++ticks: 100
++network: network.json
++demand:
++  - demand/a.yaml
++  - demand/b.yaml
++`)
++	writeFile(t, baseDir, "demand/a.yaml", `format_version: 1
++flows:
++  - {id: x, origin: a_0, veh_per_h: 100, spacing: constant}
++`)
++	writeFile(t, baseDir, "demand/b.yaml", `format_version: 1
++flows:
++  - {id: x, origin: a_0, veh_per_h: 200, spacing: constant}
++`)
++	variantDir := filepath.Join(root, "v")
++	writeFile(t, variantDir, VariantManifest, `format_version: 1
++id: two-parts-patched
++base: ../base
++patches:
++  - {part: demand/b.yaml, flow: x, set: {veh_per_h: 999}}
++`)
++	v, err := Load(variantDir)
++	if err != nil {
++		t.Fatalf("Load: %v", err)
++	}
++	if v.Demands[0].Flows[0].VehPerH != 100 {
++		t.Errorf("part a flow = %v, want 100 (untouched)", v.Demands[0].Flows[0].VehPerH)
++	}
++	if v.Demands[1].Flows[0].VehPerH != 999 {
++		t.Errorf("part b flow = %v, want 999 (patched)", v.Demands[1].Flows[0].VehPerH)
++	}
++}
++
++// Added part files extend the base's demand; both parts validate against
++// the effective network and share the run.
++func TestVariantAddedParts(t *testing.T) {
++	_, variantDir := variantPair(t, `format_version: 1
++id: with-extra
++base: ../../base
++demand:
++  - demand/extra.yaml
++`)
++	writeFile(t, variantDir, "demand/extra.yaml", `format_version: 1
++flows:
++  - origin: a_0
++    veh_per_h: 120
++    spacing: constant
++`)
++	v, err := Load(variantDir)
++	if err != nil {
++		t.Fatalf("Load: %v", err)
++	}
++	if len(v.Demands) != 2 || len(v.Manifest.Demand) != 2 {
++		t.Fatalf("demands = %d parts %v", len(v.Demands), v.Manifest.Demand)
++	}
++	if v.Demands[1].Flows[0].VehPerH != 120 {
++		t.Errorf("added flow rate = %v", v.Demands[1].Flows[0].VehPerH)
++	}
++}
++
++// Whole-network replacement: demand re-validates against the EFFECTIVE
++// network — a replacement whose origins don't cover the base demand fails
++// at variant load, not at spawn time.
++func TestVariantNetworkReplacement(t *testing.T) {
++	baseDir, variantDir := variantPair(t, `format_version: 1
++id: new-net
++base: ../../base
++network: net/alt.json
++`)
++	writeNetAlt(t, variantDir, "net/alt.json")
++	if _, err := Load(variantDir); err == nil || !strings.Contains(err.Error(), "not a spawn origin") {
++		t.Fatalf("base demand vs replaced network: err = %v", err)
++	}
++	// Same replacement, but the variant patches the flow onto an origin
++	// that EXISTS in the new network — valid end to end.
++	writeFile(t, variantDir, VariantManifest, `format_version: 1
++id: new-net
++base: ../../base
++network: net/alt.json
++patches:
++  - part: demand/main.yaml
++    flow: wb-commute
++    set:
++      origin: c_0
++`)
++	v, err := Load(variantDir)
++	if err != nil {
++		t.Fatalf("Load with patched origin: %v", err)
++	}
++	if v.Demands[0].Flows[0].Origin != "c_0" {
++		t.Errorf("origin = %q, want c_0", v.Demands[0].Flows[0].Origin)
++	}
++	if v.Manifest.Network != "net/alt.json" {
++		t.Errorf("materialized manifest network = %q, want the EFFECTIVE net/alt.json", v.Manifest.Network)
++	}
++	base, err := Load(baseDir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if v.Hash() == base.Hash() {
++		t.Error("network replacement did not move the hash")
++	}
++
++	// The variant hashes identically to the equivalent hand-written
++	// scenario (M12 addendum §5) — the regression test for the
++	// eff.Network divergence the external review caught.
++	hand := t.TempDir()
++	writeNetAlt(t, hand, "net/alt.json")
++	writeFile(t, hand, ManifestFile, strings.NewReplacer(
++		"id: test-baseline", "id: new-net",
++		"network: network.json", "network: net/alt.json",
++	).Replace(goodManifest))
++	writeFile(t, hand, "demand/main.yaml", strings.Replace(variantDemand, "origin: a_0", "origin: c_0", 1))
++	h, err := Load(hand)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if v.Hash() != h.Hash() {
++		t.Errorf("network-replacing variant hash %s != hand-written equivalent %s", v.Hash(), h.Hash())
++	}
++}
++
++// An anchor naming a flow that exists but carries no id is a hard error —
++// the M12 addendum's distinct mode: patches anchor by durable id only.
++func TestVariantAnchorRequiresID(t *testing.T) {
++	baseDir, variantDir := variantPair(t, `format_version: 1
++id: x
++base: ../../base
++patches:
++  - {part: demand/main.yaml, flow: wb-commute, set: {veh_per_h: 100}}
++`)
++	writeFile(t, baseDir, "demand/main.yaml", goodDemand) // the flow has no id
++	_, err := Load(variantDir)
++	if err == nil || !strings.Contains(err.Error(), "no flow with id") {
++		t.Fatalf("err = %v, want id-less anchor rejection", err)
++	}
++}
++
++// A variant carrying its OWN network.json over the base's network.json is
++// the conventional layout: replacement shadows the base network's hash
++// frame, it does not collide with it (round-2 external review).
++func TestVariantNetworkShadowing(t *testing.T) {
++	baseDir, variantDir := variantPair(t, `format_version: 1
++id: shadow-net
++base: ../../base
++network: network.json
++patches:
++  - part: demand/main.yaml
++    flow: wb-commute
++    set:
++      origin: c_0
++`)
++	writeNetAlt(t, variantDir, "network.json")
++	v, err := Load(variantDir)
++	if err != nil {
++		t.Fatalf("Load with shadowing network: %v", err)
++	}
++	if v.Manifest.Network != "network.json" {
++		t.Errorf("manifest network = %q, want network.json", v.Manifest.Network)
++	}
++	// Hash-equals-hand-written on the shadowing layout too.
++	hand := t.TempDir()
++	writeNetAlt(t, hand, "network.json")
++	writeFile(t, hand, ManifestFile, strings.Replace(goodManifest, "id: test-baseline", "id: shadow-net", 1))
++	writeFile(t, hand, "demand/main.yaml", strings.Replace(variantDemand, "origin: a_0", "origin: c_0", 1))
++	h, err := Load(hand)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if v.Hash() != h.Hash() {
++		t.Errorf("shadowing variant hash %s != hand-written equivalent %s", v.Hash(), h.Hash())
++	}
++	_ = baseDir
++}
++
++// Type-list override replaces wholesale: dropping truck from the override
++// invalidates the base flow's vtype mix at load.
++func TestVariantTypeOverride(t *testing.T) {
++	_, variantDir := variantPair(t, `format_version: 1
++id: cars-only
++base: ../../base
++types: [car]
++`)
++	_, err := Load(variantDir)
++	if err == nil || !strings.Contains(err.Error(), "not in the scenario type list") {
++		t.Fatalf("err = %v, want vtype rejection against the effective type list", err)
++	}
++}
++
++func TestVariantErrors(t *testing.T) {
++	cases := []struct {
++		name    string
++		variant string
++		want    string
++	}{
++		{"missing anchor", `format_version: 1
++id: x
++base: ../../base
++patches:
++  - {part: demand/main.yaml, flow: nope, set: {veh_per_h: 100}}
++`, "no flow with id"},
++		{"null is deletion", `format_version: 1
++id: x
++base: ../../base
++patches:
++  - part: demand/main.yaml
++    flow: wb-commute
++    set:
++      vtypes:
++        truck: null
++`, "addition only"},
++		{"empty set", `format_version: 1
++id: x
++base: ../../base
++patches:
++  - {part: demand/main.yaml, flow: wb-commute, set: {}}
++`, "non-empty mapping"},
++		{"unknown key in set", `format_version: 1
++id: x
++base: ../../base
++patches:
++  - {part: demand/main.yaml, flow: wb-commute, set: {veh_per_hour: 100}}
++`, "field veh_per_hour not found"},
++		{"coercion in set", `format_version: 1
++id: x
++base: ../../base
++patches:
++  - {part: demand/main.yaml, flow: wb-commute, set: {veh_per_h: lots}}
++`, "wants !!float"},
++		{"patch not a base demand part", `format_version: 1
++id: x
++base: ../../base
++patches:
++  - {part: demand/other.yaml, flow: wb-commute, set: {veh_per_h: 100}}
++`, "not a demand part of the base"},
++		{"absolute base", `format_version: 1
++id: x
++base: /tmp/base
++`, "clean relative"},
++		{"backslash base", "format_version: 1\nid: x\nbase: '..\\base'\n", "forward slashes"},
++		{"unclean base", `format_version: 1
++id: x
++base: ../../variants/../base
++`, "clean relative"},
++		{"missing base", `format_version: 1
++id: x
++`, "missing base"},
++		{"duplicate anchor", `format_version: 1
++id: x
++base: ../../base
++patches:
++  - {part: demand/main.yaml, flow: wb-commute, set: {veh_per_h: 100}}
++  - {part: demand/main.yaml, flow: wb-commute, set: {veh_per_h: 200}}
++`, "duplicate anchor"},
++		{"patching id is forbidden", `format_version: 1
++id: x
++base: ../../base
++patches:
++  - {part: demand/main.yaml, flow: wb-commute, set: {id: renamed, veh_per_h: 100}}
++`, "anchor is immutable"},
++		{"control ref names the variant manifest", `format_version: 1
++id: x
++base: ../../base
++control: [variant.yaml]
++`, "names a manifest file"},
++		{"null override is a removal directive", `format_version: 1
++id: x
++base: ../../base
++seed: null
++`, "addition only"},
++		{"empty types override", `format_version: 1
++id: x
++base: ../../base
++types: []
++`, "empty override"},
++		{"empty params override", `format_version: 1
++id: x
++base: ../../base
++params: {}
++`, "empty override"},
++		{"empty spawner override", `format_version: 1
++id: x
++base: ../../base
++spawner: {}
++`, "empty override"},
++		{"duplicate key in set", `format_version: 1
++id: x
++base: ../../base
++patches:
++  - part: demand/main.yaml
++    flow: wb-commute
++    set: {veh_per_h: 100, veh_per_h: 200}
++`, "duplicate mapping key"},
++		{"drive-qualified base", `format_version: 1
++id: x
++base: C:/base
++`, "drive-qualified"},
++		{"empty network override", `format_version: 1
++id: x
++base: ../../base
++network: ""
++`, "empty override"},
++		{"network shadows base part", `format_version: 1
++id: x
++base: ../../base
++network: demand/main.yaml
++`, "duplicate part reference"},
++		{"newer version", strings.Replace(identityVariant, "format_version: 1", "format_version: 2", 1), "unsupported format_version 2"},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			_, variantDir := variantPair(t, tc.variant)
++			_, err := Load(variantDir)
++			if err == nil || !strings.Contains(err.Error(), tc.want) {
++				t.Fatalf("err = %v, want substring %q", err, tc.want)
++			}
++		})
++	}
++}
++
++// Added part paths may not shadow a base part path (the merged directory
++// is the hash's frame of reference) — including the base's network path.
++func TestVariantPartCollision(t *testing.T) {
++	_, variantDir := variantPair(t, `format_version: 1
++id: x
++base: ../../base
++demand:
++  - demand/main.yaml
++`)
++	writeFile(t, variantDir, "demand/main.yaml", variantDemand)
++	_, err := Load(variantDir)
++	if err == nil || !strings.Contains(err.Error(), "collides with a base part") {
++		t.Fatalf("err = %v, want collision rejection", err)
++	}
++
++	_, variantDir2 := variantPair(t, `format_version: 1
++id: x
++base: ../../base
++demand:
++  - network.json
++`)
++	writeFile(t, variantDir2, "network.json", variantDemand)
++	_, err = Load(variantDir2)
++	if err == nil || !strings.Contains(err.Error(), "collides with a base part") {
++		t.Fatalf("base-network shadow: err = %v, want collision rejection", err)
++	}
++}
++
++// Single-level composition: a variant's base must be a plain scenario.
++func TestVariantChainingRejected(t *testing.T) {
++	root := t.TempDir()
++	mid := filepath.Join(root, "mid")
++	if err := os.MkdirAll(mid, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	writeNet(t, mid)
++	writeFile(t, mid, ManifestFile, goodManifest)
++	writeFile(t, mid, "demand/main.yaml", variantDemand)
++	// mid is itself turned into a variant directory.
++	if err := os.Remove(filepath.Join(mid, ManifestFile)); err != nil {
++		t.Fatal(err)
++	}
++	writeFile(t, mid, VariantManifest, identityVariant)
++	leaf := filepath.Join(root, "leaf")
++	writeFile(t, leaf, VariantManifest, `format_version: 1
++id: leaf
++base: ../mid
++`)
++	_, err := Load(leaf)
++	if err == nil || !strings.Contains(err.Error(), "single-level") {
++		t.Fatalf("err = %v, want chaining rejection", err)
++	}
++}
++
++// A directory holding both manifests is neither scenario nor variant.
++func TestBothManifestsRejected(t *testing.T) {
++	dir := goodScenario(t)
++	writeFile(t, dir, VariantManifest, identityVariant)
++	_, err := Load(dir)
++	if err == nil || !strings.Contains(err.Error(), "both") {
++		t.Fatalf("err = %v, want both-manifests rejection", err)
++	}
++}
++
++// fmt touches only the variant's own files — the base is never rewritten.
++func TestVariantFormatLeavesBaseAlone(t *testing.T) {
++	baseDir, variantDir := variantPair(t, `# peak variant
++id: test-peak-x2
++base: ../../base
++format_version: 1
++patches:
++  - {flow: wb-commute, part: demand/main.yaml, set: {veh_per_h: 1800}}
++`)
++	baseBefore, err := os.ReadFile(filepath.Join(baseDir, "demand/main.yaml"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	before, err := Load(variantDir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := Format(variantDir); err != nil {
++		t.Fatalf("Format: %v", err)
++	}
++	baseAfter, err := os.ReadFile(filepath.Join(baseDir, "demand/main.yaml"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if string(baseBefore) != string(baseAfter) {
++		t.Error("fmt rewrote a BASE file")
++	}
++	data, _ := os.ReadFile(filepath.Join(variantDir, VariantManifest))
++	if !strings.Contains(string(data), "# peak variant") {
++		t.Errorf("fmt lost the variant comment:\n%s", data)
++	}
++	// Keys sorted canonically (base before format_version before id).
++	if strings.Index(string(data), "base:") > strings.Index(string(data), "id:") {
++		t.Errorf("variant.yaml not canonical:\n%s", data)
++	}
++	after, err := Load(variantDir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if before.Hash() != after.Hash() {
++		t.Error("hash moved across variant fmt")
++	}
++	if err := Format(variantDir); err != nil {
++		t.Fatalf("Format again: %v", err)
++	}
++}

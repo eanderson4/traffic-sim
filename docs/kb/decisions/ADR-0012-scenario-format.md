@@ -359,3 +359,35 @@ the scoping choices. Written design-first per the milestone plan.
    spawn-table export, and a possible `scenario materialize` export
    (write the flattened scenario for intent-vs-effective review —
    candidate at implementation time, not required by this design).
+
+## Addendum (2026-07-21, M12 implementation notes)
+
+- **Realized as designed above; no grammar drift.** `engine/scenario`
+  detects the manifest kind (both present = hard error) and
+  materializes variants into the same `Scenario` shape; `serve`,
+  `simrun`, and the `scenario` tool needed no changes — `Load`/`Format`
+  carry the overlay. Patches merge at the YAML node level
+  (`mergeMapping`), then the patched document goes back through the full
+  strict fence (`parseDemand`) — a patch inherits every hand-authored
+  validation for free. The base is fully loaded standalone first, so a
+  broken base fails as itself, not as variant noise.
+- **Verified:** identity variant ≡ base hash; patched variant ≡
+  hand-written equivalent hash; golden variant vector pinned; nested-map
+  merge keeps unmentioned keys; sequences replace wholesale; null/empty
+  set/unknown key/coercion/missing anchor/non-demand target/collision/
+  chaining/both-manifests all fail loud; network replacement re-validates
+  demand against the effective origins; type override re-validates
+  against the effective type list; fmt touches only the variant's own
+  files and preserves its comments; full engine suite green. Run
+  bit-identity follows from hash equality — the RunSpec is the same
+  input the M11 CRC equivalence pinned.
+- **`scenario materialize` not built** — the candidate stayed a
+  candidate; `scenario hash` equality against the hand-written
+  equivalent already serves intent-vs-effective review.
+- **Known limitation (external review, deferred):** `Scenario.Dir` is
+  the variant directory while inherited `Manifest` part refs stay
+  base-relative, so the materialized struct is NOT resolvable through
+  `Dir` the way a hand-authored one is — "indistinguishable" covers the
+  hash, the RunSpec, and the run (CRC-pinned), not path resolution.
+  Today's consumers use the eagerly loaded parts; revisit when a
+  consumer needs to resolve manifest paths through `Dir`.

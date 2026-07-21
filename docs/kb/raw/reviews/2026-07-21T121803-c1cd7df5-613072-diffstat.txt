@@ -1,0 +1,5 @@
+ engine/scenario/scenario.go      |  93 +++++-
+ engine/scenario/scenario_test.go |   3 +
+ engine/scenario/variant.go       | 439 +++++++++++++++++++++++++++
+ engine/scenario/variant_test.go  | 618 +++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 1147 insertions(+), 6 deletions(-)
