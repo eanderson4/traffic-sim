@@ -34,11 +34,14 @@ An authoritative **Go engine** advances a lane-level road graph on a fixed 100 m
 | Vehicle conventions | Front-bumper `s`, bumper-to-bumper gap, IDM+MOBIL | Matches the literature; no cross-pipeline drift by a vehicle length — ADR-0007 |
 | Controller contract | 4-axis intents, exclusive claims, zero engine driving logic | TraCI/CARLA failure modes; failover is operational, not simulative — ADR-0008 |
 | OSM import | netconvert bootstrap + Go importer + permanent oracle | Only 3 compilers exist, none Go; lane tags too sparse to trust — ADR-0009 |
+| Junction right-of-way | Compiled approach classes + conflict foes, kernel stop-line guardrail | Enforcement in the kernel so every controller inherits it — ADR-0010 |
+| Fixed-time signals | Kernel-run tlLogic programs, phase = pure function of the tick | Data-driven phases leave the seam for external signal controllers — ADR-0011 |
+| Scenario format | Strict-YAML manifest-of-parts directory, overlay variants, (content-hash, seed) run identity | The scenario is what git diffs, the engine loads, and recordings bind to — ADR-0012 |
 
 ## Current State
 
 - **Strengths:** the design phase is unusually well-evidenced — every recommendation cites measurements, every subsystem has a validation oracle, and the 2026-07-17 review ratified the contested seams into ADR-0005..0009. The repo already carries working analysis tooling (`analysis/ngsim` measured a −18.1 km/h wave on NGSIM I-80) and prototype scaffolding (`prototypes/`).
-- **In flux:** four research-complete areas await their ADRs — network model, scenario format, observability metric set, project license (see [ADR index](decisions/adrs.md#research-complete-adr-pending)). Nothing is coded yet; contracts are the next artifacts.
+- **In flux:** three research-complete areas await their ADRs — network model, observability metric set, project license (see [ADR index](decisions/adrs.md#research-complete-adr-pending)); scenario format left the queue 2026-07-21 as ADR-0012 (design ratified, implementation pending). The engine is built through M10 (kernel, NATS contract, default driver, OSM import, right-of-way, fixed-time signals, runtime demand director) with a live MapLibre viz.
 - **Known gaps:** a queue of benchmark-at-bring-up measurements (JetStream puback latency, wire sizes, MapLibre throughput), prototype experiments (ring-road acceptance test, AWSC headways, zipper fairness), and external-data errands (dataset licensing, real timing sheets, equation transcription against primary sources) — full list in [Gaps & Roadmap](gaps-and-roadmap.md).
 
 ## Reading Paths

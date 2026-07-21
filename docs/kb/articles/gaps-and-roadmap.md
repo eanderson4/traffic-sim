@@ -7,7 +7,6 @@
 | Candidate ADR | Gate | Blocks |
 |---|---|---|
 | Network model | [Road Graph Model](architecture/road-graph-model.md) | Engine world-state schema, compiled network format, importer target |
-| Scenario format | [Scenario Format](concepts/scenario-format.md) | Scenario authoring, variant overlays, metric bindings, run identity |
 | Observability / metric set | [Congestion Metrics](business-domains/congestion-metrics.md) | Metric message schemas, detector layer, experiment protocol |
 | Project license | [Simulator Landscape](business-domains/simulator-landscape.md) | Nothing yet (deferred 2026-07-17, leaning MIT); ODbL posture stands per ADR-0009 regardless |
 
@@ -79,13 +78,14 @@
 
 ## Suggested Next Research
 
-1. **Draft the four pending ADRs** (network model, scenario format, observability, license) — their research gates are closed; drafting is the cheapest unblocking step before engine code.
+1. **Draft the three remaining pending ADRs** (network model, observability, license) — their research gates are closed; drafting is the cheapest unblocking step. (Scenario format left this list 2026-07-21 → ADR-0012.)
 2. **`arch-engine-internals`** — engine module decomposition against the 10⁵ vehicle-update/s tier target; would absorb several benchmark-queue items into one bring-up plan.
 3. **`domain-demand-modeling`** — demand estimation and generation tooling (the field's dfrouter/od2trips shape), including calibration from the trajectory corpora.
 4. **`concept-human-driver-client`** — input-to-intent pipeline and HUD, completing the multiplayer story end to end.
 
 ## Freshness Notes
 
+- 2026-07-21: ADR-0012 (scenario format) ratified — manifest-of-parts directory in strict YAML, runtime director demand sampling (the M10 contract as-is; demand files ARE director configs), kustomize-style overlay variants (addition-only, no templating, ADR-0009 network delta-patch grammar), run identity = (content-hash, seed), per-file `format_version` with the Kubernetes round-trip rule. One dependency exception: a YAML library confined to `engine/scenario/` (ADR-0006 natsio precedent). Implementation is the next milestone (M11: loader + `scenario fmt/validate/migrate` + `-scenario` on serve/simrun); deferred to later ADRs/work: pack format, controller-assignment syntax, signal-program schema, real-data demand import, scenario-from-recording initial state. Pending-ADR queue is now three: network model, observability/metric set, license.
 - 2026-07-20 (b): M10 runtime demand director landed (ADR-0006 addendum, ADR-0008 clarification — grant model UNCHANGED, `director` grant covers verbs). New additive channels: `ts.{run}.ctl.verb.{controller_id}` (request/reply spawn verbs, idempotent by director request id) and `ts.{run}.log.verb` (record plane; replay re-enqueues, the sampler never re-runs — bit-identity pinned in `TestDirectorVerbRecordReplay`). Kernel injection reuses the Spawner's mechanics with bounded hold-and-retry (600 ticks). Reference client `engine/cmd/demand-director` (strict-JSON flows, Poisson/constant, vType weights, per-vehicle keyed sampling). The C2 runtime-director review item is now implemented; the scenario format ADR is what remains to make demand definitions files instead of flags. TSKF keyframes are at v3 (v2 loads; empty queues marshal byte-identical).
 - 2026-07-20: M9 signal state on the live plane (ADR-0006 addendum) — new additive subject `ts.{run}.state.sig` (TSSG v1) ships the signal-program TABLE + publish tick; clients derive light states by the kernel's own integer math (phase changes need zero messages; late joiners converge ≤ keyframe cadence). Key finding, now contractual: TSSF v1 decoders hard-reject on exact length AND version, so in-frame extension is never additive — new channels are the only backward-compatible shape (the M6 TSSF bump candidates — speed, lane id — are affected by this when they land). Viz renders the two I-280 junctions' stop-line lights, verified in headless Chrome (green/amber/red cycling, metered queue visible).
 - 2026-07-19: M8 fixed-time signals landed (ADR-0011) — static tlLogic compiles to kernel-run programs; phase state is a pure function of the tick count (no CRC/keyframe coverage needed); enforcement composes with the ADR-0010 stop-line guardrail (red hold, amber stop-if-able, green + box checks). I-280: 0 collisions at rate 600, the 8 known right_before_left residuals at 2400 unchanged. The data-driven phase seam (D1) leaves external signal controllers as the next signal milestone — a message-contract change needing its own ADR.

@@ -26,9 +26,9 @@ mechanism and eschewed-features list, FHWA's seed-sweep statistics, Kubernetes' 
 rules, written in strict YAML so git can see everything. A content-addressed scenario
 identity (hash of the materialized scenario) appears in **no** surveyed traffic tool —
 overlays + declarative metrics + content hashing is, as far as the research found,
-unpublished. No scenario-format ADR exists yet; this article records the recommended
-positions, amended by the 2026-07-17 design review (which settled demand sampling and
-network-variant patching via ADR-0008/ADR-0009).
+unpublished. These positions are ratified by [ADR-0012](../../decisions/ADR-0012-scenario-format.md)
+(2026-07-21), which also folded in the 2026-07-17 design-review amendments
+(demand sampling via ADR-0008, network-variant patching via ADR-0009).
 
 ## Key Components
 
@@ -59,8 +59,8 @@ Go) so diffs are semantic and hashing is stable. JSON-Schema validation at load.
 the only mainstream format with comments + clean deep nesting + a decade of "config as
 reviewable code" culture; its traps (`NO`→`false`, `9.3`→float) are spec-compliant implicit
 typing and must be fenced. TOML is the runner-up, CUE the documented upgrade path if
-cross-field constraints outgrow the schema. This one is a *recommendation* awaiting the ADR;
-the overlay/versioning decisions are syntax-independent.
+cross-field constraints outgrow the schema. Ratified by ADR-0012 §2, including the
+dependency exception (one YAML library confined to `engine/scenario/`).
 
 **3. Demand: layered primitives, sim-second times, runtime sampling (review-resolved).**
 The v1 demand vocabulary mirrors the field's revealed structure: explicit vehicles (scripted
@@ -177,8 +177,11 @@ newer attributes and OpenSCENARIO's shipped XSLT migrations are the positive pre
   flows) as a first-class path, tying to `analysis/ngsim` tooling.
 - **Scenario-from-recording schema**: the "vehicles present at t=0" initial-state primitive
   needed for keyframe export.
-- The scenario-format **ADR itself** is still unwritten — this research is its gate; the
-  strict-YAML choice in particular is a recommendation, not a decision.
+
+These remain open under [ADR-0012](../../decisions/ADR-0012-scenario-format.md) (ratified
+2026-07-21), which decided the container: manifest-of-parts directory, strict YAML,
+overlay variants, (content-hash, seed) run identity, `format_version` migrations. The
+open items above are its deferred list.
 
 ## Related
 
