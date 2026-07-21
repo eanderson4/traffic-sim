@@ -1,6 +1,7 @@
 // Package scenario loads ADR-0012 scenario directories: a strict-YAML
 // manifest (scenario.yaml) referencing network, demand, control, and metrics
-// part files, materialized into an engine.RunSpec plus director demand
+// part files — or a variant.yaml overlay materialized against its base
+// (ADR-0012 §4, M12) — into an engine.RunSpec plus director demand
 // definitions. It also provides the canonical formatter and the content
 // hash — the run key is (content-hash, seed).
 //
@@ -28,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 	"os"
 	"path"
@@ -141,8 +143,27 @@ type hashPart struct {
 
 // Load reads, validates, and materializes a scenario directory (ADR-0012:
 // fail-loud everywhere — unknown fields, bad references, and semantic
-// errors are all load-time errors).
+// errors are all load-time errors). A directory holding variant.yaml
+// instead of scenario.yaml is an overlay (ADR-0012 §4, M12): it is
+// materialized against its base and then treated exactly like a
+// hand-authored scenario.
 func Load(dir string) (*Scenario, error) {
+	_, mErr := os.Stat(filepath.Join(dir, ManifestFile))
+	_, vErr := os.Stat(filepath.Join(dir, VariantManifest))
+	if mErr == nil && vErr == nil {
+		return nil, fmt.Errorf("scenario %s: both %s and %s present — a directory is either a scenario or a variant (ADR-0012 §4)", dir, ManifestFile, VariantManifest)
+	}
+	// Only not-exist means "absent" — an I/O or permission error must not
+	// silently reroute manifest dispatch (fail loud, ADR-0012 §2).
+	if mErr != nil && !errors.Is(mErr, fs.ErrNotExist) {
+		return nil, fmt.Errorf("scenario %s: %w", filepath.Join(dir, ManifestFile), mErr)
+	}
+	if vErr != nil && !errors.Is(vErr, fs.ErrNotExist) {
+		return nil, fmt.Errorf("scenario %s: %w", filepath.Join(dir, VariantManifest), vErr)
+	}
+	if vErr == nil {
+		return loadVariant(dir)
+	}
 	s := &Scenario{Dir: dir}
 	mdata, err := os.ReadFile(filepath.Join(dir, ManifestFile))
 	if err != nil {
@@ -246,6 +267,12 @@ func loadDemandFile(path string, origins, typeSet map[string]bool) (*DemandFile,
 	if err != nil {
 		return nil, nil, err
 	}
+	return parseDemand(data, origins, typeSet)
+}
+
+// parseDemand is the byte-level core of loadDemandFile — variant loading
+// feeds it patched documents without touching the base's files on disk.
+func parseDemand(data []byte, origins, typeSet map[string]bool) (*DemandFile, []byte, error) {
 	var df DemandFile
 	if err := strictDecode(data, &df); err != nil {
 		return nil, nil, err
@@ -322,16 +349,32 @@ func (s *Scenario) Hash() string {
 // already canonical are left untouched; rewrites are staged to temp files
 // and renamed, so a failure never leaves a partially formatted directory.
 // Network, control, and metrics parts are untouched (not our formats).
+// On a variant directory only the variant's OWN files are formatted
+// (variant.yaml and its added demand parts) — never the base's.
 func Format(dir string) error {
 	if _, err := Load(dir); err != nil {
 		return err // fmt never canonicalizes a broken scenario
 	}
 	targets := []string{ManifestFile}
-	m, err := readManifest(dir)
-	if err != nil {
-		return err
+	_, vErr := os.Stat(filepath.Join(dir, VariantManifest))
+	switch {
+	case vErr == nil:
+		v, err := readVariant(dir)
+		if err != nil {
+			return err
+		}
+		targets = append([]string{VariantManifest}, v.Demand...)
+	case !errors.Is(vErr, fs.ErrNotExist):
+		// Same fail-loud dispatch discipline as Load: only not-exist
+		// means "not a variant".
+		return fmt.Errorf("scenario %s: %w", filepath.Join(dir, VariantManifest), vErr)
+	default:
+		m, err := readManifest(dir)
+		if err != nil {
+			return err
+		}
+		targets = append(targets, m.Demand...)
 	}
-	targets = append(targets, m.Demand...)
 	type staged struct {
 		final string
 		tmp   string
@@ -379,6 +422,18 @@ func readManifest(dir string) (*Manifest, error) {
 	return &m, nil
 }
 
+func readVariant(dir string) (*Variant, error) {
+	data, err := os.ReadFile(filepath.Join(dir, VariantManifest))
+	if err != nil {
+		return nil, err
+	}
+	var v Variant
+	if err := strictDecode(data, &v); err != nil {
+		return nil, err
+	}
+	return &v, nil
+}
+
 // resolvePart joins a scenario-relative part reference to the directory.
 // References must be relative, slash-separated, already-clean paths that
 // stay inside the directory — lexically (no "..", no absolute, no
@@ -390,6 +445,9 @@ func resolvePart(dir, ref string) (string, error) {
 	}
 	if strings.ContainsRune(ref, '\\') {
 		return "", fmt.Errorf("part %q: use forward slashes (portable refs)", ref)
+	}
+	if len(ref) > 1 && ref[1] == ':' {
+		return "", fmt.Errorf("part %q: drive-qualified paths are not portable refs", ref)
 	}
 	if path.IsAbs(ref) || path.Clean(ref) != ref || ref == ".." || strings.HasPrefix(ref, "../") {
 		return "", fmt.Errorf("part %q: must be a clean relative path inside the scenario directory", ref)
@@ -454,6 +512,22 @@ func validateManifest(m *Manifest) error {
 		if m.Spawner.DensityPerKm < 0 {
 			return errors.New("spawner.density_per_km must be >= 0 (0 = uncapped)")
 		}
+	}
+	// Part refs are hash frames: duplicates would silently double flows
+	// (and under an overlay, patch the first copy only), and a ref naming
+	// a manifest would hash the run coordinates as content — both break
+	// the directory-as-identity rule (ADR-0012 §1/§6).
+	refs := append(append(append([]string{}, m.Demand...), m.Control...), m.Metrics...)
+	seenRefs := make(map[string]bool, len(refs)+1)
+	seenRefs[m.Network] = true // the network is a hash frame too
+	for _, r := range refs {
+		if r == ManifestFile || r == VariantManifest {
+			return fmt.Errorf("part %q names a manifest file — not a part", r)
+		}
+		if seenRefs[r] {
+			return fmt.Errorf("duplicate part reference %q", r)
+		}
+		seenRefs[r] = true
 	}
 	return nil
 }
@@ -581,8 +655,9 @@ func strictDecode(data []byte, v any) error {
 // rejectNonStrict walks the node tree refusing the YAML features the
 // strict subset fences out (ADR-0012 §2): anchors/aliases create invisible
 // long-range coupling; merge keys are alias-adjacent; custom tags are
-// invisible typing. (Duplicate mapping keys are already a yaml.v3 parse
-// error.)
+// invisible typing. (Duplicate mapping keys are a yaml.v3 parse error for
+// map/struct destinations; yaml.Node destinations — patch sets — are
+// covered by rejectDupKeys in variant.go.)
 func rejectNonStrict(n *yaml.Node) error {
 	if n.Kind == yaml.DocumentNode {
 		for _, c := range n.Content {
@@ -622,6 +697,13 @@ func rejectNonStrict(n *yaml.Node) error {
 func checkNodeTypes(n *yaml.Node, t reflect.Type) error {
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
+	}
+	// A yaml.Node destination (a patch's set) takes the subtree raw —
+	// checking it against Node's own struct schema would misreport patch
+	// keys that collide with Node field names; the merged document gets
+	// the real schema check at apply time.
+	if t == reflect.TypeOf(yaml.Node{}) {
+		return nil
 	}
 	switch n.Kind {
 	case yaml.DocumentNode:

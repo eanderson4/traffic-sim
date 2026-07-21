@@ -352,6 +352,9 @@ func TestStrictYAMLFence(t *testing.T) {
 		{"anchor+alias", "format_version: 1\nid: &x test\nseed: 7\nticks: 3000\nnetwork: network.json\nspawner: {rate_per_lane_h: 600}\nmetrics: [*x]\n", "not strict YAML"},
 		{"custom tag", "format_version: 1\nid: !foo test\nseed: 7\nticks: 3000\nnetwork: network.json\nspawner: {rate_per_lane_h: 600}\n", "not strict YAML"},
 		{"two documents", goodManifest + "---\nformat_version: 1\n", "one document"},
+		{"duplicate part refs", strings.Replace(goodManifest, "demand:\n  - demand/main.yaml\n", "demand:\n  - demand/main.yaml\n  - demand/main.yaml\n", 1), "duplicate part reference"},
+		{"demand ref names the manifest", strings.Replace(goodManifest, "demand/main.yaml", ManifestFile, 1), "names a manifest file"},
+		{"control ref shadows the network", strings.Replace(goodManifest, "demand:\n  - demand/main.yaml\n", "demand:\n  - demand/main.yaml\ncontrol: [network.json]\n", 1), "duplicate part reference"},
 		{"newer version", strings.Replace(goodManifest, "format_version: 1", "format_version: 2", 1), "unsupported format_version 2"},
 		{"no demand", "format_version: 1\nid: x\nseed: 1\nticks: 10\nnetwork: network.json\n", "no demand"},
 	}
