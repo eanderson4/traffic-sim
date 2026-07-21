@@ -61,6 +61,7 @@ type Recorder struct {
 	KeyframesWritten uint64
 	CRCsWritten      uint64
 	EventsWritten    uint64
+	VerbsWritten     uint64
 }
 
 // Record-plane-only intent flag bits (the wire bits 0–4 are shared with the
@@ -105,12 +106,18 @@ func (r *Recorder) LogStart(e *engine.Engine) error {
 }
 
 // LogTick writes one tick's record in stream order — arbitrated intents
-// (in application order, each with its applied_tick), then the keyframe and
-// rolling CRC at their cadences — and awaits the batch's pubacks.
+// (in application order, each with its applied_tick), then accepted
+// director verbs (with theirs), then the keyframe and rolling CRC at their
+// cadences — and awaits the batch's pubacks.
 func (r *Recorder) LogTick(e *engine.Engine) error {
 	tick := e.Tick
 	for _, t := range e.AppliedIntents() {
 		if err := r.logIntent(t); err != nil {
+			return err
+		}
+	}
+	for _, s := range e.AppliedSpawns() {
+		if err := r.logVerb(s); err != nil {
 			return err
 		}
 	}
@@ -259,6 +266,23 @@ func (r *Recorder) logIntent(t engine.TickedIntent) error {
 		return err
 	}
 	r.IntentsWritten++
+	return nil
+}
+
+// logVerb appends one accepted director spawn directive to the record
+// (ts.{run}.log.verb, JSON — low-rate administrative traffic, same shape
+// rationale as log.event). Replay re-enqueues the verb at its recorded
+// applied_tick; the kernel's deterministic injection queue reproduces the
+// spawn, so the demand sampler never re-runs (ADR-0006 M10 addendum).
+func (r *Recorder) logVerb(s engine.TickedSpawn) error {
+	data, err := encodeLoggedVerb(s)
+	if err != nil {
+		return err
+	}
+	if err := r.publish(SubjectLogVerb(r.run), s.Tick, data); err != nil {
+		return err
+	}
+	r.VerbsWritten++
 	return nil
 }
 

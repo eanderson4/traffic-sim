@@ -28,6 +28,9 @@ import (
 //	per origin lane (spawner order):
 //	  laneIdx u32 | rate f64 | spawnTick u64 | pendID u64 | pendRngDraws u64 |
 //	  pendRngLen u8 | pend rng bytes
+//	v3 only (written solely while the director queue is non-empty):
+//	  nDirectives u32 | per directive: tick u64 | laneIdx u32 | typeIdx u32 |
+//	  earliestTick u64 | reqIDLen u16 | reqID bytes
 //
 // Payloads stay far under the 1 MB max_payload discipline (ADR-0002) at
 // current network sizes (~70 B/vehicle); the measured byte curve and the
@@ -36,8 +39,18 @@ import (
 const (
 	// keyframeMagic spells "TSKF" in the byte stream (little-endian u32).
 	keyframeMagic = 0x464b5354
-	// keyframeVersion 2 adds the persistent controller axes per vehicle.
-	keyframeVersion = 2
+	// keyframeVersion is the current write version. Version 2 added the
+	// persistent controller axes per vehicle. Version 3 (written only
+	// while the director injection queue is non-empty — an empty queue
+	// marshals byte-identical v2) appends the pending directives:
+	//
+	//	nDirectives u32 | per directive:
+	//	  tick u64 | laneIdx u32 | typeIdx u32 | earliestTick u64 |
+	//	  reqIDLen u16 | reqID bytes
+	keyframeVersion = 3
+	// keyframeMinVersion is the oldest readable version (v2 recordings
+	// predate the director path; their queue is empty by definition).
+	keyframeMinVersion = 2
 )
 
 // MarshalState serializes the engine's complete dynamic state at the
@@ -45,7 +58,11 @@ const (
 func (e *Engine) MarshalState() ([]byte, error) {
 	w := &byteWriter{}
 	w.u32(keyframeMagic)
-	w.u16(keyframeVersion)
+	version := uint16(keyframeMinVersion)
+	if len(e.dirQueue) > 0 {
+		version = keyframeVersion
+	}
+	w.u16(version)
 	w.u16(0)
 	w.u64(e.Tick)
 	w.u64(e.crc)
@@ -105,6 +122,19 @@ func (e *Engine) MarshalState() ([]byte, error) {
 			w.bytes(rngBytes)
 		}
 	}
+	if len(e.dirQueue) > 0 {
+		// TSKF v3: pending director directives (seek must resume the
+		// injection queue bit-exactly; version stays 2 when empty).
+		w.u32(uint32(len(e.dirQueue)))
+		for _, d := range e.dirQueue {
+			w.u64(d.Tick)
+			w.u32(uint32(d.LaneIdx))
+			w.u32(uint32(d.TypeIdx))
+			w.u64(d.EarliestTick)
+			w.u16(uint16(len(d.RequestID)))
+			w.bytes([]byte(d.RequestID))
+		}
+	}
 	return w.buf, nil
 }
 
@@ -118,8 +148,9 @@ func RestoreState(spec RunSpec, data []byte) (*Engine, error) {
 	if magic := r.u32(); magic != keyframeMagic {
 		return nil, fmt.Errorf("keyframe: bad magic %#08x", magic)
 	}
-	if v := r.u16(); v != keyframeVersion {
-		return nil, fmt.Errorf("keyframe: unsupported version %d", v)
+	ver := r.u16()
+	if ver < keyframeMinVersion || ver > keyframeVersion {
+		return nil, fmt.Errorf("keyframe: unsupported version %d", ver)
 	}
 	r.u16() // flags
 	tick := r.u64()
@@ -217,6 +248,30 @@ func RestoreState(spec RunSpec, data []byte) (*Engine, error) {
 			st.rate = rate
 			st.tick = spawnTick
 			st.pend = &Vehicle{ID: pendID, rng: stream}
+		}
+	}
+	if ver >= 3 {
+		// Pending director directives resume with the queue (their recorded
+		// applied ticks and request ids ride along so the CRC chain and any
+		// later keyframe stay bit-identical to the live run).
+		n := r.u32()
+		for i := uint32(0); i < n; i++ {
+			d := TickedSpawn{
+				Tick:    r.u64(),
+				LaneIdx: int(r.u32()),
+				TypeIdx: int(r.u32()),
+			}
+			d.EarliestTick = r.u64()
+			d.RequestID = string(r.bytesN(int(r.u16())))
+			if r.err != nil {
+				return nil, fmt.Errorf("keyframe: directive %d: %w", i, r.err)
+			}
+			if d.LaneIdx >= len(e.Net.Lanes) || d.TypeIdx >= len(e.scen.Types) {
+				return nil, fmt.Errorf("keyframe: directive %d lane/type index out of range", i)
+			}
+			d.Origin = e.Net.Lanes[d.LaneIdx].ID
+			d.TypeName = e.scen.Types[d.TypeIdx].Name
+			e.dirQueue = append(e.dirQueue, d)
 		}
 	}
 	if len(r.buf) != 0 {

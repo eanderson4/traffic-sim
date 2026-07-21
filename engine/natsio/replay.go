@@ -26,6 +26,7 @@ type ReplayReport struct {
 	KeyframeSeq     uint64 // its stream sequence
 	ToTick          uint64 // last re-simulated tick
 	IntentsReplayed int
+	VerbsReplayed   int // director spawn directives re-enqueued
 	CRCsVerified    int
 	FinalCRC        uint64 // rolling CRC at ToTick
 }
@@ -59,6 +60,12 @@ func MaterializeRunRecord(js nats.JetStreamContext, meta *RunMeta) (*RunRecord, 
 				return nil, err
 			}
 			rec.Log.Intents = append(rec.Log.Intents, k)
+		case SubjectLogVerb(run):
+			s, err := decodeLoggedVerb(m.Data)
+			if err != nil {
+				return nil, err
+			}
+			rec.Log.Spawns = append(rec.Log.Spawns, s)
 		case SubjectLogCRC(run):
 			crc, err := decodeLoggedCRC(m.Data)
 			if err != nil {
@@ -100,6 +107,7 @@ func ReplayFromStream(js nats.JetStreamContext, meta *RunMeta, target uint64) (*
 	}
 
 	intents := map[uint64][]engine.KeyedIntent{}
+	verbs := map[uint64][]engine.SpawnDirective{}
 	crcs := map[uint64]uint64{}
 	var lastLoggedTick uint64
 	for _, m := range msgs {
@@ -117,6 +125,12 @@ func ReplayFromStream(js nats.JetStreamContext, meta *RunMeta, target uint64) (*
 				return nil, err
 			}
 			intents[k.Tick] = append(intents[k.Tick], k.KeyedIntent)
+		case SubjectLogVerb(run):
+			s, err := decodeLoggedVerb(m.Data)
+			if err != nil {
+				return nil, err
+			}
+			verbs[s.Tick] = append(verbs[s.Tick], s.SpawnDirective)
 		case SubjectLogCRC(run):
 			crc, err := decodeLoggedCRC(m.Data)
 			if err != nil {
@@ -138,6 +152,15 @@ func ReplayFromStream(js nats.JetStreamContext, meta *RunMeta, target uint64) (*
 		for _, k := range intents[next] {
 			e.EnqueueIntent(k)
 			rep.IntentsReplayed++
+		}
+		for _, d := range verbs[next] {
+			// The verb was validated when first accepted; re-resolution
+			// against the same spec is deterministic and cannot newly fail
+			// — a failure here means the record and spec disagree.
+			if err := e.EnqueueSpawn(d); err != nil {
+				return nil, fmt.Errorf("replay verb %q at tick %d: %w", d.RequestID, next, err)
+			}
+			rep.VerbsReplayed++
 		}
 		e.Step()
 		if want, ok := crcs[next]; ok {

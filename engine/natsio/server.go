@@ -116,6 +116,15 @@ func SubjectCtlHeartbeat(run, ctl string) string {
 }
 func SubjectCtlHeartbeatAll(run string) string { return Namespace + "." + run + ".ctl.heartbeat.>" }
 
+// Director verbs (ADR-0008 §5; ADR-0006 2026-07-20 M10 addendum):
+// ts.{run}.ctl.verb.{controller_id} — request/reply, requires the director
+// grant. v1 verb vocabulary: spawn (despawn/teleport/trigger land with
+// later milestones; unknown verbs are rejected, not silently ignored).
+func SubjectCtlVerb(run, ctl string) string {
+	return Namespace + "." + run + ".ctl.verb." + ctl
+}
+func SubjectCtlVerbAll(run string) string { return Namespace + "." + run + ".ctl.verb.>" }
+
 // SubjectCtlObs is the per-controller observation subject:
 // ts.{run}.ctl.obs.{controller_id} — one binary observation frame per tick.
 func SubjectCtlObs(run, ctl string) string { return Namespace + "." + run + ".ctl.obs." + ctl }
@@ -133,12 +142,18 @@ func SubjectEventPause(run string) string { return Namespace + "." + run + ".ctl
 // (request/reply, off the hot path): ts.{run}.drive.introspect.
 func SubjectDriveIntrospect(run string) string { return Namespace + "." + run + ".drive.introspect" }
 
-// Record-plane subjects (engine sole writer): ts.{run}.log.{intent,keyframe,crc,event}.
+// Record-plane subjects (engine sole writer): ts.{run}.log.{intent,keyframe,crc,event,verb}.
 func SubjectLogIntent(run string) string   { return Namespace + "." + run + ".log.intent" }
 func SubjectLogKeyframe(run string) string { return Namespace + "." + run + ".log.keyframe" }
 func SubjectLogCRC(run string) string      { return Namespace + "." + run + ".log.crc" }
 func SubjectLogEvent(run string) string    { return Namespace + "." + run + ".log.event" }
 func SubjectLogAll(run string) string      { return Namespace + "." + run + ".log.>" }
+
+// SubjectLogVerb is the record-plane director-verb subject:
+// ts.{run}.log.verb — accepted spawn directives, one per message, stamped
+// with their applied_tick (replay re-enqueues from these; the demand
+// sampler never re-runs, ADR-0006 M10 addendum).
+func SubjectLogVerb(run string) string { return Namespace + "." + run + ".log.verb" }
 
 // StreamName is the per-run log stream (ADR-0006 §5: one log stream per
 // run). Stream names are single tokens; run ids are validated accordingly.

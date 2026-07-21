@@ -184,3 +184,67 @@ needs; Synadia's Cybervet runs embedded NATS + 10 ms tick + KV + WebSocket at
   states replace fixed-time derivation, light state ceases to be
   tick-derivable; this subject is the natural carrier for that evolution,
   which is its own contract ADR.
+
+## Addendum (2026-07-20, M10 runtime demand director)
+
+- **New contract-plane channel `ts.{run}.ctl.verb.{controller_id}`**
+  (request/reply, JSON) carries director verbs (ADR-0008 §5's director
+  role; scenario-format §3's runtime demand director). The sender must
+  hold the **director** grant — the grant model is UNCHANGED (the grant
+  has existed since ADR-0008; see its 2026-07-20 clarification). v1
+  implements verb `spawn`: origin lane id, vehicle-type name,
+  `earliest_tick`, and a director-assigned **`request_id`** that is the
+  idempotency key — the engine remembers the reply per id for the run's
+  lifetime, so a retried verb (reconnect, publish retry, director
+  failover with deterministic ids) is answered `duplicate: true` and
+  never double-spawns. Request/reply — not the intents' fire-and-forget —
+  because the director paces its sampling schedule on accept/reject, and
+  validation rejections (unknown origin, lane not a spawn origin, unknown
+  type, unsupported verb) must reach it.
+- **New record-plane subject `ts.{run}.log.verb`** (JSON, one message per
+  ACCEPTED verb, in the tick's log batch after the arbitrated intents)
+  stamped with the verb's applied_tick. Only first-seen accepted verbs
+  are recorded — rejections and duplicates are not — so the log is
+  exactly the accepted set. Replay re-enqueues verbs at their recorded
+  ticks and the kernel's deterministic injection queue (hold-and-retry,
+  bounded at 600 ticks past `earliest_tick`; the Spawner's own
+  origin-clearance and density-cap rules) reproduces the identical spawn
+  ticks, vehicle ids, and per-vehicle streams: **the demand sampler
+  never re-runs**, and replay is bit-identical (pinned in
+  `engine/natsio/verb_test.go`: live run + verbs → `ReplayFromStream`
+  re-simulates through verb re-enqueue and verifies every logged CRC).
+- **Migration note: additive; old clients and engines are unaffected.**
+  Old clients never subscribe `...ctl.verb.>` and never see
+  `...log.verb` (replay consumers filter by subject); old engines simply
+  have no verb handler — a director talking to one gets no reply, which
+  is the designed absence signal. All M1–M9 payload shapes are
+  byte-unchanged. The one visible change is on the keyframe path:
+  **TSKF v3** appends the pending-directive queue and is written ONLY
+  while that queue is non-empty — an empty queue marshals byte-identical
+  v2, so director-free runs produce bit-identical keyframes, CRCs, and
+  log streams (the pinned scenario CRCs hold). Readers accept v2|v3;
+  pre-M10 binaries reject v3 keyframes with the explicit
+  "unsupported version" error — acceptable per the M4 precedent (no
+  persistent deployments; recordings are local artifacts).
+- **Tick-order point (documented in code, `engine/director.go`):** verbs
+  drained between ticks are stamped with the next tick (the intents'
+  applied_tick convention) and inject at Step phase 1 (events),
+  immediately after the deterministic spawner and before intents.
+- **Blocked-origin policy: hold-and-retry, bounded and deterministic**
+  (chosen over reject-and-let-director-retry): it matches the Spawner's
+  "unmet demand carries over" semantics, keeps the engine authoritative
+  over injection timing, and — critically for replay — makes the
+  injection outcome a pure function of (recorded verb, world state), so
+  no rejection round-trips need recording. Expiry (600 ticks) is likewise
+  a pure function and needs no record.
+- **Rolling CRC** folds the pending-directive queue (only when non-empty)
+  so replay catches queue divergence; TSKF v3 round-trips the same queue
+  for seek fidelity (tested: keyframe mid-hold restores and matches the
+  uninterrupted run's CRC).
+- **Reference client:** `engine/cmd/demand-director` — strict-JSON flows
+  (constant | Poisson spacing, piecewise-constant slices in sim seconds,
+  per-flow vType weights), per-vehicle keyed sampling via
+  `engine.DeriveStream(seed, flowKey^ordinal)` (ADR-0005/ADR-0007
+  discipline; deterministic request ids make director failover
+  invisible), heartbeats between sparse verbs (the liveness budget
+  detaches silent controllers — measured in bring-up).

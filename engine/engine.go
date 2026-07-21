@@ -77,6 +77,11 @@ type Engine struct {
 	applied   []TickedIntent // applied during the last Step (reused each Step)
 	IntentLog []TickedIntent // arbitrated log in application order (ADR-0005)
 
+	dirNew        []TickedSpawn // buffered director directives, applied next boundary
+	dirQueue      []TickedSpawn // accepted directives awaiting injection (FIFO)
+	appliedSpawns []TickedSpawn // entered the queue during the last Step (reused)
+	SpawnLog      []TickedSpawn // every accepted directive, in application order
+
 	Stats Stats
 }
 
@@ -174,7 +179,9 @@ func (e *Engine) CRC() uint64 { return e.crc }
 
 // Step advances the simulation exactly one tick. Phase order:
 //
-//  1. events: deterministic spawner (ADR-0005: events fire before the sweep)
+//  1. events: deterministic spawner, then director spawn directives
+//     (ADR-0005: events fire before the sweep; the director queue's fixed
+//     point is documented in director.go)
 //  2. intents: buffered controller intents applied in deterministic order
 //     (ADR-0006 §4), recorded in the arbitrated log
 //  3. IDM acceleration per vehicle from a consistent snapshot (intent
@@ -191,6 +198,7 @@ func (e *Engine) Step() {
 	if e.spawner != nil {
 		e.spawner.step(e)
 	}
+	e.stepDirectorSpawns()
 	e.applyIntents()
 	e.rebuildOccupancy()
 	e.computeAccels()
@@ -478,7 +486,10 @@ func (e *Engine) observeGap(g float64, section string) {
 //	order — deterministic from the seed; the CRC's canonical order since
 //	M1) : ID, lane index, type index, Float64bits(S), Float64bits(V),
 //	Float64bits(F), cooldown, RNG draw count | per origin lane: pending
-//	spawn (vehicle ID, scheduled tick).
+//	spawn (vehicle ID, scheduled tick) | pending director directives when
+//	any (applied tick, lane/type index, earliest tick, request ID — the
+//	section is omitted with an empty queue, so director-free runs keep
+//	the M3 byte stream).
 //
 // Fixed iteration order + float64 bits via encoding/binary make the bytes
 // canonical; the draw counts catch RNG-consumption divergence between
@@ -488,7 +499,7 @@ func (e *Engine) observeGap(g float64, section string) {
 // route) are deliberately NOT folded in: the CRC stays the M3 trajectory
 // oracle so NATS-off baselines keep matching across milestones; controller
 // state reaches the CRC through its trajectory effects (S/V/lane) and is
-// restored bit-exactly by keyframes (TSKF v2) for seek fidelity.
+// restored bit-exactly by keyframes (TSKF v2/v3) for seek fidelity.
 func (e *Engine) computeCRC() uint64 {
 	h := fnv.New64a()
 	var b [8]byte
@@ -512,6 +523,19 @@ func (e *Engine) computeCRC() uint64 {
 			st := &e.spawner.origins[i]
 			u(st.pend.ID)
 			u(st.tick)
+		}
+	}
+	// Pending director directives (only when a director is attached — the
+	// fold is skipped entirely with an empty queue, so director-free runs
+	// keep the M3 byte stream). Queue order is canonical (FIFO).
+	if len(e.dirQueue) > 0 {
+		u(uint64(len(e.dirQueue)))
+		for _, d := range e.dirQueue {
+			u(d.Tick)
+			u(uint64(d.LaneIdx))
+			u(uint64(d.TypeIdx))
+			u(d.EarliestTick)
+			h.Write([]byte(d.RequestID))
 		}
 	}
 	return h.Sum64()

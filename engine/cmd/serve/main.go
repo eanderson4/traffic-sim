@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -38,8 +39,9 @@ func main() {
 	run := flag.String("run", "demo", "run id (single NATS token)")
 	ticks := flag.Uint64("ticks", 36000, "ticks to simulate (100 ms tick; 36000 = 1 h)")
 	seed := flag.Uint64("seed", 1, "scenario seed")
-	rate := flag.Float64("rate", 600, "spawn rate per origin lane (veh/h)")
+	rate := flag.Float64("rate", 600, "spawn rate per origin lane (veh/h); 0 disables the built-in spawner (director-driven runs)")
 	density := flag.Float64("density", 80, "density cap (veh/lane-km)")
+	types := flag.String("types", "car", "comma-separated vehicle-type names for the scenario type list (car,truck); director spawn verbs resolve against this list")
 	geojson := flag.String("geojson", "", "also write the network as GeoJSON (local metric frame) to this path")
 	withDriver := flag.Bool("driver", true, "run an in-process default driver replica")
 	capacity := flag.Int("capacity", 1000, "driver claim capacity")
@@ -124,9 +126,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The scenario type list is what director spawn verbs resolve vtype
+	// against; the default ("car") is byte-identical to the pre-flag
+	// behavior (NewEngine's [Car] default).
+	typeReg := map[string]*engine.VehicleType{"car": &engine.Car, "truck": &engine.Truck}
+	var typeList []*engine.VehicleType
+	for _, name := range strings.Split(*types, ",") {
+		t, ok := typeReg[strings.TrimSpace(name)]
+		if !ok {
+			fmt.Fprintf(os.Stderr, "serve: unknown vehicle type %q (known: car, truck)\n", name)
+			os.Exit(2)
+		}
+		typeList = append(typeList, t)
+	}
+
 	spec := engine.RunSpec{
 		Net:    engine.NetSpec{Kind: "file", Path: *netfile},
-		Scen:   engine.Scenario{SpawnRatePerLaneHour: *rate, DensityTargetPerKm: *density},
+		Scen:   engine.Scenario{SpawnRatePerLaneHour: *rate, DensityTargetPerKm: *density, Types: typeList},
 		Params: engine.DefaultParams(),
 		Seed:   *seed,
 		Ticks:  *ticks,

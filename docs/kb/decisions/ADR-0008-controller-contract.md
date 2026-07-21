@@ -111,3 +111,26 @@ precedent for engine-enforced safety clamps.
 - **v1 stances**: directors pass 4-axis intents unfiltered (privileged verbs
   land with scenario work); cadence >1 is contract-complete but lightly
   dogfooded; AoI radius currently measures the placeholder lane projection.
+
+## Clarification (2026-07-20, M10 director verbs land)
+
+- **The grant model did NOT extend** (no ADR-0012): the `director` grant
+  declared in §5 covers spawn verbs as designed. The verb channel
+  (`ts.{run}.ctl.verb.{controller_id}`, request/reply) enforces the grant
+  at the contract layer — a verb from a controller without the grant is
+  rejected ("verb requires the director grant"); the engine stays
+  authoritative over injection (validation, origin clearance, density
+  cap), per §5's "engine-arbitrated, recorded on the record plane".
+- **v1 verb vocabulary is `spawn` only**; despawn/teleport/trigger remain
+  open and land additively on the same channel (unknown verbs are
+  rejected, never silently ignored). Directors may still pass 4-axis
+  intents unfiltered (the M3/M4 stance).
+- **Idempotency is the director's request id**: spawn verbs carry a
+  director-assigned `request_id`; the engine dedups per run and replays
+  the original answer to retries — a supervised director restarted after
+  failure re-issues its deterministic program and cannot double-spawn
+  (the §6 failover philosophy applied to the director role).
+- **Liveness applies to directors too**: a director that only emits
+  sparse verbs must heartbeat inside DetachAfterTicks or it is detached
+  like any controller (learned in M10 bring-up; the reference
+  `engine/cmd/demand-director` heartbeats on the snapshot rhythm).

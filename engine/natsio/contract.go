@@ -176,7 +176,7 @@ type holdState struct {
 
 // ctlReq is a buffered wire request (callbacks → run loop).
 type ctlReq struct {
-	kind    int // reqHello | reqClaim | reqRelease | reqHeartbeat
+	kind    int // reqHello | reqClaim | reqRelease | reqHeartbeat | reqVerb
 	ctl     string
 	reply   string
 	payload []byte
@@ -187,6 +187,7 @@ const (
 	reqClaim
 	reqRelease
 	reqHeartbeat
+	reqVerb
 )
 
 // Contract is the engine side of the ADR-0008 contract.
@@ -205,6 +206,7 @@ type Contract struct {
 	hold       map[uint64]holdState
 	legacySeqs map[string]uint64
 	announced  map[uint64]bool
+	verbs      map[string]VerbReply // director request_id → reply (dedup; lookup only)
 	nextID     int
 	driveSeen  bool // pause gating arms once a drive controller has attached
 	deficit    uint64
@@ -232,6 +234,7 @@ func NewContract(nc *nats.Conn, run string, cfg ContractConfig, bus *Bus, rec *R
 		hold:       map[uint64]holdState{},
 		legacySeqs: map[string]uint64{},
 		announced:  map[uint64]bool{},
+		verbs:      map[string]VerbReply{},
 	}
 	bind := func(subject string, kind int, parseCtl bool) error {
 		sub, err := nc.Subscribe(subject, func(msg *nats.Msg) {
@@ -263,6 +266,9 @@ func NewContract(nc *nats.Conn, run string, cfg ContractConfig, bus *Bus, rec *R
 		return nil, err
 	}
 	if err := bind(SubjectCtlHeartbeatAll(run), reqHeartbeat, true); err != nil {
+		return nil, err
+	}
+	if err := bind(SubjectCtlVerbAll(run), reqVerb, true); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -311,6 +317,8 @@ func (c *Contract) ProcessControl(e *engine.Engine) error {
 			if ctl, ok := c.ctrls[r.ctl]; ok {
 				ctl.lastSeen = e.Tick
 			}
+		case reqVerb:
+			c.handleVerb(e, r)
 		}
 	}
 
@@ -536,6 +544,66 @@ func (c *Contract) handleRelease(e *engine.Engine, r ctlReq) {
 	if req.Detach {
 		c.detach(e, ctl, ReasonDisconnect)
 	}
+}
+
+// handleVerb answers one director verb (ts.{run}.ctl.verb.{id},
+// request/reply). The director grant is required; v1 implements "spawn".
+// Dedup is by the director-assigned request_id: the first-seen reply is
+// remembered and replayed (Duplicate set) for any retry, so a retried verb
+// never double-spawns. Accepted verbs are validated and buffered by the
+// kernel (engine.EnqueueSpawn) and take effect at the next tick boundary;
+// the record plane logs them with that applied_tick.
+func (c *Contract) handleVerb(e *engine.Engine, r ctlReq) {
+	var reply VerbReply
+	defer func() {
+		data, _ := json.Marshal(reply)
+		if r.reply != "" {
+			_ = c.nc.Publish(r.reply, data)
+		}
+	}()
+	// Parse first so every rejection still echoes verb/request_id (the
+	// director correlates replies by id, including "not attached" ones).
+	var req VerbRequest
+	if err := json.Unmarshal(r.payload, &req); err != nil {
+		reply.Reason = fmt.Sprintf("bad verb payload: %v", err)
+		return
+	}
+	reply.Verb, reply.RequestID = req.Verb, req.RequestID
+	ctl, ok := c.ctrls[r.ctl]
+	if !ok {
+		reply.Reason = "not attached"
+		return
+	}
+	ctl.lastSeen = e.Tick
+	if !ctl.grants["director"] {
+		reply.Reason = "verb requires the director grant"
+		return
+	}
+	if req.Verb != "spawn" {
+		reply.Reason = fmt.Sprintf("unsupported verb %q (v1: spawn)", req.Verb)
+		return
+	}
+	if req.RequestID == "" {
+		reply.Reason = "missing request_id"
+		return
+	}
+	if prev, dup := c.verbs[req.RequestID]; dup {
+		reply = prev
+		reply.Duplicate = true
+		return
+	}
+	err := e.EnqueueSpawn(engine.SpawnDirective{
+		RequestID:    req.RequestID,
+		Origin:       req.Origin,
+		TypeName:     req.VType,
+		EarliestTick: req.EarliestTick,
+	})
+	if err != nil {
+		reply.Reason = err.Error()
+	} else {
+		reply.Accepted = true
+	}
+	c.verbs[req.RequestID] = reply
 }
 
 // releaseOne drops one claim without emitting events (callers batch them).

@@ -20,7 +20,7 @@ asyncapi: 3.0.0
 
 info:
   title: traffic-sim engine contract
-  version: 2.1.0
+  version: 2.2.0
   description: |
     The engine's NATS surface per ADR-0006 (planes, taxonomy, pipelines) and
     ADR-0008 (the engine↔controller contract — M4, schema_version 2):
@@ -64,6 +64,19 @@ info:
     tick already rides every TSSF header. TSSF v1 and TSKF v2 are
     byte-unchanged: old clients decode new streams without error (they
     simply never subscribe the new subject).
+
+    **M10 changes (additive; info version 2.2.0):** the runtime demand
+    director (scenario-format §3, ADR-0008 §5 director role). New
+    contract-plane channel `ts.{run}.ctl.verb.{controller_id}`
+    (request/reply, requires the director grant) carrying director verbs —
+    v1 implements `spawn` with a director-assigned `request_id`
+    (idempotent: a retried verb never double-spawns) — and a new
+    record-plane subject `ts.{run}.log.verb` where accepted verbs are
+    logged with their applied_tick, exactly like intents. Replay
+    re-enqueues verbs from the log; the demand sampler never re-runs.
+    Keyframes stay TSKF v2 except while the injection queue is non-empty
+    (TSKF v3 appends it; readers accepting v2|v3 are unaffected — see the
+    M10 addendum migration note).
 
 servers:
   embedded:
@@ -196,6 +209,32 @@ channels:
     messages:
       heartbeat: { $ref: '#/components/messages/Heartbeat' }
 
+  ctlVerb:
+    address: ts.{run}.ctl.verb.{controller_id}
+    description: |
+      Director verbs (ADR-0008 §5; ADR-0006 2026-07-20 M10 addendum),
+      request/reply, JSON. The sender must hold the director grant. v1
+      implements verb "spawn": origin lane id (must be a network origin),
+      vehicle-type name (resolved against the scenario type list), and
+      earliest_tick (not-before, sim ticks). Every verb carries a
+      director-assigned request_id — the engine remembers the reply per id
+      for the run's lifetime, so a retried verb (reconnect, publish retry,
+      director failover) gets the same answer with duplicate: true and
+      NEVER double-spawns. Request/reply (not fire-and-forget like raw
+      intents) because the director paces its schedule on accept/reject.
+      Validation rejections (unknown origin, lane not a spawn origin,
+      unknown type, unsupported verb) carry a reason; accepted verbs take
+      effect at the next tick boundary and are logged on
+      ts.{run}.log.verb. Blocked origins hold-and-retry (bounded, 600
+      ticks past earliest_tick) with the Spawner's own clearance and
+      density-cap rules — the engine stays authoritative over injection.
+    parameters:
+      run: { $ref: '#/components/parameters/runId' }
+      controller_id: { $ref: '#/components/parameters/controllerId' }
+    messages:
+      verbRequest: { $ref: '#/components/messages/VerbRequest' }
+      verbReply: { $ref: '#/components/messages/VerbReply' }
+
   ctlObs:
     address: ts.{run}.ctl.obs.{controller_id}
     description: |
@@ -314,6 +353,26 @@ channels:
     x-nats:
       stream: TS_LOG_{run}
 
+  logVerb:
+    address: ts.{run}.log.verb
+    description: |
+      Accepted director verbs on the record plane (ADR-0006 2026-07-20
+      M10 addendum), one JSON message per verb, written in the tick's log
+      batch after the arbitrated intents, stamped with the verb's
+      applied_tick (the tick it entered the kernel's injection queue).
+      Replay re-enqueues verbs at their recorded ticks; the kernel's
+      deterministic hold-and-retry injection reproduces the identical
+      spawn ticks and vehicle streams — the demand sampler never re-runs
+      (scenario-format §3). Rejected or duplicate verbs are NOT recorded:
+      the log reflects exactly what the engine accepted, and dedup makes
+      the accepted-set canonical.
+    parameters:
+      run: { $ref: '#/components/parameters/runId' }
+    messages:
+      logVerb: { $ref: '#/components/messages/LoggedVerb' }
+    x-nats:
+      stream: TS_LOG_{run}
+
   runMeta:
     address: ts.{run}.meta.>
     description: |
@@ -367,6 +426,10 @@ operations:
     title: Engine ← liveness keepalives
     action: receive
     channel: { $ref: '#/channels/ctlHeartbeat' }
+  directorVerbs:
+    title: Engine ↔ director verbs (spawn; accept/reject, request-id idempotent)
+    action: receive
+    channel: { $ref: '#/channels/ctlVerb' }
   publishObservations:
     title: Engine → per-controller observations per tick
     action: send
@@ -395,6 +458,10 @@ operations:
     title: Engine → pause/resume events (dead-time metadata; invisible to tick determinism)
     action: send
     channel: { $ref: '#/channels/logEvent' }
+  writeLogVerb:
+    title: Engine → accepted director verbs (replay re-enqueues; the sampler never re-runs)
+    action: send
+    channel: { $ref: '#/channels/logVerb' }
   writeRegistry:
     title: Engine → run registry (meta at start/finish, state pointer at keyframe cadence)
     action: send
@@ -501,6 +568,22 @@ components:
         schemaFormat: application/octet-stream
         $ref: '#/components/schemas/EmptyPayload'
 
+    VerbRequest:
+      name: verbRequest
+      title: 'Director verb (v1 spawn; request_id is the idempotency key)'
+      headers: { $ref: '#/components/schemas/SchemaHeaders' }
+      payload:
+        schemaFormat: application/schema+json;version=draft-07
+        $ref: '#/components/schemas/VerbRequestView'
+
+    VerbReply:
+      name: verbReply
+      title: 'Verb accept/reject (duplicate: retried request_id, original answer replayed)'
+      headers: { $ref: '#/components/schemas/SchemaHeaders' }
+      payload:
+        schemaFormat: application/schema+json;version=draft-07
+        $ref: '#/components/schemas/VerbReplyView'
+
     Observation:
       name: observation
       title: Per-controller observation frame (AoI window, per tick)
@@ -558,15 +641,19 @@ components:
 
     Keyframe:
       name: keyframe
-      title: Full-state keyframe (engine.MarshalState bytes, TSKF v2)
+      title: Full-state keyframe (engine.MarshalState bytes, TSKF v2; v3 while director directives pending)
       summary: |
         Complete dynamic state: tick, rolling CRC, next vehicle id, every
         vehicle (id, lane, type, s, v, f, cooldown, RNG words + draw count,
         persistent controller axes — cruise setpoint, held turn, signals,
-        route), spawner demand state. Layout: engine/keyframe.go ("TSKF",
-        version 2 — v2 adds the controller axes). Payloads stay under the
-        1 MB discipline (ADR-0002 clarification); the vehicle-count/byte
-        curve feeding the chunking decision is in engine/BENCHMARKS.md.
+        route), spawner demand state. Layout: engine/keyframe.go ("TSKF";
+        v2 adds the controller axes, v3 — written ONLY while the director
+        injection queue is non-empty — appends the pending directives so a
+        seek resumes them bit-exactly; an empty queue marshals
+        byte-identical v2, and readers accept v2|v3). Payloads stay under
+        the 1 MB discipline (ADR-0002 clarification); the
+        vehicle-count/byte curve feeding the chunking decision is in
+        engine/BENCHMARKS.md.
       headers: { $ref: '#/components/schemas/LogHeaders' }
       payload:
         schemaFormat: application/octet-stream
@@ -580,6 +667,14 @@ components:
         schemaFormat: application/octet-stream
         $ref: '#/components/schemas/LoggedCRCFrame'
       x-json-view: '#/components/schemas/LoggedCRCView'
+
+    LoggedVerb:
+      name: loggedVerb
+      title: Accepted director verb (applied_tick, resolved type index; replay re-enqueues verbatim)
+      headers: { $ref: '#/components/schemas/LogHeaders' }
+      payload:
+        schemaFormat: application/schema+json;version=draft-07
+        $ref: '#/components/schemas/LoggedVerbView'
 
     RunMeta:
       name: runMeta
@@ -887,6 +982,46 @@ components:
           items: { type: integer, minimum: 1 }
           description: Initial claims granted.
         contract_version: { type: integer, const: 2 }
+
+    VerbRequestView:
+      title: Director verb request (ADR-0008 §5; M10)
+      type: object
+      required: [verb, request_id, origin, vtype, earliest_tick]
+      properties:
+        verb:
+          type: string
+          enum: [spawn]
+          description: 'v1 implements spawn only; despawn/teleport/trigger (the remaining OpenSCENARIO verbs) land additively on this same channel — unknown verbs are rejected, never silently ignored.'
+        request_id:
+          type: string
+          minLength: 1
+          description: 'Director-assigned idempotency key: unique per intended spawn for the run. The engine remembers the reply per id; a retry answers duplicate: true and never double-spawns. Deterministic ids (e.g. f{flow}-{ordinal}) make director failover invisible.'
+        origin: { type: string, description: 'Origin lane id; must be a network origin lane (rejected otherwise).' }
+        vtype: { type: string, description: 'Vehicle-type name, resolved against the scenario type list (rejected if unknown).' }
+        earliest_tick: { type: integer, minimum: 0, description: 'Not-before sim tick (ADR-0005 tick clock; 0 = as soon as applied). A blocked origin holds-and-retries from this tick, bounded at 600 ticks.' }
+
+    VerbReplyView:
+      title: Director verb reply
+      type: object
+      required: [accepted, verb, request_id]
+      properties:
+        accepted: { type: boolean, description: 'true = validated and queued for the next tick boundary (injection still obeys clearance/density rules); false = rejected, see reason.' }
+        verb: { type: string }
+        request_id: { type: string, description: 'Echoed even on parse-level and not-attached rejections.' }
+        duplicate: { type: boolean, description: 'true = this request_id was seen before; the ORIGINAL reply is replayed and nothing re-queued.' }
+        reason: { type: string, description: '"not attached" | "verb requires the director grant" | "unsupported verb" | "missing request_id" | validation message (unknown origin lane / not a spawn origin / unknown vehicle type).' }
+
+    LoggedVerbView:
+      title: Recorded director verb (ts.{run}.log.verb payload)
+      type: object
+      required: [tick, request_id, origin, vtype, type_idx, earliest_tick]
+      properties:
+        tick: { type: integer, minimum: 0, description: 'applied_tick — the tick the verb entered the injection queue; replay re-enqueues here.' }
+        request_id: { type: string }
+        origin: { type: string, description: 'Origin lane id; replay re-resolves it against the run spec (deterministic).' }
+        vtype: { type: string }
+        type_idx: { type: integer, minimum: 0, description: 'Resolved scenario type index (auditability).' }
+        earliest_tick: { type: integer, minimum: 0 }
         run: { type: string }
         tick: { type: integer, minimum: 0, description: Tick at attach (the contract's clock reference). }
         reason: { type: string, description: Reject reason when accepted = false. }

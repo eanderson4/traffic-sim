@@ -21,6 +21,7 @@ type RunSpec struct {
 type RunLog struct {
 	Spec    RunSpec
 	Intents []TickedIntent // applied intents, chronological (Tick ascending)
+	Spawns  []TickedSpawn  // accepted director directives, chronological
 	CRCs    []uint64
 }
 
@@ -34,7 +35,7 @@ func Run(spec RunSpec) (*Engine, *RunLog, error) {
 	for e.Tick < spec.Ticks {
 		e.Step()
 	}
-	return e, &RunLog{Spec: spec, Intents: e.IntentLog, CRCs: e.CRCs}, nil
+	return e, &RunLog{Spec: spec, Intents: e.IntentLog, Spawns: e.SpawnLog, CRCs: e.CRCs}, nil
 }
 
 // Replay re-executes a recorded run from its spec and arbitrated intent log
@@ -47,7 +48,7 @@ func Replay(log *RunLog) (*RunLog, error) {
 	if err != nil {
 		return nil, err
 	}
-	ii := 0
+	ii, si := 0, 0
 	for e.Tick < log.Spec.Ticks {
 		for ii < len(log.Intents) && log.Intents[ii].Tick <= e.Tick+1 {
 			if log.Intents[ii].Tick == e.Tick+1 {
@@ -55,9 +56,18 @@ func Replay(log *RunLog) (*RunLog, error) {
 			}
 			ii++
 		}
+		for si < len(log.Spawns) && log.Spawns[si].Tick <= e.Tick+1 {
+			if log.Spawns[si].Tick == e.Tick+1 {
+				if err := e.EnqueueSpawn(log.Spawns[si].SpawnDirective); err != nil {
+					return nil, fmt.Errorf("replay spawn %q at tick %d: %w",
+						log.Spawns[si].RequestID, log.Spawns[si].Tick, err)
+				}
+			}
+			si++
+		}
 		e.Step()
 	}
-	relog := &RunLog{Spec: log.Spec, Intents: e.IntentLog, CRCs: e.CRCs}
+	relog := &RunLog{Spec: log.Spec, Intents: e.IntentLog, Spawns: e.SpawnLog, CRCs: e.CRCs}
 	if len(relog.CRCs) != len(log.CRCs) {
 		return nil, fmt.Errorf("replay produced %d CRCs, log has %d", len(relog.CRCs), len(log.CRCs))
 	}

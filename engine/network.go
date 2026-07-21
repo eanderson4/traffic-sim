@@ -65,6 +65,18 @@ type Network struct {
 // LaneByID looks up a lane by ID (lookup only, never iterated).
 func (n *Network) LaneByID(id string) *Lane { return n.byID[id] }
 
+// OriginByID resolves a spawn origin lane by ID (linear scan of the small,
+// fixed Origins list — no map, no iteration-order hazard). Director spawn
+// verbs must name an origin, matching the Spawner's domain.
+func (n *Network) OriginByID(id string) *Lane {
+	for _, l := range n.Origins {
+		if l.ID == id {
+			return l
+		}
+	}
+	return nil
+}
+
 // TotalLaneKm is the total lane length in kilometres (density denominator).
 func (n *Network) TotalLaneKm() float64 {
 	var l float64
