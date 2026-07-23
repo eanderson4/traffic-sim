@@ -9,7 +9,10 @@
 // a vehicle present in both snapshots lerps, one only in the newer appears
 // at its newer position (spawn), one only in the older is gone (despawn).
 // Speed is derived client-side (TSSF v1 carries no speed field) from the
-// displacement between the two source snapshots — a labelled estimate.
+// displacement between the two source snapshots over SIM time
+// ((newer.tick - older.tick) × dt) — never the wall-clock arrival span,
+// which shrinks under faster-than-realtime replay and would inflate every
+// speed (and free-flow the congestion overlay) by the pace factor.
 
 import type { SnapshotFrame } from "./tssf.ts";
 
@@ -43,11 +46,13 @@ function lerpAngle(a: number, b: number, t: number): number {
 export class SnapshotBuffer {
   private frames: TimedFrame[] = [];
   readonly bufferMs: number;
+  readonly simDt: number; // engine timestep, s — sim seconds per tick
   private readonly maxFrames: number;
 
   // NOTE: erasable-syntax only (node strip-only mode loads this directly).
-  constructor(bufferMs = 250, maxFrames = 60 /* 6 s at 10 Hz — ample for the 250 ms buffer */) {
+  constructor(bufferMs = 250, simDt = 0.1, maxFrames = 60 /* 6 s at 10 Hz — ample for the 250 ms buffer */) {
     this.bufferMs = bufferMs;
+    this.simDt = simDt;
     this.maxFrames = maxFrames;
   }
 
@@ -92,7 +97,10 @@ export class SnapshotBuffer {
 
     const span = newer.recvMs - older.recvMs;
     const t = starved || span <= 0 ? 1 : Math.min(1, Math.max(0, (renderAt - older.recvMs) / span));
-    const dtSec = span / 1000;
+    // Speed divides by the SIM-time span, not the wall-clock span above:
+    // faster-than-realtime replay delivers the same sim content faster,
+    // and speed is a property of the sim, not of the delivery rate.
+    const simSec = (newer.frame.tick - older.frame.tick) * this.simDt;
 
     const prevById = new Map<number, { x: number; y: number; angle: number }>();
     if (older !== newer) {
@@ -113,7 +121,7 @@ export class SnapshotBuffer {
         y,
         angle: lerpAngle(p.angle, v.angle, t),
         cls: v.cls,
-        speed: dtSec > 0 ? Math.hypot(v.x - p.x, v.y - p.y) / dtSec : 0,
+        speed: simSec > 0 ? Math.hypot(v.x - p.x, v.y - p.y) / simSec : 0,
       });
     }
     return { vehicles, tick: newer.frame.tick, starved };

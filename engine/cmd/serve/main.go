@@ -3,21 +3,26 @@
 // engine + contract + record planes via natsio.RunLive — with the embedded
 // broker's WebSocket listener up for browser clients (ADR-0006 §8:
 // "browsers over the server's WebSocket listener with binary frames").
-// The loop is paced at 1× wall time (ContractConfig.PaceFloor = one tick),
-// and an in-process default driver (ADR-0008 §5) drives the fleet so the
-// demo needs no external controller. -geojson additionally exports the
-// network as a GeoJSON artifact for the viz client (engine/geojson.go —
-// local metric frame + frame descriptor; the client projects to WGS84).
+// The loop is paced at 1× wall time by default (ContractConfig.PaceFloor =
+// one tick); -pace N multiplies that (N>1 = faster than wall time, 0 =
+// unpaced batch mode for fast recording). An in-process default driver
+// (ADR-0008 §5) drives the fleet so the demo needs no external controller.
+// -geojson additionally exports the network as a GeoJSON artifact for the
+// viz client (engine/geojson.go — local metric frame + frame descriptor;
+// the client projects to WGS84).
 //
 // Demo only: shutdown on SIGINT abandons the KV run entry (no graceful
-// finish), and the recorder's JetStream store is a temp dir.
+// finish). The recorder's JetStream store is a temp dir deleted on exit
+// unless -store names a durable directory (kept on exit, for replay).
 package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"os"
 	"os/signal"
@@ -48,6 +53,8 @@ func main() {
 	types := flag.String("types", "car", "comma-separated vehicle-type names for the scenario type list (car,truck); director spawn verbs resolve against this list")
 	geojson := flag.String("geojson", "", "also write the network as GeoJSON (local metric frame) to this path")
 	metricsOut := flag.String("metrics-out", "", "write M13 metric-kernel output (ADR-0014 §6) as JSON to this path at run end")
+	pace := flag.Float64("pace", 1, "wall-time pace multiplier: PaceFloor = dt/pace (1 = realtime, >1 = faster; 0 = unpaced batch mode, driverless runs only; >10 refused while driver/demand clients are attached)")
+	store := flag.String("store", "", "durable JetStream store directory (created if missing, kept on exit, refuses to append into an existing recording of the same run id); default is a temp dir deleted on exit")
 	withDriver := flag.Bool("driver", true, "run an in-process default driver replica")
 	capacity := flag.Int("capacity", 1000, "driver claim capacity")
 	flag.Parse()
@@ -137,6 +144,33 @@ func main() {
 		}
 	}
 
+	// Pacing (ADR-0005 §4 — pacing is a wrapper's business; the loop itself
+	// never blocks on input): default 1 keeps PaceFloor = one tick of wall
+	// time, today's behavior exactly.
+	paceFloorDur, err := paceFloor(spec.Params.Dt, *pace)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "serve:", err)
+		os.Exit(2)
+	}
+	if paceFloorDur == 0 {
+		// Unpaced mode outruns every asynchronous NATS client: the in-process
+		// driver replica AND the demand director both attach after the run
+		// loop starts, so an unpaced run can finish before either attaches —
+		// an empty or scheduler-dependent recording. Refuse the combination.
+		switch {
+		case *withDriver:
+			fmt.Fprintln(os.Stderr, "serve: -pace 0 (unpaced) outruns the in-process driver replica — rerun with -driver=false or a high finite -pace")
+			os.Exit(2)
+		case scen != nil && len(scen.Demands) > 0:
+			fmt.Fprintln(os.Stderr, "serve: -pace 0 (unpaced) outruns the demand director — use a high finite -pace for demand scenarios")
+			os.Exit(2)
+		}
+	}
+	if err := checkPaceClients(*pace, *withDriver, scen != nil && len(scen.Demands) > 0); err != nil {
+		fmt.Fprintln(os.Stderr, "serve:", err)
+		os.Exit(2)
+	}
+
 	// GeoJSON export first: fail loud on a bad network file before serving.
 	if *geojson != "" {
 		data, err := os.ReadFile(spec.Net.Path)
@@ -166,12 +200,12 @@ func main() {
 
 	// Embedded broker (ADR-0006 §8 single-binary demo): no client-port
 	// listener, WebSocket listener for the browser plane.
-	storeDir, err := os.MkdirTemp("", "ts-serve-js")
+	storeDir, cleanupStore, err := jetStreamStoreDir(*store)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "serve:", err)
 		os.Exit(1)
 	}
-	defer os.RemoveAll(storeDir)
+	defer cleanupStore()
 	ns, err := server.NewServer(&server.Options{
 		DontListen: true,
 		JetStream:  true,
@@ -201,6 +235,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	// A durable store survives serve exits, so a rerun with the same run id
+	// would otherwise APPEND a second run's log into the recording the store
+	// exists to preserve (the recorder adopts an existing stream). Refuse
+	// before RunLive touches the registry. Must stay ahead of any future
+	// append/resume semantics — today's replay expects one run per stream.
+	if *store != "" {
+		if err := checkFreshRecording(js, *run); err != nil {
+			fmt.Fprintln(os.Stderr, "serve:", err)
+			os.Exit(1)
+		}
+	}
+
 	// Metric kernel (ADR-0014 §6 file sink): a read-only observer on the run
 	// loop — the run stays bit-identical (CRC-invariance tested in
 	// engine/metrics_test.go). The config comes from the scenario's metrics
@@ -223,9 +269,9 @@ func main() {
 
 	runErr := make(chan error, 1)
 	go func() {
-		// PaceFloor = one tick of wall time: 1× realtime (ADR-0005 §4 — pacing
-		// is a wrapper's business; the loop itself never blocks on input).
-		cc := natsio.ContractConfig{PaceFloor: time.Duration(spec.Params.Dt * float64(time.Second))}
+		// PaceFloor = one tick of wall time at -pace 1 (1× realtime); -pace N
+		// divides it by N, -pace 0 disables pacing entirely (batch mode).
+		cc := natsio.ContractConfig{PaceFloor: paceFloorDur}
 		if mobs != nil {
 			cc.Observer = mobs
 		}
@@ -287,9 +333,13 @@ func main() {
 	if host == "" || host == "0.0.0.0" {
 		wsURL = fmt.Sprintf("ws://127.0.0.1:%d", port)
 	}
-	fmt.Printf("serve: run %q on %s (%d ticks @ 1× wall time)\n", *run, wsURL, spec.Ticks)
-	fmt.Printf("serve: snapshots on %s — point the viz at it (?run=%s&ws=%s)\n",
-		natsio.SubjectStateSnap(*run), *run, wsURL)
+	paceDesc := fmt.Sprintf("%g× wall time", *pace)
+	if paceFloorDur == 0 {
+		paceDesc = "unpaced (batch mode)"
+	}
+	fmt.Printf("serve: run %q on %s (%d ticks @ %s)\n", *run, wsURL, spec.Ticks, paceDesc)
+	fmt.Printf("serve: snapshots on %s — point the viz at it (?run=%s&ws=%s&dt=%g)\n",
+		natsio.SubjectStateSnap(*run), *run, wsURL, spec.Params.Dt)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
@@ -306,6 +356,86 @@ func main() {
 			fmt.Printf("serve: wrote metrics to %s\n", *metricsOut)
 		}
 	}
+}
+
+// paceFloor maps the -pace multiplier to the run loop's PaceFloor: dt/pace
+// of wall time per tick (1 = one tick = realtime, >1 = faster), 0 = unpaced
+// (the run loop skips the sleep when the floor is zero). Negative, NaN, and
+// Inf are usage errors, as is a floor that overflows time.Duration.
+func paceFloor(dt, pace float64) (time.Duration, error) {
+	if math.IsNaN(pace) || math.IsInf(pace, 0) || pace < 0 {
+		return 0, fmt.Errorf("-pace must be a finite value >= 0 (got %g)", pace)
+	}
+	if pace == 0 {
+		return 0, nil
+	}
+	v := dt / pace * float64(time.Second)
+	// 2^63 as float64 (== float64(math.MaxInt64)) is already out of range for
+	// the conversion, and a positive floor that truncates below 1 ns would be
+	// silently unpaced — both are usage errors, not batch mode.
+	if math.IsInf(v, 0) || v < 1 || v >= float64(math.MaxInt64) {
+		return 0, fmt.Errorf("-pace %g puts the tick floor outside the representable range", pace)
+	}
+	return time.Duration(v), nil
+}
+
+// maxClientPace bounds the pace multiplier while asynchronous NATS clients
+// (the in-process driver replica, the demand director) are attached. The run
+// loop starts before they finish attaching, and client reaction latency in
+// TICKS scales with pace: at 10× a ~100 ms attach costs ≤10 early ticks (the
+// network is still near-empty — harmless); beyond that the head of the
+// recording is increasingly under-controlled hold-last behavior. The cap
+// keeps "fast recording" honest; batch mode (-pace 0) remains available for
+// driverless runs only. NOTE: pace is an unrecorded run condition — the same
+// (scenario, seed) at different paces produces different traffic (client
+// latency scales in ticks), so cross-pace metric comparisons are invalid.
+const maxClientPace = 10
+
+// checkPaceClients enforces maxClientPace when driver or demand clients are
+// attached (see the const's comment).
+func checkPaceClients(pace float64, driver, demand bool) error {
+	if pace > maxClientPace && (driver || demand) {
+		return fmt.Errorf("-pace %g exceeds %g, the safe bound with an attached driver/demand director (their attach and reaction latency scales in ticks) — use -driver=false and no demand parts for faster batch runs", pace, float64(maxClientPace))
+	}
+	return nil
+}
+
+// checkFreshRecording refuses to start a run whose recording stream already
+// exists non-empty in a durable store: the recorder ADOPTS an existing
+// stream, so a rerun would append a second run's log after the first and
+// replay would read interleaved history from two runs. Not-found is the
+// happy path; any other lookup error also fails loud (fail-closed).
+func checkFreshRecording(js nats.JetStreamContext, run string) error {
+	info, err := js.StreamInfo(natsio.StreamName(run))
+	if err != nil {
+		if errors.Is(err, nats.ErrStreamNotFound) {
+			return nil
+		}
+		return fmt.Errorf("-store: cannot inspect recording stream for run %q: %w", run, err)
+	}
+	if info.State.Msgs > 0 {
+		return fmt.Errorf("-store: run %q already has a recording (%d messages) in this store — pick a fresh -run id or a fresh -store dir", run, info.State.Msgs)
+	}
+	return nil
+}
+
+// jetStreamStoreDir resolves the embedded broker's JetStream store
+// directory. Empty dir keeps the demo behavior: a fresh temp dir removed on
+// exit (cleanup removes it). A named dir is created if missing and kept on
+// exit (cleanup is a no-op) so run recordings survive for replay. The store
+// is single-server: two brokers on the same dir corrupt it.
+func jetStreamStoreDir(dir string) (path string, cleanup func(), err error) {
+	if dir == "" {
+		tmp, err := os.MkdirTemp("", "ts-serve-js")
+		if err != nil {
+			return "", nil, err
+		}
+		return tmp, func() { os.RemoveAll(tmp) }, nil
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", nil, fmt.Errorf("-store: %w", err)
+	}
+	return dir, func() {}, nil
 }
 
 // metricObserver adapts the M13 metric kernel to natsio.RunObserver: the

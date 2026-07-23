@@ -187,7 +187,7 @@ async function main(): Promise<void> {
   });
   map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-right");
 
-  const buffer = new SnapshotBuffer(cfg.bufferMs);
+  const buffer = new SnapshotBuffer(cfg.bufferMs, cfg.dt);
   const applied = new Map<number, RenderedVehicle>();
   const appliedTrailers = new Map<number, RenderedTrailer>();
   const artic = new Articulator();
