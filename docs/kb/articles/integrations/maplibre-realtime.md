@@ -236,6 +236,28 @@ physical trailer must). No contract change was needed: front-bumper point,
 heading, and class already flow on TSSF v1; the trailer rides a second
 `updateData`-diffed source under the vehicles layer.
 
+## Addendum 2026-07-23: signal heads + loading overlay
+
+Two live-viewing fixes:
+
+- **`icon-image` cannot read feature-state** (style spec: its expression
+  parameters are `zoom` + `feature` only), so a state-switchable ICON is
+  impossible — the per-lane stop-line circles became signal HEADS: a
+  static housing sprite with three dim lenses (`viz/src/signalhead.ts`)
+  plus one circle layer per lens position (red/amber/green), each with a
+  fixed viewport-anchored `circle-translate` and `circle-opacity` gated by
+  feature-state. One zoom curve drives housing `icon-size` AND lens
+  radius/translate so the lit lens always lands on its dim counterpart.
+  Points are grouped one head per (program, link index) at the centroid of
+  the movement's bound stop-line entries — lanes sharing a state char show
+  the same light by construction, and netimport grids bind several fragment
+  lanes per movement.
+- **Loading overlay** (`#loading` in `viz/index.html`): page load →
+  network fetch → ws connect → first snapshot takes noticeable seconds on
+  big demos (engine world build precedes the first TSSF frame) and a bare
+  "connecting…" HUD read as a hang. A full-screen stage readout lifts on
+  the first renderable sample.
+
 ## Related
 
 - [NATS Backbone](../architecture/nats-backbone.md) — owns the subject taxonomy and JetStream replay the viz consumes; the SoA vehicle frame shape was fixed together with ADR-0006.
