@@ -1,0 +1,448 @@
+diff --git a/docs/kb/articles/gaps-and-roadmap.md b/docs/kb/articles/gaps-and-roadmap.md
+index 1587790469d589d7e91d2c505c971ee3249f7fca..0b343a6aafb9a71137cc31875a2fb2fd67595728 100644
+--- a/docs/kb/articles/gaps-and-roadmap.md
++++ b/docs/kb/articles/gaps-and-roadmap.md
+@@ -86,6 +86,7 @@
+ 
+ ## Freshness Notes
+ 
++- 2026-07-22: viz legibility pass — legend overlay (class swatches, signal key, congestion ramp, sim clock off the sample tick) and SDF rotated-rect vehicle glyphs encoding class (color + 12/5 length ratio from engine dims) and heading (CCW-from-east rad → CW-from-north deg); palette centralized in `viz/src/theme.ts`; pure layer swap, no engine/wire change.
+ - 2026-07-21 (f): M13 (ADR-0014 kernel slice) landed — trajectory-first metric kernel (`engine/metrics.go`, distance-referenced, dt-deterministic via time-carried overshoot refunds), JSON file sink (`WriteMetricsJSON`, `-metrics-out` on simrun/serve), scenario `metrics/*.yaml` bindings (typed, canonical-YAML hashed, no format_version bump — no in-tree scenario carries a metrics part; old free-form parts fail loud at load), additive natsio `RunObserver` hook. 13 gate rounds; key catches: netimport parked-overshoot distance/time corruption on sub-4 m internal lanes, 10× backlog unit error, entry-tick off-by-one, simrun ignoring `Scenario.MetricConfig`. Behavior change: `EnqueueSpawn` rejects duplicate live RequestIDs (wire recordings unaffected — contract-layer dedup stands). The M13 commit went through with `EXTERNAL_REVIEW_SKIP=1` by owner decision (GPT-5.6-sol quota exhausted; Fable had reviewed the identical diff clean in the round-13 attempt). Also authored: `data/scenarios/i280-woodside/` baseline scenario dir (seed 42, 36000 ticks, 2×600 veh/h Poisson 90/10 car/truck) — the project's first real scenario; `data/` is gitignored so it stays local. Remaining M13 slice: NATS metrics publisher + asyncapi channels (`ts.{run}.metrics.interval.{set_id}`/`.trip`/`.totals` on the dedicated `ts-{run}-metrics` stream). Next: M14 paired-seed sweep runner.
+ - 2026-07-21 (e): ADR-0014 (observability/metrics) ratified after a Fable+Sol design-review round (archive `raw/reviews/2026-07-21T124819-*`): in-process trajectory-first kernel (XTField-observer precedent, zero kernel feedback), two primitives — trip records INCLUDING flagged horizon partials (completed-trips-only is the survivorship-bias failure mode) and one lane-interval record (Edie q/k/u + selectable occupancy/stops/time-loss); normative definitions are contract text (stop = v < 0.1 m/s episodes, occupancy = time-weighted space fraction, tick-multiple windows, flagged partial final interval, lane-crossing ticks split proportionally by distance, totals from interval accumulations + denied-entry wait); metrics ride a DEDICATED JetStream stream `ts-{run}-metrics` (the log stream's OCC sequence prediction forbids interleaving), per-set subjects `metrics.interval.{set_id}`, plus a `simrun` metrics.json file sink; scenario `metrics/*.yaml` grammar concretized with a zero-authoring default set; sweep protocol reports the CI of the PAIRED difference with the showcase seed picked once on the baseline run; LOS = pinned-edition skin only. Phasing: M13 = kernel + sinks + bindings (demo-critical), M14 = sweep/compare runner. Pending-ADR queue: network model, license.
+ - 2026-07-21 (d): M12 scenario overlays landed (ADR-0012 §4 + M12 addenda). A variant directory carries `variant.yaml` INSTEAD of `scenario.yaml`: base reference (single-level — chaining deferred), wholesale manifest overrides, added part files, and patches anchored by (part path, flow id) that merge at the YAML node level (mappings key-wise, sequences/scalars wholesale, null forbidden — addition-only) and re-validate through the full strict fence. Materialization is identity-transparent: identity variant ≡ base hash, patched variant ≡ hand-written equivalent hash (golden vector pinned); all validation runs against the EFFECTIVE network/type list; fmt touches only the variant's own files. `serve`/`simrun`/`scenario` needed no changes. `scenario materialize` not built (hash equality already serves intent-vs-effective). Still deferred: ADR-0009 fine-grained network delta grammar (needs the network-model ADR), vtype definition parts, control/metrics binding grammars, pack format, offline spawn-table export. Also today: the external-review commit gate landed (ADR-0013) — every code commit is Fable+Sol reviewed and stamped (triage bar: blockers only, one round); gate dogfooded through 8 self-review rounds.
+diff --git a/docs/kb/articles/integrations/maplibre-realtime.md b/docs/kb/articles/integrations/maplibre-realtime.md
+index b2b016b5126772e650b7e04fb68e0a8f87c61f05..7e67e3b6dd96626df250ea7c0703a54d67d69d25 100644
+--- a/docs/kb/articles/integrations/maplibre-realtime.md
++++ b/docs/kb/articles/integrations/maplibre-realtime.md
+@@ -183,6 +183,38 @@ requirement). There are *no published benchmarks* of feature-state or
+ - City-scale static network: load-once GeoJSON vs MVT/MLT vector tiles —
+   depends on [OSM Extraction](../integrations/osm-extraction.md) region sizes; GeoJSON first.
+ 
++## Addendum 2026-07-22: glyph rung — SDF rect vehicles + legend overlay
++
++The rung-0 circle layer gave way to a rotated-rectangle **symbol** layer,
++still on the same `updateData`-diffed vehicle source (source, `promoteId`,
++and diff channel untouched — a pure layer swap). One white rectangle is
++drawn to an offscreen canvas at load and registered with
++`map.addImage("veh-rect", img, { sdf: true })`, so a single image serves
++every class: `icon-color` tints, `icon-rotate` aims, `icon-size` scales.
++Three decisions worth recording:
++
++- **Bearing conversion**: the wire heading is radians CCW from east (engine
++  local frame, UTM north-up); MapLibre's `icon-rotate` is degrees CW from
++  north. The conversion `90 − angle·180/π` lives in `viz/src/theme.ts` as a
++  tested pure function; the layer re-evaluates the same math inline as a
++  style expression (expressions can't call back into TS). The rect image is
++  drawn vertically (long axis = image north) so the unrotated icon already
++  reads as heading north at bearing 0.
++- **Screen-space glyphs over true-metric polygons**: at corridor zooms
++  (11–15) a real 5 m footprint is sub-pixel to a few px — fidelity would be
++  invisible. Class and heading are the data being encoded, so glyphs are
++  screen-sized (`icon-size` by zoom, car ≈ 9 px at z14) while the *ratio*
++  between classes comes from the engine's real dimensions (Truck/Car =
++  12/5 = 2.4× longer). MapLibre rejects `["zoom"]` nested under `["*"]`, so
++  the per-class multiplier rides the interpolate stop outputs (composite
++  expression).
++- **Legend overlay** (`viz/src/legend.ts`): a pure-DOM panel (no MapLibre
++  APIs) keyed to the same theme tokens — class swatches at the true length
++  ratio, signal green/amber/red, the congestion ramp (per-lane mean
++  speed/limit), and a sim clock derived from the render loop's sample tick
++  (× dt = 0.1 s). All palette literals moved to `viz/src/theme.ts` so
++  swatches can't drift from the map.
++
+ ## Related
+ 
+ - [NATS Backbone](../architecture/nats-backbone.md) — owns the subject taxonomy and JetStream replay the viz consumes; the SoA vehicle frame shape was fixed together with ADR-0006.
+diff --git a/viz/index.html b/viz/index.html
+index 8081c632fe0335ee2b90ef32e69f4bc25acdba36..57cf2b7e260e4fd078e86d32ebda4e436898d93d 100644
+--- a/viz/index.html
++++ b/viz/index.html
+@@ -20,15 +20,28 @@
+         white-space: pre;
+       }
+       #status { top: 10px; left: 10px; }
+-      #inspect { top: 10px; right: 10px; display: none; }
++      #inspect { bottom: 10px; left: 10px; display: none; }
+       #status .ok { color: #1e9e6a; }
+       #status .bad { color: #e5484d; }
++      /* Legend key — same HUD tokens; colors injected from theme.ts. */
++      #legend { top: 10px; right: 10px; min-width: 150px; }
++      .legend-title { text-transform: uppercase; letter-spacing: 0.12em; font-size: 10px; color: #9fb2e8; }
++      .legend-row { display: flex; align-items: center; gap: 8px; margin-top: 5px; }
++      .legend-row span:last-child { margin-left: auto; }
++      .legend-veh { display: inline-block; border-radius: 1px; flex: none; }
++      .legend-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex: none; }
++      .legend-sep { border-top: 1px solid rgba(46, 91, 255, 0.4); margin: 7px 0 2px; }
++      .legend-ramp { height: 8px; border-radius: 2px; margin-top: 5px; }
++      .legend-ramp-labels { display: flex; justify-content: space-between; font-size: 10px; color: #9fb2e8; }
++      .legend-caption { font-size: 10px; color: #9fb2e8; }
++      .legend-clock { font-variant-numeric: tabular-nums; }
+     </style>
+   </head>
+   <body>
+     <div id="map"></div>
+     <div id="status" class="hud">connecting…</div>
+     <div id="inspect" class="hud"></div>
++    <div id="legend" class="hud"></div>
+     <script type="module" src="/src/main.ts"></script>
+   </body>
+ </html>
+diff --git a/viz/src/glyphs.ts b/viz/src/glyphs.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..98aee6822cbbfe582c76a65a7ffad91472d18f40
+--- /dev/null
++++ b/viz/src/glyphs.ts
+@@ -0,0 +1,50 @@
++// glyphs.ts — rotated-rectangle vehicle symbols. One white rectangle drawn
++// to an offscreen canvas and registered with { sdf: true } so a single
++// image serves every class: icon-color tints it, icon-rotate aims it along
++// the heading, icon-size scales it. The rect is drawn VERTICALLY (long
++// axis = image north) so icon-rotate can take the bearing from
++// theme.ts:vehicleBearingDeg directly — at bearing 0 (heading north) the
++// unrotated image already reads as a vehicle pointing up-screen.
++//
++// Glyphs are screen-space by design: at corridor zooms (11–15) true-metric
++// vehicle polygons render sub-pixel, so legibility wins over scale fidelity
++// — class and heading are the data being encoded, not footprint. Class
++// proportions still come from the real engine dimensions (theme.ts GLYPHS).
++
++import { GLYPHS } from "./theme.ts";
++
++// Image canvas 32×64 px with 8 px of padding around the white rect; the
++// padding gives the SDF field room to fall off. At icon-size 1 the visible
++// rect is 48 px long (RECT_LEN_PX).
++const IMG_W = 32;
++const IMG_H = 64;
++const PAD = 8;
++export const RECT_LEN_PX = IMG_H - 2 * PAD; // 48
++
++export function makeVehicleRectImage(): ImageData {
++  const canvas = document.createElement("canvas");
++  canvas.width = IMG_W;
++  canvas.height = IMG_H;
++  const ctx = canvas.getContext("2d");
++  if (!ctx) throw new Error("glyphs: 2d canvas context unavailable");
++  ctx.fillStyle = "#ffffff";
++  ctx.fillRect(PAD, PAD, IMG_W - 2 * PAD, IMG_H - 2 * PAD);
++  return ctx.getImageData(0, 0, IMG_W, IMG_H);
++}
++
++// Car target: ~9 px long at zoom 14 — small enough that queued platoons
++// stay separable, big enough to read the heading. icon-size scales the
++// 48 px rect, so 9 px ⇒ 0.19.
++export const CAR_ICON_SIZE_STOPS: Array<[number, number]> = [
++  [11, 0.09],
++  [14, 0.19],
++  [17, 0.45],
++];
++
++// Length ratio between classes, from the real engine dimensions: trucks
++// render 12/5 = 2.4× longer than cars at every zoom.
++export function classLengthScale(cls: number): number {
++  const car = GLYPHS[0]!;
++  const g = GLYPHS.find((g) => g.cls === cls);
++  return g === undefined ? 1 : g.lengthM / car.lengthM;
++}
+diff --git a/viz/src/legend.ts b/viz/src/legend.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..22fdd5858da6d8b2402461c79a3f40ffe96430fa
+--- /dev/null
++++ b/viz/src/legend.ts
+@@ -0,0 +1,70 @@
++// legend.ts — top-right key panel: what the encodings on the map mean.
++// Pure DOM (ADR-0003: no framework, no MapLibre APIs), styled with the same
++// HUD tokens, and every swatch color comes from theme.ts so the key can't
++// drift from the map. Contents, all real data channels:
++//
++//   - vehicle class glyphs (rects at their true length ratio),
++//   - signal light states (green/amber/red),
++//   - the client-derived congestion ramp (per-lane mean speed / limit),
++//   - a sim-clock readout fed from the render loop's sample tick.
++
++import { THEME, GLYPHS } from "./theme.ts";
++
++// Engine timestep (ADR-0005: dt = 0.1 s, Kesting & Treiber validated);
++// sim seconds = tick × dt.
++export const SIM_DT_S = 0.1;
++
++export function simClockHMS(tick: number): string {
++  const s = Math.floor(tick * SIM_DT_S);
++  const p = (n: number): string => String(n).padStart(2, "0");
++  return `${p(Math.floor(s / 3600))}:${p(Math.floor((s % 3600) / 60))}:${p(s % 60)}`;
++}
++
++export class Legend {
++  private clockEl: HTMLElement;
++
++  constructor(elId: string) {
++    const el = document.getElementById(elId);
++    if (!el) throw new Error("legend: missing DOM element");
++
++    // Vehicle swatches at the true class length ratio (engine dims via
++    // theme.ts), 3.6 px per metre.
++    const PX_PER_M = 3.6;
++    const vehRows = GLYPHS.map(
++      (g) =>
++        `<div class="legend-row">` +
++        `<span class="legend-veh" style="width:${(g.lengthM * PX_PER_M).toFixed(0)}px;` +
++        `height:${(g.widthM * PX_PER_M).toFixed(0)}px;background:${g.color}"></span>` +
++        `<span>${g.name}</span></div>`,
++    ).join("");
++
++    const sigRow = (label: string, color: string): string =>
++      `<div class="legend-row"><span class="legend-dot" style="background:${color}"></span>` +
++      `<span>${label}</span></div>`;
++
++    el.innerHTML =
++      `<div class="legend-title">legend</div>` +
++      vehRows +
++      `<div class="legend-sep"></div>` +
++      sigRow("green", THEME.signalGreen) +
++      sigRow("amber", THEME.signalAmber) +
++      sigRow("red", THEME.signalRed) +
++      `<div class="legend-sep"></div>` +
++      `<div class="legend-ramp" style="background:linear-gradient(90deg,` +
++      `${THEME.stopped} 0%, ${THEME.mid} 35%, ${THEME.freeFlow} 70%)"></div>` +
++      `<div class="legend-ramp-labels"><span>stopped</span><span>free flow</span></div>` +
++      `<div class="legend-caption">lane mean speed / limit</div>` +
++      `<div class="legend-sep"></div>` +
++      `<div class="legend-row"><span>sim time</span><span class="legend-clock">00:00:00</span></div>`;
++
++    const clock = el.querySelector(".legend-clock");
++    if (!(clock instanceof HTMLElement)) throw new Error("legend: clock element missing");
++    this.clockEl = clock;
++  }
++
++  // setTick is called from the render loop with the interpolated sample's
++  // sim tick (same tick the HUD and signal derivation use).
++  setTick(tick: number): void {
++    this.clockEl.textContent = simClockHMS(tick);
++  }
++}
+diff --git a/viz/src/main.ts b/viz/src/main.ts
+index 7dc8cb749a90ccfe0c552c6e12ee8c03fda9c12a..25fb3b52caecab94048004ed6144e15b2bafbc53 100644
+--- a/viz/src/main.ts
++++ b/viz/src/main.ts
+@@ -30,6 +30,9 @@ import { diffVehicles, type RenderedVehicle, type SourceDiff } from "./vehicles.
+ import { LaneIndex, laneSpeedRatios } from "./congestion.ts";
+ import { subscribeSnapshots } from "./nats-client.ts";
+ import { Hud } from "./status.ts";
++import { Legend } from "./legend.ts";
++import { THEME, GLYPHS } from "./theme.ts";
++import { makeVehicleRectImage, CAR_ICON_SIZE_STOPS, classLengthScale } from "./glyphs.ts";
+ 
+ interface NetworkFile {
+   type: string;
+@@ -40,16 +43,17 @@ interface NetworkFile {
+ const EMPTY_FC: FeatureCollection = { type: "FeatureCollection", features: [] };
+ 
+ // Blank dark style — local-first (ADR-0004): no tile-service dependency.
+-// Navy canvas per the project design tokens (math-900).
++// Navy canvas per the project design tokens (math-900, theme.ts).
+ const DARK_STYLE: maplibregl.StyleSpecification = {
+   version: 8,
+   sources: {},
+-  layers: [{ id: "background", type: "background", paint: { "background-color": "#0e1d5c" } }],
++  layers: [{ id: "background", type: "background", paint: { "background-color": THEME.bg } }],
+ };
+ 
+ async function main(): Promise<void> {
+   const cfg = loadConfig(location.search, location.hostname);
+   const hud = new Hud("status", "inspect");
++  const legend = new Legend("legend");
+ 
+   const res = await fetch(cfg.networkUrl);
+   if (!res.ok) throw new Error(`fetch ${cfg.networkUrl}: ${res.status} ${res.statusText}`);
+@@ -166,7 +170,7 @@ async function main(): Promise<void> {
+       source: "network",
+       layout: { "line-cap": "round", "line-join": "round" },
+       paint: {
+-        "line-color": "#122881", // math-800 casing
++        "line-color": THEME.casing,
+         "line-opacity": 0.9,
+         "line-width": ["interpolate", ["linear"], ["zoom"], 11, 2.5, 14, 7, 17, 12],
+       },
+@@ -182,24 +186,51 @@ async function main(): Promise<void> {
+           "interpolate",
+           ["linear"],
+           ["coalesce", ["feature-state", "ratio"], -1],
+-          -1, "#7e9dff", // math-300: no congestion data
+-          0, "#e5484d", // stopped
+-          0.35, "#e8b43a", // gold
+-          0.7, "#1e9e6a", // free flow
+-          1.5, "#1e9e6a",
++          -1, THEME.noData,
++          0, THEME.stopped,
++          0.35, THEME.mid,
++          0.7, THEME.freeFlow,
++          1.5, THEME.freeFlow,
+         ],
+         "line-width": ["interpolate", ["linear"], ["zoom"], 11, 1.2, 14, 4, 17, 8],
+       },
+     });
++    // Vehicle glyphs (2026-07-22 legibility pass): one SDF rectangle
++    // tinted per class and rotated to the wire heading — class and heading
++    // are the encoded data. icon-rotate evaluates the same conversion as
++    // theme.ts:vehicleBearingDeg (CCW-from-east rad → CW-from-north deg)
++    // inline, since style expressions can't call back into TS. Source,
++    // promoteId, and the updateData diff channel are unchanged.
++    map.addImage("veh-rect", makeVehicleRectImage(), { sdf: true });
+     map.addLayer({
+       id: "vehicles",
+-      type: "circle",
++      type: "symbol",
+       source: "vehicles",
++      layout: {
++        "icon-image": "veh-rect",
++        "icon-rotation-alignment": "map",
++        "icon-allow-overlap": true,
++        "icon-ignore-placement": true,
++        "icon-rotate": ["-", 90, ["*", ["get", "angle"], 180 / Math.PI]],
++        // Composite expression: zoom interpolation is top-level (MapLibre
++        // rejects ["zoom"] nested under ["*"]); the per-class length scale
++        // rides the stop outputs instead.
++        "icon-size": [
++          "interpolate",
++          ["linear"],
++          ["zoom"],
++          CAR_ICON_SIZE_STOPS[0]![0],
++          ["*", ["match", ["get", "cls"], 0, 1, classLengthScale(1)], CAR_ICON_SIZE_STOPS[0]![1]],
++          CAR_ICON_SIZE_STOPS[1]![0],
++          ["*", ["match", ["get", "cls"], 0, 1, classLengthScale(1)], CAR_ICON_SIZE_STOPS[1]![1]],
++          CAR_ICON_SIZE_STOPS[2]![0],
++          ["*", ["match", ["get", "cls"], 0, 1, classLengthScale(1)], CAR_ICON_SIZE_STOPS[2]![1]],
++        ],
++      },
+       paint: {
+-        "circle-color": ["match", ["get", "cls"], 0, "#eaf0ff", "#ff7d4d"],
+-        "circle-radius": ["match", ["get", "cls"], 0, 3.2, 5],
+-        "circle-stroke-color": "#0e1d5c",
+-        "circle-stroke-width": 1,
++        "icon-color": ["match", ["get", "cls"], 0, GLYPHS[0]!.color, GLYPHS[1]!.color],
++        "icon-halo-color": THEME.bg,
++        "icon-halo-width": 1,
+       },
+     });
+     // Signal lights (M9): one circle per signal-bound internal lane at its
+@@ -214,16 +245,16 @@ async function main(): Promise<void> {
+           "match",
+           ["coalesce", ["feature-state", "sig"], "off"],
+           "green",
+-          "#2ecc71",
++          THEME.signalGreen,
+           "amber",
+-          "#f5b301",
++          THEME.signalAmber,
+           "red",
+-          "#e5484d",
+-          "#0e1d5c",
++          THEME.signalRed,
++          THEME.bg,
+         ],
+         "circle-opacity": ["match", ["coalesce", ["feature-state", "sig"], "off"], "off", 0, 1],
+         "circle-radius": ["interpolate", ["linear"], ["zoom"], 11, 3, 14, 5, 17, 8],
+-        "circle-stroke-color": "#0e1d5c",
++        "circle-stroke-color": THEME.bg,
+         "circle-stroke-width": 1,
+       },
+     });
+@@ -321,6 +352,7 @@ async function main(): Promise<void> {
+           for (const [id, v] of next) applied.set(id, v);
+         }
+         hud.setFrame(sample.tick, sample.vehicles.length, sample.starved);
++        legend.setTick(sample.tick);
+         updateCongestion(nowMs);
+         updateSignals(sample.tick);
+       }
+diff --git a/viz/src/theme.ts b/viz/src/theme.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..b8c3336f094d94cb3e757795b006ba49d73cce2f
+--- /dev/null
++++ b/viz/src/theme.ts
+@@ -0,0 +1,46 @@
++// theme.ts — single source of truth for the viz palette and the per-class
++// vehicle glyph table. Every color on the map (background, casing,
++// congestion ramp, signals, vehicles) and the legend panel reads from here
++// so a visual tweak is a one-line change, and so the legend swatches can
++// never drift from what the map actually paints. Pure data + pure math:
++// this module must stay DOM-free so node --test can import it.
++
++export const THEME = {
++  bg: "#0e1d5c", // math-900 navy canvas
++  casing: "#122881", // math-800 lane casing
++  noData: "#7e9dff", // math-300: lane with no congestion sample
++  stopped: "#e5484d", // congestion ramp: mean speed / limit → 0
++  mid: "#e8b43a", // congestion ramp: ~0.35
++  freeFlow: "#1e9e6a", // congestion ramp: ≥ 0.7
++  signalGreen: "#2ecc71",
++  signalAmber: "#f5b301",
++  signalRed: "#e5484d",
++} as const;
++
++export interface GlyphSpec {
++  cls: number; // TSSF v1 vehicle class id
++  name: string;
++  color: string;
++  lengthM: number;
++  widthM: number;
++}
++
++// Per-class glyph table. Dimensions mirror the engine's authoritative
++// VehicleType geometry (engine/vehicle.go: Car 5×2 m, Truck 12×2.5 m); the
++// glyph scale between classes derives from these, so a new class with real
++// dimensions slots in without retuning.
++export const GLYPHS: GlyphSpec[] = [
++  { cls: 0, name: "car", color: "#eaf0ff", lengthM: 5, widthM: 2 },
++  { cls: 1, name: "truck", color: "#ff7d4d", lengthM: 12, widthM: 2.5 },
++];
++
++// vehicleBearingDeg converts the wire heading (radians, CCW from east —
++// the math convention of the engine's local metric frame, UTM north-up per
++// proj.ts) to MapLibre's icon-rotate (degrees, CW from north). The style
++// layer evaluates the same conversion as a MapLibre expression per feature
++// (expressions can't call back into TS); this function is the tested spec
++// for that math.
++export function vehicleBearingDeg(angleRad: number): number {
++  const deg = (90 - (angleRad * 180) / Math.PI) % 360;
++  return deg < 0 ? deg + 360 : deg;
++}
+diff --git a/viz/test/theme.test.ts b/viz/test/theme.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..b43c8c168a6b134e7029fb640261aaa2adcaeb56
+--- /dev/null
++++ b/viz/test/theme.test.ts
+@@ -0,0 +1,34 @@
++// theme.test.ts — the glyph table (one entry per engine class, real
++// dimensions) and the heading conversion the vehicles symbol layer
++// evaluates as a style expression (CCW-from-east rad → CW-from-north deg).
++
++import { test } from "node:test";
++import assert from "node:assert/strict";
++
++import { GLYPHS, vehicleBearingDeg } from "../src/theme.ts";
++
++test("glyph table covers car (cls 0) and truck (cls 1) with positive dims", () => {
++  const byCls = new Map(GLYPHS.map((g) => [g.cls, g]));
++  for (const cls of [0, 1]) {
++    const g = byCls.get(cls);
++    assert.ok(g !== undefined, `missing glyph for cls ${cls}`);
++    assert.ok(g.lengthM > 0 && g.widthM > 0, `cls ${cls}: dims must be positive`);
++    assert.ok(g.lengthM > g.widthM, `cls ${cls}: longer than wide`);
++  }
++  // Truck reads longer than car (engine: 12 m vs 5 m).
++  assert.ok(byCls.get(1)!.lengthM > byCls.get(0)!.lengthM);
++});
++
++test("vehicleBearingDeg converts CCW-from-east to CW-from-north", () => {
++  // Wrap-aware: 359.999… and 0 are the same bearing (float noise).
++  const close = (got: number, want: number): void => {
++    const d = Math.abs(got - want) % 360;
++    assert.ok(Math.min(d, 360 - d) < 1e-9, `got ${got}, want ${want}`);
++  };
++  close(vehicleBearingDeg(0), 90); // east → bearing 90
++  close(vehicleBearingDeg(Math.PI / 2), 0); // north → bearing 0
++  close(vehicleBearingDeg(Math.PI), 270); // west → bearing 270 (≡ -90)
++  close(vehicleBearingDeg(-Math.PI / 2), 180); // south (negative angle) → 180
++  close(vehicleBearingDeg((3 * Math.PI) / 2), 180); // south via wraparound → 180
++  close(vehicleBearingDeg(2 * Math.PI), 90); // full turn ≡ east
++});

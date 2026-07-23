@@ -1,0 +1,15 @@
+ docs/kb/articles/gaps-and-roadmap.md               |   1 +
+ docs/kb/articles/integrations/maplibre-realtime.md |  53 ++++++++
+ engine/geometry.go                                 |  20 ++-
+ engine/geometry_test.go                            |  35 ++++-
+ engine/netfile.go                                  |  10 +-
+ viz/index.html                                     |  15 ++-
+ viz/src/artic.ts                                   |  86 ++++++++++++
+ viz/src/glyphs.ts                                  |  71 ++++++++++
+ viz/src/legend.ts                                  |  70 ++++++++++
+ viz/src/main.ts                                    | 145 ++++++++++++++++++---
+ viz/src/theme.ts                                   |  52 ++++++++
+ viz/src/vehicles.ts                                |  46 +++++++
+ viz/test/artic.test.ts                             | 118 +++++++++++++++++
+ viz/test/theme.test.ts                             |  34 +++++
+ 14 files changed, 721 insertions(+), 35 deletions(-)

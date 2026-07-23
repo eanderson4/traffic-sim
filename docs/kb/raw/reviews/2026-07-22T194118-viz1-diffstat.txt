@@ -1,0 +1,9 @@
+ docs/kb/articles/gaps-and-roadmap.md               |  1 +
+ docs/kb/articles/integrations/maplibre-realtime.md | 32 ++++++++++
+ viz/index.html                                     | 15 ++++-
+ viz/src/glyphs.ts                                  | 50 ++++++++++++++++
+ viz/src/legend.ts                                  | 70 ++++++++++++++++++++++
+ viz/src/main.ts                                    | 68 +++++++++++++++------
+ viz/src/theme.ts                                   | 46 ++++++++++++++
+ viz/test/theme.test.ts                             | 34 +++++++++++
+ 8 files changed, 297 insertions(+), 19 deletions(-)
