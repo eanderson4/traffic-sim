@@ -23,6 +23,7 @@ func TestWriteGeoJSON(t *testing.T) {
 		Lanes: []NetLane{
 			{
 				ID: "a_0", Length: 10, SpeedLimit: 29.06, Width: 3.2,
+				Edge: "a", EdgeIndex: 0,
 				Shape: [][2]float64{{0, 0}, {10, 0}},
 			},
 			{
@@ -50,6 +51,8 @@ func TestWriteGeoJSON(t *testing.T) {
 				SpeedLimit float64 `json:"speedLimit"`
 				Width      float64 `json:"width"`
 				Internal   bool    `json:"internal"`
+				Edge       string  `json:"edge"`
+				EdgeIndex  int     `json:"edgeIndex"`
 			} `json:"properties"`
 			Geometry struct {
 				Type        string       `json:"type"`
@@ -79,8 +82,14 @@ func TestWriteGeoJSON(t *testing.T) {
 	if f0.Properties.SpeedLimit != 29.06 || f0.Properties.Width != 3.2 || f0.Properties.Internal {
 		t.Fatalf("feature 0 properties: %+v", f0.Properties)
 	}
+	if f0.Properties.Edge != "a" || f0.Properties.EdgeIndex != 0 {
+		t.Fatalf("feature 0 edge group: %+v", f0.Properties)
+	}
 	if f1.Properties.Width != 3.5 || !f1.Properties.Internal {
 		t.Fatalf("feature 1 width default/internal: %+v", f1.Properties)
+	}
+	if f1.Properties.Edge != "" {
+		t.Fatalf("feature 1 (internal) must carry no edge group: %+v", f1.Properties)
 	}
 }
 

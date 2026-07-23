@@ -19,11 +19,16 @@ import (
 // GeoJSONLaneProperties is the per-lane property block the viz styles on:
 // id is the promoteId / feature-state key, speedLimit the congestion-ratio
 // denominator, width the line width, internal marks junction interiors.
+// edge/edgeIndex are the lateral-chaining group (network-format v1): the
+// viz draws group-boundary casing from them so same-road lanes read as one
+// road; empty edge (junction interiors) = no lateral neighbors.
 type GeoJSONLaneProperties struct {
 	ID         string  `json:"id"`
 	SpeedLimit float64 `json:"speedLimit"` // m/s
 	Width      float64 `json:"width"`      // m
 	Internal   bool    `json:"internal"`
+	Edge       string  `json:"edge,omitempty"`
+	EdgeIndex  int     `json:"edgeIndex"`
 }
 
 // GeoJSONFrame is the foreign member describing the local metric frame the
@@ -80,6 +85,8 @@ func WriteGeoJSON(nf *NetFile, w io.Writer) error {
 				SpeedLimit: nl.SpeedLimit,
 				Width:      width,
 				Internal:   nl.Internal,
+				Edge:       nl.Edge,
+				EdgeIndex:  nl.EdgeIndex,
 			},
 			Geometry: geoJSONGeometry{Type: "LineString", Coordinates: nl.Shape},
 		})

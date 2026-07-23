@@ -40,6 +40,7 @@ import {
   type SourceDiff,
 } from "./vehicles.ts";
 import { LaneIndex, laneSpeedRatios } from "./congestion.ts";
+import { edgeBoundaries } from "./edges.ts";
 import { subscribeSnapshots } from "./nats-client.ts";
 import { Hud } from "./status.ts";
 import { Legend } from "./legend.ts";
@@ -133,8 +134,23 @@ async function main(): Promise<void> {
     }
     return [c[0], c[1]];
   };
+  // Edge-group boundaries (edges.ts): lanes sharing the engine's lateral
+  // group are "the same road" — the casing layer reads the edgeB flag to
+  // draw the group's outer shell only, so a multi-lane road renders as one
+  // band with colored interior stripes instead of N independent roads.
+  const edgeBounds = edgeBoundaries(
+    net.features.map((f) => ({
+      id: String(f.id ?? f.properties?.["id"]),
+      edge: f.properties?.["edge"] as string | undefined,
+      edgeIndex: f.properties?.["edgeIndex"] as number | undefined,
+    })),
+  );
   const lanes: Feature<LineString>[] = net.features.map((f) => ({
     ...f,
+    properties: {
+      ...f.properties,
+      edgeB: edgeBounds.has(String(f.id ?? f.properties?.["id"])),
+    },
     geometry: {
       type: "LineString",
       coordinates: f.geometry.coordinates.map((c) => project(...pair(c))),
@@ -240,7 +256,12 @@ async function main(): Promise<void> {
       layout: { "line-cap": "round", "line-join": "round" },
       paint: {
         "line-color": THEME.casing,
-        "line-opacity": 0.9,
+        // Casing on edge-group boundaries only (edgeB, edges.ts): the
+        // outer shell of each road. Interior lanes keep a faint trace so
+        // adjacent stripes stay separable. Lanes without an edge group
+        // (junction interiors, stale caches) are all boundaries, so they
+        // degrade to full casing inside edgeBoundaries.
+        "line-opacity": ["case", ["boolean", ["get", "edgeB"], true], 0.9, 0.15],
         "line-width": ["interpolate", ["linear"], ["zoom"], 11, 2.5, 14, 7, 17, 12],
       },
     });

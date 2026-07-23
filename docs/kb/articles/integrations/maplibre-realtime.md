@@ -257,6 +257,13 @@ Two live-viewing fixes:
   big demos (engine world build precedes the first TSSF frame) and a bare
   "connecting…" HUD read as a hang. A full-screen stage readout lifts on
   the first renderable sample.
+- **Edge-group casing** (`viz/src/edges.ts`): the network format's
+  lateral-chaining group (`edge` + `edgeIndex`, now exported in the
+  GeoJSON lane properties) doubles as the viz's "same road" signal — the
+  casing layer draws only each group's outermost lanes (min/max index),
+  so zoomed-in a multi-lane road reads as one cased band with per-lane
+  congestion stripes inside instead of N independently-cased lines.
+  Interior lanes keep a faint 0.15 casing trace for separability.
 
 ## Related
 
