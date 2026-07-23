@@ -118,3 +118,36 @@ command it later.
   list; `kernel+netimport` test coverage: phase boundaries and wrap,
   offset semantics, red hold, amber both branches, green box-block,
   off fallback, save/load round-trip, determinism, loader validation.
+
+## Amendment 2026-07-23: red is a conditional wall (clearance window); the gate reaches through fragments
+
+The original decision made red **absolute** ("hold at the stop line").
+The behavior fixtures (single-junction OSM crops) falsified the two
+premises behind that simplicity: netimport emits sub-vehicle-length
+fragment lanes at junction boundaries, so a wall applied only at the
+current lane's end engages ~0.2 m before the line — far too late — and an
+absolute wall re-captures vehicles that were legally committed at the
+amber→red transition. The amended semantics:
+
+- **Gate target (`gateTarget`)**: the gate targets the first internal
+  lane that *exerts control this tick* along the vehicle's
+  picked-successor chain (bounded by `maxLaneHops` and `maxSightM`),
+  walking through non-internal fragments and uncontrolled internal lanes
+  (back-to-back boxes). The wall distance is measured through the chain,
+  so braking begins on the real approach, not on a 0.2 m stub.
+- **Red**: within `clearanceSeconds` (3 s, compiled to ticks per program)
+  after an amber→red transition the wall applies the *amber* comfort
+  criterion (`v² ≤ 2·d·B`) — amber-committed traffic is never
+  re-captured mid-clearance (textbook dilemma-zone clearance). Outside
+  the window the wall holds anything it can physically stop
+  (`v² ≤ 2·d·emergencyDecel`). Both criteria are stateless functions of
+  the program and tick, so keyframe restore replays them bit-exactly.
+- **Green and committed** movements remain box-gated, and the box checks
+  themselves were generalized (see ADR-0010's same-day amendment):
+  exit-room walks short successors, box exits are re-checked from inside
+  the box, and a downstream red/stop caps release into it.
+
+Fixture evidence: zero *uncommitted* red crossings on the signal-4way
+crop (was: mass red-running from spawn-adjacent fragments); the
+clearance crossings that remain are all committed-legal and classified
+as such by the fixture.

@@ -105,3 +105,37 @@ was throwing it away: the connection `state` attribute (SUMO's major/minor
   format since ADR-0009 but was dropped at load).
 - netimport's report gains `yieldApproaches`, `stopApproaches`,
   `conflictPairs`.
+
+## Amendment 2026-07-23: exit-room walks fragments; in-box exit checks; cross-junction merge arbitration
+
+The behavior fixtures falsified the box model's two geometric
+assumptions — that a box's exit lane is long enough to matter, and that
+conflict zones only interact within one junction:
+
+- **Exit-room (`exitBlocked`)** replaces the immediate-successor check:
+  room accumulates through short empty successors (netimport's 0.2–3.5 m
+  stubs), stops at the first internal lane reached (foe occupancy →
+  blocked; a downstream red caps room at its start; otherwise the next
+  box's gate takes over), and an empty stop-sign line no longer caps
+  (an empty stop is servable — the in-box gate performs the stop).
+- **In-box exit check**: vehicles already inside a box re-verify the
+  exit funnel at the lane end (foe occupancy of reached internal lanes,
+  downstream red) — the entry gate cannot see what arrives *while* the
+  vehicle crosses a long box. The own-path tail is left to car-following
+  (walling it serialized discharge to one vehicle per box traversal).
+- **Cross-junction merges (`mergeThreat`)**: netimport compiles foes
+  WITHIN a junction only, so adjacent boxes funneling through a shared
+  stub had no arbitration and produced simultaneous-entry overlaps. The
+  exit walk now arbitrates shared stubs by closest-vehicle-then-ID,
+  walking sibling branches backward through fragment chains (in-box
+  only — at entry the approach's own gate owns near-merge arbitration).
+- **Injection safety (`injectionPlan`, spawn.go)** moved origin
+  clearance to braking physics toward the leader *through the
+  connection* or the gate's stop-line wall, with no speed floor
+  (creep entries grow queues honestly); same-phase injections see each
+  other via `register()`'s occupancy insert.
+
+All mechanics are deterministic (slice-order walks, distance/ID
+tie-breaks, no RNG, no wall clock); replay/keyframe fidelity is covered
+by `TestKeyframeRestoreWithHeldSpawn` and the stop-control fixture's
+CRC-identical rerun.
