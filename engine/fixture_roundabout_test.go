@@ -34,22 +34,21 @@ import (
 //	    so all W trips must COMPLETE by the horizon, and the draining path
 //	    must keep moving (no vehicle parked through the final 300 ticks).
 //
-// KNOWN ENGINE VIOLATION (skip-guarded TestFixtureRoundaboutCirculation):
-// the intended roundabout behavior — vehicles enter the ring, circulate,
-// entries yield to them and are served cyclically — does not emerge on this
-// fixture. netimport emits sub-vehicle-length normal lanes wherever ring
-// junctions sit close together (0.2–1.4 m segments of the circulatory
-// ring), and boxBlocked's exit-room rule (rightofway.go) measures room
-// only in the IMMEDIATE successor lane: free = 0.2 m < Length+S0 (~7 m)
-// can never open, so every ring entry whose box exit is a micro-lane gates
-// the approach FOREVER. Four of five entry movements deadlock at their
-// yield lines (vehicles 1–4 of the demand plan park from ~tick 200 on
-// n9663293_0 / n99370300_0 / n368911279_0_d2 and never move again); the
-// S-arm platoon behind them can never inject (3 director directives
-// expire); the ring itself is equally un traversable — even a major
-// circulatory connection's exit is one of the micro-lanes. This is the
-// same fragment-exit limitation the stop-control fixture records for
-// junction pairs; here it closes an entire roundabout ring.
+// ROUNDABOUT STATUS (2026-07-23): the fragment-exit deadlock that closed
+// the ring is FIXED — vehicles enter, circulate (slowly: the ring's exit
+// lanes are 1.4–8.6 m fragments, so circulation creeps), and the
+// co-presence/collision gates hold at zero. TestFixtureRoundaboutCirculation
+// stays skip-guarded on two REMAINING gaps, both demand/expectation-level
+// rather than safety-level:
+//
+//  1. Director directive expiry (director.go: 600-tick hold) drops
+//     platoon demand whose entry yield waits out the window — 9 of 12
+//     inject. Whether flow demand should expire at all is an ADR-level
+//     question (the deterministic spawner carries demand over forever).
+//  2. The yield gate is conservative enough that entry queues never
+//     exceed 1 on this tight crop (maxQueue ≥ 2 wanted as "yield
+//     challenged" evidence).
+//
 // Set TRAFFICSIM_FIXTURE_EXPECT_FAIL=1 to assert the intended behavior.
 //
 // Demand is director-injected (EnqueueSpawn) at deterministic ticks, seed 42

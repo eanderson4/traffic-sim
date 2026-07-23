@@ -2,7 +2,6 @@ package engine
 
 import (
 	"fmt"
-	"os"
 	"sort"
 	"testing"
 )
@@ -40,12 +39,13 @@ import (
 // 36.8 m exit lane. Determinism (ADR-0005): two identical runs must produce
 // identical CRC sequences.
 //
-// KNOWN-FAILURE (TestFixtureStopControlCrossTraffic): with realistic cross
-// traffic the fixture exposes two engine pathologies — origin injection
-// overlapping stopped leaders (2709 collisions, min gap −5.00 m) and
-// boxBlocked permanently gating movements whose exit lane is a
-// sub-vehicle-length netimport fragment. That test is skip-guarded; set
-// TRAFFICSIM_FIXTURE_EXPECT_FAIL=1 to run its assertions as hard failures.
+// RESOLVED (2026-07-23, TestFixtureStopControlCrossTraffic): both
+// pathologies this fixture exposed are fixed — origin injection overlaps
+// (injectionPlan caps entry at braking-safe speed toward the leader
+// THROUGH the connection; register() makes same-phase injections visible)
+// and the boxBlocked fragment-exit seal (exitBlocked walks short
+// successors; the in-box exit check re-verifies the funnel). The
+// assertions run unguarded as regression gates.
 
 const fixtureStopControlNet = "testdata/stop-control/network.json"
 
@@ -202,34 +202,23 @@ func TestFixtureStopControl(t *testing.T) {
 	assertEqualCRCs(t, e1.CRCs, e2.CRCs)
 }
 
-// TestFixtureStopControlCrossTraffic documents KNOWN engine pathologies
-// this fixture surfaces once the stop junction sees realistic cross traffic
+// TestFixtureStopControlCrossTraffic is the regression gate for the two
+// engine pathologies this fixture surfaced under realistic cross traffic
 // (23rd St → alley → Amelia WB stop approach, the aisle stop approach, and
-// 24th St major through-flow, ~1 veh per 4.5–15 s per stream):
+// 24th St major through-flow, ~1 veh per 4.5–15 s per stream), both fixed
+// 2026-07-23:
 //
-//  1. Origin injection is NOT collision-free behind a stopped leader.
-//     The clearance rule admits a new vehicle when the origin's first
-//     vehicle has 8+0.8·v_leader clear (spawn.go / director.go), and the
-//     entry-speed rule then injects at min(v0, max(8, v_leader+2)) — at
-//     least 8 m/s even when the leader STANDS at a queue tail 8 m ahead.
-//     IDM cannot hold that pair under the discrete integrator: measured
-//     2709 collision observations, min gap −5.00 m (complete overlap), all
-//     on section 436774073#0 — the 24th St origin whose queue spills back
-//     from the stop junction. (The same mechanism produced 21 collisions
-//     on the 34 m aisle approach at 6 s headways during fixture tuning.)
+//  1. Origin injection was NOT collision-free behind a stopped leader
+//     (2709 collisions, min gap −5.00 m, all on the 24th St origin
+//     section). Fixed: injectionPlan caps entry at braking-safe speed
+//     toward the leader measured THROUGH the connection (or the stop-line
+//     wall), and register() makes same-phase injections visible to each
+//     other (the identical-position clusters were a same-tick backlog
+//     stacking into S=0, invisible to leaderAt's strict S>s search).
 //
-//  2. Sub-vehicle-length exit lanes permanently gate a movement.
-//     boxBlocked (rightofway.go) requires Length+S0 (~7.1 m) free in the
-//     IMMEDIATE exit lane and never looks past it; netimport emits fragment
-//     lanes shorter than that where two junctions sit close together (e.g.
-//     n5603457_5_0_d2, 3.5 m, Amelia between the alley cluster and the
-//     parking-aisle junction). A movement exiting onto such a fragment can
-//     never enter: observed head vehicles standing at boxBlocked=true
-//     against an empty conflict zone (probes below).
-//
-// Skipped by default (the numbers are logged every run); set
-// TRAFFICSIM_FIXTURE_EXPECT_FAIL=1 to turn the assertions into hard
-// failures, e.g. when verifying a fix.
+//  2. Sub-vehicle-length exit lanes permanently gated movements
+//     (boxBlocked checked only the immediate successor). Fixed: the
+//     exit-room walk continues through short successors (exitBlocked).
 func TestFixtureStopControlCrossTraffic(t *testing.T) {
 	const (
 		wbOrigin    = "n5623027_20_0"     // → alley → Amelia WB stop approach
@@ -252,7 +241,7 @@ func TestFixtureStopControlCrossTraffic(t *testing.T) {
 		}
 	}
 	spec := stopFixtureSpec()
-	e, k, crossings, completedLate, violations := stopFixtureRun(t, spec, plan)
+	e, k, _, completedLate, violations := stopFixtureRun(t, spec, plan)
 	tot := k.Totals()
 
 	// Diagnostic dump (logs only with -v or on failure): where the live
@@ -280,13 +269,6 @@ func TestFixtureStopControlCrossTraffic(t *testing.T) {
 			e.boxBlocked(v, next), e.rowConflict(v, next), v.stopDone)
 	}
 
-	if os.Getenv("TRAFFICSIM_FIXTURE_EXPECT_FAIL") != "1" {
-		t.Skipf("KNOWN-FAILURE: injection+cross-traffic collisions — spawned=%d despawned=%d crossings=%d completed=%d "+
-			"completedLateThird=%d live=%d collisions=%d minGap=%.2fm (by section: %v); "+
-			"set TRAFFICSIM_FIXTURE_EXPECT_FAIL=1 to assert",
-			e.Stats.Spawned, e.Stats.Despawned, crossings, tot.CompletedTrips, completedLate,
-			len(e.Vehicles()), e.Stats.Collisions, e.Stats.MinGap, e.Stats.CollisionsBySection)
-	}
 	if len(violations) > 0 {
 		t.Errorf("stop compliance: %d crossings without an observed stop (first: %s)", len(violations), violations[0])
 	}

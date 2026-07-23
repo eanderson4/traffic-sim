@@ -76,8 +76,15 @@ func I80Scenario() Scenario {
 // resulting discharge shortfall matches the real growth rate. i80RefDrop
 // leaves 5 of 6 lanes past the downstream drop — 6→4 over-restricts (deep
 // solid crawl), 6→6 stays free-flowing.
+//
+// 2026-07-23: 1.20 → 1.15 with the injection-safety rewrite (spawn.go
+// injectionPlan). The old clearance rule (8+0.8·v buffer, 8 m/s entry
+// floor) HELD entries in congestion that the braking-physics rule now
+// admits at crawl speed — realized demand at the bottleneck rose at the
+// same nominal rate, so the validated structure (2 wave stripes, scan
+// −11.5 km/h, FD in range) moved down the demand scale.
 const (
-	i80RefDemand = 1.20
+	i80RefDemand = 1.15
 	i80RefDrop   = 5
 )
 

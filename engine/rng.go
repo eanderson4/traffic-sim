@@ -20,16 +20,31 @@ type Stream struct {
 // deriveStream hashes (scenarioSeed, vehicleID) into the two PCG seed words
 // via FNV-1a. Deterministic across runs, independent across vehicles.
 func deriveStream(seed, id uint64) *Stream {
+	return deriveStreamDomain("traffic-sim/engine/vehicle-stream", seed, id)
+}
+
+// spawnAttrStream derives the SIDE stream a pending spawner vehicle's type
+// and desired-speed factor are drawn from — separate from the vehicle's
+// main stream so the draws are idempotent: a pend held across injection
+// retries re-derives identical values, and a keyframe restore (which
+// persists a pend as ID + main stream only, keyframe.go) replays the
+// identical draw with no state to persist. Distinct domain label keeps it
+// independent of the main stream's schedule/policy draws.
+func spawnAttrStream(seed, id uint64) *Stream {
+	return deriveStreamDomain("traffic-sim/engine/spawn-attr-stream", seed, id)
+}
+
+func deriveStreamDomain(domain string, seed, id uint64) *Stream {
 	var b [8]byte
 	h := fnv.New64a()
-	h.Write([]byte("traffic-sim/engine/vehicle-stream"))
+	h.Write([]byte(domain))
 	binary.LittleEndian.PutUint64(b[:], seed)
 	h.Write(b[:])
 	binary.LittleEndian.PutUint64(b[:], id)
 	h.Write(b[:])
 	s1 := h.Sum64()
 	h.Reset()
-	h.Write([]byte("traffic-sim/engine/vehicle-stream/2"))
+	h.Write([]byte(domain + "/2"))
 	binary.LittleEndian.PutUint64(b[:], s1)
 	h.Write(b[:])
 	p := rand.NewPCG(s1, h.Sum64())

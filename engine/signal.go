@@ -19,7 +19,10 @@ import (
 // Enforcement rides the same shared-path cap as the priority model
 // (computeAccels → rowGate): on a signal-controlled approach
 //
-//	red:   hold at the stop line (virtual stop-line wall);
+//	red:   hold at the stop line (virtual stop-line wall) if the vehicle
+//	       can stop comfortably before it (v² ≤ 2·d·B — the same criterion
+//	       as amber, so amber-committed vehicles are never re-captured),
+//	       else it is committed and proceeds through clearance;
 //	amber: hold only if the vehicle can stop comfortably before the line
 //	       (v² ≤ 2·d·B, the ADR-0010 brake-comfort criterion), else it is
 //	       committed and proceeds as on green;
@@ -65,6 +68,7 @@ type SignalProgram struct {
 	phaseTicks  []uint64 // per-phase duration in ticks (Σ = cycle)
 	cycle       uint64   // total cycle length in ticks
 	offsetTicks uint64   // Offset in ticks
+	clearance   uint64   // red-clearance window in ticks (clearanceSeconds compiled)
 }
 
 // newSignalProgram validates the compiled-file form (netfile.go). State
@@ -108,6 +112,7 @@ func (p *SignalProgram) compileTicks(dt float64) error {
 		p.cycle += tk
 	}
 	p.offsetTicks = uint64(math.Round(p.Offset / dt))
+	p.clearance = uint64(math.Round(clearanceSeconds / dt))
 	return nil
 }
 
@@ -116,14 +121,21 @@ func (p *SignalProgram) compileTicks(dt float64) error {
 // program's phase 0 begins at tick offsetTicks; before that the cycle
 // wraps). Deterministic: integer arithmetic over the slice in order.
 func (p *SignalProgram) phaseAt(tick uint64) int {
+	idx, _ := p.phaseAtElapsed(tick)
+	return idx
+}
+
+// phaseAtElapsed returns the phase index in force and how many ticks ago
+// it began — the red-clearance window (sigGate) needs the onset distance.
+func (p *SignalProgram) phaseAtElapsed(tick uint64) (int, uint64) {
 	x := (tick%p.cycle + p.cycle - p.offsetTicks%p.cycle) % p.cycle
 	for i, tk := range p.phaseTicks {
 		if x < tk {
-			return i
+			return i, x
 		}
 		x -= tk
 	}
-	return len(p.phaseTicks) - 1 // unreachable (x < cycle), kept total
+	return len(p.phaseTicks) - 1, 0 // unreachable (x < cycle), kept total
 }
 
 // PhaseAt exposes the phase-index derivation (phaseAt) for wire encoders:
@@ -182,32 +194,87 @@ func (e *Engine) sigState(l *Lane) SigState {
 	return mapSigChar(st[l.LinkIdx])
 }
 
+// clearanceSeconds is the red-clearance window (the all-red clearance
+// concept: the dilemma zone empties legally, then red is near-absolute).
+// Compiled to ticks per program (compileTicks) — dt is a scenario
+// parameter (ADR-0005), never a constant.
+const clearanceSeconds = 3.0
+
+// sigInClearance reports whether the link's red phase began within the
+// clearance window directly after an amber phase — a real amber→red
+// transition (never at run start, and never for green→red programs).
+// Stateless: derived from the program and the tick, so keyframe restore
+// replays it bit-exactly (no latch to persist).
+func (e *Engine) sigInClearance(l *Lane) bool {
+	p := l.Signal
+	if p == nil {
+		return false
+	}
+	_, elapsed := p.phaseAtElapsed(e.Tick)
+	if elapsed > p.clearance || e.Tick < elapsed {
+		return false
+	}
+	onset := e.Tick - elapsed
+	if onset == 0 {
+		return false
+	}
+	prev := p.Phases[p.phaseAt(onset-1)].State
+	if l.LinkIdx >= len(prev) {
+		return false
+	}
+	return mapSigChar(prev[l.LinkIdx]) == SigAmber
+}
+
 // sigGate evaluates the signal guardrail for v approaching the internal
-// lane next. ok=true means v may not enter this tick; the returned accel is
-// the virtual stop-line wall, applied by rowGate's caller as a cap.
+// lane next, whose stop line is dist ahead of v's front bumper (through
+// any fragment stubs — gateTarget). ok=true means v may not enter this
+// tick; the returned accel is the virtual stop-line wall, applied by
+// rowGate's caller as a cap.
 // ok=false on SigOff means "no signal control" — the caller falls through
 // to the priority model (the documented off/blinking fallback).
-func (e *Engine) sigGate(v *Vehicle, next *Lane) (float64, bool) {
+//
+// Red holds only a vehicle that can stop COMFORTABLY before the line
+// (v² ≤ 2·d·B — the same criterion as amber, so a legally
+// amber-committed vehicle is never re-captured by the red wall
+// mid-clearance). A vehicle that cannot stop comfortably is committed:
+// it crosses during the clearance window instead of sliding
+// uncontrollably into the box, and the box checks below still gate it
+// (never enter a box a conflicting vehicle occupies or whose exit has no
+// room). This is textbook red-clearance behavior — the fixture's earlier
+// red "violations" were vehicles the wall could not stop crossing ~0.2 s
+// into red.
+func (e *Engine) sigGate(v *Vehicle, next *Lane, dist float64) (float64, bool) {
 	lane := v.Lane
 	wall := func() float64 {
-		return idmAccel(v.Type, v.v0eff(lane), v.V, LeaderInfo{OK: true, Gap: lane.Length - v.S, V: 0})
+		return idmAccel(v.Type, v.v0eff(lane), v.V, LeaderInfo{OK: true, Gap: dist, V: 0})
 	}
 	switch e.sigState(next) {
 	case SigOff:
 		return 0, false
 	case SigRed:
-		return wall(), true
+		if e.sigInClearance(next) {
+			// Clearance window after an amber→red transition: release
+			// exactly the vehicles the amber rule committed (the SAME
+			// comfort criterion, v² ≤ 2·d·B) — amber-committed traffic is
+			// never re-captured by the red wall mid-clearance (Fable S3).
+			if v.V*v.V <= 2*dist*v.Type.B {
+				return wall(), true
+			}
+		} else if v.V*v.V <= 2*dist*emergencyDecel {
+			// Stale red: hold anything the wall can physically stop.
+			return wall(), true
+		}
 	case SigAmber:
 		// Stop if able: hold when the vehicle can stop comfortably before
 		// the line (v² ≤ 2·d·B, the ADR-0010 criterion); a vehicle that
 		// cannot is committed and proceeds as on green. A vehicle already
 		// stopped at the line holds (0 ≤ anything).
-		if d := lane.Length - v.S; v.V*v.V <= 2*d*v.Type.B {
+		if v.V*v.V <= 2*dist*v.Type.B {
 			return wall(), true
 		}
 	}
-	// Green (or committed on amber): the light adjudicates conflicts, but
-	// green never means enter a box you cannot exit — the ADR-0010 box
+	// Green (or committed on amber/red): the light adjudicates conflicts,
+	// but green never means enter a box you cannot exit — the ADR-0010 box
 	// occupancy and exit-room checks still gate.
 	if e.boxBlocked(v, next) {
 		return wall(), true

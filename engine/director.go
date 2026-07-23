@@ -159,28 +159,27 @@ func (e *Engine) stepDirectorSpawns() {
 			kept = append(kept, d)
 			continue
 		}
-		var first *Vehicle
-		if len(lane.vehs) > 0 {
-			first = lane.vehs[0]
+		// Injection safety — exactly the Spawner's rule (shared helper).
+		// The probe is a lightweight stand-in (not ID-streamed); its ID is
+		// the max uint64 so the mutual-yield tie-breaks (foe.ID < v.ID) read
+		// as "loses to every real vehicle" — conservative, and deterministic.
+		probe := &Vehicle{ID: ^uint64(0), Lane: lane, Type: e.scen.Types[d.TypeIdx]}
+		speed, ok := e.injectionPlan(probe)
+		if !ok {
+			kept = append(kept, d)
+			continue
 		}
-		if first != nil {
-			// Origin clearance rule (identical to the Spawner's).
-			if first.S-first.Type.Length < 8+0.8*first.V {
-				kept = append(kept, d)
-				continue
-			}
-		}
-		e.injectDirective(&d, lane, first)
+		e.injectDirective(&d, lane, speed)
 	}
 	e.dirQueue = kept
 }
 
-// injectDirective performs the actual injection: a fresh per-vehicle keyed
-// stream via e.newVehicle(), the desired-speed factor from that stream, and
-// the Spawner's entry-speed rule (near the leader's speed so the arrival
-// never forces an emergency). Type comes from the directive — the director
-// already sampled the type mix, so no draw is consumed here beyond F.
-func (e *Engine) injectDirective(d *TickedSpawn, lane *Lane, first *Vehicle) {
+// injectDirective performs the actual injection at the speed injectionPlan
+// computed: a fresh per-vehicle keyed stream via e.newVehicle() and the
+// desired-speed factor from that stream. Type comes from the directive —
+// the director already sampled the type mix, so no draw is consumed here
+// beyond F.
+func (e *Engine) injectDirective(d *TickedSpawn, lane *Lane, speed float64) {
 	v := e.newVehicle()
 	v.Type, v.TypeIdx = e.scen.Types[d.TypeIdx], d.TypeIdx
 	v.F = 1 + e.Params.SpeedFactorSigma*v.rng.Norm()
@@ -191,14 +190,7 @@ func (e *Engine) injectDirective(d *TickedSpawn, lane *Lane, first *Vehicle) {
 	}
 	v.Lane = lane
 	v.S = 0
-	v0 := v.v0eff(lane)
-	if first != nil {
-		// Enter near the leader's speed so the arrival never forces an
-		// emergency (identical to the Spawner's rule).
-		v.V = math.Min(v0, math.Max(8, first.V+2))
-	} else {
-		v.V = v0
-	}
+	v.V = math.Min(speed, v.v0eff(lane)) // the plan is F-free; apply the driver's own factor
 	v.Cooldown = e.Params.SpawnCooldown
 	e.register(v)
 	e.Stats.Spawned++

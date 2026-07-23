@@ -151,10 +151,24 @@ func (e *Engine) newVehicle() *Vehicle {
 // register adds v to the live set (order + ID index). Spawn order is NOT ID
 // order: the per-origin spawn schedules interleave, so e.order is kept in
 // append order — which the CRC's canonical serialization has always used —
-// and ID lookup goes through e.index.
+// and ID lookup goes through e.index. The vehicle is ALSO inserted into its
+// lane's occupancy immediately: lane.vehs is only rebuilt after the events
+// phase, and injections later in the same phase (a held directive clearing
+// alongside a spawner entry, a backlog of held directives in one tick) must
+// see the fresh vehicle or they stack into the same slot (the stop-control
+// fixture's identical-position collision clusters).
 func (e *Engine) register(v *Vehicle) {
 	e.order = append(e.order, v)
 	e.index[v.ID] = v
+	if v.Lane != nil {
+		a := v.Lane.vehs
+		i := sort.Search(len(a), func(i int) bool {
+			return a[i].S > v.S || (a[i].S == v.S && a[i].ID > v.ID)
+		})
+		v.Lane.vehs = append(v.Lane.vehs, nil)
+		copy(v.Lane.vehs[i+1:], v.Lane.vehs[i:])
+		v.Lane.vehs[i] = v
+	}
 }
 
 // AddInitialVehicle places a vehicle before the run starts (test harness).
@@ -233,13 +247,23 @@ func (e *Engine) rebuildOccupancy() {
 	}
 }
 
-// maxLaneHops bounds the leader search across lane boundaries.
-const maxLaneHops = 4
+// The leader search walks at least baseLaneHops lane boundaries (the M1
+// bound — long-lane behavior is unchanged) and beyond them while it has
+// not yet seen maxSightM ahead, never past maxLaneHops. Sight must cover
+// an emergency stop from the fastest desired speed the type mix allows
+// (1.3 × 27.78 ≈ 36 m/s → 72 m at emergencyDecel, plus margin): on
+// fragment-dense imported networks four hops can be under 20 m, and
+// vehicles at 30+ m/s met standing queues they could no longer brake for
+// (fixture collision sections, 2026-07-23).
+const baseLaneHops = 4
+const maxLaneHops = 12
+const maxSightM = 100.0
 
 // leaderAt resolves the car-following leader for a hypothetical vehicle at
 // position s on lane: the next vehicle ahead on the lane, else the first
 // vehicle on the successor lane with the gap measured through the connection,
-// walking further successors if the next lane is empty. skip is excluded
+// walking further successors if the next lane is empty (bounded by
+// maxLaneHops AND maxSightM). skip is excluded
 // (a vehicle is never its own leader). On the ring this wraps around; a lone
 // ring vehicle resolves to "no leader" (free flow).
 func (e *Engine) leaderAt(lane *Lane, s float64, skip *Vehicle) LeaderInfo {
@@ -254,7 +278,7 @@ func (e *Engine) leaderAt(lane *Lane, s float64, skip *Vehicle) LeaderInfo {
 	}
 	dist := lane.Length - s
 	cur := lane
-	for hops := 0; hops < maxLaneHops; hops++ {
+	for hops := 0; hops < maxLaneHops && (hops < baseLaneHops || dist < maxSightM); hops++ {
 		if len(cur.Successors) == 0 {
 			return LeaderInfo{}
 		}
@@ -283,13 +307,14 @@ func (e *Engine) leader(v *Vehicle) LeaderInfo {
 // prevFollower resolves the nearest follower behind a hypothetical rear
 // bumper at position rear on lane when no vehicle is behind on the lane
 // itself: the last vehicle of the predecessor lane, walking further empty
-// predecessors up to maxLaneHops (mirror of leaderAt; gaps measured through
-// the connections). Lane-change safety checks use it so hops near a lane
-// start cannot land on an unchecked cross-boundary follower.
+// predecessors (mirror of leaderAt, same maxLaneHops/maxSightM bounds;
+// gaps measured through the connections). Lane-change safety checks use
+// it so hops near a lane start cannot land on an unchecked cross-boundary
+// follower.
 func (e *Engine) prevFollower(lane *Lane, rear float64) (f *Vehicle, fLane *Lane, gap float64, ok bool) {
 	dist := rear
 	cur := lane
-	for hops := 0; hops < maxLaneHops; hops++ {
+	for hops := 0; hops < maxLaneHops && (hops < baseLaneHops || dist < maxSightM); hops++ {
 		if len(cur.Prevs) == 0 {
 			return nil, nil, 0, false
 		}
@@ -400,9 +425,16 @@ func (e *Engine) boundaries() {
 				e.Stats.Despawned++
 			case len(lane.Successors) > 0:
 				v.S -= lane.Length
-				v.Lane = pickSuccessor(lane, v.HeldTurn)
-				v.HeldTurn = 0     // turn-at-junction is held until consumed
-				v.stopDone = false // stop-line duty is per approach (ADR-0010)
+				next := pickSuccessor(lane, v.HeldTurn)
+				v.Lane = next
+				v.HeldTurn = 0 // turn-at-junction is held until consumed
+				// Stop-line duty is per junction APPROACH (ADR-0010), and an
+				// approach spans its fragment stubs (gateTarget measures the
+				// line through them) — reset only when the junction itself
+				// is consumed, or stubbed stop junctions double-stop.
+				if next.Internal {
+					v.stopDone = false
+				}
 			case lane.EndWall:
 				v.S = lane.Length
 				v.V = 0

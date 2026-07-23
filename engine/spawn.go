@@ -93,11 +93,61 @@ func (sp *Spawner) init(e *Engine) {
 	}
 }
 
+// injectionPlan decides whether the pending vehicle v (Lane and Type set,
+// S = 0, not yet registered) may enter this tick, and the physical entry
+// cap. ok=false holds the spawn — unmet demand carries over. The entry is
+// safe when v can brake COMFORTABLY (its Type.B) to whichever constraint
+// is nearer:
+//
+//   - the nearest leader measured THROUGH the connection (leaderAt from
+//     the lane start) — the old rule (8+0.8·v buffer against vehicles ON
+//     the origin lane only) never looked past the lane end, so entries at
+//     full speed met queues standing in the next lane (the origin-overlap
+//     collisions the fixtures counted by origin section);
+//   - the junction stop-line wall when the upcoming junction would hold
+//     (junctionHold: red/amber light, stop sign, right-of-way conflict,
+//     blocked box) — the old rule injected at full desired speed onto
+//     netimport's 0.2 m junction-boundary stubs facing a red light, which
+//     is where the fixtures' mass red crossings came from.
+//
+// The entry speed caps at what can still stop short of the constraint:
+// v² ≤ v_leader² + 2·B·(gap − s0). There is no speed floor: origin lanes
+// have no predecessors, so nothing can rear-end a slow entry, and joining
+// a queue tail at crawl speed is how real queues grow (the prototype's
+// 8 m/s floor only starved congested origins). F-free by design — the
+// plan may be probed for a vehicle whose desired-speed factor has not
+// been drawn (the director probe); callers apply their own F via
+// min(cap, v0eff) at injection.
+func (e *Engine) injectionPlan(v *Vehicle) (float64, bool) {
+	lane := v.Lane
+	gap := math.Inf(1)
+	vl := 0.0
+	// leaderAt from a hair BEFORE the lane start: its strict S > s search
+	// would miss a vehicle injected at exactly S = 0 earlier in the same
+	// events phase (the director queue's same-tick backlog stack).
+	if li := e.leaderAt(lane, -1e-9, nil); li.OK {
+		gap = li.Gap
+		vl = li.V
+	}
+	if next, dist := e.gateTarget(v); next != nil && dist < gap && e.junctionHold(v, next) {
+		gap = dist
+		vl = 0
+	}
+	if math.IsInf(gap, 1) {
+		return gap, true // unconstrained: the caller caps at the driver's desired speed
+	}
+	room := gap - v.Type.S0
+	if room <= 0 {
+		return 0, false
+	}
+	return math.Sqrt(vl*vl + 2*v.Type.B*room), true
+}
+
 // step attempts the scheduled spawn on each origin lane, in fixed lane
-// order. A blocked entry (density cap, no room) holds and retries next tick —
-// the schedule is demand, and unmet demand carries over. DemandSchedule
-// steps fire first; an already-pending spawn keeps its tick (future
-// intervals use the new rate).
+// order. A blocked entry (density cap, unsafe injection) holds and retries
+// next tick — the schedule is demand, and unmet demand carries over.
+// DemandSchedule steps fire first; an already-pending spawn keeps its tick
+// (future intervals use the new rate).
 func (sp *Spawner) step(e *Engine) {
 	for sp.next < len(sp.sched) && e.Tick >= sp.sched[sp.next].Tick {
 		for i := range sp.origins {
@@ -113,63 +163,57 @@ func (sp *Spawner) step(e *Engine) {
 		if sp.target > 0 && float64(len(e.order))/e.Net.TotalLaneKm() >= sp.target {
 			continue
 		}
-		var first *Vehicle
-		if len(st.lane.vehs) > 0 {
-			first = st.lane.vehs[0]
-		}
-		if first != nil {
-			// Origin clearance rule (prototype 1): the empty space ahead of
-			// the first vehicle must cover a speed-dependent buffer.
-			if first.S-first.Type.Length < 8+0.8*first.V {
-				continue
-			}
-		}
 
 		v := st.pend
-		types := e.scen.Types
-		ti := 0
-		if len(types) > 1 {
-			// One uniform draw either way; weights only remap it.
-			u := v.rng.Float64()
-			if w := e.scen.TypeWeights; len(w) == len(types) {
-				tot := 0.0
-				for _, x := range w {
-					tot += x
-				}
-				u *= tot
-				cum := 0.0
-				ti = len(types) - 1
-				for i, x := range w {
-					cum += x
-					if u < cum {
-						ti = i
-						break
+		if v.Type == nil {
+			// Type and desired-speed factor derive from the vehicle's SIDE
+			// stream (spawnAttrStream), not its main stream: the draw is
+			// idempotent across holds AND keyframe restore — a pend
+			// persisted mid-hold (keyframe keeps ID + main stream only)
+			// replays the identical Type/F with nothing to persist.
+			attr := spawnAttrStream(e.Seed, v.ID)
+			types := e.scen.Types
+			ti := 0
+			if len(types) > 1 {
+				// One uniform draw either way; weights only remap it.
+				u := attr.Float64()
+				if w := e.scen.TypeWeights; len(w) == len(types) {
+					tot := 0.0
+					for _, x := range w {
+						tot += x
+					}
+					u *= tot
+					cum := 0.0
+					ti = len(types) - 1
+					for i, x := range w {
+						cum += x
+						if u < cum {
+							ti = i
+							break
+						}
+					}
+				} else {
+					ti = int(u * float64(len(types)))
+					if ti >= len(types) {
+						ti = len(types) - 1
 					}
 				}
-			} else {
-				ti = int(u * float64(len(types)))
-				if ti >= len(types) {
-					ti = len(types) - 1
-				}
 			}
-		}
-		v.Type, v.TypeIdx = types[ti], ti
-		v.F = 1 + e.Params.SpeedFactorSigma*v.rng.Norm()
-		if v.F < 0.8 {
-			v.F = 0.8
-		} else if v.F > 1.3 {
-			v.F = 1.3
+			v.Type, v.TypeIdx = types[ti], ti
+			v.F = 1 + e.Params.SpeedFactorSigma*attr.Norm()
+			if v.F < 0.8 {
+				v.F = 0.8
+			} else if v.F > 1.3 {
+				v.F = 1.3
+			}
 		}
 		v.Lane = st.lane
 		v.S = 0
-		v0 := v.v0eff(st.lane)
-		if first != nil {
-			// Enter near the leader's speed so the arrival never forces an
-			// emergency (prototype 1's rule).
-			v.V = math.Min(v0, math.Max(8, first.V+2))
-		} else {
-			v.V = v0
+		speed, ok := e.injectionPlan(v)
+		if !ok {
+			continue // unsafe entry this tick: hold, retry next tick
 		}
+		v.V = math.Min(speed, v.v0eff(st.lane)) // the plan is F-free; apply the driver's own factor
 		v.Cooldown = e.Params.SpawnCooldown
 		e.register(v)
 		e.Stats.Spawned++

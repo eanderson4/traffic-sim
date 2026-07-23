@@ -61,25 +61,43 @@ func ParseRowState(s string) (RowState, error) {
 	return RowNone, fmt.Errorf("unknown row state %q (want major|minor|stop)", s)
 }
 
-// rowGate evaluates the right-of-way guardrail for v at the end of its
-// current lane. ok=true means v may not enter the junction this tick; the
-// returned accel is the virtual stop-line wall (IDM toward a standing
-// vehicle at the lane end), applied by the caller as a cap on v.Acc.
-// Approaching an unmodeled junction (RowNone) or a non-internal successor
-// is never gated. Signal-controlled approaches (next.Signal) are gated by
-// the light first (ADR-0011); an off/blinking light exerts no control and
-// falls through to the priority model below.
+// rowGate evaluates the right-of-way guardrail for v: ok=true means v may
+// not enter the junction this tick; the returned accel is the virtual
+// stop-line wall (IDM toward a standing vehicle at the line), applied by
+// the caller as a cap on v.Acc. The gate target is the first INTERNAL lane
+// reached by following v's picked successors (gateTarget), so approaches
+// behind netimport's sub-vehicle-length junction-boundary stubs are gated
+// from their real approach lane with the distance measured THROUGH the
+// stubs — a 0.2 m stub is not enough road to stop on, and gating only
+// there let every approach run the line (fixtures, 2026-07-23).
+// Approaching an unmodeled junction (RowNone) is never gated.
+// Signal-controlled approaches (target.Signal) are gated by the light
+// first (ADR-0011); an off/blinking light exerts no control and falls
+// through to the priority model below.
 func (e *Engine) rowGate(v *Vehicle) (float64, bool) {
 	lane := v.Lane
-	if lane == nil || lane.Internal || len(lane.Successors) == 0 {
+	if lane == nil || len(lane.Successors) == 0 {
 		return 0, false
 	}
-	next := pickSuccessor(lane, v.HeldTurn)
-	if !next.Internal {
+	if lane.Internal {
+		// Inside a box the entry gate no longer applies, but the box EXIT
+		// must still take v: a fast vehicle crossing a long box meets
+		// whatever entered the shared exit funnel meanwhile (the residual
+		// box-interior overlaps after the entry-time fixes). The wall at
+		// the lane end holds v INSIDE the box — stopping in the box is a
+		// textbook violation, but a safe one; overlapping is worse.
+		if e.exitBlocked(v, lane, true) {
+			wall := idmAccel(v.Type, v.v0eff(lane), v.V, LeaderInfo{OK: true, Gap: lane.Length - v.S, V: 0})
+			return wall, true
+		}
+		return 0, false
+	}
+	next, dist := e.gateTarget(v)
+	if next == nil {
 		return 0, false
 	}
 	if next.Signal != nil {
-		if w, gated := e.sigGate(v, next); gated {
+		if w, gated := e.sigGate(v, next, dist); gated {
 			return w, true
 		}
 	}
@@ -91,7 +109,7 @@ func (e *Engine) rowGate(v *Vehicle) (float64, bool) {
 		// Stop approach: hold until a full stop has been reached AT the line
 		// (the wall stops the vehicle within its jam gap of the line; a stop
 		// further back is queueing, not the required stop).
-		if v.V == 0 && lane.Length-v.S <= v.Type.S0+1.0 {
+		if v.V == 0 && dist <= v.Type.S0+1.0 {
 			v.stopDone = true
 		}
 	} else if !e.rowConflict(v, next) {
@@ -100,8 +118,58 @@ func (e *Engine) rowGate(v *Vehicle) (float64, bool) {
 	if !hold {
 		return 0, false
 	}
-	wall := idmAccel(v.Type, v.v0eff(lane), v.V, LeaderInfo{OK: true, Gap: lane.Length - v.S, V: 0})
+	wall := idmAccel(v.Type, v.v0eff(lane), v.V, LeaderInfo{OK: true, Gap: dist, V: 0})
 	return wall, true
+}
+
+// gateTarget resolves the junction v is actually approaching: the first
+// internal lane that EXERTS CONTROL this tick along v's picked-successor
+// chain, and the distance from v's front bumper to its start, bounded by
+// maxLaneHops like leaderAt. Two kinds of lanes are walked THROUGH, their
+// lengths accumulated into the distance:
+//
+//   - non-internal fragments (netimport's 0.2–3.5 m junction-boundary
+//     stubs — not enough road to stop on, so gating only there ran every
+//     line);
+//   - UNCONTROLLED internal lanes (no live signal, RowNone): back-to-back
+//     junction crops chain one junction's internal lane straight into the
+//     next junction's stop line, and the only gate that can hold that
+//     traffic is the downstream one. Holding upstream of the intermediate
+//     box is also the textbook "don't block the box" outcome.
+//
+// nil when the chain reaches no controlled internal lane within sight
+// (free road, network exit, hop cap, or beyond maxSightM — the same sight
+// bound leaderAt uses; a farther junction will cycle before v arrives).
+func (e *Engine) gateTarget(v *Vehicle) (*Lane, float64) {
+	cur := v.Lane
+	dist := cur.Length - v.S
+	for hops := 0; hops < maxLaneHops; hops++ {
+		if len(cur.Successors) == 0 {
+			return nil, 0
+		}
+		next := pickSuccessor(cur, v.HeldTurn)
+		if next.Internal && e.controlled(next) {
+			if dist > maxSightM {
+				return nil, 0
+			}
+			return next, dist
+		}
+		dist += next.Length
+		cur = next
+		if dist > maxSightM {
+			return nil, 0
+		}
+	}
+	return nil, 0
+}
+
+// controlled reports whether an internal lane exerts any control this
+// tick: a live (non-off) signal state, or a modeled right-of-way class.
+func (e *Engine) controlled(l *Lane) bool {
+	if l.Signal != nil && e.sigState(l) != SigOff {
+		return true
+	}
+	return l.Row != RowNone
 }
 
 // rowConflict reports whether entering the internal lane next would
@@ -146,23 +214,191 @@ func (e *Engine) boxBlocked(v *Vehicle, next *Lane) bool {
 			return true
 		}
 	}
-	// Exit room: don't enter a junction you cannot clear — the box exit
-	// must have room for v behind the exit lane's queue TAIL (its first
-	// vehicle, the one nearest the box). Room further downstream is
-	// irrelevant: entering against a tail sitting at the box exit is how
-	// the funnel overlaps happened.
-	if len(next.Successors) > 0 {
-		exit := next.Successors[0]
-		free := exit.Length
-		if n := len(exit.vehs); n > 0 {
-			first := exit.vehs[0]
-			free = first.S - first.Type.Length
+	return e.exitBlocked(v, next, false)
+}
+
+// exitBlocked reports whether the lane's EXIT chain cannot take v. The
+// walk accumulates room through short EMPTY non-internal successors
+// exactly like leaderAt walks lanes (maxLaneHops): netimport emits
+// sub-vehicle-length exit stubs (0.2–3.5 m) at junction boundaries, and
+// checking only the immediate successor sealed every movement of stubbed
+// junctions permanently (fixtures, 2026-07-23). The walk STOPS at the
+// first internal lane it reaches — the next box's domain, whose own gate
+// (entry or in-box) takes over from there:
+//
+//   - a CONVERGENT/CROSSING foe inside it → blocked (adjacent boxes
+//     funnel through shared stubs; this is the simultaneous-entry overlap
+//     the entry-time foe check misses across boxes);
+//   - a HOLDING stop line (red, stop sign) → room capped at its start
+//     (a green light here must not release traffic into a red line one
+//     stub away);
+//   - otherwise → the room to clear THIS box suffices; pass.
+//
+// The tail rule differs by discipline: at ENTRY (inBox=false, wrapped by
+// boxBlocked with the entry-time foe checks) the whole chain behind the
+// first queue tail must fit v — "don't enter a junction you cannot
+// clear". IN-BOX (inBox=true) the tail is v's own leader — car-following
+// (leaderAt) already brakes for it, and walling the box end against it
+// serialized discharge to one vehicle per box traversal.
+func (e *Engine) exitBlocked(v *Vehicle, next *Lane, inBox bool) bool {
+	need := v.Type.Length + v.Type.S0
+	free := 0.0
+	// dist is v's distance to the lane being examined; it is consumed by
+	// the merge-funnel arbitration, which only runs in-box (v.Lane == next
+	// there, so next.Length is correct). In the entry case it is unused.
+	dist := next.Length - v.S
+	cur := next
+	for hops := 0; hops < maxLaneHops; hops++ {
+		if len(cur.Successors) == 0 {
+			break
 		}
-		if free < v.Type.Length+v.Type.S0 {
+		exit := pickSuccessor(cur, v.HeldTurn) // v's actual route, not the default
+		// A shared funnel (several lanes feeding one) arbitrates
+		// simultaneous arrivals itself: no foe set covers cross-junction
+		// merges (netimport compiles foes WITHIN a junction only), so a
+		// vehicle committed to a sibling branch meets v at the merge point
+		// with no gate between them (the 42430333→8375523265 stub overlap).
+		// The sibling search walks each branch BACKWARD through short
+		// fragment chains (the 0.2 m stubs multiply crossings per tick) —
+		// the closest approaching vehicle per branch wins; ties by lower
+		// ID. A stopped-far-back sibling (queued, not committed) never
+		// blocks. IN-BOX ONLY: at entry the approach's own gate
+		// (rowConflict/foe approaches) owns near-merge arbitration, and
+		// entry distances would make every converging branch a blocker.
+		if inBox && len(exit.Prevs) > 1 && e.mergeThreat(v, cur, exit, dist) {
+			return true
+		}
+		if n := len(exit.vehs); n > 0 {
+			if inBox {
+				return false // own-path tail: car-following owns it
+			}
+			first := exit.vehs[0]
+			// Room behind the tail measured from this lane's start; a tail
+			// protruding before it (negative) eats the accumulated room.
+			free += first.S - first.Type.Length
+			break
+		}
+		if exit.Internal {
+			for _, f := range exit.FoesCross {
+				if len(f.vehs) > 0 {
+					return true
+				}
+			}
+			for _, f := range exit.FoesMerge {
+				if len(f.vehs) > 0 {
+					return true
+				}
+			}
+			// A HOLDING stop line caps the room at its start; shallow by
+			// design (signal wall states + stop class only): no foe
+			// evaluation, so no recursion into rowConflict → boxBlocked.
+			if e.downstreamHold(exit) {
+				break
+			}
+			return false // the next box's gate takes over from here
+		}
+		if exit.Exit {
+			return false // drains out of the network: room is unbounded
+		}
+		free += exit.Length
+		dist += exit.Length
+		if free >= need {
+			break
+		}
+		cur = exit
+	}
+	if free < need {
+		return true
+	}
+	return false
+}
+
+// mergeThreat reports whether a vehicle on a sibling branch feeding exit
+// (any prev except v's own chain node cur) reaches the merge before v,
+// whose own distance to the merge is distV. Branches are walked backward
+// breadth-first through short fragment chains (bounded by maxSightM and a
+// visited set — ring topologies loop) and the closest vehicle per branch
+// competes: closer wins, ties by lower ID.
+func (e *Engine) mergeThreat(v *Vehicle, cur, exit *Lane, distV float64) bool {
+	type item struct {
+		lane *Lane
+		dist float64 // distance from the lane's END to the merge
+	}
+	var work []item
+	seen := map[*Lane]bool{}
+	for _, p := range exit.Prevs {
+		if p != cur && !seen[p] {
+			seen[p] = true
+			work = append(work, item{p, 0})
+		}
+	}
+	for len(work) > 0 {
+		it := work[0]
+		work = work[1:]
+		if n := len(it.lane.vehs); n > 0 {
+			last := it.lane.vehs[n-1]
+			dOther := it.dist + it.lane.Length - last.S
+			if dOther < distV || (dOther == distV && last.ID < v.ID) {
+				return true
+			}
+			continue // closest vehicle on this branch found
+		}
+		for _, pp := range it.lane.Prevs {
+			d := it.dist + it.lane.Length
+			// Branches only lengthen backward; past distV no deeper
+			// vehicle can win the merge (and rings are visited-guarded).
+			if !seen[pp] && d < distV {
+				seen[pp] = true
+				work = append(work, item{pp, d})
+			}
+		}
+	}
+	return false
+}
+
+// downstreamHold reports whether an internal lane is a mandatory stop
+// point this tick for anything approaching it: a red/amber light.
+// Deliberately shallower than junctionHold — no foe or box evaluation —
+// so boxBlocked can consult it without recursion. A stop-sign class is
+// NOT a hold here: the walk only reaches EMPTY lanes (the tail rule runs
+// first), an empty stop line is servable — v proceeds and does its own
+// stop there, held by the in-box gate. Capping room at an empty stop line
+// sealed stop-controlled fragment chains permanently (Fable round 2).
+func (e *Engine) downstreamHold(l *Lane) bool {
+	if l.Signal != nil {
+		switch e.sigState(l) {
+		case SigRed, SigAmber:
 			return true
 		}
 	}
 	return false
+}
+
+// junctionHold reports whether the junction v approaches (next = its
+// gateTarget) would hold a vehicle at the stop line THIS tick — the
+// rowGate/sigGate decision with v's dynamics removed (a pending spawn is
+// "able to stop" by definition: it can simply not enter) and without the
+// wall or the stopDone side effect. injectionPlan uses it to treat the
+// stop line as a virtual leader.
+func (e *Engine) junctionHold(v *Vehicle, next *Lane) bool {
+	if next.Signal != nil {
+		switch e.sigState(next) {
+		case SigRed, SigAmber:
+			return true
+		case SigGreen:
+			if e.boxBlocked(v, next) {
+				return true
+			}
+		}
+		// SigOff: no signal control; fall through to the priority model.
+	}
+	if next.Row == RowNone {
+		return false
+	}
+	if next.Row == RowStop && !v.stopDone {
+		return true
+	}
+	return e.rowConflict(v, next)
 }
 
 // foeApproachBlocks reports whether the closest vehicle heading for the foe

@@ -41,9 +41,12 @@ func TestRingStable(t *testing.T) {
 
 // Lane drop: with 3×1500 veh/h demand into a 2-lane bottleneck, density
 // builds upstream of the drop — mean speed on section A must end clearly
-// below mean speed on section B after 600 ticks (60 s).
+// below mean speed on section B after 1200 ticks (120 s; the queue spillback
+// reaches section A later under the injectionPlan creep-entry regime than
+// it did with the old 8 m/s-floor injection — measured: ratio 0.92 at 600
+// ticks, 0.65 at 1200, 0.51 at 1800).
 func TestLaneDropCongestion(t *testing.T) {
-	spec, _ := DefaultSpec("lanedrop", 600, 1)
+	spec, _ := DefaultSpec("lanedrop", 1200, 1)
 	e, _, err := Run(spec)
 	if err != nil {
 		t.Fatal(err)
