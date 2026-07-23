@@ -262,7 +262,10 @@ async function main(): Promise<void> {
         // (junction interiors, stale caches) are all boundaries, so they
         // degrade to full casing inside edgeBoundaries.
         "line-opacity": ["case", ["boolean", ["get", "edgeB"], true], 0.9, 0.15],
-        "line-width": ["interpolate", ["linear"], ["zoom"], 11, 2.5, 14, 7, 17, 12],
+        // Zoomed-out legibility: a touch wider from z=11 (interpolating up
+        // to z=14) — the network must read under the vehicle stream before
+        // any detail matters.
+        "line-width": ["interpolate", ["linear"], ["zoom"], 11, 3.2, 14, 7, 17, 12],
       },
     });
     map.addLayer({
@@ -282,7 +285,7 @@ async function main(): Promise<void> {
           0.7, THEME.freeFlow,
           1.5, THEME.freeFlow,
         ],
-        "line-width": ["interpolate", ["linear"], ["zoom"], 11, 1.2, 14, 4, 17, 8],
+        "line-width": ["interpolate", ["linear"], ["zoom"], 11, 1.8, 14, 4, 17, 8],
       },
     });
     // Vehicle glyphs (2026-07-22 legibility pass): one SDF rectangle per
@@ -355,7 +358,9 @@ async function main(): Promise<void> {
     // Signal lights (M9): one head per signalized MOVEMENT (grouped
     // stop-lines, signals.ts) — the housing sprite carries three dim
     // lenses and one circle layer per lens position paints the active
-    // light, gated by feature-state "sig" (off = no lit lens).
+    // light, gated by feature-state "sig" (off = no lit lens). Zoom-gated
+    // to ≥13: at city zooms the heads blob into clutter that hides the
+    // network itself (zoomed-out detail is the congestion channel's job).
     map.addSource("signals", { type: "geojson", data: EMPTY_FC, promoteId: "id" });
     const sigHeadImg = signalHeadImage();
     map.addImage(SIGNAL_HEAD_IMAGE_ID, sigHeadImg.image, { pixelRatio: sigHeadImg.pixelRatio });
@@ -363,6 +368,7 @@ async function main(): Promise<void> {
       id: "signals-housing",
       type: "symbol",
       source: "signals",
+      minzoom: 13,
       layout: {
         "icon-image": SIGNAL_HEAD_IMAGE_ID,
         "icon-allow-overlap": true,
@@ -382,6 +388,7 @@ async function main(): Promise<void> {
         id: `signals-lens-${lens.color}`,
         type: "circle",
         source: "signals",
+        minzoom: 13,
         paint: {
           "circle-color": lens.fill,
           "circle-opacity": [

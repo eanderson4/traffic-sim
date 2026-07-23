@@ -1,0 +1,96 @@
+# Podcast Demo Work-Queue (agent-dispatchable)
+
+> Working todo for the demo-matrix / trust-building program. Each item is written so a
+> fresh agent can pick it up cold. Owner adds items at the bottom; strike or annotate
+> when done. Podcast deadline is ~2 days out — prioritize engine trust over polish.
+>
+> Ground rules: `AGENTS.md` (read `docs/VISION.md`, KB-first, ADRs for consequential
+> decisions). Every non-doc commit: run `scripts/external-review.sh` first and triage
+> Fable's findings (it prints them even when Sol fails). Sol is quota-dead since
+> 2026-07-23; the owner has authorized committing with `EXTERNAL_REVIEW_SKIP=1`
+> after that Fable pass, recording Sol's failure count in the commit message, until
+> Sol recovers. Do not skip the script itself — that would bypass Fable too. Never push.
+
+## Operational state (2026-07-23 evening)
+
+- Engine + all fixtures green at `0f14d1f` (see freshness notes (c)–(g) in
+  `gaps-and-roadmap.md` for the full found/fixed bug history).
+- demosrv serves the demo menu + built viz on http://localhost:8900/.
+  Rebuild/restart: `cd engine && go build -o /tmp/demosrv ./cmd/demosrv && /tmp/demosrv`
+  (run from repo root; it serves `viz/dist`, so `cd viz && pnpm build` first for viz changes).
+- Headless verification: `cd viz && node scripts/screenshot.mjs "<url>" /tmp/x.png <waitMs>`;
+  scripted all-demo verification lived at `/tmp/verify-demos.mjs` (NOT committed — gone
+  on reboot; regenerate from the recipe in freshness note (d) if needed).
+- Demo registry: `data/scenarios/demos.json` (10 imported networks + 4 behavior fixtures).
+
+## Open issues (viz, from live viewing)
+
+### WQ-1: Spurious/"extra" signal heads at junctions
+Observed 2026-07-23 (screenshot 15-24-54): heads render at lane ends around the
+junction box that look like exit-side stubs / netconvert fragment ends, not true
+stop-line entries. Classify each head's source (true stop-line vs fragment artifact)
+and suppress or re-gate artifacts. Heads are zoom-gated at minzoom 13 (housing +
+3 lens layers, `viz/src/main.ts`). Related: mid-zoom (13–15) clustering at dense
+junctions — consider per-junction declutter (offset or count-badged single head).
+
+### WQ-2: Trailer jackknife physics
+`viz/src/artic.ts` — trailers render perpendicular/detached. Root cause understood
+(single-track angle law has a second stable equilibrium at θ_front ± π; a >90° hitch
+upset from lane-hop teleports or curved-fragment spawns flips onto the jackknife
+branch and never recovers). Fix directions in freshness note (f): clamp |Δθ| per
+frame, re-anchor to θ_front on large wraps, smooth hitch on lane hops.
+
+### WQ-3: Junction-interior squiggles at city zoom
+`internal` lanes still draw when zoomed out (squiggle clutter at every junction).
+Candidate: zoom-gate internal lanes to ≥13 like the signal heads. Quick win.
+
+## Engine trust / architecture
+
+### WQ-4: Big-simulation stress test (owner priority)
+Prove the architecture holds at scale. Scripted elevated-demand run of stress-dtla
+(14.9k lanes, 1202 signals; gridlocked at 1200 veh/h/lane with ~8k peak vehicles,
+~7 ms/tick kernel cost — pacing-bound, note (b)) via demosrv. Quantify: kernel
+ms/tick vs vehicle count curve, NATS/ws pipeline health, viz `updateData` behavior
+at 5–10k vehicles, mean time-loss / VMT sanity. Watch for the known ADR-0008 §6
+pause-gate deadlock on overload runs (resume requires demand ≤ spare capacity;
+jammed runs wedge with zero CPU/log; workaround is raised `-capacity`; needs an
+escape hatch or at least a loud log/metric).
+
+### WQ-5: Driver-lag divergence (skip-guarded test)
+`TestDifferentialLanedrop` wave-envelope assertion skip-guarded on a documented
+signature; needs a driver-model fix. Details in the fixture test file.
+
+### WQ-6: Roundabout circulation
+Directive expiry + yield conservatism; ADR-level. Fixture: `engine/fixture_roundabout_test.go`
+(Circulation SKIP-guarded). Not podcast-blocking.
+
+### WQ-7: stopDone keyframe persistence (v4)
+Deferred until recordings exist. Not podcast-blocking.
+
+## Program items (bigger, parallelizable, post-podcast unless cheap)
+
+### WQ-8: GIS network analysis (LA vs NY)
+Compare imported networks (lane miles, junction density, signal density, fragment
+rates, origin/exit counts) to see if GIS-type analysis yields anything useful for
+the episode. `engine/netimport` + `data/networks/`; metrics kernel (M13) can emit
+per-lane intervals. Research-flavored; agent-friendly.
+
+### WQ-9: Intersection visualization + explanation layers
+What an intersection IS in the sim (stop lines, conflict points, signal programs)
+rendered/explained for the episode. Needs design thought; ADR-0003 (MapLibre-first,
+no UI framework) governs.
+
+### WQ-10: Benchmark queue items unblocked by the stress test
+Feed WQ-4 measurements into the Benchmark Queue table in `gaps-and-roadmap.md`
+(per-vehicle wire size at 10k vehicles, nats.ws throughput, MapLibre updateData
+fleet ceiling, GC jitter in paced loops).
+
+## Done recently (for orientation, newest first)
+
+- Signal zoom-gating + road width bump at z≤12 (`viz/src/main.ts`).
+- Edge-group casing so same-road lanes read as one road (`91bfa51`).
+- demosrv params API + viz model panel — controllers + sim params exposed (`bfcf982`).
+- Three fixture-found engine bugs fixed: fragment gate-through, red clearance
+  window, safe origin injection (`71461b9` + ADR-0010/0011 amendments `0f14d1f`).
+- 14/14 demo-swap verification scripted and green (freshness note (d)).
+- 10-network demo matrix imported and smoke-tested (freshness note (b)).
