@@ -1,0 +1,23 @@
+{
+  "_placeholder": "Template for data/scenarios/demos.json (JSON has no comments; remove this key before use — demosrv rejects unknown fields). scenarioDir is REPO-ROOT-relative (run demosrv from the repo root). run is a single NATS token matching [A-Za-z0-9_-]+ (it also rides the app URL raw). seed/ticks are OPTIONAL: they override the scenario manifest for this demo (serve's -seed/-ticks); omit them to run the manifest as authored. capacity is OPTIONAL: driver claim capacity (serve's -capacity, default 1000) — raise it for dense/overload demos, since ADR-0008's pause gate pauses the run when live unclaimed vehicles exceed spare capacity.",
+  "demos": [
+    {
+      "id": "i280-baseline",
+      "title": "I-280 / Woodside — baseline",
+      "blurb": "Freeway corridor, 2 signalized junctions, 2×600 veh/h Poisson demand, 90/10 car/truck. Seed 42, one simulated hour.",
+      "tags": ["freeway", "signals", "baseline"],
+      "scenarioDir": "data/scenarios/i280-woodside",
+      "run": "baseline",
+      "ticks": 36000,
+      "seed": 42
+    },
+    {
+      "id": "my-demo",
+      "title": "My scenario — descriptive subtitle",
+      "blurb": "One or two sentences: network, demand, horizon, seed.",
+      "tags": ["tag-one", "tag-two"],
+      "scenarioDir": "data/scenarios/my-scenario",
+      "run": "my-run"
+    }
+  ]
+}

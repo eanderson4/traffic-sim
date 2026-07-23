@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>traffic-sim — demos</title>
+    <style>
+      /* demosrv menu chrome — same design tokens as the map app (math-900
+         navy canvas, math-800 cards, math-300/500 accents; see
+         viz/src/theme.ts and index.html). */
+      html, body { margin: 0; min-height: 100%; background: #0e1d5c; }
+      body {
+        font: 14px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: #d6e1ff;
+        padding: 48px 24px 64px;
+      }
+      header { max-width: 1080px; margin: 0 auto 32px; }
+      h1 { font-size: 22px; letter-spacing: 0.04em; margin: 0; color: #eaf0ff; }
+      h1 .accent { color: #7e9dff; }
+      header p { margin: 6px 0 0; color: #9fb2e8; font-size: 12px; }
+      #notice {
+        max-width: 1080px; margin: 0 auto 16px; display: none;
+        border: 1px solid #e5484d; border-radius: 6px; padding: 8px 12px;
+        color: #ffb4b6; font-size: 12px; white-space: pre-wrap;
+      }
+      #grid {
+        max-width: 1080px; margin: 0 auto;
+        display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px;
+      }
+      .card {
+        position: relative; cursor: pointer;
+        background: rgba(18, 40, 129, 0.45);
+        border: 1px solid #2e5bff; border-radius: 8px;
+        padding: 16px 18px 14px;
+        transition: border-color 0.15s, background 0.15s, transform 0.15s;
+      }
+      .card:hover { border-color: #7e9dff; background: rgba(18, 40, 129, 0.75); transform: translateY(-1px); }
+      .card.running { border-color: #1e9e6a; }
+      .card h2 { margin: 0; font-size: 15px; color: #eaf0ff; padding-right: 90px; }
+      .card .blurb { margin: 8px 0 12px; color: #9fb2e8; font-size: 12px; }
+      .tags { display: flex; flex-wrap: wrap; gap: 6px; }
+      .chip {
+        font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
+        color: #7e9dff; border: 1px solid rgba(126, 157, 255, 0.5);
+        border-radius: 999px; padding: 2px 9px;
+      }
+      .badge {
+        position: absolute; top: 14px; right: 16px;
+        font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
+        color: #1e9e6a;
+      }
+      .badge::before { content: "●"; margin-right: 5px; }
+      .card.starting .badge { color: #e8b43a; }
+      .card.starting .badge::before {
+        content: ""; display: inline-block; width: 8px; height: 8px;
+        border: 2px solid #e8b43a; border-top-color: transparent; border-radius: 50%;
+        animation: spin 0.8s linear infinite; vertical-align: -1px;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      .stop {
+        position: absolute; bottom: 12px; right: 14px;
+        font: inherit; font-size: 11px; color: #ffb4b6;
+        background: none; border: 1px solid #e5484d; border-radius: 4px;
+        padding: 3px 10px; cursor: pointer;
+      }
+      .stop:hover { background: rgba(229, 72, 77, 0.25); }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>traffic-sim <span class="accent">// demos</span></h1>
+      <p>One click starts the engine for that scenario (the previous run stops) and drops you into the live map.</p>
+    </header>
+    <div id="notice"></div>
+    <main id="grid"></main>
+    <script type="module" src="/src/demos.ts"></script>
+  </body>
+</html>
