@@ -25,6 +25,25 @@
 
 ## Open issues (viz, from live viewing)
 
+### WQ-0: Replay deferrals from the -pace/-store review rounds (2026-07-23)
+- **dt from registry meta, not `?dt=`** — the viz trusts a hand-copied URL param
+  (silent 0.1 default); authoritative dt lives in `RunMeta.Spec.Params.Dt`. When the
+  viz grows registry access (or via the demosrv params API, which already exposes
+  dtS), drop the URL param. Until then a stale/omitted dt on a non-0.1 scenario
+  silently scales all speeds + the congestion overlay.
+- **Pace is an unrecorded run condition** — same (scenario-hash, seed) at different
+  paces yields different traffic (client latency scales in ticks). Code-commented at
+  `maxClientPace`; cross-pace metric comparisons are INVALID. Stamp pace into the
+  registry meta when the meta schema next changes (ADR note needed).
+- **SIGINT leaves durable run meta "running"** — with `-store`, an interrupted run's
+  KV entry persists as forever-running. Demo-acceptable; finalize as aborted when
+  lifecycle matters.
+- **60-frame SnapshotBuffer cap** covers the 250 ms buffer only to ~24× wall delivery;
+  replay decimates to ~10 Hz so this is moot until someone raises decimation.
+- **Chord-vs-path speed underestimate** grows with tick-skip on curved geometry (nit;
+  speeds are a labelled client-side estimate).
+
+
 ### WQ-1: Spurious/"extra" signal heads at junctions
 Observed 2026-07-23 (screenshot 15-24-54): heads render at lane ends around the
 junction box that look like exit-side stubs / netconvert fragment ends, not true
