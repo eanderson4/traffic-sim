@@ -1,0 +1,13 @@
+ docs/kb/articles/gaps-and-roadmap.md  |   1 +
+ engine/cmd/demosrv/demos.example.json |  23 +++
+ engine/cmd/demosrv/demosrv_test.go    | 321 ++++++++++++++++++++++++++++++++++
+ engine/cmd/demosrv/geojson.go         |  75 ++++++++
+ engine/cmd/demosrv/main.go            | 272 ++++++++++++++++++++++++++++
+ engine/cmd/demosrv/registry.go        | 130 ++++++++++++++
+ engine/cmd/demosrv/supervisor.go      | 157 +++++++++++++++++
+ viz/demos.html                        |  78 +++++++++
+ viz/src/demos-core.ts                 |  35 ++++
+ viz/src/demos.ts                      | 136 ++++++++++++++
+ viz/test/demos.test.ts                |  23 +++
+ viz/vite.config.ts                    |  18 ++
+ 12 files changed, 1269 insertions(+)
