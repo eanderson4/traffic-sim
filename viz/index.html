@@ -84,6 +84,15 @@
         flex: none;
       }
       .legend-sig i { display: block; width: 6px; height: 6px; border-radius: 50%; }
+      /* Model panel — resolved controllers + sim parameters (modelpanel.ts).
+         Interactive; bottom-right above the nav control; hides unless the
+         demosrv params API answers. */
+      #model { bottom: 60px; right: 10px; pointer-events: auto; user-select: none; max-width: 360px; max-height: 62vh; overflow-y: auto; white-space: normal; }
+      #model .mp-toggle { font-weight: 700; letter-spacing: 0.08em; cursor: pointer; }
+      #model .mp-sec { margin-top: 7px; text-transform: uppercase; letter-spacing: 0.12em; font-size: 10px; color: #9fb2e8; }
+      #model .mp-row { display: flex; gap: 10px; margin-top: 2px; font-size: 11px; }
+      #model .mp-row span:first-child { color: #9fb2e8; flex: none; }
+      #model .mp-row span:last-child { margin-left: auto; text-align: right; }
     </style>
   </head>
   <body>
@@ -92,6 +101,7 @@
     <div id="inspect" class="hud"></div>
     <div id="legend" class="hud"></div>
     <div id="switcher" class="hud"></div>
+    <div id="model" class="hud"></div>
     <div id="loading"><div class="spin"></div><div id="loading-msg">loading…</div></div>
     <script type="module" src="/src/main.ts"></script>
   </body>

@@ -44,6 +44,7 @@ import { subscribeSnapshots } from "./nats-client.ts";
 import { Hud } from "./status.ts";
 import { Legend } from "./legend.ts";
 import { DemoSwitcher, demoIdFromNetUrl } from "./switcher.ts";
+import { ModelPanel } from "./modelpanel.ts";
 import { THEME, glyphByCls } from "./theme.ts";
 import { bodyImages, glyphImageId, TRACTOR_IMAGE_ID, TRAILER_IMAGE_ID, ICON_SIZE_STOPS } from "./glyphs.ts";
 import { Articulator } from "./artic.ts";
@@ -93,11 +94,11 @@ async function main(): Promise<void> {
   const hud = new Hud("status", "inspect");
   const legend = new Legend("legend");
   // In-map demo swap; hides itself when no demosrv answers (detached —
-  // the map must not wait on the probe).
-  void new DemoSwitcher(
-    document.getElementById("switcher")!,
-    demoIdFromNetUrl(cfg.networkUrl),
-  ).init();
+  // the map must not wait on the probe). The model panel (same probe
+  // discipline) shows the resolved controllers + sim parameters.
+  const demoId = demoIdFromNetUrl(cfg.networkUrl);
+  void new DemoSwitcher(document.getElementById("switcher")!, demoId).init();
+  void new ModelPanel(document.getElementById("model")!, demoId).init();
 
   // Loading overlay: page load → network fetch → ws connect → first
   // snapshot can take noticeable seconds on big demos (engine world build

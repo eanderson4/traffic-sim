@@ -179,6 +179,7 @@ func (s *server) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/demos", s.handleDemos)
 	mux.HandleFunc("GET /api/status", s.handleStatus)
 	mux.HandleFunc("POST /api/demo/{id}/start", s.handleStart)
+	mux.HandleFunc("GET /api/demo/{id}/params", s.handleParams)
 	mux.HandleFunc("POST /api/demo/stop", s.handleStop)
 	// Go's ServeMux wildcards are whole segments, so the .geojson suffix is
 	// parsed out of {file} in the handler.
