@@ -1,0 +1,3130 @@
+diff --git a/docs/kb/decisions/ADR-0014-observability-metrics.md b/docs/kb/decisions/ADR-0014-observability-metrics.md
+index 82ecf6a4901a479ba7e9489799481a11b94b10df..f3b36005555a51b3920a71f2375a6a4681738d0f 100644
+--- a/docs/kb/decisions/ADR-0014-observability-metrics.md
++++ b/docs/kb/decisions/ADR-0014-observability-metrics.md
+@@ -235,3 +235,62 @@ delay/speed/throughput numbers, with the full catalog ratified but phased.
+   finer stream granularity; the first field-calibration scenario forces
+   the detector layer; viz wants live Edie heatmaps at <900 s latency
+   (window trade-offs); queue definitions prove out against NGSIM.
++
++## Addendum (2026-07-21, M13 implementation)
++
++The metric kernel (and this addendum) lands here after ten Fable+Sol gate
++rounds (`docs/kb/raw/reviews/2026-07-21T13*`–`T16*`); the JSON file sink and
++the scenario `metrics/*.yaml` bindings land in the immediately following
++commit:
++
++- **Whole-run scoping (decision, not omission):** kernel state is NOT
++  keyframe/replay-persisted. Metrics are computed over whole runs, and
++  mid-run re-derivation is UNSUPPORTED: `NewKernel` rejects attach at any
++  tick ≠ 0, and `Observe`/`Finalize` panic on a skipped or doubled tick.
++  Replay re-derivation equality remains a regression test over whole
++  recordings.
++- **Interval conventions as implemented:** observation tick T covers
++  (T−1)·dt…T·dt, so intervals hold ticks (B, B+P] and records stamp the
++  SIM-TIME tick grid: an interval covering observations (begin, end]
++  stamps [begin, end) — BeginTick·dt…EndTick·dt converts naively to sim
++  time, with duration (EndTick − BeginTick)·dt. Horizon partials stamp
++  end = last observed tick; exact horizons yield no manufactured partial.
++  `MetricSetConfig.LastTick` (config) is inclusive; `IntervalRecord.EndTick`
++  (record) is exclusive — named differently for exactly that reason.
++- **Lane-crossing attribution:** movement attributes to the TRAVELED
++  lane(s) — integration/boundaries run before lane changes in Step, so a
++  lateral hop is an instantaneous tick-end event (its tick books to the
++  pre-hop lane). Multi-boundary chains (sub-4 m OSM internal lanes are
++  routine — I-280's minimum is 0.1 m) walk the successor chain by BFS
++  and book each intermediate lane its full length. Unresolvable or
++  ambiguous-branch cases book conservatively and count
++  `Totals.DroppedCrossings` — loud, never silent.
++- **Approximations (v1 semantics, documented in code):** despawn
++  exit-distance is exact (in-network remainder); exit-TIME uses the
++  last-observed speed (the final accel is unobservable — constant-speed
++  is the unbiased midpoint); vehicles spawned and crossed/despawned
++  within their first tick are unobservable at this layer (unreachable on
++  current nets — shortest I-280 origin lane is 13 m ≫ 4.3 m/tick — and
++  loud via `DroppedCrossings` if a net ever violates it); spawner
++  denied-entry backlog is a per-tick INTEGRATED mean-field estimate
++  (newly overdue: 1, the held vehicle — the pairing guard makes
++  first-overdue lag always 0; then += rate·dt per overdue tick, −1 per
++  injection, floored at 0 — a DemandSchedule rate change applies
++  prospectively only); expired director directives keep accrued wait
++  (wait-without-pending) and count toward `DeniedServed`.
++- **Engine alternatives deliberately not taken:** making `boundaries()`
++  cascade crossings regardless of lane index order (so S ≤ Length is a
++  real invariant) would change the CRC streams and is ADR-0005-adjacent —
++  a non-goal for M13, noted as a revisit candidate; the kernel's
++  overshoot-refund bookkeeping is exact in the meantime.
++- **SchemaVersion 1** for the metrics schemas: channels version
++  independently (the TSSG v1 precedent, ADR-0006 2026-07-20 addendum);
++  ADR-0006's "schema_version 2" bound the M4-era envelopes.
++- **The §3 contract pin lands with the NATS publisher commit**
++  (asyncapi channels + `ts-{run}-metrics` stream); the JSON file sink
++  (`simrun`/`serve -metrics-out`, schema_version 1) lands in the following
++  commit as the demo-critical path (sequencing only).
++- Six rounds' real catches before any number became decision-grade:
++  ring-wrap distance corruption, pre-placed phantom distance, despawn
++  tick accounting, interval off-by-one, hop-attribution to the wrong
++  lane, a 10× denied-backlog unit error, and the multi-boundary void.
+diff --git a/engine/director.go b/engine/director.go
+index 0cd7d90134adcb0bbc39de9ffa9b61518425285e..b45d07bab7c9bb967cd602797a433e47ec8715aa 100644
+--- a/engine/director.go
++++ b/engine/director.go
+@@ -63,9 +63,12 @@ type TickedSpawn struct {
+ 
+ // EnqueueSpawn validates a directive and buffers it for application at the
+ // next tick boundary. Unknown origin lane, a lane that is not a spawn
+-// origin, or an unknown vehicle type is rejected with a reason; the run is
+-// unaffected. Like EnqueueIntent, it must be called only from the goroutine
+-// that owns the engine, between Steps.
++// origin, an unknown vehicle type, or a RequestID already live in the queue
++// is rejected with a reason; the run is unaffected. RequestID uniqueness
++// among live entries is ENGINE-enforced here (the NATS contract layer
++// dedups first, so this only ever fires on local-enqueue misuse). Like
++// EnqueueIntent, it must be called only from the goroutine that owns the
++// engine, between Steps.
+ func (e *Engine) EnqueueSpawn(d SpawnDirective) error {
+ 	lane := e.Net.OriginByID(d.Origin)
+ 	if lane == nil {
+@@ -84,6 +87,16 @@ func (e *Engine) EnqueueSpawn(d SpawnDirective) error {
+ 	if ti < 0 {
+ 		return fmt.Errorf("unknown vehicle type %q", d.TypeName)
+ 	}
++	for _, q := range e.dirQueue {
++		if q.RequestID == d.RequestID {
++			return fmt.Errorf("duplicate spawn request id %q (already in the injection queue)", d.RequestID)
++		}
++	}
++	for _, q := range e.dirNew {
++		if q.RequestID == d.RequestID {
++			return fmt.Errorf("duplicate spawn request id %q (already buffered for this boundary)", d.RequestID)
++		}
++	}
+ 	e.dirNew = append(e.dirNew, TickedSpawn{
+ 		TypeIdx: ti, LaneIdx: lane.Index,
+ 		SpawnDirective: SpawnDirective{
+diff --git a/engine/director_test.go b/engine/director_test.go
+index 1f4135de90a4a1089403b8c08006e115520cb82a..977d1222bc439c2a66b82eb9a935a2a9d2e67b65 100644
+--- a/engine/director_test.go
++++ b/engine/director_test.go
+@@ -49,10 +49,25 @@ func TestDirectorSpawnValidation(t *testing.T) {
+ 	if err := e.EnqueueSpawn(SpawnDirective{RequestID: "ok", Origin: "A1", TypeName: "truck"}); err != nil {
+ 		t.Fatalf("valid directive rejected: %v", err)
+ 	}
++	// RequestID uniqueness among live entries is engine-enforced: the same
++	// ID while one is buffered fails loud.
++	if err := e.EnqueueSpawn(SpawnDirective{RequestID: "ok", Origin: "A1", TypeName: "truck"}); err == nil ||
++		!strings.Contains(err.Error(), "duplicate spawn request id") {
++		t.Errorf("duplicate RequestID accepted: %v", err)
++	}
+ 	e.Step()
+ 	if got := e.AppliedSpawns(); len(got) != 1 || got[0].Tick != 1 || got[0].TypeIdx != 1 {
+ 		t.Fatalf("applied spawns after boundary: %+v", got)
+ 	}
++	// …and while one is live in the queue (a not-yet-due directive).
++	if err := e.EnqueueSpawn(SpawnDirective{RequestID: "hold", Origin: "A1", TypeName: "car", EarliestTick: 1 << 40}); err != nil {
++		t.Fatalf("hold directive rejected: %v", err)
++	}
++	e.Step()
++	if err := e.EnqueueSpawn(SpawnDirective{RequestID: "hold", Origin: "A1", TypeName: "car", EarliestTick: 1 << 40}); err == nil ||
++		!strings.Contains(err.Error(), "duplicate spawn request id") {
++		t.Errorf("duplicate RequestID accepted against the live queue: %v", err)
++	}
+ }
+ 
+ // TestDirectorInjection: an unblocked directive injects at its applied tick
+diff --git a/engine/engine.go b/engine/engine.go
+index 5c675fba8f5b4345a8ac8c3222b52152a5df91cb..afb4b4a26ef71f47ee11c92abf76fcd61b12b9e9 100644
+--- a/engine/engine.go
++++ b/engine/engine.go
+@@ -171,7 +171,9 @@ func (e *Engine) AddInitialVehicle(lane *Lane, typeIdx int, s, v, f float64) *Ve
+ 	return veh
+ }
+ 
+-// Vehicles returns the live vehicles in ID order. Read-only; do not mutate.
++// Vehicles returns the live vehicles in spawn (append) order — deterministic
++// from the complete run inputs (seed, demand, recorded intents). Read-only;
++// do not mutate.
+ func (e *Engine) Vehicles() []*Vehicle { return e.order }
+ 
+ // CRC returns the rolling state CRC after the last executed tick.
+diff --git a/engine/metrics.go b/engine/metrics.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..abce240c58f53b7d97c04c7c0201107315fdfb50
+--- /dev/null
++++ b/engine/metrics.go
+@@ -0,0 +1,1228 @@
++package engine
++
++// metrics.go — the M13 metric kernel (ADR-0014): a read-only observer that
++// folds each engine tick into the two ratified primitives — per-vehicle trip
++// records and Edie lane-interval records — plus run totals. It follows the
++// XTField precedent (engine/xtfield.go): the caller drives Observe(e) once
++// per Step and Finalize(e) once at the horizon; the kernel never feeds back
++// into world state, so CRC/keyframe/replay semantics are untouched (the
++// kernel-attached-vs-free CRC equality regression test lives in
++// metrics_test.go). The normative metric definitions are ADR-0014 §3; the
++// transport sinks (NATS publisher, file sink) are separate consumers of the
++// records drained here — the kernel itself is transport-agnostic (§6).
++//
++// Determinism discipline (ADR-0005 applies to derived numbers too, ADR-0014
++// §1): vehicles are accumulated in e.Vehicles() order (spawn/append order —
++// deterministic from the seed), spawner origins and the director queue in
++// their fixed orders, and map contents are only ever emitted after sorting —
++// floats are non-associative, so no bare map iteration reaches an
++// accumulation or emission path.
++
++import (
++	"fmt"
++	"math"
++	"sort"
++)
++
++// metricStopSpeed is the ADR-0014 §3 stop pin: a vehicle is stopped in a
++// tick when v < 0.1 m/s.
++const metricStopSpeed = 0.1
++
++// MetricGroups selects which field groups a measurement set computes and
++// emits (ADR-0014 §5's metrics list). Edie is the q/k/v core; the raw sums
++// (SumDistM/SumTimeS) are always emitted — downstream seed pairing needs
++// them regardless of group selection.
++type MetricGroups struct {
++	Edie      bool
++	Occupancy bool
++	Stops     bool
++	TimeLoss  bool
++}
++
++// MetricSetConfig binds a set of element lanes to a measurement window
++// (ADR-0014 §5 concretizing ADR-0012 §5; v1 elements are flat stable lane
++// IDs only). The window is in ticks — integral multiples of the tick length
++// by construction, satisfying ADR-0014 §3's interval pin. Intervals align to
++// tick 0 offset by BeginTick: an observation at tick T covers sim time
++// (T−1)·dt … T·dt, so interval k holds the observation ticks
++// (BeginTick + k·PeriodTicks, BeginTick + (k+1)·PeriodTicks] — every full
++// interval holds exactly PeriodTicks observations — and records stamp the
++// aligned time grid [BeginTick + k·PeriodTicks, BeginTick + (k+1)·PeriodTicks).
++// Only ticks inside the window (BeginTick, LastTick] accumulate (LastTick ==
++// 0 = run horizon). Note the convention asymmetry: the config's LastTick is
++// INCLUSIVE (last accumulating tick) while IntervalRecord.EndTick is the
++// usual EXCLUSIVE time bound — different names, different bounds.
++type MetricSetConfig struct {
++	ID          string       // stable set id (unique within a KernelConfig)
++	LaneIDs     []string     // element lanes (flat stable IDs, ADR-0012 §5)
++	Groups      MetricGroups // which field groups to compute
++	BeginTick   uint64       // window start; the first accumulating tick is BeginTick+1
++	PeriodTicks uint64       // interval length in ticks
++	LastTick    uint64       // last accumulating tick (inclusive); 0 = run horizon
++}
++
++// KernelConfig is the whole measurement plan: the interval sets plus whether
++// per-vehicle trip records are emitted (ADR-0014 §5's trips switch). Run
++// totals are defined either way — they derive from accumulator state, never
++// from trip records alone (ADR-0014 §3).
++type KernelConfig struct {
++	Sets  []MetricSetConfig
++	Trips bool
++}
++
++// DefaultKernelConfig is the zero-authoring plan (ADR-0014 §5): one set with
++// every network lane (sorted IDs), all four field groups at the 900 s window
++// — derived from the tick length (900/dt ticks; 9000 at the validated
++// dt = 0.1 s, ADR-0005) — plus trip records.
++func DefaultKernelConfig(net *Network, dt float64) KernelConfig {
++	ids := make([]string, 0, len(net.Lanes))
++	for _, l := range net.Lanes {
++		ids = append(ids, l.ID)
++	}
++	sort.Strings(ids)
++	return KernelConfig{
++		Sets: []MetricSetConfig{{
++			ID:          "default",
++			LaneIDs:     ids,
++			Groups:      MetricGroups{Edie: true, Occupancy: true, Stops: true, TimeLoss: true},
++			PeriodTicks: uint64(math.Round(900 / dt)),
++		}},
++		Trips: true,
++	}
++}
++
++// IntervalRecord is the lane-interval primitive (ADR-0014 §2): one record
++// per (set element, closed interval), self-contained aggregates (never
++// cumulative deltas, §4). Q = SumDistM/(L·T) veh/s, K = SumTimeS/(L·T)
++// veh/m, V = Q/K m/s — the Edie space-mean speed over the cell, with q = k·v
++// holding identically; V is nil when SumTimeS == 0 (omitted, never
++// zero-filled, §2). ALL group fields are pointers, nil when their field
++// group is off — "not computed" is never confusable with a genuine zero.
++//
++// BeginTick/EndTick stamp the SIM-TIME tick grid as the half-open range
++// [BeginTick, EndTick): the interval covers observation ticks (BeginTick,
++// EndTick] — observation tick T covers sim time (T−1)·dt … T·dt — so the
++// covered sim time is exactly BeginTick·dt … EndTick·dt and the duration is
++// (EndTick − BeginTick)·dt. A final interval truncated by the horizon (or
++// by the set's LastTick) is emitted flagged Partial with its actual bounds
++// (§3); comparison tooling drops partials.
++type IntervalRecord struct {
++	SchemaVersion int
++	SetID         string
++	LaneID        string
++	BeginTick     uint64
++	EndTick       uint64 // exclusive tick bound
++	Partial       bool
++	SumDistM      float64  // Σ distance over vehicle-ticks present (m)
++	SumTimeS      float64  // Σ time over vehicle-ticks present (s)
++	Q             *float64 // veh/s; nil when the edie group is off
++	K             *float64 // veh/m; nil when the edie group is off
++	V             *float64 // m/s; nil when edie is off OR SumTimeS == 0
++	Occupancy     *float64 // time-weighted space fraction (§3); nil when off
++	Stops         *int     // stop-episode starts; nil when the stops group is off
++	TimeLossS     *float64 // accumulated time-loss; nil when the time_loss group is off
++}
++
++// TripRecord is the per-vehicle primitive (ADR-0014 §2): emitted when a
++// vehicle leaves the network (Completed = true) and, flagged Completed =
++// false with ExitTick = horizon, for every vehicle still in-network at the
++// horizon — entered-but-unfinished vehicles are precisely the worst-served,
++// and omitting them is the survivorship bias §3 forbids. TimeLossS is SUMO's
++// timeLoss: per tick, Δt − distance_moved/v_desired, negative contributions
++// clamped to 0, with v_desired = speedFactor × min(vType.v0,
++// lane.speedLimit) (§3). DistanceM includes the despawn tick's exit segment
++// (last-seen position to the lane end).
++type TripRecord struct {
++	SchemaVersion int
++	VehicleID     uint64
++	TypeName      string
++	OriginLaneID  string // first-seen lane
++	DestLaneID    string // last-seen lane
++	EntryTick     uint64 // first observation tick
++	ExitTick      uint64 // despawn tick, or the horizon for partials
++	DistanceM     float64
++	TimeLossS     float64
++	Stops         int     // stop-episode starts (§3)
++	StoppedTimeS  float64 // total stopped time (§3)
++	Completed     bool    // false = horizon partial
++}
++
++// LaneDenied is the denied-entry (latent) demand of one origin lane
++// (ADR-0014 §3): accumulated wait of vehicles requested but not yet
++// injected, plus the demand still pending at the horizon. Pending is the
++// mean-field backlog estimate: the spawner holds ONE pending vehicle per
++// origin, but schedule lag implies lag × dt × rate requested
++// vehicles (the formula, deterministic, includes the held vehicle — it is
++// ≥ 1 while the origin is overdue). Director-queue entries count singly
++// (each IS one requested vehicle).
++type LaneDenied struct {
++	WaitS   float64
++	Pending float64
++	// Served counts vehicles that waited ≥ 1 tick past their
++	// scheduled/request tick and then left the pending state (injected or
++	// expired) — ADR-0014 §3's "denied-entry count".
++	Served int
++}
++
++// Totals is the run-total view (ADR-0014 §3): derived from the kernel's
++// accumulators over ALL observed vehicle-ticks — unfinished trips contribute
++// — never from completed-trip records alone. DeniedByLane carries per-origin
++// denied-entry demand; DeniedWaitS/DeniedPending are the network-wide sums.
++// DroppedCrossings counts lane changes no successor chain could attribute
++// (genuinely disjoint — the defensive fallback books them, but the
++// undercount risk is surfaced here, never silent).
++type Totals struct {
++	CompletedTrips  int
++	ActiveAtHorizon int
++	VMT             float64 // Σ distance over all observed vehicle-ticks (m)
++	VHT             float64 // Σ time over all observed vehicle-ticks (s)
++	TotalTimeLossS  float64
++	MeanTimeLossS   float64 // TotalTimeLossS per trip (completed + tracked); 0 when none
++	DeniedWaitS     float64
++	DeniedPending   float64
++	DeniedServed    int // vehicles that waited ≥1 tick, then injected/expired (ADR-0014 §3)
++	// DroppedCrossings mixes two units (split when the NATS publisher pins
++	// the schema): conservative-booking events (~meters of misattributed
++	// travel) and unobserved-vehicle estimates (whole invisible trips).
++	// Mid-run values are provisional: pending gap IDs reconcile on first
++	// observation and at Finalize, so a polling consumer may see a gap that
++	// later resolves.
++	DroppedCrossings int
++	// DeniedByLane is a lookup map: consumers iterating it for emission
++	// must sort the keys first (Go map order is nondeterministic).
++	DeniedByLane map[string]LaneDenied
++}
++
++// Kernel is the M13 metric kernel: a caller-driven, read-only observer over
++// engine state. Construct with NewKernel, call Observe after every Step and
++// Finalize once at the horizon; pull records with DrainIntervals/DrainTrips
++// and the run view with Totals.
++type Kernel struct {
++	dt    float64
++	trips bool
++	sets  []*metricSet
++
++	last    map[uint64]mLastObs   // vehicle ID → previous observation
++	tstates map[uint64]*tripState // vehicle ID → open trip accumulation
++
++	pendIntervals []IntervalRecord // closed since the last drain
++	pendTrips     []TripRecord     // completed since the last drain
++
++	// Run-total accumulators (ADR-0014 §3). VMT/VHT/TotalTimeLossS fold
++	// every observed vehicle-tick once, network-wide, independent of set
++	// windows — interval records are per-set views over the same per-tick
++	// accounting.
++	vmt, vht, timeLoss float64
++	completedTrips     int
++	activeAtHorizon    int
++	finalized          bool
++	observed           bool   // an Observe has landed (pairing guard)
++	lastTick           uint64 // last observed tick (pairing guard)
++	maxFirstSeenID     uint64 // highest first-observed vehicle ID (invisible-gap detection)
++	// pendingGaps holds vehicle IDs skipped by the first-observation
++	// sequence but not yet accounted: an ID leaving the set on its first
++	// observation was just a late-spawning pending entry (jittered
++	// multi-origin schedules invert injection order routinely); IDs still
++	// in the set are invisible-vehicle estimates (reported in Totals) until
++	// Finalize reconciles them against live pending IDs.
++	pendingGaps      map[uint64]bool
++	seenIDs          map[uint64]bool // every vehicle ID ever first-observed (exact invisible reconciliation)
++	droppedCrossings int
++	deniedWait       map[string]float64 // origin lane ID → accumulated wait (veh·s)
++	deniedPending    map[string]float64 // origin lane ID → backlog estimate at horizon
++	deniedServed     map[string]int     // origin lane ID → waited ≥1 tick, then injected/expired
++	spOverdue        map[string]bool    // origin lane ID → was overdue last tick
++	spPend           map[string]uint64  // origin lane ID → last-seen pending vehicle ID
++	spBacklog        map[string]float64 // origin lane ID → integrated denied backlog (veh)
++	dirDue           map[string]string  // due director request ID → lane ID (last tick; RequestID uniqueness among live entries is engine-enforced, EnqueueSpawn)
++}
++
++// mLastObs is the previous tick's observation of one vehicle. Speed, type,
++// and desired-speed factor ride along so the despawn tick's exit segment can
++// be accounted without the vehicle (which is gone by then).
++type mLastObs struct {
++	lane    *Lane
++	s       float64
++	v       float64      // speed at that observation (exit-time estimate)
++	vt      *VehicleType // length + v0 for the despawn-tick accounting
++	f       float64      // per-driver desired-speed factor (v0eff INPUT, not v0eff)
++	stopped bool         // v < metricStopSpeed at that observation
++}
++
++// tripState is the open per-vehicle trip accumulation.
++type tripState struct {
++	typeName  string
++	origin    string
++	dest      string
++	entryTick uint64
++	dist      float64
++	timeLoss  float64
++	stops     int
++	stoppedS  float64
++}
++
++// laneAccum is the open-interval accumulator for one (set, lane).
++type laneAccum struct {
++	sumDist     float64
++	sumTime     float64
++	sumOcc      float64 // Σ time × vehicle length (m·s)
++	sumTimeLoss float64
++	stopStarts  int
++}
++
++// metricSet is one resolved measurement set with a single open interval.
++type metricSet struct {
++	cfg       MetricSetConfig
++	lanes     []*Lane               // element lanes in config order
++	acc       map[string]*laneAccum // lane ID → open-interval accumulator
++	openFirst uint64                // first observation tick of the open interval
++	openLast  uint64                // last observation tick once fully covered
++}
++
++// NewKernel builds a kernel over e's network for the given plan. Attach
++// before the first Step (enforced — a mid-run attach would book placed
++// positions as traveled distance and mis-seed trips), and after any pre-run
++// placement: construction is the LAST pre-run mutation point — a vehicle
++// added via AddInitialVehicle AFTER NewKernel is treated as a mid-run spawn
++// and its placement books as traveled distance. Vehicles already in the
++// network are seeded as last-known observations AND as open trips (entry
++// tick 0 — they entered before the kernel attached), so their initial
++// placement is never booked as traveled distance and their trip records
++// share one semantics with mid-run-seen vehicles. Unknown or duplicate lane
++// IDs, empty/duplicate set IDs, zero periods, a non-positive-length element
++// lane, and a LastTick not after BeginTick fail loud at construction (the
++// strict fence of ADR-0014 §5).
++func NewKernel(e *Engine, cfg KernelConfig) (*Kernel, error) {
++	if e.Tick != 0 {
++		return nil, fmt.Errorf("metrics: attach before the first Step (engine already at tick %d)", e.Tick)
++	}
++	k := &Kernel{
++		dt:            e.Params.Dt,
++		trips:         cfg.Trips,
++		last:          map[uint64]mLastObs{},
++		tstates:       map[uint64]*tripState{},
++		pendingGaps:   map[uint64]bool{},
++		seenIDs:       map[uint64]bool{},
++		deniedWait:    map[string]float64{},
++		deniedPending: map[string]float64{},
++		deniedServed:  map[string]int{},
++		spOverdue:     map[string]bool{},
++		spPend:        map[string]uint64{},
++		spBacklog:     map[string]float64{},
++		dirDue:        map[string]string{},
++	}
++	seen := map[string]bool{}
++	for i := range cfg.Sets {
++		sc := cfg.Sets[i]
++		if sc.ID == "" {
++			return nil, fmt.Errorf("metrics: set %d: empty id", i)
++		}
++		if seen[sc.ID] {
++			return nil, fmt.Errorf("metrics: duplicate set id %q", sc.ID)
++		}
++		seen[sc.ID] = true
++		if sc.PeriodTicks == 0 {
++			return nil, fmt.Errorf("metrics: set %q: zero period", sc.ID)
++		}
++		if sc.LastTick > 0 && sc.LastTick <= sc.BeginTick {
++			return nil, fmt.Errorf("metrics: set %q: last tick %d not after begin tick %d", sc.ID, sc.LastTick, sc.BeginTick)
++		}
++		s := &metricSet{
++			cfg:       sc,
++			acc:       map[string]*laneAccum{},
++			openFirst: sc.BeginTick + 1,
++			openLast:  sc.BeginTick + sc.PeriodTicks,
++		}
++		seenLanes := map[string]bool{}
++		for _, id := range sc.LaneIDs {
++			l := e.Net.LaneByID(id)
++			if l == nil {
++				return nil, fmt.Errorf("metrics: set %q: unknown lane %q", sc.ID, id)
++			}
++			if seenLanes[id] {
++				return nil, fmt.Errorf("metrics: set %q: duplicate lane %q", sc.ID, id)
++			}
++			seenLanes[id] = true
++			if l.Length <= 0 {
++				return nil, fmt.Errorf("metrics: set %q: lane %q has non-positive length %v", sc.ID, id, l.Length)
++			}
++			s.lanes = append(s.lanes, l)
++			s.acc[id] = &laneAccum{}
++		}
++		k.sets = append(k.sets, s)
++	}
++	// Seed the denied-demand trackers from spawner state (spawner.init has
++	// already run): without the pending-ID seed the first Observe reads a
++	// phantom injection and decrements a backlog that was never built.
++	if e.spawner != nil {
++		for i := range e.spawner.origins {
++			st := &e.spawner.origins[i]
++			if st.pend != nil {
++				k.spPend[st.lane.ID] = st.pend.ID
++				k.spOverdue[st.lane.ID] = st.tick <= e.Tick
++			}
++		}
++	}
++	for _, v := range e.Vehicles() {
++		k.last[v.ID] = mLastObs{lane: v.Lane, s: v.S, v: v.V, vt: v.Type, f: v.F, stopped: v.V < metricStopSpeed}
++		k.seenIDs[v.ID] = true
++		if v.ID > k.maxFirstSeenID {
++			k.maxFirstSeenID = v.ID // pre-placed IDs seed the gap baseline
++		}
++		if k.trips {
++			k.tstates[v.ID] = &tripState{typeName: v.Type.Name, origin: v.Lane.ID, dest: v.Lane.ID, entryTick: 0}
++		}
++	}
++	// Seeded `stopped` pins the v1 stop semantics: stop counts are episode
++	// STARTS that begin in-run — a vehicle stopped at construction accrues
++	// stopped TIME but no episode start until it moves and re-stops (the
++	// pre-run start of its current episode is unobservable).
++	return k, nil
++}
++
++// Observe folds one engine tick into the kernel. Call once per Step, after
++// the Step — the observation at tick T covers sim time (T−1)·dt … T·dt.
++func (k *Kernel) Observe(e *Engine) {
++	// Pairing guard: observations must be consecutive from tick 1 — a
++	// skipped or doubled tick mis-books despawns and crossings silently.
++	switch {
++	case k.finalized:
++		panic("metrics: Observe called after Finalize")
++	case !k.observed && e.Tick != 1:
++		panic(fmt.Sprintf("metrics: first Observe at tick %d, want 1 (attach and observe from the first Step)", e.Tick))
++	case k.observed && e.Tick != k.lastTick+1:
++		panic(fmt.Sprintf("metrics: Observe at tick %d after tick %d — observations must be consecutive", e.Tick, k.lastTick))
++	}
++	k.observed, k.lastTick = true, e.Tick
++	dt := k.dt
++	tick := e.Tick
++	cur := make(map[uint64]mLastObs, len(k.last)+4)
++	for _, v := range e.Vehicles() {
++		lane := v.Lane
++		prev, seen := k.last[v.ID]
++		var ts *tripState
++		if k.trips {
++			ts = k.tripFor(v, tick, lane)
++		}
++		var tickLoss float64 // this tick's time-loss: one clamp per vehicle-tick (ADR §3)
++		switch {
++		case !seen:
++			// First observation: a genuine mid-run spawn (S = 0 injection in
++			// phase 1) that has already moved — count dist = S, time = dt.
++			// (Vehicles present at NewKernel time are pre-seeded in k.last
++			// and never land here.) A vehicle first observed OFF any origin
++			// lane spawned AND crossed a boundary within its spawn tick —
++			// the traveled chain is unobservable post-hoc, so the tick books
++			// wholly to the seen lane and DroppedCrossings makes it loud.
++			// Current networks can't reach this: the shortest origin lane
++			// (I-280: 13.02 m) far exceeds one tick's travel (≤ ~4.3 m).
++			if e.Net.OriginByID(lane.ID) == nil {
++				k.droppedCrossings++
++			}
++			// Invisible-vehicle detection: vehicle IDs are sequential with
++			// pre-assigned IDs on pending entries, so a spawn+despawn within
++			// one tick leaves a GAP before this ID. Gaps go into pendingGaps
++			// for reconciliation — a late-spawning pending entry (jittered
++			// multi-origin schedules invert injection order routinely)
++			// removes itself on ITS first observation; what remains is the
++			// invisible-vehicle estimate. DETECTS but cannot account the
++			// invisible vehicles — loud beats silent.
++			if v.ID > k.maxFirstSeenID+1 {
++				for id := k.maxFirstSeenID + 1; id < v.ID; id++ {
++					k.pendingGaps[id] = true
++				}
++			}
++			delete(k.pendingGaps, v.ID)
++			k.seenIDs[v.ID] = true
++			if v.ID > k.maxFirstSeenID {
++				k.maxFirstSeenID = v.ID
++			}
++			k.addSegment(lane, v.S, dt, tick)
++			tickLoss = k.addTimeLoss(lane, dt-v.S/v.v0eff(lane), tick)
++			k.addOccupancy(lane, dt*v.Type.Length, tick)
++			if ts != nil {
++				ts.dist += v.S
++			}
++		case prev.lane == lane:
++			d := v.S - prev.s
++			if d < 0 {
++				// Self-successor wrap (ring): boundaries() wrapped S by the
++				// lane length with the lane pointer unchanged. V ≥ 0
++				// always, so a same-lane decrease is exactly a wrap.
++				d = lane.Length - prev.s + v.S
++				if d < 0 {
++					d = 0
++				}
++			}
++			k.addSegment(lane, d, dt, tick)
++			// Single-segment degenerate of the ADR §3 pin: the one per-tick
++			// clamp IS the per-segment clamp when there is one segment.
++			tickLoss = k.addTimeLoss(lane, dt-d/v.v0eff(lane), tick)
++			k.addOccupancy(lane, dt*v.Type.Length, tick)
++			if ts != nil {
++				ts.dist += d
++			}
++		default:
++			// The lane changed between observations. Step integrates
++			// movement and boundary crossings BEFORE applying lane changes
++			// (engine.go Step phases 4–6), so a lateral hop is an
++			// instantaneous boundary event at the tick end: the tick's
++			// travel happened on the TRAVELED lane, not necessarily the
++			// final one. Assign-where-traveled (ADR-0014 §3) pins
++			// distance/time/time-loss/occupancy there. The observation
++			// baseline still records (cur, S) — next tick's travel starts
++			// on cur.
++			if prev.lane.Left == lane || prev.lane.Right == lane {
++				// Pure lateral hop: the whole tick was traveled on the
++				// pre-hop lane (S is preserved across the hop, mobil.go).
++				d := v.S - prev.s
++				if d < 0 {
++					// Defensive only: wrap+hop in one tick — unreachable
++					// today (the only self-successor net, the ring, is
++					// single-lane and has no laterals to hop to).
++					d = 0
++				}
++				k.addSegment(prev.lane, d, dt, tick)
++				// Single-segment degenerate of the ADR §3 pin: the one
++				// per-tick clamp IS the per-segment clamp here.
++				tickLoss = k.addTimeLoss(prev.lane, dt-d/v.v0eff(prev.lane), tick)
++				k.addOccupancy(prev.lane, dt*v.Type.Length, tick)
++				if ts != nil {
++					ts.dist += d
++				}
++			} else {
++				// Boundary crossing — possibly several on a net with
++				// sub-vehicle-length internal lanes (netimport/OSM),
++				// possibly followed by a same-tick hop.
++				tickLoss = k.splitTick(prev.lane, lane, prev.s, v, dt, tick, ts)
++			}
++		}
++		k.timeLoss += tickLoss
++		if ts != nil {
++			ts.timeLoss += tickLoss
++		}
++		// Stops (§3): an episode is a maximal run of consecutive stopped
++		// ticks; count episode starts, attributed to the lane+interval
++		// containing the first stopped tick. Note the asymmetry: the stop
++		// attributes to the END-of-tick lane while the tick's distance/time
++		// follow the traveled lane(s) — the episode is observed there.
++		stopped := v.V < metricStopSpeed
++		if stopped {
++			if ts != nil {
++				ts.stoppedS += dt
++			}
++			if !seen || !prev.stopped {
++				k.addStopStart(lane, tick)
++				if ts != nil {
++					ts.stops++
++				}
++			}
++		}
++		cur[v.ID] = mLastObs{lane: lane, s: v.S, v: v.V, vt: v.Type, f: v.F, stopped: stopped}
++		if ts != nil {
++			ts.dest = lane.ID
++		}
++	}
++
++	// Despawns: IDs seen last tick but gone now left the network this tick.
++	// (A vehicle spawned AND despawned within one tick never appears in
++	// k.last at all — it is invisible to per-tick observation entirely.
++	// Inherent to the observer model, not fixable at this layer. Likewise a
++	// vehicle spawned and crossing to a successor within its first tick is
++	// attributed wholly to the successor — the origin lane of an injection
++	// isn't visible post-hoc; no current network has origin lanes short
++	// enough for either case.)
++	var gone []uint64
++	for id := range k.last {
++		if _, ok := cur[id]; !ok {
++			gone = append(gone, id)
++		}
++	}
++	sort.Slice(gone, func(i, j int) bool { return gone[i] < gone[j] })
++	for _, id := range gone {
++		prev := k.last[id]
++		// Exit-tick travel (exit lanes despawn past Length): the vehicle
++		// drove from its last-seen position to the network edge this tick.
++		// When the last-seen lane is not an exit lane, the vehicle crossed
++		// at least one boundary this tick (netimport lane orderings can
++		// reprocess a just-entered exit lane within one boundaries() pass);
++		// exitShares books the full chain. The in-network distance is exact
++		// (despawn happens past the exit lane's Length, so it is the lane's
++		// full length); the in-lane time is estimated from the last
++		// observed speed (documented approximation: no sub-tick speed
++		// profile is observable).
++		shares, exitLane, ok, ambiguous := exitShares(prev)
++		if !ok || ambiguous {
++			k.droppedCrossings++
++		}
++		// The time estimate rides the POSITIVE distance only — a negative
++		// (refund) share is a correction of last tick's booking, not travel
++		// this tick. D keeps the full sum for the trip record.
++		var D, dPos float64
++		for _, sh := range shares {
++			D += sh.d
++			if sh.d > 0 {
++				dPos += sh.d
++			}
++		}
++		t := dt
++		if prev.v > 0 && dPos/prev.v < t {
++			t = dPos / prev.v
++		}
++		if t < 0 {
++			t = 0 // pure overshoot refund: distance-only, zero time
++		}
++		tl := k.accountShares(shares, prev.vt.Length, t,
++			func(l *Lane) float64 { return v0effOf(prev.vt, prev.f, l) }, tick)
++		k.timeLoss += tl
++		k.completedTrips++
++		if k.trips {
++			ts := k.tstates[id]
++			if ts == nil {
++				// Defensive nil-guard: a vehicle in k.last without a trip
++				// accumulation (shouldn't happen — NewKernel seeds both).
++				// Reconstruct from the seeded observation — origin = dest =
++				// the exit lane, entryTick = 0 (entered before the kernel
++				// attached). No stop crediting here: both despawn paths
++				// share the same exit-tick stop semantics — the final
++				// fraction is unobservable.
++				ts = &tripState{typeName: prev.vt.Name, origin: prev.lane.ID, dest: prev.lane.ID}
++			}
++			if exitLane != nil {
++				ts.dest = exitLane.ID
++			}
++			ts.dist += D
++			ts.timeLoss += tl
++			k.emitTrip(id, ts, tick, true)
++			delete(k.tstates, id)
++		}
++	}
++	k.last = cur
++
++	// Denied-entry (latent) demand (§3): vehicles requested but not yet
++	// injected accrue wait per origin lane — spawner origins whose scheduled
++	// tick has passed (hold-and-retry, spawn.go) and director queue entries
++	// past their earliest tick (future directives are scheduled demand, not
++	// denied). The spawner holds ONE pending vehicle per origin, but the
++	// schedule lag implies a backlog, INTEGRATED per tick so a DemandSchedule
++	// rate change applies prospectively only (never revalues already-accrued
++	// latent demand): when an origin first becomes overdue, backlog =
++	// max(1, lag × dt × rate) — the floor 1 is the held vehicle; each
++	// subsequent overdue tick adds rate × dt read at THAT tick; each
++	// injection (st.pend's pre-assigned ID changes) subtracts 1, floored at
++	// 0 — and while the backlog sits at 0 the origin accrues no wait even
++	// if still technically overdue (service has outrun integrated
++	// arrivals). The origin accrues dt × backlog per overdue tick. Director
++	// entries count singly. DeniedServed counts vehicles that waited ≥ 1
++	// tick past their scheduled/request tick and then left the pending
++	// state (injected or expired) — spawner: the origin was overdue and its
++	// held vehicle injected (the float backlog excess is estimation and is
++	// NOT counted); director: a due request ID that leaves the queue. A
++	// directive that expires after DirectorSpawnHoldTicks keeps the wait it
++	// accrued while held — it WAS denied — and counts as served (expired):
++	// dropped demand shows up as wait without pending.
++	if e.spawner != nil {
++		for i := range e.spawner.origins {
++			st := &e.spawner.origins[i]
++			if st.pend != nil {
++				// Service BEFORE accrual: an overdue vehicle that injects
++				// this tick does not accrue a further tick of wait — the
++				// tick's accrual below uses the post-service backlog.
++				if st.pend.ID != k.spPend[st.lane.ID] {
++					if k.spOverdue[st.lane.ID] {
++						k.deniedServed[st.lane.ID]++
++					}
++					if b := k.spBacklog[st.lane.ID] - 1; b > 0 {
++						k.spBacklog[st.lane.ID] = b
++					} else {
++						k.spBacklog[st.lane.ID] = 0
++					}
++					k.spPend[st.lane.ID] = st.pend.ID
++				}
++			}
++			overdue := st.pend != nil && st.tick <= tick
++			if overdue {
++				if k.spOverdue[st.lane.ID] {
++					k.spBacklog[st.lane.ID] += st.rate * dt
++				} else {
++					// Newly overdue: the backlog starts at the held vehicle.
++					// (The pairing guard means an origin first goes overdue
++					// exactly at its scheduled tick — lag is always 0, so
++					// there is no lag term to seed; integration does the
++					// real work from here.)
++					k.spBacklog[st.lane.ID] = 1
++				}
++				k.deniedWait[st.lane.ID] += dt * k.spBacklog[st.lane.ID]
++			}
++			k.spOverdue[st.lane.ID] = overdue
++		}
++	}
++	dueNow := make(map[string]string, len(k.dirDue))
++	for _, d := range e.dirQueue {
++		if d.EarliestTick <= tick {
++			laneID := e.Net.Lanes[d.LaneIdx].ID
++			k.deniedWait[laneID] += dt
++			dueNow[d.RequestID] = laneID
++		}
++	}
++	var servedIDs []string
++	for id := range k.dirDue {
++		if _, ok := dueNow[id]; !ok {
++			servedIDs = append(servedIDs, id)
++		}
++	}
++	sort.Strings(servedIDs)
++	for _, id := range servedIDs {
++		k.deniedServed[k.dirDue[id]]++
++	}
++	k.dirDue = dueNow
++
++	// Close intervals whose last observation tick has been seen.
++	for _, s := range k.sets {
++		s.closeDue(k, tick)
++	}
++}
++
++// Finalize closes the run at the horizon (ADR-0014 §2/§3): every still-open
++// interval is emitted flagged Partial with its actual bounds, every vehicle
++// still in-network gets a horizon-partial trip record (Completed = false,
++// ExitTick = horizon), and the denied-demand pending counts are stamped.
++// Call once, after the last Step/Observe; a second call is a no-op. The
++// pairing guard panics if Steps happened between the last Observe and this
++// call — they would silently stretch the final interval and mis-stamp trip
++// exit ticks.
++func (k *Kernel) Finalize(e *Engine) {
++	if k.finalized {
++		return
++	}
++	if k.observed && e.Tick != k.lastTick {
++		panic(fmt.Sprintf("metrics: Finalize at tick %d but the last Observe was tick %d — observe every Step before finalizing", e.Tick, k.lastTick))
++	}
++	if !k.observed && e.Tick != 0 {
++		panic(fmt.Sprintf("metrics: Finalize at tick %d with no observations", e.Tick))
++	}
++	k.finalized = true
++	tick := e.Tick
++	for _, s := range k.sets {
++		end := tick // the horizon is the last covered observation tick
++		if s.cfg.LastTick > 0 && s.cfg.LastTick < end {
++			end = s.cfg.LastTick
++		}
++		if s.openFirst <= end {
++			// Time-aligned stamp (see closeDue): [openFirst−1, end).
++			s.closeInterval(k, s.openFirst-1, end, true)
++			s.openFirst = end + 1
++		}
++	}
++	if k.trips {
++		ids := make([]uint64, 0, len(k.tstates))
++		for id := range k.tstates {
++			ids = append(ids, id)
++		}
++		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
++		for _, id := range ids {
++			k.emitTrip(id, k.tstates[id], tick, false)
++			delete(k.tstates, id)
++		}
++	}
++	k.activeAtHorizon = len(k.last)
++	pending := map[uint64]bool{}
++	if e.spawner != nil {
++		for i := range e.spawner.origins {
++			st := &e.spawner.origins[i]
++			if st.pend != nil && st.tick <= tick {
++				// Horizon pending = the integrated backlog estimate.
++				k.deniedPending[st.lane.ID] += k.spBacklog[st.lane.ID]
++			}
++			if st.pend != nil {
++				// An ID still pending at the horizon is a real future
++				// vehicle, never an invisible one. (Director directives
++				// carry no pre-assigned vehicle IDs — nothing to exclude.)
++				pending[st.pend.ID] = true
++				delete(k.pendingGaps, st.pend.ID)
++			}
++		}
++	}
++	// Exact invisible-vehicle reconciliation (the kernel is in-package):
++	// vehicle IDs are issued sequentially (newVehicle), so every issued
++	// but never-first-observed, not-pending ID at the horizon is an
++	// invisible same-tick vehicle — including trailing ones the mid-run
++	// gap heuristic can't see (no later high ID followed them). The
++	// heuristic set is a subset of the exact count, so the counter takes
++	// the exact total and the set retires.
++	exact := 0
++	for id := uint64(1); id < e.nextID; id++ {
++		if !k.seenIDs[id] && !pending[id] {
++			exact++
++		}
++	}
++	k.droppedCrossings += exact
++	k.pendingGaps = map[uint64]bool{}
++	for _, d := range e.dirQueue {
++		if d.EarliestTick <= tick {
++			k.deniedPending[e.Net.Lanes[d.LaneIdx].ID]++
++		}
++	}
++}
++
++// DrainIntervals returns the interval records closed since the last drain,
++// sorted by (set id, lane id, begin tick), and clears the pending buffer.
++// Totals are accumulator reads and are unaffected by drains.
++func (k *Kernel) DrainIntervals() []IntervalRecord {
++	recs := k.pendIntervals
++	k.pendIntervals = nil
++	sort.Slice(recs, func(i, j int) bool {
++		a, b := recs[i], recs[j]
++		if a.SetID != b.SetID {
++			return a.SetID < b.SetID
++		}
++		if a.LaneID != b.LaneID {
++			return a.LaneID < b.LaneID
++		}
++		return a.BeginTick < b.BeginTick
++	})
++	return recs
++}
++
++// DrainTrips returns the trip records completed (or horizon-closed) since
++// the last drain, sorted by (exit tick, vehicle id), and clears the pending
++// buffer.
++func (k *Kernel) DrainTrips() []TripRecord {
++	recs := k.pendTrips
++	k.pendTrips = nil
++	sort.Slice(recs, func(i, j int) bool {
++		a, b := recs[i], recs[j]
++		if a.ExitTick != b.ExitTick {
++			return a.ExitTick < b.ExitTick
++		}
++		return a.VehicleID < b.VehicleID
++	})
++	return recs
++}
++
++// Totals returns the run totals (ADR-0014 §3) as a pure read of the
++// accumulators — drains and record emission do not affect it. MeanTimeLossS
++// is the total time-loss per trip (completed plus currently tracked), so it
++// stays defined when trip-record emission is off.
++func (k *Kernel) Totals() Totals {
++	t := Totals{
++		CompletedTrips:   k.completedTrips,
++		ActiveAtHorizon:  k.activeAtHorizon,
++		VMT:              k.vmt,
++		VHT:              k.vht,
++		TotalTimeLossS:   k.timeLoss,
++		DroppedCrossings: k.droppedCrossings + len(k.pendingGaps),
++		DeniedByLane:     map[string]LaneDenied{},
++	}
++	if n := k.completedTrips + len(k.last); n > 0 {
++		t.MeanTimeLossS = k.timeLoss / float64(n)
++	}
++	ids := make([]string, 0, len(k.deniedWait)+len(k.deniedPending)+len(k.deniedServed))
++	seenIDs := map[string]bool{}
++	for id := range k.deniedWait {
++		seenIDs[id] = true
++	}
++	for id := range k.deniedPending {
++		seenIDs[id] = true
++	}
++	for id := range k.deniedServed {
++		seenIDs[id] = true
++	}
++	for id := range seenIDs {
++		ids = append(ids, id)
++	}
++	sort.Strings(ids)
++	for _, id := range ids {
++		ld := LaneDenied{WaitS: k.deniedWait[id], Pending: k.deniedPending[id], Served: k.deniedServed[id]}
++		t.DeniedByLane[id] = ld
++		t.DeniedWaitS += ld.WaitS
++		t.DeniedPending += ld.Pending
++		t.DeniedServed += ld.Served
++	}
++	return t
++}
++
++// tripFor returns the open trip accumulation for v, creating it at the first
++// observation.
++func (k *Kernel) tripFor(v *Vehicle, tick uint64, lane *Lane) *tripState {
++	ts, ok := k.tstates[v.ID]
++	if !ok {
++		ts = &tripState{typeName: v.Type.Name, origin: lane.ID, entryTick: tick}
++		k.tstates[v.ID] = ts
++	}
++	return ts
++}
++
++// addSegment folds one (distance, time) segment on lane into the run totals
++// and every set accumulator containing that lane at tick.
++func (k *Kernel) addSegment(lane *Lane, dist, tim float64, tick uint64) {
++	k.vmt += dist
++	k.vht += tim
++	for _, s := range k.sets {
++		if acc := s.accumFor(lane.ID, tick); acc != nil {
++			acc.sumDist += dist
++			acc.sumTime += tim
++		}
++	}
++}
++
++// addTimeLoss attributes one lane's time-loss share for this tick to that
++// lane's interval accumulators (assign-where-it-occurs, ADR-0014 §3) and
++// returns it. Non-positive shares attribute nothing; the !(tl > 0) form also
++// swallows a NaN (e.g. a degenerate v0eff == 0), so one can never poison the
++// accumulators.
++func (k *Kernel) addTimeLoss(lane *Lane, tl float64, tick uint64) float64 {
++	if !(tl > 0) {
++		return 0
++	}
++	for _, s := range k.sets {
++		if acc := s.accumFor(lane.ID, tick); acc != nil {
++			acc.sumTimeLoss += tl
++		}
++	}
++	return tl
++}
++
++// addOccupancy attributes a vehicle's presence (time × length) to lane.
++func (k *Kernel) addOccupancy(lane *Lane, occ float64, tick uint64) {
++	for _, s := range k.sets {
++		if acc := s.accumFor(lane.ID, tick); acc != nil {
++			acc.sumOcc += occ
++		}
++	}
++}
++
++func (k *Kernel) addStopStart(lane *Lane, tick uint64) {
++	for _, s := range k.sets {
++		if acc := s.accumFor(lane.ID, tick); acc != nil {
++			acc.stopStarts++
++		}
++	}
++}
++
++// splitTick accounts a tick in which the vehicle crossed at least one
++// lane boundary — on netimport/OSM networks with sub-vehicle-length
++// internal lanes it may have traversed several (prev → mid → … → arrival).
++// crossedChain resolves the traveled chain; the caller's trip accumulates
++// the total. Distance books: prev.Length − prevS (clamped ≥ 0) to prev, the
++// FULL length of every intermediate chain lane, and v.S (clamped) to the
++// arrival lane. See accountShares for the split semantics. A lane change no
++// chain can explain is genuinely disjoint: the defensive [prev, cur] split
++// books it anyway and DroppedCrossings makes the undercount loud.
++func (k *Kernel) splitTick(prev, cur *Lane, prevS float64, v *Vehicle, dt float64, tick uint64, ts *tripState) float64 {
++	chain, ambiguous, ok := crossedChain(prev, cur)
++	if !ok {
++		k.droppedCrossings++
++		chain = []*Lane{prev, cur}
++	} else if ambiguous {
++		k.droppedCrossings++
++	}
++	shares := make([]laneShare, 0, len(chain))
++	// d may be NEGATIVE when the last observation parked the vehicle past
++	// prev's end (netimport internal-lane overshoot) — accountShares
++	// carries the refund distance-only.
++	d := prev.Length - prevS
++	shares = append(shares, laneShare{lane: prev, d: d})
++	for _, mid := range chain[1 : len(chain)-1] {
++		shares = append(shares, laneShare{lane: mid, d: mid.Length})
++	}
++	if last := chain[len(chain)-1]; last != prev {
++		dNew := v.S
++		if dNew < 0 {
++			dNew = 0
++		}
++		shares = append(shares, laneShare{lane: last, d: dNew})
++	}
++	tickLoss := k.accountShares(shares, v.Type.Length, dt, v.v0eff, tick)
++	if ts != nil {
++		for _, sh := range shares {
++			ts.dist += sh.d
++		}
++	}
++	return tickLoss
++}
++
++// laneShare is one lane's distance share of a tick's travel.
++type laneShare struct {
++	lane *Lane
++	d    float64
++}
++
++// accountShares books one tick's travel split across lanes (ADR-0014 §3):
++// the distance shares are given; time totalT splits proportionally to
++// POSITIVE distance (uniform-speed assumption; zero total distance ⇒ all
++// time to the LAST lane); occupancy follows the time shares; time-loss is
++// ONE clamp per vehicle-tick — tl = totalT − Σ d_i/vd_i over positive
++// shares, clamped ≥ 0 — split between the lanes by the same proportion, so
++// shares are non-negative AND sum exactly to the tick total.
++//
++// NEGATIVE shares are overshoot refunds: boundaries() is a single pass with
++// no re-clamp, and netimport sorts internal lanes LAST, so an observation
++// can park a vehicle past its lane's end (S > Length). The overshoot was
++// booked to that lane last tick; the negative share refunds the distance —
++// and carries distance ONLY: zero time, no time-loss, no occupancy, and it
++// is excluded from the proportional split and the time-loss sum.
++// Returns the clamped time-loss.
++func (k *Kernel) accountShares(shares []laneShare, vehLen, totalT float64, vd func(*Lane) float64, tick uint64) float64 {
++	var D, loss float64
++	for _, sh := range shares {
++		if sh.d > 0 {
++			D += sh.d
++			loss += sh.d / vd(sh.lane)
++		}
++	}
++	tickLoss := totalT - loss
++	if !(tickLoss > 0) { // single per-tick clamp; also swallows NaN
++		tickLoss = 0
++	}
++	for i, sh := range shares {
++		ti, tli := totalT, tickLoss
++		switch {
++		case D > 0 && sh.d <= 0:
++			ti, tli = 0, 0 // overshoot refund: distance only
++		case D > 0:
++			ti = totalT * sh.d / D
++			tli = tickLoss * sh.d / D
++		case i < len(shares)-1:
++			ti, tli = 0, 0
++		}
++		k.addSegment(sh.lane, sh.d, ti, tick)
++		k.addTimeLoss(sh.lane, tli, tick)
++		k.addOccupancy(sh.lane, ti*vehLen, tick)
++	}
++	return tickLoss
++}
++
++// maxCrossDepth caps the successor-chain searches (crossedChain,
++// exitResolve) — far past any real internal-lane stack, short of
++// pathological graphs.
++const maxCrossDepth = 8
++
++// crossedChain finds the successor chain prev → … → arrival the vehicle
++// traveled during a lane-changed tick: cur is arrival itself or a lateral
++// neighbor of arrival (a same-tick hop after the crossing). Chains are
++// enumerated (not first-found): ANY second chain reaching the arrival
++// (parallel internal lanes / a diamond) makes the per-lane attribution
++// arbitrary — the shortest books and ambiguous=true makes it loud,
++// regardless of length equality (same VMT, arbitrary per-lane split).
++// Hitting the enumeration or depth cap also sets ambiguous (silent
++// truncation would violate the loudness pin). ok = false when no chain
++// exists (genuinely disjoint).
++func crossedChain(prev, cur *Lane) (chain []*Lane, ambiguous, ok bool) {
++	matches := func(l *Lane) bool { return l == cur || l.Left == cur || l.Right == cur }
++	chains, truncated := findChains(prev, matches, 3)
++	if len(chains) == 0 {
++		return nil, false, false
++	}
++	// ANY second chain reaching the arrival means the per-lane attribution
++	// is arbitrary (parallel paths are unobservable post-hoc) — loud
++	// regardless of length equality. Truncated enumeration likewise (a
++	// differing unenumerated chain could exist).
++	ambiguous = truncated || len(chains) > 1
++	return chains[0], ambiguous, true
++}
++
++// findChains enumerates simple successor chains from `from` to a lane
++// satisfying match, depth-capped at maxCrossDepth hops, in fixed Successors
++// slice order (deterministic), returned shortest-hop first. A matching lane
++// ends its path. Graphs here are tiny (≤ 8 hops, fanout ≤ 3). To keep the
++// cap honest it enumerates capN+1 and keeps the first capN: truncated =
++// true when a capN+1-th chain exists OR a branch was abandoned at the depth
++// cap — the caller treats that as ambiguity (silent truncation would
++// violate the loudness pin).
++func findChains(from *Lane, match func(*Lane) bool, capN int) (chains [][]*Lane, truncated bool) {
++	path := []*Lane{from}
++	onPath := map[*Lane]bool{from: true}
++	var dfs func(l *Lane)
++	dfs = func(l *Lane) {
++		if len(chains) > capN {
++			return
++		}
++		if len(path) > maxCrossDepth {
++			truncated = true
++			return
++		}
++		for _, s := range l.Successors {
++			if onPath[s] {
++				continue
++			}
++			if match(s) {
++				chains = append(chains, append(append([]*Lane{}, path...), s))
++				continue
++			}
++			onPath[s] = true
++			path = append(path, s)
++			dfs(s)
++			path = path[:len(path)-1]
++			delete(onPath, s)
++		}
++	}
++	dfs(from)
++	sort.SliceStable(chains, func(i, j int) bool { return len(chains[i]) < len(chains[j]) })
++	if len(chains) > capN {
++		return chains[:capN], true
++	}
++	return chains, truncated
++}
++
++// exitShares builds the despawn tick's lane shares: the vehicle drove from
++// its last-seen position to the network edge. When the last-seen lane is
++// itself the exit, the share is the exact in-network remainder. Otherwise
++// the vehicle crossed at least one boundary this tick — but WHICH exit lane
++// it left through is unobservable post-hoc (the held turn dies with the
++// vehicle). So the chain books only when the reachable exit within
++// maxCrossDepth is UNAMBIGUOUS (exactly one): every intermediate lane in
++// full plus the exit lane's full length (despawn happens past Length, so
++// the in-network distance is exactly the lane length), and exitLane is set
++// for the trip's destination. With zero (defensive) or MULTIPLE reachable
++// exits (branched feeder), only the last-seen lane's remainder books
++// (ok = false); a second chain of ANY length to the one exit books the
++// shortest with ambiguous = true (per-lane attribution is arbitrary).
++// Either way the caller counts a DroppedCrossing — loud, never silently
++// wrong.
++func exitShares(prev mLastObs) (shares []laneShare, exitLane *Lane, ok, ambiguous bool) {
++	// d may be NEGATIVE when the last observation parked the vehicle past
++	// the exit lane's end (no re-clamp in boundaries()) — the overshoot
++	// refund, carried distance-only by accountShares.
++	d := prev.lane.Length - prev.s
++	shares = []laneShare{{lane: prev.lane, d: d}}
++	if prev.lane.Exit {
++		return shares, prev.lane, true, false
++	}
++	chain, exit, amb := exitResolve(prev.lane)
++	if exit == nil {
++		return shares, nil, false, false
++	}
++	for _, l := range chain[1:] {
++		shares = append(shares, laneShare{lane: l, d: l.Length})
++	}
++	return shares, exit, true, amb
++}
++
++// exitResolve finds THE exit lane reachable from `from` within
++// maxCrossDepth when exactly one exists, returning the shortest chain to
++// it. nil when zero or more than one exit lane is reachable. When several
++// chains reach the one exit with different booked length sums (parallel
++// internals), ambiguous = true — the shortest books, the caller counts.
++func exitResolve(from *Lane) (chain []*Lane, exit *Lane, ambiguous bool) {
++	chains, truncated := findChains(from, func(l *Lane) bool { return l.Exit }, 3)
++	exits := map[*Lane]bool{}
++	for _, c := range chains {
++		exits[c[len(c)-1]] = true
++	}
++	if len(exits) != 1 {
++		return nil, nil, false
++	}
++	// ANY second chain to the one exit (or a truncated enumeration) makes
++	// the per-lane attribution arbitrary — loud regardless of length
++	// equality.
++	return chains[0], chains[0][len(chains[0])-1], truncated || len(chains) > 1
++}
++
++// emitTrip appends a trip record.
++func (k *Kernel) emitTrip(id uint64, ts *tripState, exitTick uint64, completed bool) {
++	k.pendTrips = append(k.pendTrips, TripRecord{
++		SchemaVersion: 1,
++		VehicleID:     id,
++		TypeName:      ts.typeName,
++		OriginLaneID:  ts.origin,
++		DestLaneID:    ts.dest,
++		EntryTick:     ts.entryTick,
++		ExitTick:      exitTick,
++		DistanceM:     ts.dist,
++		TimeLossS:     ts.timeLoss,
++		Stops:         ts.stops,
++		StoppedTimeS:  ts.stoppedS,
++		Completed:     completed,
++	})
++}
++
++// accumFor returns the open-interval accumulator for laneID when tick falls
++// inside the set's window, else nil (lane not in the set, or tick outside
++// (BeginTick, LastTick]).
++func (s *metricSet) accumFor(laneID string, tick uint64) *laneAccum {
++	if tick <= s.cfg.BeginTick {
++		return nil
++	}
++	if s.cfg.LastTick > 0 && tick > s.cfg.LastTick {
++		return nil
++	}
++	return s.acc[laneID]
++}
++
++// closeDue emits every interval whose last observation tick has been seen:
++// the open interval covers observation ticks (openFirst−1, openLast], so it
++// closes once tick reaches openLast. Records stamp the SIM-TIME tick grid:
++// the interval covering observations (begin, end] stamps [begin, end) —
++// BeginTick·dt … EndTick·dt is exactly the covered sim time. A final
++// interval truncated by the set's LastTick closes (partial) as soon as
++// LastTick itself has been observed — streaming consumers shouldn't wait
++// for the run-wide Finalize.
++func (s *metricSet) closeDue(k *Kernel, tick uint64) {
++	for s.openLast <= tick {
++		if s.cfg.LastTick > 0 && s.openLast > s.cfg.LastTick {
++			break
++		}
++		s.closeInterval(k, s.openFirst-1, s.openLast, false)
++		s.openFirst = s.openLast + 1
++		s.openLast += s.cfg.PeriodTicks
++	}
++	if s.cfg.LastTick > 0 && tick >= s.cfg.LastTick && s.openFirst <= s.cfg.LastTick {
++		s.closeInterval(k, s.openFirst-1, s.cfg.LastTick, true)
++		s.openFirst = s.cfg.LastTick + 1
++	}
++}
++
++// closeInterval emits one record per element lane for the covered
++// observation ticks [begin, end) and resets the open accumulators.
++func (s *metricSet) closeInterval(k *Kernel, begin, end uint64, partial bool) {
++	dur := float64(end-begin) * k.dt
++	for _, l := range s.lanes {
++		acc := s.acc[l.ID]
++		rec := IntervalRecord{
++			SchemaVersion: 1,
++			SetID:         s.cfg.ID,
++			LaneID:        l.ID,
++			BeginTick:     begin,
++			EndTick:       end,
++			Partial:       partial,
++			SumDistM:      acc.sumDist,
++			SumTimeS:      acc.sumTime,
++		}
++		denom := l.Length * dur
++		if s.cfg.Groups.Edie {
++			q := acc.sumDist / denom
++			kk := acc.sumTime / denom
++			rec.Q, rec.K = &q, &kk
++			if acc.sumTime > 0 {
++				v := q / kk
++				rec.V = &v
++			}
++		}
++		if s.cfg.Groups.Occupancy {
++			occ := acc.sumOcc / denom
++			rec.Occupancy = &occ
++		}
++		if s.cfg.Groups.Stops {
++			n := acc.stopStarts
++			rec.Stops = &n
++		}
++		if s.cfg.Groups.TimeLoss {
++			tl := acc.sumTimeLoss
++			rec.TimeLossS = &tl
++		}
++		k.pendIntervals = append(k.pendIntervals, rec)
++		*acc = laneAccum{}
++	}
++}
++
++// v0effOf is the desired speed of a vehicle with type vt and speed factor f
++// on lane — Vehicle.v0eff for a vehicle that is no longer observable
++// (despawn-tick accounting).
++func v0effOf(vt *VehicleType, f float64, lane *Lane) float64 {
++	v0 := vt.V0
++	if lane.SpeedLimit < v0 {
++		v0 = lane.SpeedLimit
++	}
++	return f * v0
++}
+diff --git a/engine/metrics_test.go b/engine/metrics_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..0391729fb0d82561add50ab3b91dec09f0d00265
+--- /dev/null
++++ b/engine/metrics_test.go
+@@ -0,0 +1,1741 @@
++package engine
++
++import (
++	"encoding/json"
++	"math"
++	"os"
++	"path/filepath"
++	"reflect"
++	"testing"
++)
++
++// defaultCfg is the zero-authoring plan at the tests' dt (0.1 s).
++func defaultCfg(n *Network) KernelConfig { return DefaultKernelConfig(n, 0.1) }
++
++// runWithKernel drives a fresh run with a metric kernel attached: Observe
++// after every Step, Finalize at the horizon.
++func runWithKernel(t *testing.T, spec RunSpec, cfg func(*Network) KernelConfig) (*Engine, *Kernel) {
++	t.Helper()
++	e, err := NewEngine(spec)
++	if err != nil {
++		t.Fatalf("NewEngine: %v", err)
++	}
++	k, err := NewKernel(e, cfg(e.Net))
++	if err != nil {
++		t.Fatalf("NewKernel: %v", err)
++	}
++	for e.Tick < spec.Ticks {
++		e.Step()
++		k.Observe(e)
++	}
++	k.Finalize(e)
++	return e, k
++}
++
++// closeWithin reports whether a and b agree to 1e-9 relative (1e-9 absolute
++// near zero) — float summation order differs between the per-tick totals and
++// the per-(lane, interval) records over the same segments.
++func closeWithin(a, b float64) bool {
++	return math.Abs(a-b) <= 1e-9*math.Max(1, math.Abs(b))
++}
++
++// The kernel is a read-only observer (ADR-0014 §1): an observed run must
++// produce the identical per-tick CRC sequence as an unobserved one.
++func TestKernelCRCInvariance(t *testing.T) {
++	spec, err := DefaultSpec("lanedrop", 800, 42)
++	if err != nil {
++		t.Fatal(err)
++	}
++	_, log, err := Run(spec)
++	if err != nil {
++		t.Fatalf("Run: %v", err)
++	}
++	e, _ := runWithKernel(t, spec, defaultCfg)
++	assertEqualCRCs(t, log.CRCs, e.CRCs)
++}
++
++// Same seed, two kernels: identical drained records and totals — the
++// ADR-0005 discipline applied to derived numbers (ADR-0014 §1).
++func TestKernelDeterminism(t *testing.T) {
++	spec, err := DefaultSpec("lanedrop", 800, 42)
++	if err != nil {
++		t.Fatal(err)
++	}
++	run := func() ([]IntervalRecord, []TripRecord, Totals, *Kernel) {
++		_, k := runWithKernel(t, spec, defaultCfg)
++		return k.DrainIntervals(), k.DrainTrips(), k.Totals(), k
++	}
++	i1, tr1, to1, k1 := run()
++	i2, tr2, to2, _ := run()
++	if !reflect.DeepEqual(i1, i2) {
++		t.Fatal("interval records differ between identical runs")
++	}
++	if !reflect.DeepEqual(tr1, tr2) {
++		t.Fatal("trip records differ between identical runs")
++	}
++	if !reflect.DeepEqual(to1, to2) {
++		t.Fatal("totals differ between identical runs")
++	}
++	if len(i1) == 0 || len(tr1) == 0 {
++		t.Fatal("expected non-empty record drains")
++	}
++	// Drains are destructive; Totals is not.
++	if n := len(k1.DrainIntervals()); n != 0 {
++		t.Fatalf("second DrainIntervals returned %d records, want 0", n)
++	}
++	if n := len(k1.DrainTrips()); n != 0 {
++		t.Fatalf("second DrainTrips returned %d records, want 0", n)
++	}
++	if got := k1.Totals(); !reflect.DeepEqual(got, to1) {
++		t.Fatal("Totals changed after drains")
++	}
++}
++
++// lightDemandSpec is the straight 5 km exit lane at 180 veh/h with
++// homogeneous drivers (σ = 0 ⇒ F = 1): exact free flow at v0.
++func lightDemandSpec(t *testing.T, ticks uint64) RunSpec {
++	t.Helper()
++	spec, err := DefaultSpec("straight", ticks, 1)
++	if err != nil {
++		t.Fatal(err)
++	}
++	spec.Scen.SpawnRatePerLaneHour = 180
++	spec.Params.SpeedFactorSigma = 0
++	return spec
++}
++
++// Free-flow sanity: time-loss ≈ 0, Edie V ≈ desired speed, the q = k·v
++// identity holds within the cell, occupancy is a fraction (ADR-0014 §2/§3).
++func TestKernelFreeFlow(t *testing.T) {
++	spec := lightDemandSpec(t, 3000)
++	cfg := func(*Network) KernelConfig {
++		return KernelConfig{
++			Sets: []MetricSetConfig{{
++				ID:          "main",
++				LaneIDs:     []string{"S0"},
++				Groups:      MetricGroups{Edie: true, Occupancy: true, Stops: true, TimeLoss: true},
++				PeriodTicks: 1000,
++			}},
++			Trips: true,
++		}
++	}
++	_, k := runWithKernel(t, spec, cfg)
++	tot := k.Totals()
++	if tot.VHT == 0 {
++		t.Fatal("no traffic observed")
++	}
++	if tot.TotalTimeLossS > 0.02*tot.VHT {
++		t.Errorf("free-flow time-loss %v s exceeds 2%% of VHT %v s", tot.TotalTimeLossS, tot.VHT)
++	}
++	const v0 = 33.3 // Car.V0 == lane limit, F = 1
++	checked := 0
++	for _, r := range k.DrainIntervals() {
++		if r.Partial || r.SumTimeS == 0 {
++			continue
++		}
++		checked++
++		if r.V == nil {
++			t.Fatalf("interval [%d,%d): V nil with SumTimeS = %v", r.BeginTick, r.EndTick, r.SumTimeS)
++		}
++		if math.Abs(*r.V-v0)/v0 > 0.02 {
++			t.Errorf("interval [%d,%d): V = %v m/s, want ≈ %v", r.BeginTick, r.EndTick, *r.V, v0)
++		}
++		if !closeWithin(*r.Q, *r.K**r.V) {
++			t.Errorf("interval [%d,%d): q = %v but k·v = %v", r.BeginTick, r.EndTick, *r.Q, *r.K**r.V)
++		}
++		if *r.Occupancy <= 0 || *r.Occupancy >= 1 {
++			t.Errorf("interval [%d,%d): occupancy %v outside (0,1)", r.BeginTick, r.EndTick, *r.Occupancy)
++		}
++	}
++	if checked == 0 {
++		t.Fatal("no full intervals with traffic")
++	}
++}
++
++// Horizon mid-trip: every in-network vehicle gets a partial trip record
++// (Completed = false, exit tick = horizon), and run totals include the
++// unfinished trips — the survivorship-bias guard of ADR-0014 §2/§3.
++func TestKernelHorizonPartials(t *testing.T) {
++	spec := lightDemandSpec(t, 1200) // crossing the 5 km lane takes ≈ 1500 ticks
++	spec.Scen.SpawnRatePerLaneHour = 360
++	_, k := runWithKernel(t, spec, defaultCfg)
++	tot := k.Totals()
++	trips := k.DrainTrips()
++	if len(trips) == 0 {
++		t.Fatal("no trip records at horizon")
++	}
++	var partialDist float64
++	for _, r := range trips {
++		if r.Completed {
++			t.Errorf("trip %d completed before the 1200-tick horizon", r.VehicleID)
++		}
++		if r.ExitTick != spec.Ticks {
++			t.Errorf("trip %d: exit tick %d, want horizon %d", r.VehicleID, r.ExitTick, spec.Ticks)
++		}
++		partialDist += r.DistanceM
++	}
++	if tot.CompletedTrips != 0 {
++		t.Errorf("CompletedTrips = %d, want 0 (no vehicle can cross in time)", tot.CompletedTrips)
++	}
++	if tot.ActiveAtHorizon != len(trips) {
++		t.Errorf("ActiveAtHorizon = %d, want %d partial trips", tot.ActiveAtHorizon, len(trips))
++	}
++	// The completed-trip distance sum is 0, yet VMT carries everything the
++	// active vehicles drove — totals never come from completed trips alone.
++	if tot.VMT <= 0 {
++		t.Error("VMT = 0 with active vehicles at the horizon")
++	}
++	if !closeWithin(tot.VMT, partialDist) {
++		t.Errorf("VMT %v vs Σ partial trip distance %v", tot.VMT, partialDist)
++	}
++}
++
++// Oversaturated lanedrop: queues produce stop episodes, stopped time, and
++// time-loss; demand the density cap keeps out shows up as denied entry
++// (ADR-0014 §3 latent demand).
++func TestKernelCongestion(t *testing.T) {
++	spec, err := DefaultSpec("lanedrop", 3000, 7)
++	if err != nil {
++		t.Fatal(err)
++	}
++	spec.Scen.SpawnRatePerLaneHour = 3000
++	spec.Scen.DensityTargetPerKm = 80
++	_, k := runWithKernel(t, spec, defaultCfg)
++	tot := k.Totals()
++	var stops int
++	var stoppedS float64
++	for _, r := range k.DrainTrips() {
++		stops += r.Stops
++		stoppedS += r.StoppedTimeS
++	}
++	if stops == 0 {
++		t.Error("no stop episodes under overload")
++	}
++	if stoppedS == 0 {
++		t.Error("no stopped time under overload")
++	}
++	if tot.TotalTimeLossS == 0 {
++		t.Error("no time-loss under overload")
++	}
++	if tot.DeniedWaitS == 0 {
++		t.Error("no denied-entry wait under overload")
++	}
++	if tot.DeniedPending == 0 {
++		t.Error("no denied demand pending at the horizon")
++	}
++	// Multi-origin jitter inverts injection order routinely — the gap
++	// detector must reconcile, not overcount. Everything here books cleanly.
++	if tot.DroppedCrossings != 0 {
++		t.Errorf("DroppedCrossings = %d on a clean congestion run, want 0 (gap reconciliation)", tot.DroppedCrossings)
++	}
++}
++
++// A lane with zero traffic still emits its interval records, with zero sums
++// and V omitted — never zero-filled (ADR-0014 §2).
++func TestKernelEmptyInterval(t *testing.T) {
++	spec, err := DefaultSpec("straight", 250, 1) // no demand: spawner nil
++	if err != nil {
++		t.Fatal(err)
++	}
++	cfg := func(*Network) KernelConfig {
++		return KernelConfig{
++			Sets: []MetricSetConfig{{
++				ID:          "main",
++				LaneIDs:     []string{"S0"},
++				Groups:      MetricGroups{Edie: true, Occupancy: true, Stops: true, TimeLoss: true},
++				PeriodTicks: 100,
++			}},
++			Trips: true,
++		}
++	}
++	_, k := runWithKernel(t, spec, cfg)
++	recs := k.DrainIntervals()
++	if len(recs) != 3 { // [1,101), [101,201), partial [201,251)
++		t.Fatalf("got %d interval records, want 3", len(recs))
++	}
++	for _, r := range recs[:2] {
++		if r.Partial {
++			t.Errorf("interval [%d,%d) flagged partial at a period boundary", r.BeginTick, r.EndTick)
++		}
++		if r.SumDistM != 0 || r.SumTimeS != 0 || *r.Stops != 0 || *r.TimeLossS != 0 {
++			t.Errorf("interval [%d,%d): nonzero sums on an empty lane: %+v", r.BeginTick, r.EndTick, r)
++		}
++		if r.Stops == nil || r.TimeLossS == nil {
++			t.Errorf("interval [%d,%d): group-on Stops/TimeLossS must be non-nil zeros", r.BeginTick, r.EndTick)
++		}
++		if r.V != nil {
++			t.Errorf("interval [%d,%d): V = %v, want nil when SumTimeS == 0", r.BeginTick, r.EndTick, *r.V)
++		}
++		if *r.Q != 0 || *r.K != 0 || *r.Occupancy != 0 {
++			t.Errorf("interval [%d,%d): q/k/occupancy not exactly 0 on an empty lane", r.BeginTick, r.EndTick)
++		}
++	}
++}
++
++// Lane-crossing conservation (ADR-0014 §3): on a net with lateral hops,
++// successor crossings, and despawns, every segment lands in exactly one lane
++// accumulator — the per-(lane, interval) sums and the per-vehicle trip
++// distances both add up to the network totals.
++func TestKernelLaneCrossingConservation(t *testing.T) {
++	spec, err := DefaultSpec("lanedrop", 2000, 3)
++	if err != nil {
++		t.Fatal(err)
++	}
++	e, k := runWithKernel(t, spec, defaultCfg)
++	if e.Stats.LaneChanges == 0 {
++		t.Fatal("no lane changes in the run — the crossing path went untested")
++	}
++	tot := k.Totals()
++	if tot.CompletedTrips == 0 {
++		t.Fatal("no completed trips in the run — the despawn path went untested")
++	}
++	var sumDist, sumTime float64
++	for _, r := range k.DrainIntervals() {
++		sumDist += r.SumDistM
++		sumTime += r.SumTimeS
++	}
++	if !closeWithin(sumDist, tot.VMT) {
++		t.Errorf("Σ interval distance %v vs VMT %v", sumDist, tot.VMT)
++	}
++	if !closeWithin(sumTime, tot.VHT) {
++		t.Errorf("Σ interval time %v vs VHT %v", sumTime, tot.VHT)
++	}
++	var tripDist float64
++	for _, r := range k.DrainTrips() {
++		tripDist += r.DistanceM
++	}
++	if !closeWithin(tripDist, tot.VMT) {
++		t.Errorf("Σ trip distance %v vs VMT %v", tripDist, tot.VMT)
++	}
++}
++
++// A horizon that is not a period boundary truncates the final interval,
++// which is emitted flagged Partial with its actual bounds (ADR-0014 §3).
++func TestKernelPartialFinalInterval(t *testing.T) {
++	spec := lightDemandSpec(t, 1500)
++	cfg := func(*Network) KernelConfig {
++		return KernelConfig{
++			Sets: []MetricSetConfig{{
++				ID:          "main",
++				LaneIDs:     []string{"S0"},
++				Groups:      MetricGroups{Edie: true, Occupancy: true, Stops: true, TimeLoss: true},
++				PeriodTicks: 1000,
++			}},
++			Trips: true,
++		}
++	}
++	_, k := runWithKernel(t, spec, cfg)
++	var full, partial *IntervalRecord
++	recs := k.DrainIntervals()
++	for i := range recs {
++		switch r := &recs[i]; {
++		case r.Partial:
++			partial = r
++		default:
++			full = r
++		}
++	}
++	if full == nil || partial == nil {
++		t.Fatalf("want one full and one partial interval, got %+v", recs)
++	}
++	// Interval k holds observation ticks (kP, (k+1)P] and stamps the
++	// sim-time grid: the first full interval covers ticks 1..1000, stamped
++	// [0, 1000), duration 100 s.
++	if full.BeginTick != 0 || full.EndTick != 1000 {
++		t.Errorf("full interval = [%d,%d), want [0,1000)", full.BeginTick, full.EndTick)
++	}
++	// The partial covers ticks 1001..1500, stamped [1000, 1500): 50 s.
++	if partial.BeginTick != 1000 || partial.EndTick != 1500 {
++		t.Errorf("partial interval = [%d,%d), want [1000,1500)", partial.BeginTick, partial.EndTick)
++	}
++	if partial.SumTimeS == 0 {
++		t.Error("partial interval lost the traffic observed in it")
++	}
++}
++
++// Ring wrap + pre-placed vehicles + exact period boundary: the 22-vehicle
++// Sugiyama ring wraps S past the lane length every lap (self-successor);
++// vehicles are placed before the kernel attaches, so their initial positions
++// must not be booked as distance; and a horizon of exactly k·P ticks yields
++// exactly k full intervals with no trailing partial.
++func TestKernelRingWrap(t *testing.T) {
++	spec, err := DefaultSpec("ring", 1200, 42) // 22 pre-placed vehicles, 230 m loop
++	if err != nil {
++		t.Fatal(err)
++	}
++	cfg := func(*Network) KernelConfig {
++		return KernelConfig{
++			Sets: []MetricSetConfig{{
++				ID:          "ring",
++				LaneIDs:     []string{"R0"},
++				Groups:      MetricGroups{Edie: true, Occupancy: true, Stops: true, TimeLoss: true},
++				PeriodTicks: 200,
++			}},
++			Trips: true,
++		}
++	}
++	_, k := runWithKernel(t, spec, cfg)
++	recs := k.DrainIntervals()
++	if len(recs) != 6 { // 1200 ticks = 6 × 200, exactly
++		t.Fatalf("got %d interval records, want 6 full ones", len(recs))
++	}
++	const wantTime = 22 * 200 * 0.1 // 22 always-present vehicles × 200 ticks × dt
++	for _, r := range recs {
++		if r.Partial {
++			t.Errorf("interval [%d,%d): partial at an exact period boundary", r.BeginTick, r.EndTick)
++		}
++		if r.SumDistM < 0 || r.SumTimeS < 0 || *r.TimeLossS < 0 {
++			t.Errorf("interval [%d,%d): negative sum: %+v", r.BeginTick, r.EndTick, r)
++		}
++		if !closeWithin(r.SumTimeS, wantTime) {
++			t.Errorf("interval [%d,%d): SumTimeS = %v, want %v (P observations per vehicle)", r.BeginTick, r.EndTick, r.SumTimeS, wantTime)
++		}
++	}
++	// Phantom placement distance would add Σ initial S ≈ 2415 m to the first
++	// interval; real travel is ≈ 22 × 2.15 m/s × 20 s ≈ 950 m.
++	if recs[0].SumDistM > 1500 {
++		t.Errorf("first interval SumDistM = %v m — initial placement booked as distance?", recs[0].SumDistM)
++	}
++	tot := k.Totals()
++	var sumDist, tripDist float64
++	for _, r := range recs {
++		sumDist += r.SumDistM
++	}
++	for _, tr := range k.DrainTrips() {
++		if tr.Completed {
++			t.Error("ring has no exits — no trip should complete")
++		}
++		if tr.EntryTick != 0 || tr.OriginLaneID != "R0" {
++			t.Errorf("pre-placed trip %d: entry %d origin %q, want entry 0 origin R0 (seeded at construction)",
++				tr.VehicleID, tr.EntryTick, tr.OriginLaneID)
++		}
++		tripDist += tr.DistanceM
++	}
++	if tot.VMT <= 0 {
++		t.Error("VMT = 0 on a moving ring")
++	}
++	if !closeWithin(sumDist, tot.VMT) {
++		t.Errorf("Σ interval distance %v vs VMT %v", sumDist, tot.VMT)
++	}
++	if !closeWithin(tripDist, tot.VMT) {
++		t.Errorf("Σ trip distance %v vs VMT %v — wrap corrupts distance", tripDist, tot.VMT)
++	}
++}
++
++// Despawn-tick accounting: a lone vehicle at constant speed crossing a 500 m
++// exit lane must book exactly the lane length — including the final
++// last-seen-position → lane-end segment — to its trip and to the totals.
++func TestKernelDespawnAccounting(t *testing.T) {
++	spec := RunSpec{
++		Net:    NetSpec{Kind: "straight", Length: 500},
++		Params: DefaultParams(),
++		Ticks:  200,
++	}
++	e, err := NewEngine(spec)
++	if err != nil {
++		t.Fatal(err)
++	}
++	lane := e.Net.LaneByID("S0")
++	e.AddInitialVehicle(lane, 0, 0, 33.3, 1) // v = v0 ⇒ zero accel, constant speed
++	k, err := NewKernel(e, DefaultKernelConfig(e.Net, e.Params.Dt))
++	if err != nil {
++		t.Fatal(err)
++	}
++	for e.Tick < spec.Ticks {
++		e.Step()
++		k.Observe(e)
++	}
++	k.Finalize(e)
++
++	tot := k.Totals()
++	if tot.CompletedTrips != 1 {
++		t.Fatalf("CompletedTrips = %d, want 1", tot.CompletedTrips)
++	}
++	// 150 ticks at 3.33 m/tick = 499.5 m, then the exit segment to 500 m.
++	if !closeWithin(tot.VMT, 500) {
++		t.Errorf("VMT = %v m, want 500 (lane length)", tot.VMT)
++	}
++	wantVHT := 150*0.1 + 0.5/33.3 // full ticks + the estimated exit time
++	if !closeWithin(tot.VHT, wantVHT) {
++		t.Errorf("VHT = %v s, want %v", tot.VHT, wantVHT)
++	}
++	trips := k.DrainTrips()
++	if len(trips) != 1 {
++		t.Fatalf("got %d trip records, want 1", len(trips))
++	}
++	tr := trips[0]
++	if !tr.Completed || tr.ExitTick != 151 || tr.EntryTick != 0 {
++		t.Errorf("trip = %+v, want Completed with ticks [0,151] (pre-placed ⇒ entry 0)", tr)
++	}
++	if !closeWithin(tr.DistanceM, 500) {
++		t.Errorf("trip DistanceM = %v m, want 500 — exit segment missing?", tr.DistanceM)
++	}
++	recs := k.DrainIntervals()
++	if len(recs) != 1 || !recs[0].Partial {
++		t.Fatalf("want one partial interval record, got %+v", recs)
++	}
++	if !closeWithin(recs[0].SumDistM, 500) || !closeWithin(recs[0].SumTimeS, wantVHT) {
++		t.Errorf("interval sums = %v m / %v s, want 500 / %v", recs[0].SumDistM, recs[0].SumTimeS, wantVHT)
++	}
++}
++
++// Denied-entry guard (ADR-0014 §3): a director directive whose EarliestTick
++// is still in the future is scheduled demand, not denied — it accrues no
++// wait; an overdue one blocked by the density cap does.
++func TestKernelDeniedFutureDirective(t *testing.T) {
++	spec := RunSpec{
++		Net:    NetSpec{Kind: "lanedrop"},
++		Params: DefaultParams(),
++		Scen:   Scenario{DensityTargetPerKm: 1}, // 3 lane-km ⇒ 3 vehicles cap
++		Ticks:  30,
++	}
++	e, err := NewEngine(spec)
++	if err != nil {
++		t.Fatal(err)
++	}
++	// Fill the density cap so the due directive stays queued.
++	for _, id := range []string{"A0", "A1", "A2"} {
++		e.AddInitialVehicle(e.Net.LaneByID(id), 0, 100, 10, 1)
++	}
++	k, err := NewKernel(e, DefaultKernelConfig(e.Net, e.Params.Dt))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := e.EnqueueSpawn(SpawnDirective{RequestID: "future", Origin: "A0", TypeName: "car", EarliestTick: 1 << 40}); err != nil {
++		t.Fatal(err)
++	}
++	if err := e.EnqueueSpawn(SpawnDirective{RequestID: "due", Origin: "A1", TypeName: "car", EarliestTick: 0}); err != nil {
++		t.Fatal(err)
++	}
++	for e.Tick < spec.Ticks {
++		e.Step()
++		k.Observe(e)
++	}
++	k.Finalize(e)
++	tot := k.Totals()
++	if w := tot.DeniedByLane["A0"].WaitS; w != 0 {
++		t.Errorf("future directive accrued %v s of denied wait, want 0", w)
++	}
++	if p := tot.DeniedByLane["A0"].Pending; p != 0 {
++		t.Errorf("future directive counted %v pending at horizon, want 0", p)
++	}
++	if w := tot.DeniedByLane["A1"].WaitS; w <= 0 {
++		t.Error("overdue, density-blocked directive accrued no denied wait")
++	}
++	if p := tot.DeniedByLane["A1"].Pending; p != 1 {
++		t.Errorf("overdue directive pending = %v, want 1", p)
++	}
++}
++
++// The default plan (ADR-0014 §5): every lane, sorted IDs, all four field
++// groups at 9000 ticks, trips on. Bad plans fail loud at construction.
++func TestDefaultKernelConfig(t *testing.T) {
++	net, err := BuildNet(NetSpec{Kind: "lanedrop"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	cfg := DefaultKernelConfig(net, 0.1)
++	if !cfg.Trips {
++		t.Error("default plan has trips off")
++	}
++	if len(cfg.Sets) != 1 {
++		t.Fatalf("default plan has %d sets, want 1", len(cfg.Sets))
++	}
++	s := cfg.Sets[0]
++	want := []string{"A0", "A1", "A2", "B0", "B1"}
++	if !reflect.DeepEqual(s.LaneIDs, want) {
++		t.Errorf("default lanes = %v, want %v", s.LaneIDs, want)
++	}
++	if s.Groups != (MetricGroups{Edie: true, Occupancy: true, Stops: true, TimeLoss: true}) {
++		t.Errorf("default groups = %+v, want all four on", s.Groups)
++	}
++	if s.PeriodTicks != 9000 {
++		t.Errorf("default period = %d ticks, want 9000 (900 s)", s.PeriodTicks)
++	}
++	// The 900 s window derives from dt (ADR-0005 configurable tick):
++	// dt = 0.2 → 4500 ticks.
++	if got := DefaultKernelConfig(net, 0.2).Sets[0].PeriodTicks; got != 4500 {
++		t.Errorf("default period at dt=0.2 = %d ticks, want 4500", got)
++	}
++
++	e, err := NewEngine(RunSpec{Net: NetSpec{Kind: "lanedrop"}, Params: DefaultParams()})
++	if err != nil {
++		t.Fatal(err)
++	}
++	bad := DefaultKernelConfig(e.Net, e.Params.Dt)
++	bad.Sets[0].LaneIDs = []string{"A0", "NOPE"}
++	if _, err := NewKernel(e, bad); err == nil {
++		t.Error("unknown lane ID accepted")
++	}
++	bad = DefaultKernelConfig(e.Net, e.Params.Dt)
++	bad.Sets[0].LaneIDs = []string{"A0", "A0"}
++	if _, err := NewKernel(e, bad); err == nil {
++		t.Error("duplicate lane ID accepted")
++	}
++	bad = DefaultKernelConfig(e.Net, e.Params.Dt)
++	bad.Sets[0].PeriodTicks = 0
++	if _, err := NewKernel(e, bad); err == nil {
++		t.Error("zero period accepted")
++	}
++	bad = DefaultKernelConfig(e.Net, e.Params.Dt)
++	bad.Sets[0].BeginTick, bad.Sets[0].LastTick = 100, 100
++	if _, err := NewKernel(e, bad); err == nil {
++		t.Error("LastTick == BeginTick accepted")
++	}
++	bad = DefaultKernelConfig(e.Net, e.Params.Dt)
++	bad.Sets[0].BeginTick, bad.Sets[0].LastTick = 100, 50
++	if _, err := NewKernel(e, bad); err == nil {
++		t.Error("LastTick < BeginTick accepted")
++	}
++	e2, err := NewEngine(RunSpec{Net: NetSpec{Kind: "lanedrop"}, Params: DefaultParams()})
++	if err != nil {
++		t.Fatal(err)
++	}
++	e2.Net.LaneByID("A0").Length = 0
++	if _, err := NewKernel(e2, DefaultKernelConfig(e2.Net, e2.Params.Dt)); err == nil {
++		t.Error("zero-length element lane accepted")
++	}
++}
++
++// First-Step despawn of a pre-placed vehicle: seeded at construction with
++// entry tick 0 (origin = dest = construction lane), it must complete
++// cleanly on the very first Step — exercising the seeded-state despawn
++// path. (The nil-tripState reconstruction branch stays as a defensive
++// guard; seeding means this test no longer hits it.)
++func TestKernelFirstStepDespawn(t *testing.T) {
++	spec := RunSpec{
++		Net:    NetSpec{Kind: "straight", Length: 500},
++		Params: DefaultParams(),
++		Ticks:  10,
++	}
++	e, err := NewEngine(spec)
++	if err != nil {
++		t.Fatal(err)
++	}
++	// One tick from the lane end at 33.3 m/s (3.33 m/tick): despawns on Step 1.
++	e.AddInitialVehicle(e.Net.LaneByID("S0"), 0, 497, 33.3, 1)
++	k, err := NewKernel(e, DefaultKernelConfig(e.Net, e.Params.Dt))
++	if err != nil {
++		t.Fatal(err)
++	}
++	for e.Tick < spec.Ticks {
++		e.Step()
++		k.Observe(e)
++	}
++	k.Finalize(e)
++	tot := k.Totals()
++	if tot.CompletedTrips != 1 {
++		t.Fatalf("CompletedTrips = %d, want 1", tot.CompletedTrips)
++	}
++	if !closeWithin(tot.VMT, 3) {
++		t.Errorf("VMT = %v, want 3 (the exit segment)", tot.VMT)
++	}
++	trips := k.DrainTrips()
++	if len(trips) != 1 {
++		t.Fatalf("got %d trip records, want 1", len(trips))
++	}
++	tr := trips[0]
++	if !tr.Completed || tr.EntryTick != 0 || tr.ExitTick != 1 {
++		t.Errorf("pre-placed trip = %+v, want Completed with ticks [0,1]", tr)
++	}
++	if tr.OriginLaneID != "S0" || tr.DestLaneID != "S0" {
++		t.Errorf("pre-placed trip origin/dest = %q/%q, want S0/S0", tr.OriginLaneID, tr.DestLaneID)
++	}
++	if !closeWithin(tr.DistanceM, 3) {
++		t.Errorf("pre-placed trip DistanceM = %v, want 3", tr.DistanceM)
++	}
++}
++
++// Crossing time-loss clamp semantics (ADR-0014 §3): ONE clamp per
++// vehicle-tick, then a distance-proportional split — the shares are
++// non-negative and sum exactly to the clamped tick total. With vdOld = 39
++// and vdNew = 43.29 the old side's raw share is negative (−0.00064), so the
++// round-2 per-side clamp would inflate the tick total (0.00570 vs the pinned
++// 0.00506): this case discriminates the two formulas.
++func TestKernelCrossingTimeLossClamp(t *testing.T) {
++	prev := &Lane{ID: "old", Length: 600, SpeedLimit: 30}
++	cur := &Lane{ID: "new", Length: 600, SpeedLimit: 40}
++	prev.Successors = []*Lane{cur}
++	k := &Kernel{
++		dt: 0.1,
++		sets: []*metricSet{{
++			cfg: MetricSetConfig{ID: "s", PeriodTicks: 100},
++			acc: map[string]*laneAccum{"old": {}, "new": {}},
++		}},
++	}
++	v := &Vehicle{ID: 1, Type: &Car, F: 1.3, S: 3, Lane: cur}
++	// vdOld = 1.3 × min(33.3, 30) = 39; vdNew = 1.3 × min(33.3, 40) = 43.29.
++	// dOld = 1 m (prevS 599 of 600), dNew = 3 m.
++	vdOld, vdNew := 1.3*30.0, 1.3*33.3
++	want := 0.1 - (1.0/vdOld + 3.0/vdNew)
++	if want <= 0 {
++		t.Fatalf("test geometry broken: clamped tick loss %v ≤ 0", want)
++	}
++	if raw := 0.025 - 1.0/vdOld; raw >= 0 {
++		t.Fatalf("test geometry broken: old-side raw share %v ≥ 0 (no discrimination)", raw)
++	}
++	tl := k.splitTick(prev, cur, 599, v, 0.1, 1, nil)
++	if !closeWithin(tl, want) {
++		t.Errorf("tick time-loss = %v, want single-clamp value %v", tl, want)
++	}
++	oldShare := k.sets[0].acc["old"].sumTimeLoss
++	newShare := k.sets[0].acc["new"].sumTimeLoss
++	if oldShare <= 0 {
++		t.Errorf("old lane share = %v — per-side clamping would zero it; want proportional share %v", oldShare, want/4)
++	}
++	if newShare < 0 {
++		t.Errorf("new lane share = %v, want ≥ 0", newShare)
++	}
++	if !closeWithin(oldShare+newShare, tl) {
++		t.Errorf("shares %v + %v ≠ tick total %v", oldShare, newShare, tl)
++	}
++	// Distance/time split is unchanged: 1 m / 3 m, 0.025 s / 0.075 s.
++	if d := k.sets[0].acc["old"].sumDist; d != 1 {
++		t.Errorf("old lane distance = %v, want 1", d)
++	}
++	if tm := k.sets[0].acc["new"].sumTime; !closeWithin(tm, 0.075) {
++		t.Errorf("new lane time = %v, want 0.075", tm)
++	}
++}
++
++// crossedChain resolves the TRAVELED chain of a boundary-crossing tick
++// (Step moves and crosses boundaries before hopping): direct successor,
++// multi-boundary traversal (sub-vehicle-length internal lanes, routine on
++// netimport/OSM nets), and crossing+hop all resolve; a genuinely disjoint
++// change finds no chain; parallel chains with different booked lengths are
++// ambiguous (loud); same-length parallels are not. Hand-wired lanes,
++// lateral neighbors deliberately NOT index-consecutive.
++func TestCrossedChain(t *testing.T) {
++	prev := &Lane{ID: "A0", Index: 0}
++	mid := &Lane{ID: "J0", Index: 7, Length: 2} // junction interior, far in file order
++	succ := &Lane{ID: "B0", Index: 5}
++	hop := &Lane{ID: "B1", Index: 2} // lateral of succ, far from it in file order
++	succ.Left = hop
++	prev.Successors = []*Lane{mid}
++	mid.Successors = []*Lane{succ}
++
++	chain, ambiguous, ok := crossedChain(prev, succ)
++	if !ok || ambiguous || len(chain) != 3 || chain[0] != prev || chain[1] != mid || chain[2] != succ {
++		t.Errorf("multi-boundary: chain = %v, ambiguous = %v, ok = %v, want [A0 J0 B0] unambiguous", laneIDs(chain), ambiguous, ok)
++	}
++	chain, ambiguous, ok = crossedChain(prev, mid)
++	if !ok || ambiguous || len(chain) != 2 || chain[1] != mid {
++		t.Errorf("direct crossing: chain = %v, ambiguous = %v, ok = %v, want [A0 J0] unambiguous", laneIDs(chain), ambiguous, ok)
++	}
++	chain, ambiguous, ok = crossedChain(prev, hop)
++	if !ok || ambiguous || chain[len(chain)-1] != succ {
++		t.Errorf("crossing+hop: chain = %v, ambiguous = %v, ok = %v, want arrival B0 (not the hop target)", laneIDs(chain), ambiguous, ok)
++	}
++	stranger := &Lane{ID: "X", Index: 6}
++	if _, _, ok := crossedChain(prev, stranger); ok {
++		t.Error("genuinely disjoint lane change resolved a chain")
++	}
++
++	// Parallel internals of DIFFERENT lengths to the same arrival: the
++	// actual path is unobservable — shortest books, ambiguity is loud.
++	p := &Lane{ID: "P", Index: 0, Length: 500}
++	m1 := &Lane{ID: "M1", Index: 1, Length: 1}
++	m2 := &Lane{ID: "M2", Index: 2, Length: 2}
++	q := &Lane{ID: "Q", Index: 3, Length: 500}
++	p.Successors = []*Lane{m1, m2}
++	m1.Successors = []*Lane{q}
++	m2.Successors = []*Lane{q}
++	chain, ambiguous, ok = crossedChain(p, q)
++	if !ok || !ambiguous {
++		t.Errorf("parallel 1 m vs 2 m internals: chain = %v, ambiguous = %v, ok = %v, want shortest chain, ambiguous", laneIDs(chain), ambiguous, ok)
++	}
++	if chain[1] != m1 {
++		t.Errorf("parallel internals: booked mid = %v, want M1 (shortest first)", chain[1].ID)
++	}
++	// Identical-length parallels book the same VMT but the PER-LANE
++	// attribution is still arbitrary — ambiguous too (round-11 semantics).
++	m3 := &Lane{ID: "M3", Index: 4, Length: 1}
++	m3.Successors = []*Lane{q}
++	p.Successors = []*Lane{m1, m3}
++	if _, ambiguous, ok = crossedChain(p, q); !ok || !ambiguous {
++		t.Errorf("identical-length parallels: ambiguous = %v, ok = %v, want loud (arbitrary attribution)", ambiguous, ok)
++	}
++	// ≥3 divergent parallels: the enumeration cap truncates — a differing
++	// unenumerated chain could exist, so truncation itself is loud.
++	m4 := &Lane{ID: "M4", Index: 5, Length: 4}
++	m4.Successors = []*Lane{q}
++	p.Successors = []*Lane{m1, m2, m4}
++	if _, ambiguous, ok = crossedChain(p, q); !ok || !ambiguous {
++		t.Errorf("cap-truncated enumeration: ambiguous = %v, ok = %v, want loud", ambiguous, ok)
++	}
++}
++
++func laneIDs(chain []*Lane) []string {
++	ids := make([]string, len(chain))
++	for i, l := range chain {
++		ids[i] = l.ID
++	}
++	return ids
++}
++
++// A window-truncated final interval streams as soon as its LastTick has been
++// observed — it must not wait for the run-wide Finalize.
++func TestKernelLastTickStreaming(t *testing.T) {
++	spec := lightDemandSpec(t, 400)
++	cfg := func(*Network) KernelConfig {
++		return KernelConfig{
++			Sets: []MetricSetConfig{{
++				ID:          "win",
++				LaneIDs:     []string{"S0"},
++				Groups:      MetricGroups{Edie: true, Occupancy: true, Stops: true, TimeLoss: true},
++				PeriodTicks: 100,
++				LastTick:    250,
++			}},
++			Trips: true,
++		}
++	}
++	e, err := NewEngine(spec)
++	if err != nil {
++		t.Fatal(err)
++	}
++	k, err := NewKernel(e, cfg(e.Net))
++	if err != nil {
++		t.Fatal(err)
++	}
++	for e.Tick < spec.Ticks {
++		e.Step()
++		k.Observe(e)
++	}
++	// Before Finalize: both full intervals AND the LastTick-truncated partial
++	// must already be drained — the partial closed at tick 250.
++	recs := k.DrainIntervals()
++	if len(recs) != 3 {
++		t.Fatalf("got %d records before Finalize, want 3 (2 full + streamed partial)", len(recs))
++	}
++	last := recs[2]
++	if !last.Partial || last.BeginTick != 200 || last.EndTick != 250 {
++		t.Errorf("streamed partial = [%d,%d) partial=%v, want [200,250) partial=true",
++			last.BeginTick, last.EndTick, last.Partial)
++	}
++	k.Finalize(e)
++	if n := len(k.DrainIntervals()); n != 0 {
++		t.Errorf("Finalize emitted %d more interval records, want 0 (window already streamed)", n)
++	}
++}
++
++// A second Finalize is a no-op: totals (in particular the denied-pending
++// counts) don't double, and no further records are emitted.
++func TestKernelFinalizeIdempotent(t *testing.T) {
++	spec, err := DefaultSpec("lanedrop", 600, 7)
++	if err != nil {
++		t.Fatal(err)
++	}
++	spec.Scen.SpawnRatePerLaneHour = 3000
++	spec.Scen.DensityTargetPerKm = 80 // overload ⇒ denied demand pending at horizon
++	e, err := NewEngine(spec)
++	if err != nil {
++		t.Fatal(err)
++	}
++	k, err := NewKernel(e, DefaultKernelConfig(e.Net, e.Params.Dt))
++	if err != nil {
++		t.Fatal(err)
++	}
++	for e.Tick < spec.Ticks {
++		e.Step()
++		k.Observe(e)
++	}
++	k.Finalize(e)
++	first := k.Totals()
++	if first.DeniedPending == 0 {
++		t.Fatal("no denied demand pending at horizon — the doubling case went untested")
++	}
++	if len(k.DrainIntervals()) == 0 || len(k.DrainTrips()) == 0 {
++		t.Fatal("first Finalize emitted nothing")
++	}
++	k.Finalize(e) // no-op
++	second := k.Totals()
++	if !reflect.DeepEqual(first, second) {
++		t.Errorf("Totals changed after a second Finalize:\nfirst:  %+v\nsecond: %+v", first, second)
++	}
++	if n := len(k.DrainIntervals()); n != 0 {
++		t.Errorf("second Finalize emitted %d interval records", n)
++	}
++	if n := len(k.DrainTrips()); n != 0 {
++		t.Errorf("second Finalize emitted %d trip records", n)
++	}
++}
++
++// Multi-boundary traversal in one tick (netimport/OSM nets have
++// sub-vehicle-length internal lanes): a 3.33 m move crossing prev → 2 m mid
++// → cur books prev's remainder, mid's FULL length, and the arrival
++// remainder — distance conserved exactly.
++func TestKernelMultiBoundaryConservation(t *testing.T) {
++	prev := &Lane{ID: "prev", Length: 500, SpeedLimit: 33.3}
++	mid := &Lane{ID: "mid", Length: 2, SpeedLimit: 33.3}
++	cur := &Lane{ID: "cur", Length: 500, SpeedLimit: 33.3}
++	prev.Successors = []*Lane{mid}
++	mid.Successors = []*Lane{cur}
++	k := &Kernel{
++		dt: 0.1,
++		sets: []*metricSet{{
++			cfg: MetricSetConfig{ID: "s", PeriodTicks: 100},
++			acc: map[string]*laneAccum{"prev": {}, "mid": {}, "cur": {}},
++		}},
++	}
++	v := &Vehicle{ID: 1, Type: &Car, F: 1, S: 0.83, Lane: cur}
++	k.splitTick(prev, cur, 499.5, v, 0.1, 1, nil)
++	acc := k.sets[0].acc
++	if !closeWithin(acc["prev"].sumDist, 0.5) {
++		t.Errorf("prev share = %v, want 0.5", acc["prev"].sumDist)
++	}
++	if acc["mid"].sumDist != 2 {
++		t.Errorf("mid share = %v, want its full length 2", acc["mid"].sumDist)
++	}
++	if !closeWithin(acc["cur"].sumDist, 0.83) {
++		t.Errorf("cur share = %v, want 0.83", acc["cur"].sumDist)
++	}
++	if !closeWithin(k.vmt, 0.5+2+0.83) {
++		t.Errorf("VMT = %v, want %v (conserved)", k.vmt, 0.5+2+0.83)
++	}
++	if !closeWithin(acc["prev"].sumTime+acc["mid"].sumTime+acc["cur"].sumTime, 0.1) {
++		t.Error("time shares do not sum to dt")
++	}
++}
++
++// Despawn after crossing: the exit lane precedes its feeder in file order,
++// so boundaries() reprocesses it in the same pass — the vehicle crosses AND
++// despawns in one tick, with its last observation on the FEEDER. The trip
++// must book the feeder remainder plus the exit lane's full length.
++func TestKernelDespawnAfterCrossing(t *testing.T) {
++	dir := t.TempDir()
++	nf := NetFile{
++		Version: 1,
++		Name:    "cross-despawn",
++		Lanes: []NetLane{
++			{ID: "x_0", Section: "x", Length: 2, SpeedLimit: 33.3, Width: 3.2,
++				Shape: [][2]float64{{500, 0}, {502, 0}}, Exit: true},
++			{ID: "a_0", Section: "a", Length: 500, SpeedLimit: 33.3, Width: 3.2,
++				Shape: [][2]float64{{0, 0}, {500, 0}}, Successors: []string{"x_0"}, Origin: true},
++		},
++	}
++	data, err := json.Marshal(nf)
++	if err != nil {
++		t.Fatal(err)
++	}
++	p := filepath.Join(dir, "network.json")
++	if err := os.WriteFile(p, data, 0o644); err != nil {
++		t.Fatal(err)
++	}
++	spec := RunSpec{
++		Net:    NetSpec{Kind: "file", Path: p},
++		Params: DefaultParams(),
++		Ticks:  10,
++	}
++	e, err := NewEngine(spec)
++	if err != nil {
++		t.Fatal(err)
++	}
++	// 0.5 m from the feeder end at 33.3 m/s (3.33 m/tick): crosses onto the
++	// 2 m exit lane AND despawns past its end in tick 1.
++	e.AddInitialVehicle(e.Net.LaneByID("a_0"), 0, 499.5, 33.3, 1)
++	k, err := NewKernel(e, DefaultKernelConfig(e.Net, e.Params.Dt))
++	if err != nil {
++		t.Fatal(err)
++	}
++	for e.Tick < spec.Ticks {
++		e.Step()
++		k.Observe(e)
++	}
++	k.Finalize(e)
++	tot := k.Totals()
++	if tot.CompletedTrips != 1 {
++		t.Fatalf("CompletedTrips = %d, want 1", tot.CompletedTrips)
++	}
++	const want = 0.5 + 2.0 // feeder remainder + exit lane full length
++	if !closeWithin(tot.VMT, want) {
++		t.Errorf("VMT = %v, want %v", tot.VMT, want)
++	}
++	trips := k.DrainTrips()
++	if len(trips) != 1 {
++		t.Fatalf("got %d trip records, want 1", len(trips))
++	}
++	if !closeWithin(trips[0].DistanceM, want) {
++		t.Errorf("trip DistanceM = %v, want %v — exit chain not booked", trips[0].DistanceM, want)
++	}
++	if trips[0].DestLaneID != "x_0" {
++		t.Errorf("trip dest = %q, want x_0 (the resolved exit lane)", trips[0].DestLaneID)
++	}
++}
++
++// A vehicle first observed OFF any origin lane spawned and crossed within
++// its spawn tick — the traveled chain is unobservable, so the kernel books
++// the seen lane but counts a DroppedCrossing.
++func TestKernelSpawnThenCross(t *testing.T) {
++	dir := t.TempDir()
++	nf := NetFile{
++		Version: 1,
++		Name:    "spawn-cross",
++		Lanes: []NetLane{
++			{ID: "a_0", Section: "a", Length: 2, SpeedLimit: 33.3, Width: 3.2,
++				Shape: [][2]float64{{0, 0}, {2, 0}}, Successors: []string{"b_0"}, Origin: true},
++			{ID: "b_0", Section: "b", Length: 500, SpeedLimit: 33.3, Width: 3.2,
++				Shape: [][2]float64{{2, 0}, {502, 0}}, Exit: true},
++		},
++	}
++	data, err := json.Marshal(nf)
++	if err != nil {
++		t.Fatal(err)
++	}
++	p := filepath.Join(dir, "network.json")
++	if err := os.WriteFile(p, data, 0o644); err != nil {
++		t.Fatal(err)
++	}
++	spec := RunSpec{
++		Net:    NetSpec{Kind: "file", Path: p},
++		Params: DefaultParams(),
++		Scen:   Scenario{SpawnRatePerLaneHour: 3600},
++		Ticks:  30,
++	}
++	// Every spawn crosses the 2 m origin lane within its spawn tick (entry
++	// speed ≥ 8 m/s ⇒ ≥ 0.8 m... at v0 ≥ 26.6 m/s ⇒ ≥ 2.66 m > 2 m).
++	_, k := runWithKernel(t, spec, defaultCfg)
++	if got := k.Totals().DroppedCrossings; got == 0 {
++		t.Error("off-origin first observations not counted — DroppedCrossings = 0")
++	}
++}
++
++// Branched feeder with TWO reachable short exits: the actual exit lane is
++// unobservable post-hoc, so the despawn books only the last-seen lane's
++// remainder and counts a DroppedCrossing — never a guessed branch.
++func TestKernelDespawnAmbiguousExit(t *testing.T) {
++	dir := t.TempDir()
++	nf := NetFile{
++		Version: 1,
++		Name:    "ambiguous-exit",
++		Lanes: []NetLane{
++			{ID: "x_0", Section: "x", Length: 2, SpeedLimit: 33.3, Width: 3.2,
++				Shape: [][2]float64{{500, 0}, {502, 0}}, Exit: true},
++			{ID: "y_0", Section: "y", Length: 2, SpeedLimit: 33.3, Width: 3.2,
++				Shape: [][2]float64{{500, 0}, {502, 0}}, Exit: true},
++			{ID: "a_0", Section: "a", Length: 500, SpeedLimit: 33.3, Width: 3.2,
++				Shape: [][2]float64{{0, 0}, {500, 0}}, Successors: []string{"x_0", "y_0"}, Origin: true},
++		},
++	}
++	data, err := json.Marshal(nf)
++	if err != nil {
++		t.Fatal(err)
++	}
++	p := filepath.Join(dir, "network.json")
++	if err := os.WriteFile(p, data, 0o644); err != nil {
++		t.Fatal(err)
++	}
++	spec := RunSpec{
++		Net:    NetSpec{Kind: "file", Path: p},
++		Params: DefaultParams(),
++		Ticks:  10,
++	}
++	e, err := NewEngine(spec)
++	if err != nil {
++		t.Fatal(err)
++	}
++	e.AddInitialVehicle(e.Net.LaneByID("a_0"), 0, 499.5, 33.3, 1)
++	k, err := NewKernel(e, defaultCfg(e.Net))
++	if err != nil {
++		t.Fatal(err)
++	}
++	for e.Tick < spec.Ticks {
++		e.Step()
++		k.Observe(e)
++	}
++	k.Finalize(e)
++	tot := k.Totals()
++	if tot.CompletedTrips != 1 {
++		t.Fatalf("CompletedTrips = %d, want 1", tot.CompletedTrips)
++	}
++	if got := tot.DroppedCrossings; got != 1 {
++		t.Errorf("DroppedCrossings = %d, want 1 (ambiguous exit)", got)
++	}
++	trips := k.DrainTrips()
++	if len(trips) != 1 {
++		t.Fatalf("got %d trip records, want 1", len(trips))
++	}
++	if !closeWithin(trips[0].DistanceM, 0.5) {
++		t.Errorf("trip DistanceM = %v, want 0.5 (prev remainder only — no guessed branch)", trips[0].DistanceM)
++	}
++	if trips[0].DestLaneID != "a_0" {
++		t.Errorf("trip dest = %q, want a_0 (exit lane unresolved — last-seen stands)", trips[0].DestLaneID)
++	}
++}
++
++// DeniedServed (ADR-0014 §3 "denied-entry count"): vehicles that waited past
++// their scheduled/request tick and then left the pending state — spawner
++// origins unblocking after an overload, a director directive injected after
++// a wait, and a director directive expiring unserved.
++func TestKernelDeniedServed(t *testing.T) {
++	// Spawner: overload, then the queue clears and origins serve again.
++	spec, err := DefaultSpec("lanedrop", 600, 11)
++	if err != nil {
++		t.Fatal(err)
++	}
++	spec.Scen.SpawnRatePerLaneHour = 3600
++	spec.Scen.DensityTargetPerKm = 1
++	_, k := runWithKernel(t, spec, defaultCfg)
++	if got := k.Totals().DeniedServed; got == 0 {
++		t.Error("spawner: DeniedServed = 0 after overload-then-clear")
++	}
++
++	// Director, injected after a wait: cap filled, directive waits, the
++	// pre-placed vehicles clear (600 m feeder + 600 m exit at 33.3 m/s ⇒
++	// ~184 ticks), the directive injects.
++	mkRun := func(secLen float64, target float64, ticks uint64, placeS float64) (*Engine, *Kernel) {
++		spec := RunSpec{
++			Net:    NetSpec{Kind: "lanedrop", SectionLen: secLen},
++			Params: DefaultParams(),
++			Scen:   Scenario{DensityTargetPerKm: target},
++			Ticks:  ticks,
++		}
++		e, err := NewEngine(spec)
++		if err != nil {
++			t.Fatal(err)
++		}
++		for _, id := range []string{"A0", "A1", "A2"} {
++			e.AddInitialVehicle(e.Net.LaneByID(id), 0, placeS, 33.3, 1)
++		}
++		k, err := NewKernel(e, defaultCfg(e.Net))
++		if err != nil {
++			t.Fatal(err)
++		}
++		if err := e.EnqueueSpawn(SpawnDirective{RequestID: "due", Origin: "A1", TypeName: "car", EarliestTick: 0}); err != nil {
++			t.Fatal(err)
++		}
++		for e.Tick < spec.Ticks {
++			e.Step()
++			k.Observe(e)
++		}
++		k.Finalize(e)
++		return e, k
++	}
++	_, k2 := mkRun(600, 1, 220, 590) // clear at ~tick 184 ⇒ directive injects after a wait
++	if got := k2.Totals().DeniedByLane["A1"].Served; got != 1 {
++		t.Errorf("director injected-after-wait: Served = %d, want 1", got)
++	}
++	// Director, expired unserved: 60 km lanes and a tiny density target —
++	// the cap never clears, so the directive drops after
++	// DirectorSpawnHoldTicks (600).
++	_, k3 := mkRun(60000, 0.005, 650, 100)
++	if got := k3.Totals().DeniedByLane["A1"].Served; got != 1 {
++		t.Errorf("director expired: Served = %d, want 1", got)
++	}
++	if got := k3.Totals().DeniedByLane["A1"].Pending; got != 0 {
++		t.Errorf("director expired: Pending = %v, want 0 (dropped demand is wait-without-pending)", got)
++	}
++}
++
++// The pairing guard: skipped or doubled ticks and observations after
++// Finalize panic loudly instead of mis-booking silently.
++func TestKernelObservePairingGuard(t *testing.T) {
++	mustPanic := func(name string, fn func()) {
++		t.Helper()
++		defer func() {
++			if r := recover(); r == nil {
++				t.Errorf("%s: no panic", name)
++			}
++		}()
++		fn()
++	}
++	spec, err := DefaultSpec("straight", 10, 1)
++	if err != nil {
++		t.Fatal(err)
++	}
++	e, err := NewEngine(spec)
++	if err != nil {
++		t.Fatal(err)
++	}
++	k, err := NewKernel(e, defaultCfg(e.Net))
++	if err != nil {
++		t.Fatal(err)
++	}
++	e.Step()
++	e.Step()
++	mustPanic("first Observe not at tick 1", func() { k.Observe(e) })
++
++	e2, _ := NewEngine(spec)
++	k2, _ := NewKernel(e2, defaultCfg(e2.Net))
++	e2.Step()
++	k2.Observe(e2) // tick 1
++	e2.Step()
++	e2.Step() // tick 3 observed after tick 1
++	mustPanic("skipped tick", func() { k2.Observe(e2) })
++
++	e3, _ := NewEngine(spec)
++	k3, _ := NewKernel(e3, defaultCfg(e3.Net))
++	e3.Step()
++	k3.Observe(e3)
++	k3.Finalize(e3)
++	e3.Step()
++	mustPanic("Observe after Finalize", func() { k3.Observe(e3) })
++
++	e4, _ := NewEngine(spec)
++	k4, _ := NewKernel(e4, defaultCfg(e4.Net))
++	e4.Step()
++	k4.Observe(e4)
++	e4.Step() // stepped without observing
++	mustPanic("Finalize after an unobserved Step", func() { k4.Finalize(e4) })
++}
++
++// A genuinely disjoint lane change books the defensive split but is LOUD:
++// DroppedCrossings surfaces in Totals.
++func TestKernelDroppedCrossings(t *testing.T) {
++	prev := &Lane{ID: "prev", Length: 500, SpeedLimit: 33.3}
++	cur := &Lane{ID: "cur", Length: 500, SpeedLimit: 33.3} // unrelated: no chain
++	k := &Kernel{
++		dt: 0.1,
++		sets: []*metricSet{{
++			cfg: MetricSetConfig{ID: "s", PeriodTicks: 100},
++			acc: map[string]*laneAccum{"prev": {}, "cur": {}},
++		}},
++	}
++	v := &Vehicle{ID: 1, Type: &Car, F: 1, S: 3, Lane: cur}
++	k.splitTick(prev, cur, 499, v, 0.1, 1, nil)
++	if got := k.Totals().DroppedCrossings; got != 1 {
++		t.Errorf("DroppedCrossings = %d, want 1", got)
++	}
++}
++
++// deniedExpect integrates the documented backlog rule per origin from the
++// blocked schedule tick (st.tick, frozen while blocked) to the horizon:
++// newly overdue b = 1 (the held vehicle; lag 0 here), then b += rate·dt per
++// overdue tick; wait accrues dt·b. Returns (wait, pending).
++func deniedExpect(t0, horizon uint64, rateAt func(tau uint64) float64, dt float64) (wait, pending float64) {
++	b := 1.0
++	for tau := t0; tau <= horizon; tau++ {
++		if tau > t0 {
++			b += rateAt(tau) * dt
++		}
++		wait += dt * b
++	}
++	return wait, b
++}
++
++// Denied-entry backlog (ADR-0014 §3): a permanently blocked origin at rate r
++// accrues wait over the growing INTEGRATED mean-field backlog, not over the
++// one held vehicle.
++func TestKernelDeniedBacklog(t *testing.T) {
++	spec, err := DefaultSpec("lanedrop", 300, 11)
++	if err != nil {
++		t.Fatal(err)
++	}
++	spec.Scen.SpawnRatePerLaneHour = 3600 // 1 veh/s per origin
++	spec.Scen.DensityTargetPerKm = 1      // 3 lane-km ⇒ 3 vehicles, then permanent block
++	e, k := runWithKernel(t, spec, defaultCfg)
++	tot := k.Totals()
++	const dt = 0.1
++	blocked := map[string]uint64{}
++	for i := range e.spawner.origins {
++		st := &e.spawner.origins[i]
++		blocked[st.lane.ID] = st.tick // frozen schedule tick while blocked
++	}
++	seen := 0
++	for lane, t0 := range blocked {
++		seen++
++		ld := tot.DeniedByLane[lane]
++		if ld.Pending <= 1 {
++			t.Errorf("%s: pending backlog = %v, want > 1 (mean-field, not the one held vehicle)", lane, ld.Pending)
++			continue
++		}
++		want, wantP := deniedExpect(t0, 300, func(uint64) float64 { return 1.0 }, dt)
++		if !closeWithin(ld.WaitS, want) {
++			t.Errorf("%s: wait %v s, want %v (integrated backlog)", lane, ld.WaitS, want)
++		}
++		if !closeWithin(ld.Pending, wantP) {
++			t.Errorf("%s: pending %v, want %v (integrated backlog at horizon)", lane, ld.Pending, wantP)
++		}
++	}
++	if seen == 0 {
++		t.Fatal("no blocked origin — the backlog case went untested")
++	}
++}
++
++// A DemandSchedule rate change applies PROSPECTIVELY to the denied backlog:
++// the rate triples mid-overload and the integrated path bends there — a
++// retroactive lag × current-rate formula would revalue the whole history.
++func TestKernelDeniedBacklogRateChange(t *testing.T) {
++	spec, err := DefaultSpec("lanedrop", 300, 11)
++	if err != nil {
++		t.Fatal(err)
++	}
++	spec.Scen.SpawnRatePerLaneHour = 3600
++	spec.Scen.DensityTargetPerKm = 1
++	spec.Scen.DemandSchedule = []DemandStep{{Tick: 100, Scale: 3}}
++	e, k := runWithKernel(t, spec, defaultCfg)
++	tot := k.Totals()
++	const dt = 0.1
++	rateAt := func(tau uint64) float64 {
++		if tau >= 100 {
++			return 3.0
++		}
++		return 1.0
++	}
++	seen := 0
++	for i := range e.spawner.origins {
++		st := &e.spawner.origins[i]
++		lane := st.lane.ID
++		ld := tot.DeniedByLane[lane]
++		if ld.Pending <= 1 {
++			continue
++		}
++		seen++
++		want, wantP := deniedExpect(st.tick, 300, rateAt, dt)
++		if !closeWithin(ld.WaitS, want) {
++			t.Errorf("%s: wait %v s, want %v (rate triples at tick 100)", lane, ld.WaitS, want)
++		}
++		if !closeWithin(ld.Pending, wantP) {
++			t.Errorf("%s: pending %v, want %v", lane, ld.Pending, wantP)
++		}
++		// The retroactive formula (lag × current rate) must NOT match.
++		retro := float64(300-st.tick) * dt * 3.0
++		if closeWithin(ld.Pending, retro) {
++			t.Errorf("%s: pending %v matches the retroactive revaluation %v — rate change must be prospective", lane, ld.Pending, retro)
++		}
++	}
++	if seen == 0 {
++		t.Fatal("no blocked origin — the rate-change case went untested")
++	}
++}
++
++// Group fields are nil when their group is off, never confusable with a
++// genuine zero (which stays non-nil when the group is on).
++func TestKernelGroupPointers(t *testing.T) {
++	spec := lightDemandSpec(t, 200)
++	cfg := func(*Network) KernelConfig {
++		return KernelConfig{
++			Sets: []MetricSetConfig{{
++				ID:          "edie-only",
++				LaneIDs:     []string{"S0"},
++				Groups:      MetricGroups{Edie: true},
++				PeriodTicks: 100,
++			}},
++			Trips: true,
++		}
++	}
++	_, k := runWithKernel(t, spec, cfg)
++	recs := k.DrainIntervals()
++	if len(recs) == 0 {
++		t.Fatal("no interval records")
++	}
++	for _, r := range recs {
++		if r.Stops != nil || r.TimeLossS != nil {
++			t.Errorf("edie-only set: Stops = %v, TimeLossS = %v, want both nil", r.Stops, r.TimeLossS)
++		}
++		if r.Q == nil || r.Occupancy != nil {
++			t.Errorf("edie-only set: Q = %v, Occupancy = %v, want Q non-nil, Occupancy nil", r.Q, r.Occupancy)
++		}
++	}
++}
++
++// Attaching a kernel after the first Step is a hard error — a mid-run
++// attach would book placed positions as traveled distance.
++func TestNewKernelAfterStep(t *testing.T) {
++	spec, err := DefaultSpec("straight", 10, 1)
++	if err != nil {
++		t.Fatal(err)
++	}
++	e, err := NewEngine(spec)
++	if err != nil {
++		t.Fatal(err)
++	}
++	e.Step()
++	if _, err := NewKernel(e, DefaultKernelConfig(e.Net, e.Params.Dt)); err == nil {
++		t.Error("NewKernel accepted a mid-run attach (tick 1)")
++	}
++}
++
++// An origin overdue from tick 1 must integrate its backlog from the held
++// vehicle (≥ 1) — a phantom injection at the first Observe (unseeded
++// pending-ID tracker) would silently decrement it.
++func TestKernelDeniedTickOne(t *testing.T) {
++	spec, err := DefaultSpec("lanedrop", 50, 5)
++	if err != nil {
++		t.Fatal(err)
++	}
++	spec.Scen.SpawnRatePerLaneHour = 36000 // 10 veh/s ⇒ first spawn scheduled at tick 1
++	spec.Scen.DensityTargetPerKm = 1
++	e, err := NewEngine(spec)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, id := range []string{"A0", "A1", "A2"} {
++		e.AddInitialVehicle(e.Net.LaneByID(id), 0, 100, 10, 1)
++	}
++	k, err := NewKernel(e, defaultCfg(e.Net))
++	if err != nil {
++		t.Fatal(err)
++	}
++	for e.Tick < spec.Ticks {
++		e.Step()
++		k.Observe(e)
++	}
++	k.Finalize(e)
++	tot := k.Totals()
++	for _, id := range []string{"A0", "A1", "A2"} {
++		ld := tot.DeniedByLane[id]
++		want, wantP := deniedExpect(1, 50, func(uint64) float64 { return 10.0 }, 0.1)
++		if !closeWithin(ld.WaitS, want) {
++			t.Errorf("%s: wait %v s, want %v (backlog ≥ 1 from tick 1 — phantom injection?)", id, ld.WaitS, want)
++		}
++		if !closeWithin(ld.Pending, wantP) {
++			t.Errorf("%s: pending %v, want %v", id, ld.Pending, wantP)
++		}
++	}
++}
++
++// Inject-then-accrue ordering: an overdue vehicle that injects does not
++// accrue a further dt of wait — the injection tick accrues the post-service
++// backlog. The test replicates the documented order independently and
++// asserts the old accrue-first total does NOT match.
++func TestKernelDeniedInjectOrdering(t *testing.T) {
++	spec, err := DefaultSpec("lanedrop", 220, 11)
++	if err != nil {
++		t.Fatal(err)
++	}
++	spec.Scen.SpawnRatePerLaneHour = 3600
++	spec.Scen.DensityTargetPerKm = 1
++	e, err := NewEngine(spec)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, id := range []string{"A0", "A1", "A2"} {
++		e.AddInitialVehicle(e.Net.LaneByID(id), 0, 590, 33.3, 1)
++	}
++	k, err := NewKernel(e, defaultCfg(e.Net))
++	if err != nil {
++		t.Fatal(err)
++	}
++	type org struct {
++		b, bOld             float64
++		overdue, overdueOld bool
++		pend, pendOld       uint64
++	}
++	orgs := map[string]*org{}
++	for i := range e.spawner.origins {
++		st := &e.spawner.origins[i]
++		orgs[st.lane.ID] = &org{pend: st.pend.ID, pendOld: st.pend.ID}
++	}
++	var wantWait, oldWait float64
++	for e.Tick < spec.Ticks {
++		e.Step()
++		for i := range e.spawner.origins {
++			st := &e.spawner.origins[i]
++			o := orgs[st.lane.ID]
++			overdue := st.tick <= e.Tick
++			// Documented order: service first, then accrue.
++			if st.pend.ID != o.pend {
++				if b := o.b - 1; b > 0 {
++					o.b = b
++				} else {
++					o.b = 0
++				}
++				o.pend = st.pend.ID
++			}
++			if overdue {
++				if o.overdue {
++					o.b += st.rate * 0.1
++				} else {
++					o.b = 1
++				}
++				wantWait += 0.1 * o.b
++			}
++			o.overdue = overdue
++			// Old order: accrue with the pre-service backlog, then decrement.
++			if overdue {
++				if o.overdueOld {
++					o.bOld += st.rate * 0.1
++				} else {
++					o.bOld = 1
++				}
++				oldWait += 0.1 * o.bOld
++			}
++			if st.pend.ID != o.pendOld {
++				if b := o.bOld - 1; b > 0 {
++					o.bOld = b
++				} else {
++					o.bOld = 0
++				}
++				o.pendOld = st.pend.ID
++			}
++			o.overdueOld = overdue
++		}
++		k.Observe(e)
++	}
++	k.Finalize(e)
++	got := k.Totals().DeniedWaitS
++	if !closeWithin(got, wantWait) {
++		t.Errorf("DeniedWaitS = %v, want %v (post-service backlog on injection ticks)", got, wantWait)
++	}
++	if closeWithin(got, oldWait) {
++		t.Errorf("DeniedWaitS = %v matches the accrue-first order %v — served vehicles must not accrue", got, oldWait)
++	}
++}
++
++// Spawn+despawn within one tick is invisible to observation — but vehicle
++// IDs are sequential, so the gap before the next observed ID counts it
++// loudly via DroppedCrossings.
++func TestKernelInvisibleGap(t *testing.T) {
++	dir := t.TempDir()
++	nf := NetFile{
++		Version: 1,
++		Name:    "invisible-gap",
++		Lanes: []NetLane{
++			{ID: "x_0", Section: "x", Length: 2, SpeedLimit: 33.3, Width: 3.2,
++				Shape: [][2]float64{{1, 0}, {3, 0}}, Exit: true},
++			{ID: "a_0", Section: "a", Length: 1, SpeedLimit: 33.3, Width: 3.2,
++				Shape: [][2]float64{{0, 0}, {1, 0}}, Successors: []string{"x_0"}, Origin: true},
++			{ID: "b_0", Section: "b", Length: 500, SpeedLimit: 33.3, Width: 3.2,
++				Shape: [][2]float64{{3, 0}, {503, 0}}, Exit: true, Origin: true},
++		},
++	}
++	data, err := json.Marshal(nf)
++	if err != nil {
++		t.Fatal(err)
++	}
++	p := filepath.Join(dir, "network.json")
++	if err := os.WriteFile(p, data, 0o644); err != nil {
++		t.Fatal(err)
++	}
++	spec := RunSpec{
++		Net:    NetSpec{Kind: "file", Path: p},
++		Params: DefaultParams(),
++		Scen:   Scenario{SpawnRatePerLaneHour: 3600},
++		Ticks:  100,
++	}
++	// Homogeneous drivers (F = 1): every a_0 spawn crosses the 1 m origin
++	// AND the 2 m exit in its spawn tick (3.33 m) — invisible. b_0 spawns
++	// are observed, and their higher IDs expose the gaps.
++	spec.Params.SpeedFactorSigma = 0
++	e, k := runWithKernel(t, spec, defaultCfg)
++	tot := k.Totals()
++	// Exact horizon reconciliation: every issued, never-observed,
++	// not-pending ID — trailing invisibles included.
++	npend := 0
++	for i := range e.spawner.origins {
++		if e.spawner.origins[i].pend != nil {
++			npend++
++		}
++	}
++	want := int(e.nextID) - 1 - len(k.seenIDs) - npend
++	if tot.DroppedCrossings != want {
++		t.Errorf("DroppedCrossings = %d, want exactly %d (issued %d − observed %d − pending %d)",
++			tot.DroppedCrossings, want, e.nextID-1, len(k.seenIDs), npend)
++	}
++	if want < 2 {
++		t.Fatalf("expected ≥ 2 invisible vehicles, got %d — scenario went stale", want)
++	}
++	if tot.VMT == 0 {
++		t.Error("no observed traffic on b_0 — the gap detector had no baseline")
++	}
++}
++
++// Trailing invisibles: with NO observed vehicle ever (single origin, every
++// spawn invisible), the mid-run gap heuristic can never fire — only the
++// exact horizon reconciliation counts them.
++func TestKernelInvisibleTrailing(t *testing.T) {
++	dir := t.TempDir()
++	nf := NetFile{
++		Version: 1,
++		Name:    "invisible-trailing",
++		Lanes: []NetLane{
++			{ID: "x_0", Section: "x", Length: 2, SpeedLimit: 33.3, Width: 3.2,
++				Shape: [][2]float64{{1, 0}, {3, 0}}, Exit: true},
++			{ID: "a_0", Section: "a", Length: 1, SpeedLimit: 33.3, Width: 3.2,
++				Shape: [][2]float64{{0, 0}, {1, 0}}, Successors: []string{"x_0"}, Origin: true},
++		},
++	}
++	data, err := json.Marshal(nf)
++	if err != nil {
++		t.Fatal(err)
++	}
++	p := filepath.Join(dir, "network.json")
++	if err := os.WriteFile(p, data, 0o644); err != nil {
++		t.Fatal(err)
++	}
++	spec := RunSpec{
++		Net:    NetSpec{Kind: "file", Path: p},
++		Params: DefaultParams(),
++		Scen:   Scenario{SpawnRatePerLaneHour: 3600},
++		Ticks:  100,
++	}
++	spec.Params.SpeedFactorSigma = 0
++	e, k := runWithKernel(t, spec, defaultCfg)
++	if len(k.seenIDs) != 0 {
++		t.Fatalf("expected zero observed vehicles, saw %d", len(k.seenIDs))
++	}
++	want := int(e.nextID) - 1 - 1 // issued − observed(0) − the one held pend
++	if got := k.Totals().DroppedCrossings; got != want {
++		t.Errorf("DroppedCrossings = %d, want exactly %d (all spawns invisible, none observed)", got, want)
++	}
++	if want == 0 {
++		t.Fatal("no invisible vehicles — scenario went stale")
++	}
++}
++
++// Parallel internal lanes of different lengths feeding one exit: the actual
++// despawn path is unobservable — the shortest chain books and the ambiguity
++// is loud; same-length parallels book silently.
++func TestExitSharesAmbiguousPath(t *testing.T) {
++	prev := &Lane{ID: "P", Length: 500, SpeedLimit: 33.3}
++	m1 := &Lane{ID: "M1", Length: 1, SpeedLimit: 33.3}
++	m2 := &Lane{ID: "M2", Length: 3, SpeedLimit: 33.3}
++	x := &Lane{ID: "X", Length: 100, SpeedLimit: 33.3, Exit: true}
++	prev.Successors = []*Lane{m1, m2}
++	m1.Successors = []*Lane{x}
++	m2.Successors = []*Lane{x}
++	obs := mLastObs{lane: prev, s: 499, v: 33.3, vt: &Car, f: 1}
++	shares, exit, ok, ambiguous := exitShares(obs)
++	if !ok || !ambiguous || exit != x {
++		t.Errorf("exitShares = ok %v ambiguous %v exit %v, want ok+ambiguous, exit X", ok, ambiguous, exit)
++	}
++	var total float64
++	for _, sh := range shares {
++		total += sh.d
++	}
++	if !closeWithin(total, 1+1+100) {
++		t.Errorf("booked %v m, want %v (prev remainder + shortest chain)", total, 1.0+1+100)
++	}
++	m2.Length = 1 // same total on both chains — attribution still arbitrary ⇒ loud
++	if _, _, ok, ambiguous := exitShares(obs); !ok || !ambiguous {
++		t.Errorf("identical-length parallels: ok %v ambiguous %v, want loud (arbitrary attribution)", ok, ambiguous)
++	}
++	// Three divergent paths to the one exit: the enumeration cap truncates —
++	// truncation itself is ambiguous (loud).
++	m2.Length = 3
++	m3 := &Lane{ID: "M3", Length: 5, SpeedLimit: 33.3}
++	m3.Successors = []*Lane{x}
++	prev.Successors = []*Lane{m1, m2, m3}
++	if _, _, ok, ambiguous := exitShares(obs); !ok || !ambiguous {
++		t.Errorf("cap-truncated exit enumeration: ok %v ambiguous %v, want loud", ok, ambiguous)
++	}
++}
++
++// Replay re-derivation equality (ADR-0014 §1): the same recording replayed
++// with a fresh kernel attached re-derives the IDENTICAL metric stream —
++// the validity check on the kernel itself.
++func TestKernelReplayRederivation(t *testing.T) {
++	spec, err := DefaultSpec("lanedrop", 800, 7)
++	if err != nil {
++		t.Fatal(err)
++	}
++	// Live run with the kernel attached; capture the recording.
++	e1, k1 := runWithKernel(t, spec, defaultCfg)
++	log := &RunLog{Spec: spec, Intents: e1.IntentLog, Spawns: e1.SpawnLog, CRCs: e1.CRCs}
++	int1 := k1.DrainIntervals()
++	trips1 := k1.DrainTrips()
++	tot1 := k1.Totals()
++
++	// Replay from the recording with a fresh kernel (mirrors Replay()'s
++	// re-enqueue loop, plus observation).
++	e2, err := NewEngine(log.Spec)
++	if err != nil {
++		t.Fatal(err)
++	}
++	k2, err := NewKernel(e2, defaultCfg(e2.Net))
++	if err != nil {
++		t.Fatal(err)
++	}
++	ii, si := 0, 0
++	for e2.Tick < log.Spec.Ticks {
++		for ii < len(log.Intents) && log.Intents[ii].Tick <= e2.Tick+1 {
++			if log.Intents[ii].Tick == e2.Tick+1 {
++				e2.EnqueueIntent(log.Intents[ii].KeyedIntent)
++			}
++			ii++
++		}
++		for si < len(log.Spawns) && log.Spawns[si].Tick <= e2.Tick+1 {
++			if log.Spawns[si].Tick == e2.Tick+1 {
++				if err := e2.EnqueueSpawn(log.Spawns[si].SpawnDirective); err != nil {
++					t.Fatalf("replay spawn: %v", err)
++				}
++			}
++			si++
++		}
++		e2.Step()
++		k2.Observe(e2)
++	}
++	k2.Finalize(e2)
++	assertEqualCRCs(t, log.CRCs, e2.CRCs)
++	if !reflect.DeepEqual(int1, k2.DrainIntervals()) {
++		t.Fatal("replay re-derived different interval records")
++	}
++	if !reflect.DeepEqual(trips1, k2.DrainTrips()) {
++		t.Fatal("replay re-derived different trip records")
++	}
++	if !reflect.DeepEqual(tot1, k2.Totals()) {
++		t.Fatal("replay re-derived different totals")
++	}
++}
++
++// Overshoot refund (netimport index ordering — internal lanes sorted LAST,
++// boundaries() never re-clamps): a vehicle parked past a tiny internal
++// lane's end gets the overshoot refunded next tick, distance-only. Per-lane
++// nets over the crossing ticks are exact (each internal lane nets precisely
++// its own length) and VMT matches ground-truth travel, not just internal
++// consistency.
++func TestKernelOvershootRefund(t *testing.T) {
++	dir := t.TempDir()
++	nf := NetFile{
++		Version: 1,
++		Name:    "overshoot",
++		Lanes: []NetLane{
++			{ID: "f_0", Section: "f", Length: 500, SpeedLimit: 33.3, Width: 3.2,
++				Shape: [][2]float64{{0, 0}, {500, 0}}, Successors: []string{"j_0"}, Origin: true},
++			{ID: "n_0", Section: "n", Length: 500, SpeedLimit: 33.3, Width: 3.2,
++				Shape: [][2]float64{{502.5, 0}, {1002.5, 0}}, Exit: true},
++			{ID: "j_0", Section: "j", Length: 0.5, SpeedLimit: 33.3, Width: 3.2, Internal: true,
++				Shape: [][2]float64{{500, 0}, {500.5, 0}}, Successors: []string{"m_0"}},
++			{ID: "m_0", Section: "j", Length: 2, SpeedLimit: 33.3, Width: 3.2, Internal: true,
++				Shape: [][2]float64{{500.5, 0}, {502.5, 0}}, Successors: []string{"n_0"}},
++		},
++	}
++	data, err := json.Marshal(nf)
++	if err != nil {
++		t.Fatal(err)
++	}
++	p := filepath.Join(dir, "network.json")
++	if err := os.WriteFile(p, data, 0o644); err != nil {
++		t.Fatal(err)
++	}
++	spec := RunSpec{
++		Net:    NetSpec{Kind: "file", Path: p},
++		Params: DefaultParams(),
++		Ticks:  3,
++	}
++	e, err := NewEngine(spec)
++	if err != nil {
++		t.Fatal(err)
++	}
++	// 0.3 m from the feeder end at a constant 33.3 m/s (3.33 m/tick):
++	// tick 1 crosses f_0 and parks at S = 3.03 on 0.5 m j_0; tick 2 crosses
++	// j_0 and parks at S = 5.86 on 2 m m_0; tick 3 lands on n_0.
++	e.AddInitialVehicle(e.Net.LaneByID("f_0"), 0, 499.7, 33.3, 1)
++	k, err := NewKernel(e, defaultCfg(e.Net))
++	if err != nil {
++		t.Fatal(err)
++	}
++	for e.Tick < spec.Ticks {
++		e.Step()
++		k.Observe(e)
++	}
++	k.Finalize(e)
++	sumByLane := map[string]float64{}
++	for _, r := range k.DrainIntervals() {
++		sumByLane[r.LaneID] += r.SumDistM
++	}
++	for lane, want := range map[string]float64{"f_0": 0.3, "j_0": 0.5, "m_0": 2.0} {
++		if !closeWithin(sumByLane[lane], want) {
++			t.Errorf("%s booked %v m over the run, want exactly %v (its own length)", lane, sumByLane[lane], want)
++		}
++	}
++	const travel = 3 * 3.33 // 3 ticks at constant speed
++	tot := k.Totals()
++	if !closeWithin(tot.VMT, travel) {
++		t.Errorf("VMT = %v, want %v (ground-truth travel — refund conserves)", tot.VMT, travel)
++	}
++	trips := k.DrainTrips()
++	if len(trips) != 1 || !closeWithin(trips[0].DistanceM, travel) {
++		t.Errorf("trip distance = %+v, want %v", trips, travel)
++	}
++}

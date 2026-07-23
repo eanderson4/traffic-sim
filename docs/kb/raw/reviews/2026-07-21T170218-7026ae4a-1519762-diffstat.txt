@@ -1,0 +1,17 @@
+ .../kb/decisions/ADR-0014-observability-metrics.md |   59 +
+ engine/cmd/serve/main.go                           |   75 +-
+ engine/cmd/simrun/main.go                          |   58 +-
+ engine/director.go                                 |   24 +-
+ engine/director_test.go                            |   15 +
+ engine/engine.go                                   |    4 +-
+ engine/metrics.go                                  | 1233 ++++++++++++++
+ engine/metrics_test.go                             | 1759 ++++++++++++++++++++
+ engine/metricsjson.go                              |  161 ++
+ engine/metricsjson_test.go                         |  143 ++
+ engine/natsio/contract.go                          |    5 +
+ engine/natsio/run.go                               |   19 +
+ engine/scenario/metrics.go                         |  251 +++
+ engine/scenario/metrics_test.go                    |  249 +++
+ engine/scenario/scenario.go                        |   52 +-
+ engine/scenario/variant.go                         |   55 +-
+ 16 files changed, 4132 insertions(+), 30 deletions(-)

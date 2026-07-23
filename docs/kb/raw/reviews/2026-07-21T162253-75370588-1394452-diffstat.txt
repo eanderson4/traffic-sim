@@ -1,0 +1,5 @@
+ .../kb/decisions/ADR-0014-observability-metrics.md |   53 +
+ engine/engine.go                                   |    4 +-
+ engine/metrics.go                                  | 1213 +++++++++++++++
+ engine/metrics_test.go                             | 1612 ++++++++++++++++++++
+ 4 files changed, 2881 insertions(+), 1 deletion(-)
