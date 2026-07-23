@@ -58,6 +58,11 @@ type ContractConfig struct {
 	// clients. Without it an unpaced loop spins at ~10⁴ ticks/s and even
 	// in-process controllers lag dozens of ticks.
 	PaceFloor time.Duration
+	// Observer is an optional read-only per-tick observer on the run loop
+	// (RunObserver — the M13 metric kernel). Nil = none. Loop-behavior
+	// knobs ride this config (PaceFloor precedent); the observer is not
+	// part of the controller contract.
+	Observer RunObserver
 }
 
 func (c ContractConfig) withDefaults() ContractConfig {

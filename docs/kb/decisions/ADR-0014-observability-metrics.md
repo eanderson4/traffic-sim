@@ -235,3 +235,75 @@ delay/speed/throughput numbers, with the full catalog ratified but phased.
   finer stream granularity; the first field-calibration scenario forces
   the detector layer; viz wants live Edie heatmaps at <900 s latency
   (window trade-offs); queue definitions prove out against NGSIM.
+
+## Addendum (2026-07-21, M13 implementation)
+
+The metric kernel, the JSON file sink (`simrun`/`serve -metrics-out`), and
+the scenario `metrics/*.yaml` bindings all land in THIS commit, after
+thirteen Fable+Sol gate rounds (`docs/kb/raw/reviews/2026-07-21T13*`–`T17*`):
+
+- **Whole-run scoping (decision, not omission):** kernel state is NOT
+  keyframe/replay-persisted. Metrics are computed over whole runs, and
+  mid-run re-derivation is UNSUPPORTED: `NewKernel` rejects attach at any
+  tick ≠ 0, and `Observe`/`Finalize` panic on a skipped or doubled tick.
+  Replay re-derivation equality remains a regression test over whole
+  recordings.
+- **Interval conventions as implemented:** observation tick T covers
+  (T−1)·dt…T·dt, so intervals hold ticks (B, B+P] and records stamp the
+  SIM-TIME tick grid: an interval covering observations (begin, end]
+  stamps [begin, end) — BeginTick·dt…EndTick·dt converts naively to sim
+  time, with duration (EndTick − BeginTick)·dt. Horizon partials stamp
+  end = last observed tick; exact horizons yield no manufactured partial.
+  `MetricSetConfig.LastTick` (config) is inclusive; `IntervalRecord.EndTick`
+  (record) is exclusive — named differently for exactly that reason.
+- **Lane-crossing attribution:** movement attributes to the TRAVELED
+  lane(s) — integration/boundaries run before lane changes in Step, so a
+  lateral hop is an instantaneous tick-end event (its tick books to the
+  pre-hop lane). Multi-boundary chains (sub-4 m OSM internal lanes are
+  routine — I-280's minimum is 0.1 m) walk the successor chain by BFS
+  and book each intermediate lane its full length. Unresolvable or
+  ambiguous-branch cases book conservatively and count
+  `Totals.DroppedCrossings` — loud, never silent.
+- **Approximations (v1 semantics, documented in code):** despawn
+  exit-distance is exact (in-network remainder); exit-TIME uses the
+  last-observed speed (the final accel is unobservable — constant-speed
+  is the unbiased midpoint); vehicles spawned and crossed/despawned
+  within their first tick are unobservable at this layer (unreachable on
+  current nets — shortest I-280 origin lane is 13 m ≫ 4.3 m/tick — and
+  loud via `DroppedCrossings` if a net ever violates it); spawner
+  denied-entry backlog is a per-tick INTEGRATED mean-field estimate
+  (newly overdue: 1, the held vehicle — the pairing guard makes
+  first-overdue lag always 0; then += rate·dt per overdue tick, −1 per
+  injection, floored at 0 — a DemandSchedule rate change applies
+  prospectively only); expired director directives keep accrued wait
+  (wait-without-pending) and count toward `DeniedServed`.
+- **Engine alternatives deliberately not taken:** making `boundaries()`
+  cascade crossings regardless of lane index order (so S ≤ Length is a
+  real invariant) would change the CRC streams and is ADR-0005-adjacent —
+  a non-goal for M13, noted as a revisit candidate; the kernel's
+  overshoot-refund bookkeeping is exact in the meantime.
+- **SchemaVersion 1** for the metrics schemas: channels version
+  independently (the TSSG v1 precedent, ADR-0006 2026-07-20 addendum);
+  ADR-0006's "schema_version 2" bound the M4-era envelopes.
+- **The §3 contract pin lands with the NATS publisher commit**
+  (asyncapi channels + `ts-{run}-metrics` stream — that publisher is the
+  one remaining M13 slice, NOT in this commit); the JSON file sink
+  (`simrun`/`serve -metrics-out`, schema_version 1) is in THIS commit as
+  the demo-critical path.
+- **Migration note — `EnqueueSpawn` duplicate-RequestID rejection:**
+  wire-produced recordings are UNAFFECTED (the contract layer's run-wide
+  first-seen dedup plus its empty-ID rejection means they cannot contain
+  simultaneously-live duplicate IDs); only pre-change LOCAL-harness
+  recordings with such pairs become retroactively unreplayable. The
+  rejection surfaces as a verb rejection, never a run failure.
+- **Metrics-part hash transition is intentional (no format_version bump):**
+  metrics parts moved from raw-bytes to canonical-YAML hashing without
+  touching ADR-0012's promised bump because no scenario in any pinned
+  golden vector or in-tree carries a metrics part — no durable hash moves.
+  Old free-form metrics parts now fail loudly at load instead of silently
+  re-hashing. ADR-0012 §8's "under a format_version bump" note stands
+  corrected by ADR-0014 §5.
+- Six rounds' real catches before any number became decision-grade:
+  ring-wrap distance corruption, pre-placed phantom distance, despawn
+  tick accounting, interval off-by-one, hop-attribution to the wrong
+  lane, a 10× denied-backlog unit error, and the multi-boundary void.

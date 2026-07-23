@@ -49,9 +49,24 @@ func TestDirectorSpawnValidation(t *testing.T) {
 	if err := e.EnqueueSpawn(SpawnDirective{RequestID: "ok", Origin: "A1", TypeName: "truck"}); err != nil {
 		t.Fatalf("valid directive rejected: %v", err)
 	}
+	// RequestID uniqueness among live entries is engine-enforced: the same
+	// ID while one is buffered fails loud.
+	if err := e.EnqueueSpawn(SpawnDirective{RequestID: "ok", Origin: "A1", TypeName: "truck"}); err == nil ||
+		!strings.Contains(err.Error(), "duplicate spawn request id") {
+		t.Errorf("duplicate RequestID accepted: %v", err)
+	}
 	e.Step()
 	if got := e.AppliedSpawns(); len(got) != 1 || got[0].Tick != 1 || got[0].TypeIdx != 1 {
 		t.Fatalf("applied spawns after boundary: %+v", got)
+	}
+	// …and while one is live in the queue (a not-yet-due directive).
+	if err := e.EnqueueSpawn(SpawnDirective{RequestID: "hold", Origin: "A1", TypeName: "car", EarliestTick: 1 << 40}); err != nil {
+		t.Fatalf("hold directive rejected: %v", err)
+	}
+	e.Step()
+	if err := e.EnqueueSpawn(SpawnDirective{RequestID: "hold", Origin: "A1", TypeName: "car", EarliestTick: 1 << 40}); err == nil ||
+		!strings.Contains(err.Error(), "duplicate spawn request id") {
+		t.Errorf("duplicate RequestID accepted against the live queue: %v", err)
 	}
 }
 

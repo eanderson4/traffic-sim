@@ -125,17 +125,18 @@ type Slice struct {
 type Scenario struct {
 	Dir      string
 	Manifest Manifest
-	Demands  []*DemandFile // aligned with Manifest.Demand
-	NetPath  string        // resolved network path (absolute)
+	Demands  []*DemandFile  // aligned with Manifest.Demand
+	Metrics  []*MetricsFile // aligned with Manifest.Metrics
+	NetPath  string         // resolved network path (absolute)
 	origins  map[string]bool
 	parts    []hashPart // everything the content hash covers
 }
 
 // hashPart is one hashed input: rel is the scenario-relative path (forward
-// slashes, cleaned); data is canonical YAML for the manifest and demand
-// parts and canonical JSON for the network part (so the hash is
+// slashes, cleaned); data is canonical YAML for the manifest, demand, and
+// metrics parts and canonical JSON for the network part (so the hash is
 // formatting- and checkout-independent), raw bytes for the not-yet-typed
-// control/metrics parts.
+// control parts.
 type hashPart struct {
 	rel  string
 	data []byte
@@ -231,12 +232,12 @@ func Load(dir string) (*Scenario, error) {
 		s.Demands = append(s.Demands, df)
 		s.parts = append(s.parts, hashPart{rel: ref, data: canonical})
 	}
-	// Control and metrics parts are v1 pass-through: existence-checked and
-	// hashed as raw bytes (ADR-0012 §5 — the binding grammar lands with the
-	// observability ADR; the parts then move to typed canonical hashing
-	// under a format_version bump). A variant that forgets one is already a
-	// broken diff because the hash moves.
-	for _, ref := range append(append([]string{}, m.Control...), m.Metrics...) {
+	// Control parts are v1 pass-through: existence-checked and hashed as raw
+	// bytes (their binding grammar is still pending). Metrics parts are
+	// typed (ADR-0014 §5): parsed, validated against the network's lanes
+	// and the scenario's tick grid, hashed as canonical YAML — a variant
+	// that changes measurement is a different scenario (ADR-0012 §5).
+	for _, ref := range m.Control {
 		p, err := resolvePart(dir, ref)
 		if err != nil {
 			return nil, fmt.Errorf("scenario part: %w", err)
@@ -246,6 +247,25 @@ func Load(dir string) (*Scenario, error) {
 			return nil, fmt.Errorf("scenario part %s: %w", ref, err)
 		}
 		s.parts = append(s.parts, hashPart{rel: ref, data: raw})
+	}
+	laneSet := make(map[string]bool, len(net.Lanes))
+	for _, l := range net.Lanes {
+		laneSet[l.ID] = true
+	}
+	for _, ref := range m.Metrics {
+		p, err := resolvePart(dir, ref)
+		if err != nil {
+			return nil, fmt.Errorf("scenario metrics: %w", err)
+		}
+		mf, canonical, err := loadMetricsFile(p, laneSet, s.tickSeconds())
+		if err != nil {
+			return nil, fmt.Errorf("scenario metrics %s: %w", ref, err)
+		}
+		s.Metrics = append(s.Metrics, mf)
+		s.parts = append(s.parts, hashPart{rel: ref, data: canonical})
+	}
+	if err := validateMetricSetIDs(s.Metrics); err != nil {
+		return nil, fmt.Errorf("scenario %s: %w", ManifestFile, err)
 	}
 	if (m.Spawner == nil || m.Spawner.RatePerLaneHour == 0) && len(m.Demand) == 0 {
 		return nil, fmt.Errorf("scenario %s: no demand — set spawner.rate_per_lane_h > 0 or demand: (an empty run is not a scenario)", ManifestFile)
@@ -319,11 +339,11 @@ func (s *Scenario) RunSpec(typeReg map[string]*engine.VehicleType) (engine.RunSp
 }
 
 // Hash is the scenario's content identity (ADR-0012 §6): a domain-separated
-// sha256 over the canonical manifest (run coordinates stripped) and demand
-// bytes, the canonical network JSON, and the raw control/metrics bytes,
-// each framed by its length-prefixed, slash-normalized scenario-relative
-// path. Formatting- and checkout-independent for the typed parts; stable
-// across copies, renames, and machines.
+// sha256 over the canonical manifest (run coordinates stripped), demand, and
+// metrics bytes, the canonical network JSON, and the raw control bytes, each
+// framed by its length-prefixed, slash-normalized scenario-relative path.
+// Formatting- and checkout-independent for the typed parts; stable across
+// copies, renames, and machines.
 func (s *Scenario) Hash() string {
 	parts := append([]hashPart{}, s.parts...)
 	sort.Slice(parts, func(i, j int) bool { return parts[i].rel < parts[j].rel })

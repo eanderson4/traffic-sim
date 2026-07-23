@@ -25,10 +25,12 @@ func main() {
 	ticks := flag.Uint64("ticks", 600, "ticks to simulate (default tick = 100 ms)")
 	seed := flag.Uint64("seed", 1, "scenario seed")
 	verbose := flag.Bool("v", false, "print per-section collision counts")
+	metricsOut := flag.String("metrics-out", "", "write M13 metric-kernel output (ADR-0014 §6) as JSON to this path")
 	flag.Parse()
 
 	var spec engine.RunSpec
 	var err error
+	var scen *scenario.Scenario
 	name := *net
 	switch {
 	case *scenarioDir != "":
@@ -53,6 +55,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "simrun:", lerr)
 			os.Exit(1)
 		}
+		scen = sc
 		if len(sc.Demands) > 0 {
 			fmt.Fprintln(os.Stderr, "simrun: scenario declares demand parts — headless runs have no bus for director verbs; use serve (it embeds the demand director, run-seeded)")
 			os.Exit(2)
@@ -91,7 +94,33 @@ func main() {
 		fmt.Fprintln(os.Stderr, "simrun:", err)
 		os.Exit(2)
 	}
-	e, _, err := engine.Run(spec)
+	var e *engine.Engine
+	var mk *engine.Kernel
+	if *metricsOut != "" {
+		// Metrics enabled: step manually so the kernel observes every tick.
+		// The kernel is a read-only observer (ADR-0014 §1) — the run stays
+		// bit-identical to the engine.Run path (CRC-invariance tested in
+		// engine/metrics_test.go).
+		e, err = engine.NewEngine(spec)
+		if err == nil {
+			// The scenario's metrics parts drive the kernel when present
+			// (mirroring serve); otherwise the zero-authoring default.
+			cfg := engine.DefaultKernelConfig(e.Net, e.Params.Dt)
+			if scen != nil {
+				cfg = scen.MetricConfig(e.Net)
+			}
+			mk, err = engine.NewKernel(e, cfg)
+		}
+		if err == nil {
+			for e.Tick < spec.Ticks {
+				e.Step()
+				mk.Observe(e)
+			}
+			mk.Finalize(e)
+		}
+	} else {
+		e, _, err = engine.Run(spec)
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "simrun:", err)
 		os.Exit(1)
@@ -99,6 +128,13 @@ func main() {
 	fmt.Printf("net=%s ticks=%d seed=%d vehicles=%d spawned=%d despawned=%d lanechanges=%d collisions=%d mingap=%.3f crc=%016x\n",
 		name, *ticks, *seed, len(e.Vehicles()), e.Stats.Spawned, e.Stats.Despawned,
 		e.Stats.LaneChanges, e.Stats.Collisions, e.Stats.MinGap, e.CRC())
+	if mk != nil {
+		if err := writeMetricsFile(*metricsOut, mk, spec.Ticks); err != nil {
+			fmt.Fprintln(os.Stderr, "simrun: metrics:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("metrics=%s\n", *metricsOut)
+	}
 	if *verbose && len(e.Stats.CollisionsBySection) > 0 {
 		sections := make([]string, 0, len(e.Stats.CollisionsBySection))
 		for s := range e.Stats.CollisionsBySection {
@@ -109,4 +145,25 @@ func main() {
 			fmt.Printf("  collisions[%s] = %d\n", s, e.Stats.CollisionsBySection[s])
 		}
 	}
+}
+
+// writeMetricsFile writes the kernel's metric JSON atomically: temp file
+// plus rename (the scenario fmt precedent), so a crashed run never leaves a
+// truncated artifact.
+func writeMetricsFile(path string, k *engine.Kernel, ticks uint64) error {
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if err := engine.WriteMetricsJSON(f, k, ticks); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
 }

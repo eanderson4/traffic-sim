@@ -171,7 +171,9 @@ func (e *Engine) AddInitialVehicle(lane *Lane, typeIdx int, s, v, f float64) *Ve
 	return veh
 }
 
-// Vehicles returns the live vehicles in ID order. Read-only; do not mutate.
+// Vehicles returns the live vehicles in spawn (append) order — deterministic
+// from the complete run inputs (seed, demand, recorded intents). Read-only;
+// do not mutate.
 func (e *Engine) Vehicles() []*Vehicle { return e.order }
 
 // CRC returns the rolling state CRC after the last executed tick.

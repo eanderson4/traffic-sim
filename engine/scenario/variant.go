@@ -173,6 +173,7 @@ func loadVariant(dir string) (*Scenario, error) {
 	netPath, netRel := base.NetPath, base.Manifest.Network
 	origins := base.origins
 	rawNet := baseParts[base.Manifest.Network] // already canonical JSON
+	effNet := (*engine.Network)(nil)           // the effective network (resolved below)
 	if v.Network != "" {
 		// The replacement joins the conceptual merged directory. Shadowing
 		// the BASE network's own rel path is the conventional layout (a
@@ -198,6 +199,7 @@ func loadVariant(dir string) (*Scenario, error) {
 		if err != nil {
 			return nil, fmt.Errorf("variant network %s: %w", v.Network, err)
 		}
+		effNet = net
 		origins = make(map[string]bool, len(net.Origins))
 		for _, l := range net.Origins {
 			origins[l.ID] = true
@@ -264,13 +266,16 @@ func loadVariant(dir string) (*Scenario, error) {
 		s.Demands = append(s.Demands, df)
 		s.parts = append(s.parts, hashPart{rel: ref, data: canonical})
 	}
-	// Control/metrics stay raw pass-through (their grammars land with the
-	// observability ADR): base parts come from the captured snapshot,
-	// added parts from the variant; patches never target them.
-	for _, ref := range append(append([]string{}, base.Manifest.Control...), base.Manifest.Metrics...) {
+	// Control parts stay raw pass-through (their grammar is still pending):
+	// base parts come from the captured snapshot, added parts from the
+	// variant; patches never target them. Metrics parts are typed
+	// (ADR-0014 §5): inherited ones are re-validated against the EFFECTIVE
+	// network's lanes and the effective tick grid (same discipline as
+	// inherited demand), added ones are parsed against them.
+	for _, ref := range base.Manifest.Control {
 		s.parts = append(s.parts, hashPart{rel: ref, data: baseParts[ref]})
 	}
-	for _, ref := range append(append([]string{}, v.Control...), v.Metrics...) {
+	for _, ref := range v.Control {
 		pth, err := resolvePart(dir, ref)
 		if err != nil {
 			return nil, fmt.Errorf("variant part: %w", err)
@@ -280,6 +285,46 @@ func loadVariant(dir string) (*Scenario, error) {
 			return nil, fmt.Errorf("variant part %s: %w", ref, err)
 		}
 		s.parts = append(s.parts, hashPart{rel: ref, data: raw})
+	}
+	// The effective network's lane set: compiled here in the inherit case
+	// (the replacement branch already compiled its own into effNet).
+	if effNet == nil {
+		var nf engine.NetFile
+		if err := json.Unmarshal(rawNet, &nf); err != nil {
+			return nil, fmt.Errorf("variant network %s: %w", netRel, err)
+		}
+		effNet, err = engine.CompileNet(&nf)
+		if err != nil {
+			return nil, fmt.Errorf("variant network %s: %w", netRel, err)
+		}
+	}
+	laneSet := make(map[string]bool, len(effNet.Lanes))
+	for _, l := range effNet.Lanes {
+		laneSet[l.ID] = true
+	}
+	dt := s.tickSeconds()
+	for i, ref := range base.Manifest.Metrics {
+		mf := base.Metrics[i]
+		if err := validateMetrics(mf, laneSet, dt); err != nil {
+			return nil, fmt.Errorf("variant metrics %s: %w", ref, err)
+		}
+		s.Metrics = append(s.Metrics, mf)
+		s.parts = append(s.parts, hashPart{rel: ref, data: baseParts[ref]})
+	}
+	for _, ref := range v.Metrics {
+		pth, err := resolvePart(dir, ref)
+		if err != nil {
+			return nil, fmt.Errorf("variant metrics: %w", err)
+		}
+		mf, canonical, err := loadMetricsFile(pth, laneSet, dt)
+		if err != nil {
+			return nil, fmt.Errorf("variant metrics %s: %w", ref, err)
+		}
+		s.Metrics = append(s.Metrics, mf)
+		s.parts = append(s.parts, hashPart{rel: ref, data: canonical})
+	}
+	if err := validateMetricSetIDs(s.Metrics); err != nil {
+		return nil, fmt.Errorf("variant %s (materialized): %w", VariantManifest, err)
 	}
 	if (eff.Spawner == nil || eff.Spawner.RatePerLaneHour == 0) && len(eff.Demand) == 0 {
 		return nil, fmt.Errorf("variant %s (materialized): no demand — the overlay disabled the base's spawner without adding demand", VariantManifest)

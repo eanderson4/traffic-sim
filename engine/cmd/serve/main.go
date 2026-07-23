@@ -47,6 +47,7 @@ func main() {
 	density := flag.Float64("density", 80, "density cap (veh/lane-km)")
 	types := flag.String("types", "car", "comma-separated vehicle-type names for the scenario type list (car,truck); director spawn verbs resolve against this list")
 	geojson := flag.String("geojson", "", "also write the network as GeoJSON (local metric frame) to this path")
+	metricsOut := flag.String("metrics-out", "", "write M13 metric-kernel output (ADR-0014 §6) as JSON to this path at run end")
 	withDriver := flag.Bool("driver", true, "run an in-process default driver replica")
 	capacity := flag.Int("capacity", 1000, "driver claim capacity")
 	flag.Parse()
@@ -200,12 +201,38 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Metric kernel (ADR-0014 §6 file sink): a read-only observer on the run
+	// loop — the run stays bit-identical (CRC-invariance tested in
+	// engine/metrics_test.go). The config comes from the scenario's metrics
+	// parts when -scenario is in use, else the zero-authoring default.
+	var mobs *metricObserver
+	if *metricsOut != "" {
+		mnet, err := engine.BuildNet(spec.Net)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "serve: metrics:", err)
+			os.Exit(1)
+		}
+		var cfg engine.KernelConfig
+		if scen != nil {
+			cfg = scen.MetricConfig(mnet)
+		} else {
+			cfg = engine.DefaultKernelConfig(mnet, spec.Params.Dt)
+		}
+		mobs = &metricObserver{cfg: cfg}
+	}
+
 	runErr := make(chan error, 1)
 	go func() {
 		// PaceFloor = one tick of wall time: 1× realtime (ADR-0005 §4 — pacing
 		// is a wrapper's business; the loop itself never blocks on input).
-		_, err := natsio.RunLive(nc, js, *run, spec, natsio.RecorderConfig{},
-			natsio.ContractConfig{PaceFloor: time.Duration(spec.Params.Dt * float64(time.Second))})
+		cc := natsio.ContractConfig{PaceFloor: time.Duration(spec.Params.Dt * float64(time.Second))}
+		if mobs != nil {
+			cc.Observer = mobs
+		}
+		lr, err := natsio.RunLive(nc, js, *run, spec, natsio.RecorderConfig{}, cc)
+		if err == nil && mobs != nil {
+			err = mobs.finish(lr.Engine, *metricsOut, spec.Ticks)
+		}
 		runErr <- err
 	}()
 
@@ -275,5 +302,51 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println("serve: run complete")
+		if mobs != nil {
+			fmt.Printf("serve: wrote metrics to %s\n", *metricsOut)
+		}
 	}
+}
+
+// metricObserver adapts the M13 metric kernel to natsio.RunObserver: the
+// kernel attaches at tick 0 (Attach, called by RunLive right after engine
+// construction) and observes every Step. The kernel is a read-only
+// observer (ADR-0014 §1) — it never feeds back into the run.
+type metricObserver struct {
+	cfg engine.KernelConfig
+	k   *engine.Kernel
+}
+
+func (m *metricObserver) Attach(e *engine.Engine) error {
+	k, err := engine.NewKernel(e, m.cfg)
+	if err != nil {
+		return err
+	}
+	m.k = k
+	return nil
+}
+
+func (m *metricObserver) Observe(e *engine.Engine) { m.k.Observe(e) }
+
+// finish closes the kernel at the horizon and writes the metrics JSON
+// atomically (temp + rename — the simrun pattern). Horizon-only: the
+// SIGINT path abandons the run (demo mode does no graceful finish), so no
+// partial artifact is written there either.
+func (m *metricObserver) finish(e *engine.Engine, path string, ticks uint64) error {
+	m.k.Finalize(e)
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if err := engine.WriteMetricsJSON(f, m.k, ticks); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
 }

@@ -63,9 +63,17 @@ type TickedSpawn struct {
 
 // EnqueueSpawn validates a directive and buffers it for application at the
 // next tick boundary. Unknown origin lane, a lane that is not a spawn
-// origin, or an unknown vehicle type is rejected with a reason; the run is
-// unaffected. Like EnqueueIntent, it must be called only from the goroutine
-// that owns the engine, between Steps.
+// origin, an unknown vehicle type, or a RequestID already live in the queue
+// is rejected with a reason; the run is unaffected. RequestID uniqueness
+// among live entries is ENGINE-enforced here (the NATS contract layer
+// dedups first, so this only ever fires on local-enqueue misuse). Note the
+// compatibility edge: the duplicate rejection means pre-change LOCAL-harness
+// recordings with simultaneously-live duplicate RequestIDs are retroactively
+// unreplayable (wire-produced recordings can't contain them — the contract
+// layer's first-seen dedup drops them before the kernel). Empty-string IDs
+// remain accepted, but two live ""s now collide and reject as duplicates.
+// Like EnqueueIntent, it must be called only from the goroutine that owns
+// the engine, between Steps.
 func (e *Engine) EnqueueSpawn(d SpawnDirective) error {
 	lane := e.Net.OriginByID(d.Origin)
 	if lane == nil {
@@ -83,6 +91,16 @@ func (e *Engine) EnqueueSpawn(d SpawnDirective) error {
 	}
 	if ti < 0 {
 		return fmt.Errorf("unknown vehicle type %q", d.TypeName)
+	}
+	for _, q := range e.dirQueue {
+		if q.RequestID == d.RequestID {
+			return fmt.Errorf("duplicate spawn request id %q (already in the injection queue)", d.RequestID)
+		}
+	}
+	for _, q := range e.dirNew {
+		if q.RequestID == d.RequestID {
+			return fmt.Errorf("duplicate spawn request id %q (already buffered for this boundary)", d.RequestID)
+		}
 	}
 	e.dirNew = append(e.dirNew, TickedSpawn{
 		TypeIdx: ti, LaneIdx: lane.Index,

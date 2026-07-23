@@ -31,6 +31,17 @@ import (
 // loop is gated. Sim time is frozen; this is pure scheduling hygiene.
 const pausePoll = 5 * time.Millisecond
 
+// RunObserver is an optional read-only observer on the live run loop — the
+// ADR-0014 §1 metric-kernel pattern (the XTField precedent, in-process and
+// caller-driven, never the snapshot plane). Attach runs once right after
+// engine construction at tick 0 (observers seeding from initial state must
+// run there); Observe runs once per Step, immediately after, on the
+// run-loop goroutine. Neither may mutate engine state.
+type RunObserver interface {
+	Attach(e *engine.Engine) error
+	Observe(e *engine.Engine)
+}
+
 // LiveRun is the result of a completed (or aborted) live run.
 type LiveRun struct {
 	Engine   *engine.Engine
@@ -67,6 +78,11 @@ func RunLive(nc *nats.Conn, js nats.JetStreamContext, run string, spec engine.Ru
 	e, err := engine.NewEngine(spec)
 	if err != nil {
 		return nil, err
+	}
+	if contractCfg.Observer != nil {
+		if err := contractCfg.Observer.Attach(e); err != nil {
+			return nil, err
+		}
 	}
 	reg, err := NewRegistry(js)
 	if err != nil {
@@ -123,6 +139,9 @@ func RunLive(nc *nats.Conn, js nats.JetStreamContext, run string, spec engine.Ru
 			e.EnqueueIntent(k)
 		}
 		e.Step()
+		if contractCfg.Observer != nil {
+			contractCfg.Observer.Observe(e)
+		}
 		bus.PublishSnapshot(e)
 		bus.PublishAcks(e.AppliedIntents(), e.Tick)
 		if err := contract.AfterStep(e); err != nil {
