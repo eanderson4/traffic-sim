@@ -13,7 +13,10 @@
 //      the network source via setFeatureState at ~1 Hz;
 //   4. signals — TSSG v1 program table off ts.{run}.state.sig (tssg.ts,
 //      ADR-0006 M9 addendum): light states DERIVE from the snapshot tick
-//      (signals.ts), painted as stop-line circles via feature-state.
+//      (signals.ts), painted as one signal HEAD per movement (grouped
+//      stop-lines, signals.ts) — a housing sprite (signalhead.ts) plus
+//      three feature-state-gated lens layers, since icon-image cannot
+//      read feature-state.
 //
 // The wire/network coordinates are the engine's local metric frame; proj.ts
 // projects to WGS84 (network once at load, vehicles per render frame).
@@ -25,7 +28,8 @@ import type { Feature, FeatureCollection, LineString, Point } from "geojson";
 import { loadConfig } from "./config.ts";
 import { decodeFrame } from "./tssf.ts";
 import { decodeSignalFrame, type SigColor, type SignalTable } from "./tssg.ts";
-import { laneStatesAtTick, signalStopLines } from "./signals.ts";
+import { headStatesAtTick, signalHeads, type SignalHead } from "./signals.ts";
+import { SIGNAL_HEAD, SIGNAL_HEAD_IMAGE_ID, signalHeadImage } from "./signalhead.ts";
 import { makeProjector, type LocalFrame } from "./proj.ts";
 import { SnapshotBuffer } from "./snapshots.ts";
 import {
@@ -60,6 +64,30 @@ const DARK_STYLE: maplibregl.StyleSpecification = {
   layers: [{ id: "background", type: "background", paint: { "background-color": THEME.bg } }],
 };
 
+// Signal-head zoom curve: ONE size interpolation drives both the housing
+// sprite (icon-size) and the lit-lens circle layers (radius + translate),
+// so a lit lens always lands exactly on its dim counterpart.
+const HEAD_SIZE_STOPS: Array<[number, number]> = [
+  [11, 0.3],
+  [14, 0.62],
+  [17, 1.1],
+];
+
+function headSizeAt(z: number): number {
+  const [z0, s0] = HEAD_SIZE_STOPS[0]!;
+  const [z1, s1] = HEAD_SIZE_STOPS[1]!;
+  const [z2, s2] = HEAD_SIZE_STOPS[2]!;
+  if (z <= z1) return s0 + ((s1 - s0) * (z - z0)) / (z1 - z0);
+  return s1 + ((s2 - s1) * (z - z1)) / (z2 - z1);
+}
+
+// Lens order matches SIGNAL_HEAD.lensOffsetYPx: red top, amber, green.
+const SIG_LENSES: Array<{ color: SigColor; fill: string; offY: number }> = [
+  { color: "red", fill: THEME.signalRed, offY: SIGNAL_HEAD.lensOffsetYPx[0] },
+  { color: "amber", fill: THEME.signalAmber, offY: SIGNAL_HEAD.lensOffsetYPx[1] },
+  { color: "green", fill: THEME.signalGreen, offY: SIGNAL_HEAD.lensOffsetYPx[2] },
+];
+
 async function main(): Promise<void> {
   const cfg = loadConfig(location.search, location.hostname);
   const hud = new Hud("status", "inspect");
@@ -70,6 +98,22 @@ async function main(): Promise<void> {
     document.getElementById("switcher")!,
     demoIdFromNetUrl(cfg.networkUrl),
   ).init();
+
+  // Loading overlay: page load → network fetch → ws connect → first
+  // snapshot can take noticeable seconds on big demos (engine world build
+  // happens before the first TSSF frame), and a bare "connecting…" HUD
+  // read as a hang. The overlay narrates the stages and lifts on the
+  // first renderable sample.
+  const loadingEl = document.getElementById("loading");
+  const loadingMsg = document.getElementById("loading-msg");
+  if (!loadingEl || !loadingMsg) throw new Error("loading overlay: missing DOM elements");
+  let loadingHidden = false;
+  const hideLoading = (): void => {
+    if (loadingHidden) return;
+    loadingHidden = true;
+    loadingEl.style.display = "none";
+  };
+  loadingMsg.textContent = `loading network ${cfg.networkUrl} …`;
 
   const res = await fetch(cfg.networkUrl);
   if (!res.ok) throw new Error(`fetch ${cfg.networkUrl}: ${res.status} ${res.statusText}`);
@@ -133,31 +177,36 @@ async function main(): Promise<void> {
   let prevFrameMs = 0;
   let mapReady = false;
 
-  // Signal channel state: the latest TSSG table, the stop-line set applied
-  // to the "signals" source (keyed by binding signature so a republished
-  // table costs no setData), and the last-applied per-lane colors.
+  // Signal channel state: the latest TSSG table, the head set applied to
+  // the "signals" source (keyed by binding signature so a republished
+  // table costs no setData), and the last-applied per-head colors.
   let sigTable: SignalTable | null = null;
+  let sigHeads: SignalHead[] = [];
   let sigSourceKey = "";
   const prevSigStates = new Map<string, SigColor>();
   const sigPoints: Array<[number, number]> = []; // debug handle (headless proof)
   const sigDebug = { seen: 0, ok: 0, err: "", pts: -1 }; // debug handle: onSignals counters
 
-  // ensureSignalSource (re)builds the stop-line point features when the
-  // table's binding changes — the ONLY setData on this source; per-tick
-  // color changes ride feature-state below.
+  // ensureSignalSource (re)builds the head point features when the table's
+  // binding changes — the ONLY setData on this source; per-tick color
+  // changes ride feature-state below.
   function ensureSignalSource(): void {
     if (!mapReady || sigTable === null) return;
-    const pts = signalStopLines(sigTable, shapeByLane);
-    sigDebug.pts = pts.length;
-    const key = pts.map((p) => p.laneId).join(",");
+    const heads = signalHeads(sigTable, shapeByLane);
+    sigDebug.pts = heads.length;
+    const key = heads.map((h) => h.id).join(",");
+    // Always take the LATEST table's program objects: a republished table
+    // can carry identical lane bindings (same key) with new phase timing
+    // (reconnect re-convergence), and derivation reads sigHeads[i].program.
+    sigHeads = heads;
     if (key === sigSourceKey) return;
     sigSourceKey = key;
     prevSigStates.clear(); // re-apply every state on the next render pass
-    const features: Feature<Point>[] = pts.map((p) => ({
+    const features: Feature<Point>[] = heads.map((h) => ({
       type: "Feature",
-      id: p.laneId,
-      properties: { id: p.laneId },
-      geometry: { type: "Point", coordinates: project(p.x, p.y) },
+      id: h.id,
+      properties: { id: h.id },
+      geometry: { type: "Point", coordinates: project(h.x, h.y) },
     }));
     (map.getSource("signals") as maplibregl.GeoJSONSource).setData({
       type: "FeatureCollection",
@@ -167,15 +216,15 @@ async function main(): Promise<void> {
     for (const f of features) sigPoints.push(f.geometry.coordinates as [number, number]);
   }
 
-  // updateSignals derives per-lane light colors at the render tick (the
+  // updateSignals derives per-head light colors at the render tick (the
   // sim tick of the interpolated sample, not wall clock) and applies only
   // the changes — a phase flip is a handful of setFeatureState calls.
   function updateSignals(tick: number): void {
     if (!mapReady || sigTable === null || sigSourceKey === "") return;
-    for (const [laneId, color] of laneStatesAtTick(sigTable, tick)) {
-      if (prevSigStates.get(laneId) !== color) {
-        map.setFeatureState({ source: "signals", id: laneId }, { sig: color });
-        prevSigStates.set(laneId, color);
+    for (const [id, color] of headStatesAtTick(sigHeads, tick)) {
+      if (prevSigStates.get(id) !== color) {
+        map.setFeatureState({ source: "signals", id }, { sig: color });
+        prevSigStates.set(id, color);
       }
     }
   }
@@ -281,31 +330,68 @@ async function main(): Promise<void> {
         "icon-halo-width": 1,
       },
     });
-    // Signal lights (M9): one circle per signal-bound internal lane at its
-    // stop-line entry; color rides feature-state "sig" (off = invisible).
+    // Signal lights (M9): one head per signalized MOVEMENT (grouped
+    // stop-lines, signals.ts) — the housing sprite carries three dim
+    // lenses and one circle layer per lens position paints the active
+    // light, gated by feature-state "sig" (off = no lit lens).
     map.addSource("signals", { type: "geojson", data: EMPTY_FC, promoteId: "id" });
+    const sigHeadImg = signalHeadImage();
+    map.addImage(SIGNAL_HEAD_IMAGE_ID, sigHeadImg.image, { pixelRatio: sigHeadImg.pixelRatio });
     map.addLayer({
-      id: "signals",
-      type: "circle",
+      id: "signals-housing",
+      type: "symbol",
       source: "signals",
-      paint: {
-        "circle-color": [
-          "match",
-          ["coalesce", ["feature-state", "sig"], "off"],
-          "green",
-          THEME.signalGreen,
-          "amber",
-          THEME.signalAmber,
-          "red",
-          THEME.signalRed,
-          THEME.bg,
+      layout: {
+        "icon-image": SIGNAL_HEAD_IMAGE_ID,
+        "icon-allow-overlap": true,
+        "icon-ignore-placement": true,
+        "icon-size": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          HEAD_SIZE_STOPS[0]![0], HEAD_SIZE_STOPS[0]![1],
+          HEAD_SIZE_STOPS[1]![0], HEAD_SIZE_STOPS[1]![1],
+          HEAD_SIZE_STOPS[2]![0], HEAD_SIZE_STOPS[2]![1],
         ],
-        "circle-opacity": ["match", ["coalesce", ["feature-state", "sig"], "off"], "off", 0, 1],
-        "circle-radius": ["interpolate", ["linear"], ["zoom"], 11, 3, 14, 5, 17, 8],
-        "circle-stroke-color": THEME.bg,
-        "circle-stroke-width": 1,
       },
     });
+    for (const lens of SIG_LENSES) {
+      map.addLayer({
+        id: `signals-lens-${lens.color}`,
+        type: "circle",
+        source: "signals",
+        paint: {
+          "circle-color": lens.fill,
+          "circle-opacity": [
+            "match",
+            ["coalesce", ["feature-state", "sig"], "off"],
+            lens.color,
+            1,
+            0,
+          ],
+          // Slight blur reads as lens glow; radius/translate track the
+          // housing's icon-size curve (viewport anchor = screen px).
+          "circle-blur": 0.25,
+          "circle-radius": [
+            "interpolate",
+            ["linear"],
+            ["zoom"],
+            11, SIGNAL_HEAD.lensRadiusPx * headSizeAt(11),
+            14, SIGNAL_HEAD.lensRadiusPx * headSizeAt(14),
+            17, SIGNAL_HEAD.lensRadiusPx * headSizeAt(17),
+          ],
+          "circle-translate": [
+            "interpolate",
+            ["linear"],
+            ["zoom"],
+            11, ["literal", [0, lens.offY * headSizeAt(11)]],
+            14, ["literal", [0, lens.offY * headSizeAt(14)]],
+            17, ["literal", [0, lens.offY * headSizeAt(17)]],
+          ],
+          "circle-translate-anchor": "viewport",
+        },
+      });
+    }
     map.on("click", (e) => {
       const feats = map.queryRenderedFeatures(e.point, { layers: ["vehicles"] });
       const f = feats[0];
@@ -328,6 +414,7 @@ async function main(): Promise<void> {
   });
 
   hud.setConnection(false, `connecting to ${cfg.ws} …`);
+  loadingMsg.textContent = `connecting to ${cfg.ws} …`;
   await subscribeSnapshots(
     cfg.ws,
     cfg.run,
@@ -349,7 +436,16 @@ async function main(): Promise<void> {
         hud.setConnection(false, String(err));
       }
     },
-    (connected, detail) => hud.setConnection(connected, `${detail}  ·  run ${cfg.run}`),
+    (connected, detail) => {
+      hud.setConnection(connected, `${detail}  ·  run ${cfg.run}`);
+      // The overlay covers the HUD until the first sample — mirror the
+      // connection state into it or a pre-snapshot drop reads as a hang.
+      if (!loadingHidden) {
+        loadingMsg.textContent = connected
+          ? "connected — waiting for the engine's first snapshot (world build) …"
+          : `connection lost before the first snapshot — ${detail}`;
+      }
+    },
   );
 
   // Congestion: recompute per-lane ratios at ~1 Hz (research: feature-state
@@ -387,6 +483,7 @@ async function main(): Promise<void> {
     if (mapReady) {
       const sample = buffer.sample(nowMs);
       if (sample) {
+        hideLoading(); // first renderable sample — the engine is streaming
         const dtS = prevFrameMs === 0 ? 0 : (nowMs - prevFrameMs) / 1000;
         prevFrameMs = nowMs;
         const next = new Map<number, RenderedVehicle>();
@@ -445,7 +542,10 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
+  const msg = `viz failed: ${err instanceof Error ? err.message : String(err)}`;
   const el = document.getElementById("status");
-  if (el) el.textContent = `viz failed: ${err instanceof Error ? err.message : String(err)}`;
+  if (el) el.textContent = msg;
+  const lm = document.getElementById("loading-msg");
+  if (lm) lm.textContent = msg;
   console.error(err);
 });

@@ -1,11 +1,13 @@
-// signals.test.ts — the render glue: stop-line resolution against the
-// static network geometry and per-tick per-lane light colors derived from
-// the TSSG table (the wire ships programs, never states — ADR-0006 M9).
+// signals.test.ts — the render glue: movement grouping against the static
+// network geometry (one head per program+link index at the centroid of
+// its bound stop-line entries) and per-tick per-head light colors derived
+// from the TSSG table (the wire ships programs, never states — ADR-0006
+// M9).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { signalStopLines, laneStatesAtTick } from "../src/signals.ts";
+import { signalHeads, headStatesAtTick, type SignalHead } from "../src/signals.ts";
 import type { SignalTable } from "../src/tssg.ts";
 
 // The Go/TS shared fixture (see tssg.test.ts): sigA 10t "Gr" / 5t "yr"
@@ -45,50 +47,77 @@ const SHAPES = new Map<string, Array<readonly number[]>>([
   ["iJ2_0", [[-50, 30], [-40, 30]]],
 ]);
 
-test("signalStopLines resolves bound lanes to their first polyline point", () => {
-  const pts = signalStopLines(TABLE, SHAPES);
-  assert.deepEqual(pts, [
-    { laneId: "iJ1_0", x: 100, y: 200 },
-    { laneId: "iJ1_1", x: 101, y: 198 },
-    { laneId: "iJ2_0", x: -50, y: 30 },
+// Strip the derivation refs (program) so positional fields can deepEqual.
+const bare = (heads: SignalHead[]): Array<Partial<SignalHead>> =>
+  heads.map(({ id, x, y, linkIdx }) => ({ id, x, y, linkIdx }));
+
+test("signalHeads: one head per program+linkIdx at the stop-line entry", () => {
+  const heads = signalHeads(TABLE, SHAPES);
+  assert.deepEqual(bare(heads), [
+    { id: "sigA:0", x: 100, y: 200, linkIdx: 0 },
+    { id: "sigA:1", x: 101, y: 198, linkIdx: 1 },
+    { id: "sigB:0", x: -50, y: 30, linkIdx: 0 },
   ]);
 });
 
-test("signalStopLines skips lanes missing from the static network", () => {
-  const partial = new Map<string, Array<readonly number[]>>([["iJ1_0", [[1, 2], [3, 4]]]]);
-  const pts = signalStopLines(TABLE, partial);
-  assert.deepEqual(pts, [{ laneId: "iJ1_0", x: 1, y: 2 }]);
-  assert.deepEqual(signalStopLines(TABLE, new Map()), []);
+test("signalHeads: lanes sharing a link index merge to one centroid head", () => {
+  const t: SignalTable = {
+    tick: 0,
+    programs: [
+      {
+        id: "p",
+        junction: "p",
+        offsetTicks: 0,
+        phases: [{ durationTicks: 4, state: "G" }],
+        links: [
+          { linkIdx: 0, laneId: "a" },
+          { linkIdx: 0, laneId: "b" },
+        ],
+      },
+    ],
+  };
+  const shapes = new Map<string, Array<readonly number[]>>([
+    ["a", [[0, 0]]],
+    ["b", [[10, 20]]],
+  ]);
+  assert.deepEqual(bare(signalHeads(t, shapes)), [{ id: "p:0", x: 5, y: 10, linkIdx: 0 }]);
 });
 
-test("laneStatesAtTick: both junctions in step with their programs", () => {
+test("signalHeads skips lanes missing from the static network", () => {
+  const partial = new Map<string, Array<readonly number[]>>([["iJ1_0", [[1, 2], [3, 4]]]]);
+  assert.deepEqual(bare(signalHeads(TABLE, partial)), [{ id: "sigA:0", x: 1, y: 2, linkIdx: 0 }]);
+  assert.deepEqual(signalHeads(TABLE, new Map()), []);
+});
+
+test("headStatesAtTick: both junctions in step with their programs", () => {
+  const heads = signalHeads(TABLE, SHAPES);
   // tick 0: sigA phase "Gr" → link0 green, link1 red; sigB (offset wrap)
   // runs phase "G" → green.
   assert.deepEqual(
-    [...(laneStatesAtTick(TABLE, 0) as Map<string, string>).entries()],
+    [...(headStatesAtTick(heads, 0) as Map<string, string>).entries()],
     [
-      ["iJ1_0", "green"],
-      ["iJ1_1", "red"],
-      ["iJ2_0", "green"],
+      ["sigA:0", "green"],
+      ["sigA:1", "red"],
+      ["sigB:0", "green"],
     ],
   );
   // tick 10: sigA flips to "yr" → amber/red; sigB runs its phase 0 "r"
   // (begins at the offset, tick 5) → red.
   assert.deepEqual(
-    [...(laneStatesAtTick(TABLE, 10) as Map<string, string>).entries()],
+    [...(headStatesAtTick(heads, 10) as Map<string, string>).entries()],
     [
-      ["iJ1_0", "amber"],
-      ["iJ1_1", "red"],
-      ["iJ2_0", "red"],
+      ["sigA:0", "amber"],
+      ["sigA:1", "red"],
+      ["sigB:0", "red"],
     ],
   );
   // tick 5: sigB's phase 0 "r" begins at its offset → red.
-  assert.equal(laneStatesAtTick(TABLE, 5).get("iJ2_0"), "red");
+  assert.equal(headStatesAtTick(heads, 5).get("sigB:0"), "red");
   // tick 15: sigA back to "Gr".
-  assert.equal(laneStatesAtTick(TABLE, 15).get("iJ1_0"), "green");
+  assert.equal(headStatesAtTick(heads, 15).get("sigA:0"), "green");
 });
 
-test("laneStatesAtTick: link without a state char renders off", () => {
+test("headStatesAtTick: link without a state char renders off", () => {
   const t: SignalTable = {
     tick: 0,
     programs: [
@@ -104,12 +133,16 @@ test("laneStatesAtTick: link without a state char renders off", () => {
       },
     ],
   };
-  const states = laneStatesAtTick(t, 0);
-  assert.equal(states.get("iP_0"), "green");
-  assert.equal(states.get("iP_1"), "off");
+  const shapes = new Map<string, Array<readonly number[]>>([
+    ["iP_0", [[0, 0]]],
+    ["iP_1", [[1, 0]]],
+  ]);
+  const states = headStatesAtTick(signalHeads(t, shapes), 0);
+  assert.equal(states.get("p:0"), "green");
+  assert.equal(states.get("p:1"), "off");
 });
 
-test("laneStatesAtTick: the i280 program shape (820/30/50, offset 0)", () => {
+test("headStatesAtTick: the i280 program shape (820/30/50, offset 0)", () => {
   const i280: SignalTable = {
     tick: 0,
     programs: [
@@ -130,10 +163,16 @@ test("laneStatesAtTick: the i280 program shape (820/30/50, offset 0)", () => {
       },
     ],
   };
-  assert.equal(laneStatesAtTick(i280, 819).get("i5464972060_0_0"), "green");
-  assert.equal(laneStatesAtTick(i280, 820).get("i5464972060_0_0"), "amber");
-  assert.equal(laneStatesAtTick(i280, 849).get("i5464972060_0_1"), "amber");
-  assert.equal(laneStatesAtTick(i280, 850).get("i5464972060_0_2"), "red");
-  assert.equal(laneStatesAtTick(i280, 899).get("i5464972060_0_0"), "red");
-  assert.equal(laneStatesAtTick(i280, 900).get("i5464972060_0_0"), "green"); // wrap
+  const shapes = new Map<string, Array<readonly number[]>>([
+    ["i5464972060_0_0", [[0, 0]]],
+    ["i5464972060_0_1", [[3, 0]]],
+    ["i5464972060_0_2", [[6, 0]]],
+  ]);
+  const heads = signalHeads(i280, shapes);
+  assert.equal(headStatesAtTick(heads, 819).get("5464972060:0"), "green");
+  assert.equal(headStatesAtTick(heads, 820).get("5464972060:0"), "amber");
+  assert.equal(headStatesAtTick(heads, 849).get("5464972060:1"), "amber");
+  assert.equal(headStatesAtTick(heads, 850).get("5464972060:2"), "red");
+  assert.equal(headStatesAtTick(heads, 899).get("5464972060:0"), "red");
+  assert.equal(headStatesAtTick(heads, 900).get("5464972060:0"), "green"); // wrap
 });

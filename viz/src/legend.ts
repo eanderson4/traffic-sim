@@ -38,17 +38,22 @@ export class Legend {
         `<span>${g.name}</span></div>`,
     ).join("");
 
-    const sigRow = (label: string, color: string): string =>
-      `<div class="legend-row"><span class="legend-dot" style="background:${color}"></span>` +
-      `<span>${label}</span></div>`;
+    // Signal head swatch: mini housing with the three lenses in their
+    // real order (red top, amber, green) — the map lights one lens per
+    // head (signals.ts + signalhead.ts).
+    const sigHead =
+      `<span class="legend-sig">` +
+      `<i style="background:${THEME.signalRed}"></i>` +
+      `<i style="background:${THEME.signalAmber}"></i>` +
+      `<i style="background:${THEME.signalGreen}"></i>` +
+      `</span>`;
 
     el.innerHTML =
       `<div class="legend-title">legend</div>` +
       vehRows +
       `<div class="legend-sep"></div>` +
-      sigRow("green", THEME.signalGreen) +
-      sigRow("amber", THEME.signalAmber) +
-      sigRow("red", THEME.signalRed) +
+      `<div class="legend-row">${sigHead}<span>signal head</span></div>` +
+      `<div class="legend-caption">one per movement; live lens lit</div>` +
       `<div class="legend-sep"></div>` +
       `<div class="legend-ramp" style="background:linear-gradient(90deg,` +
       `${THEME.stopped} 0%, ${THEME.mid} 35%, ${THEME.freeFlow} 70%)"></div>` +

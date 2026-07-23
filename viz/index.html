@@ -46,6 +46,44 @@
       #switcher .sw-row:hover { background: rgba(46, 91, 255, 0.25); }
       #switcher .sw-current { color: #1e9e6a; }
       #switcher .sw-menu { color: #9fb2e8; }
+      /* Loading overlay — narrates page load → network fetch → ws connect
+         → first snapshot (engine world build can take seconds on big
+         demos); main.ts lifts it on the first renderable sample. */
+      #loading {
+        position: absolute;
+        inset: 0;
+        z-index: 2;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 14px;
+        background: rgba(14, 29, 92, 0.94);
+        color: #d6e1ff;
+        font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      #loading .spin {
+        width: 26px;
+        height: 26px;
+        border: 3px solid rgba(46, 91, 255, 0.35);
+        border-top-color: #d6e1ff;
+        border-radius: 50%;
+        animation: spin 0.9s linear infinite;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      /* Legend signal-head swatch — mini housing, lens colors injected
+         from theme.ts (legend.ts). */
+      .legend-sig {
+        display: inline-flex;
+        flex-direction: column;
+        gap: 1px;
+        padding: 2px;
+        background: #0a1230;
+        border: 1px solid rgba(214, 225, 255, 0.55);
+        border-radius: 3px;
+        flex: none;
+      }
+      .legend-sig i { display: block; width: 6px; height: 6px; border-radius: 50%; }
     </style>
   </head>
   <body>
@@ -54,6 +92,7 @@
     <div id="inspect" class="hud"></div>
     <div id="legend" class="hud"></div>
     <div id="switcher" class="hud"></div>
+    <div id="loading"><div class="spin"></div><div id="loading-msg">loading…</div></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
