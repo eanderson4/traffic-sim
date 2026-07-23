@@ -170,10 +170,15 @@ func CompileNet(nf *NetFile) (*Network, error) {
 			for j, p := range nl.Shape {
 				pts[j] = Point{X: p[0], Y: p[1]}
 			}
+			// SetShape drops consecutive duplicates. A 1-point result —
+			// literal or all-coincident (the zero-length junction-internal
+			// lane i30677892_0_0 on the I-280 import) — is VALID, not an
+			// error: Project sits on the point with angle 0, keeping wire
+			// coordinates in the network frame. Clearing it would fall to
+			// the synthetic placeholder chain (XOff+s, 3.5·lat), unrelated
+			// to the UTM frame — a garbage teleport on the wire that also
+			// spikes clients' displacement-derived speeds.
 			l.SetShape(pts, nl.LatOffset)
-			if l.Shape == nil {
-				return nil, fmt.Errorf("lane %s: shape needs at least 2 points", nl.ID)
-			}
 		}
 		n.Lanes = append(n.Lanes, l)
 		n.byID[l.ID] = l

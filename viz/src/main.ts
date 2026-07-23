@@ -6,7 +6,9 @@
 //   2. vehicles — TSSF v1 binary snapshots off ts.{run}.state.snap (nats.ws
 //      WebSocket), decoded (tssf.ts), buffered ~250 ms and lerped at 60 fps
 //      (snapshots.ts), applied as updateData diffs on a dedicated small
-//      source (vehicles.ts);
+//      source (vehicles.ts); trucks render ARTICULATED — the trailer pose
+//      is inferred client-side (artic.ts single-track model) onto a
+//      parallel "trailers" source under the vehicles layer;
 //   3. congestion — CLIENT-DERIVED per-lane mean speed (congestion.ts) onto
 //      the network source via setFeatureState at ~1 Hz;
 //   4. signals — TSSG v1 program table off ts.{run}.state.sig (tssg.ts,
@@ -26,10 +28,20 @@ import { decodeSignalFrame, type SigColor, type SignalTable } from "./tssg.ts";
 import { laneStatesAtTick, signalStopLines } from "./signals.ts";
 import { makeProjector, type LocalFrame } from "./proj.ts";
 import { SnapshotBuffer } from "./snapshots.ts";
-import { diffVehicles, type RenderedVehicle, type SourceDiff } from "./vehicles.ts";
+import {
+  diffVehicles,
+  diffTrailers,
+  type RenderedTrailer,
+  type RenderedVehicle,
+  type SourceDiff,
+} from "./vehicles.ts";
 import { LaneIndex, laneSpeedRatios } from "./congestion.ts";
 import { subscribeSnapshots } from "./nats-client.ts";
 import { Hud } from "./status.ts";
+import { Legend } from "./legend.ts";
+import { THEME, glyphByCls } from "./theme.ts";
+import { bodyImages, glyphImageId, TRACTOR_IMAGE_ID, TRAILER_IMAGE_ID, ICON_SIZE_STOPS } from "./glyphs.ts";
+import { Articulator } from "./artic.ts";
 
 interface NetworkFile {
   type: string;
@@ -40,16 +52,17 @@ interface NetworkFile {
 const EMPTY_FC: FeatureCollection = { type: "FeatureCollection", features: [] };
 
 // Blank dark style — local-first (ADR-0004): no tile-service dependency.
-// Navy canvas per the project design tokens (math-900).
+// Navy canvas per the project design tokens (math-900, theme.ts).
 const DARK_STYLE: maplibregl.StyleSpecification = {
   version: 8,
   sources: {},
-  layers: [{ id: "background", type: "background", paint: { "background-color": "#0e1d5c" } }],
+  layers: [{ id: "background", type: "background", paint: { "background-color": THEME.bg } }],
 };
 
 async function main(): Promise<void> {
   const cfg = loadConfig(location.search, location.hostname);
   const hud = new Hud("status", "inspect");
+  const legend = new Legend("legend");
 
   const res = await fetch(cfg.networkUrl);
   if (!res.ok) throw new Error(`fetch ${cfg.networkUrl}: ${res.status} ${res.statusText}`);
@@ -108,6 +121,9 @@ async function main(): Promise<void> {
 
   const buffer = new SnapshotBuffer(cfg.bufferMs);
   const applied = new Map<number, RenderedVehicle>();
+  const appliedTrailers = new Map<number, RenderedTrailer>();
+  const artic = new Articulator();
+  let prevFrameMs = 0;
   let mapReady = false;
 
   // Signal channel state: the latest TSSG table, the stop-line set applied
@@ -166,7 +182,7 @@ async function main(): Promise<void> {
       source: "network",
       layout: { "line-cap": "round", "line-join": "round" },
       paint: {
-        "line-color": "#122881", // math-800 casing
+        "line-color": THEME.casing,
         "line-opacity": 0.9,
         "line-width": ["interpolate", ["linear"], ["zoom"], 11, 2.5, 14, 7, 17, 12],
       },
@@ -182,24 +198,80 @@ async function main(): Promise<void> {
           "interpolate",
           ["linear"],
           ["coalesce", ["feature-state", "ratio"], -1],
-          -1, "#7e9dff", // math-300: no congestion data
-          0, "#e5484d", // stopped
-          0.35, "#e8b43a", // gold
-          0.7, "#1e9e6a", // free flow
-          1.5, "#1e9e6a",
+          -1, THEME.noData,
+          0, THEME.stopped,
+          0.35, THEME.mid,
+          0.7, THEME.freeFlow,
+          1.5, THEME.freeFlow,
         ],
         "line-width": ["interpolate", ["linear"], ["zoom"], 11, 1.2, 14, 4, 17, 8],
       },
     });
+    // Vehicle glyphs (2026-07-22 legibility pass): one SDF rectangle per
+    // BODY (car, truck tractor, truck trailer — true aspect ratios),
+    // tinted and rotated to the wire heading; trucks render articulated,
+    // the trailer pose inferred client-side (artic.ts single-track model).
+    // icon-rotate evaluates the same conversion as
+    // theme.ts:vehicleBearingDeg (CCW-from-east rad → CW-from-north deg)
+    // inline, since style expressions can't call back into TS. Sources,
+    // promoteIds, and the updateData diff channels mirror the original
+    // vehicle channel.
+    for (const b of bodyImages()) {
+      map.addImage(b.id, b.image, { sdf: true });
+    }
+    // Trailers UNDER vehicles: the tractor overlaps the trailer nose at
+    // the hitch, which reads as the pivot joint.
+    map.addSource("trailers", { type: "geojson", data: EMPTY_FC, promoteId: "id" });
+    map.addLayer({
+      id: "trailers",
+      type: "symbol",
+      source: "trailers",
+      layout: {
+        "icon-image": TRAILER_IMAGE_ID,
+        "icon-rotation-alignment": "map",
+        "icon-allow-overlap": true,
+        "icon-ignore-placement": true,
+        "icon-rotate": ["-", 90, ["*", ["get", "angle"], 180 / Math.PI]],
+        "icon-size": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          ICON_SIZE_STOPS[0]![0], ICON_SIZE_STOPS[0]![1],
+          ICON_SIZE_STOPS[1]![0], ICON_SIZE_STOPS[1]![1],
+          ICON_SIZE_STOPS[2]![0], ICON_SIZE_STOPS[2]![1],
+        ],
+      },
+      paint: {
+        "icon-color": glyphByCls(1).color,
+        "icon-halo-color": THEME.bg,
+        "icon-halo-width": 1,
+      },
+    });
     map.addLayer({
       id: "vehicles",
-      type: "circle",
+      type: "symbol",
       source: "vehicles",
+      layout: {
+        "icon-image": ["match", ["get", "cls"], 0, glyphImageId(glyphByCls(0)), TRACTOR_IMAGE_ID],
+        "icon-rotation-alignment": "map",
+        "icon-allow-overlap": true,
+        "icon-ignore-placement": true,
+        "icon-rotate": ["-", 90, ["*", ["get", "angle"], 180 / Math.PI]],
+        // One zoom curve for every body — per-class length lives in the
+        // image aspect now, not in a size multiplier.
+        "icon-size": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          ICON_SIZE_STOPS[0]![0], ICON_SIZE_STOPS[0]![1],
+          ICON_SIZE_STOPS[1]![0], ICON_SIZE_STOPS[1]![1],
+          ICON_SIZE_STOPS[2]![0], ICON_SIZE_STOPS[2]![1],
+        ],
+      },
       paint: {
-        "circle-color": ["match", ["get", "cls"], 0, "#eaf0ff", "#ff7d4d"],
-        "circle-radius": ["match", ["get", "cls"], 0, 3.2, 5],
-        "circle-stroke-color": "#0e1d5c",
-        "circle-stroke-width": 1,
+        "icon-color": ["match", ["get", "cls"], 0, glyphByCls(0).color, glyphByCls(1).color],
+        "icon-halo-color": THEME.bg,
+        "icon-halo-width": 1,
       },
     });
     // Signal lights (M9): one circle per signal-bound internal lane at its
@@ -214,16 +286,16 @@ async function main(): Promise<void> {
           "match",
           ["coalesce", ["feature-state", "sig"], "off"],
           "green",
-          "#2ecc71",
+          THEME.signalGreen,
           "amber",
-          "#f5b301",
+          THEME.signalAmber,
           "red",
-          "#e5484d",
-          "#0e1d5c",
+          THEME.signalRed,
+          THEME.bg,
         ],
         "circle-opacity": ["match", ["coalesce", ["feature-state", "sig"], "off"], "off", 0, 1],
         "circle-radius": ["interpolate", ["linear"], ["zoom"], 11, 3, 14, 5, 17, 8],
-        "circle-stroke-color": "#0e1d5c",
+        "circle-stroke-color": THEME.bg,
         "circle-stroke-width": 1,
       },
     });
@@ -308,10 +380,32 @@ async function main(): Promise<void> {
     if (mapReady) {
       const sample = buffer.sample(nowMs);
       if (sample) {
+        const dtS = prevFrameMs === 0 ? 0 : (nowMs - prevFrameMs) / 1000;
+        prevFrameMs = nowMs;
         const next = new Map<number, RenderedVehicle>();
+        const nextTrailers = new Map<number, RenderedTrailer>();
         for (const v of sample.vehicles) {
-          next.set(v.id, { ...v, lngLat: project(v.x, v.y) });
+          // The wire position is the FRONT BUMPER (engine Project: s is
+          // front-bumper arc length) but the glyph centers on its anchor.
+          if (v.cls === 0) {
+            // Car: shift back half the length along the heading so the
+            // rect spans bumper to tail instead of protruding forward.
+            const car = glyphByCls(0);
+            const cx = v.x - (car.lengthM / 2) * Math.cos(v.angle);
+            const cy = v.y - (car.lengthM / 2) * Math.sin(v.angle);
+            next.set(v.id, { ...v, lngLat: project(cx, cy) });
+          } else {
+            // Truck: articulated — the tractor keeps the wire heading, the
+            // trailer follows its hitch (artic.ts single-track model).
+            const pose = artic.update(v.id, v.x, v.y, v.angle, v.speed, dtS);
+            next.set(v.id, { ...v, lngLat: project(pose.tractorX, pose.tractorY) });
+            nextTrailers.set(v.id, {
+              lngLat: project(pose.trailerX, pose.trailerY),
+              angle: pose.trailerAngle,
+            });
+          }
         }
+        artic.prune(next);
         const diff: SourceDiff = diffVehicles(applied, next);
         if (diff.add || diff.update || diff.remove) {
           (map.getSource("vehicles") as maplibregl.GeoJSONSource).updateData(
@@ -320,7 +414,16 @@ async function main(): Promise<void> {
           applied.clear();
           for (const [id, v] of next) applied.set(id, v);
         }
+        const tDiff: SourceDiff = diffTrailers(appliedTrailers, nextTrailers);
+        if (tDiff.add || tDiff.update || tDiff.remove) {
+          (map.getSource("trailers") as maplibregl.GeoJSONSource).updateData(
+            tDiff as maplibregl.GeoJSONSourceDiff,
+          );
+          appliedTrailers.clear();
+          for (const [id, t] of nextTrailers) appliedTrailers.set(id, t);
+        }
         hud.setFrame(sample.tick, sample.vehicles.length, sample.starved);
+        legend.setTick(sample.tick);
         updateCongestion(nowMs);
         updateSignals(sample.tick);
       }

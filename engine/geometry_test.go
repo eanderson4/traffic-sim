@@ -82,22 +82,56 @@ func TestProjectScaled(t *testing.T) {
 	near(t, "x(end)", x, 100)
 }
 
-// No/short polyline: not ok. All-coincident points: sit on the point, face +x.
+// No polyline: not ok. A single point — literal, or all-coincident after
+// SetShape's duplicate drop — is a VALID degenerate shape (zero-length
+// junction-internal lane): sit on the point, face +x, ok=true. Clearing it
+// would fall to the placeholder projection and teleport the lane's
+// vehicles off-network on the wire.
 func TestProjectNoShape(t *testing.T) {
 	l := &Lane{ID: "L", Length: 100}
 	if _, _, _, ok := l.Project(10); ok {
 		t.Fatal("ok on shapeless lane")
 	}
-	l.SetShape([]Point{{1, 2}}, 0) // <2 points clears the shape
-	if _, _, _, ok := l.Project(10); ok {
-		t.Fatal("ok on 1-point shape")
-	}
-	l.SetShape([]Point{{1, 2}, {1, 2}, {1, 2}}, 0)
+	l.SetShape([]Point{{1, 2}}, 0) // literal 1-point shape: kept
 	x, y, angle, ok := l.Project(10)
 	if !ok {
-		t.Fatal("not ok on degenerate shape")
+		t.Fatal("not ok on 1-point shape")
 	}
 	near(t, "x", x, 1)
 	near(t, "y", y, 2)
 	near(t, "angle", angle, 0)
+	l.SetShape([]Point{{1, 2}, {1, 2}, {1, 2}}, 0) // dedups to the same point
+	x, y, angle, ok = l.Project(10)
+	if !ok {
+		t.Fatal("not ok on all-coincident shape")
+	}
+	near(t, "x", x, 1)
+	near(t, "y", y, 2)
+	near(t, "angle", angle, 0)
+}
+
+// A consecutive duplicate point (netconvert emits these; 4/375 lanes on the
+// I-280 import) must not create a zero-length segment whose tangent reports
+// due east: the tangent is correct on both sides of the dropped point.
+func TestProjectConsecutiveDuplicate(t *testing.T) {
+	l := &Lane{ID: "L", Length: 200}
+	l.SetShape([]Point{{0, 0}, {100, 0}, {100, 0}, {100, 100}}, 0)
+
+	// Before the dup: first segment, tangent +x.
+	x, y, angle, ok := l.Project(50)
+	if !ok {
+		t.Fatal("not ok")
+	}
+	near(t, "x", x, 50)
+	near(t, "y", y, 0)
+	near(t, "angle", angle, 0)
+
+	// After the dup: second segment, tangent +y — no east-pointing frame.
+	x, y, angle, ok = l.Project(150)
+	if !ok {
+		t.Fatal("not ok")
+	}
+	near(t, "x", x, 100)
+	near(t, "y", y, 50)
+	near(t, "angle", angle, math.Pi/2)
 }

@@ -183,6 +183,59 @@ requirement). There are *no published benchmarks* of feature-state or
 - City-scale static network: load-once GeoJSON vs MVT/MLT vector tiles —
   depends on [OSM Extraction](../integrations/osm-extraction.md) region sizes; GeoJSON first.
 
+## Addendum 2026-07-22: glyph rung — SDF rect vehicles + legend overlay
+
+The rung-0 circle layer gave way to a rotated-rectangle **symbol** layer,
+still on the same `updateData`-diffed vehicle source (source, `promoteId`,
+and diff channel untouched — a pure layer swap). One white rectangle is
+drawn to an offscreen canvas at load and registered with
+`map.addImage("veh-rect", img, { sdf: true })`, so a single image serves
+every class: `icon-color` tints, `icon-rotate` aims, `icon-size` scales.
+Three decisions worth recording:
+
+- **Bearing conversion**: the wire heading is radians CCW from east (engine
+  local frame, UTM north-up); MapLibre's `icon-rotate` is degrees CW from
+  north. The conversion `90 − angle·180/π` lives in `viz/src/theme.ts` as a
+  tested pure function; the layer re-evaluates the same math inline as a
+  style expression (expressions can't call back into TS). The rect image is
+  drawn vertically (long axis = image north) so the unrotated icon already
+  reads as heading north at bearing 0.
+- **Screen-space glyphs over true-metric polygons**: at corridor zooms
+  (11–15) a real 5 m footprint is sub-pixel to a few px — fidelity would be
+  invisible. Class and heading are the data being encoded, so glyphs are
+  screen-sized (`icon-size` by zoom, car ≈ 9 px at z14) while the *ratio*
+  between classes comes from the engine's real dimensions (Truck/Car =
+  12/5 = 2.4× longer). MapLibre rejects `["zoom"]` nested under `["*"]`, so
+  the per-class multiplier rides the interpolate stop outputs (composite
+  expression).
+- **Legend overlay** (`viz/src/legend.ts`): a pure-DOM panel (no MapLibre
+  APIs) keyed to the same theme tokens — class swatches at the true length
+  ratio, signal green/amber/red, the congestion ramp (per-lane mean
+  speed/limit), and a sim clock derived from the render loop's sample tick
+  (× dt = 0.1 s). All palette literals moved to `viz/src/theme.ts` so
+  swatches can't drift from the map.
+
+Live-viewing the pass surfaced three fixes, landed the same day: (1) the
+wire position is the FRONT bumper (`Project(s)`: s is front-bumper arc
+length), so the centered glyph anchor is shifted back half the class length
+along the heading — queued vehicles now stand bumper-to-tail instead of
+overlapping; (2) one image per class at its true aspect ratio (same px/m),
+replacing the single-image + per-class icon-size multiplier that made
+trucks 2.4× wider and span adjacent lanes; (3) netconvert emits consecutive
+duplicate polyline points (4 of 375 lanes on the I-280 import), whose
+zero-length segments reported tangent 0 — vehicles flashed due east for a
+frame. `Lane.SetShape` now drops consecutive duplicates before building the
+arc-length table (display-only, CRC-unaffected).
+
+Later the same day: trucks render ARTICULATED (tractor + trailer, pivot
+joint at the hitch). The engine stays a rigid body; the trailer is inferred
+client-side (`viz/src/artic.ts`) with the standard single-track trailer
+equation — the trailer axle follows the path of its hitch, which is real
+kinematics, not decoration (on a turn the trailer cuts inside exactly as a
+physical trailer must). No contract change was needed: front-bumper point,
+heading, and class already flow on TSSF v1; the trailer rides a second
+`updateData`-diffed source under the vehicles layer.
+
 ## Related
 
 - [NATS Backbone](../architecture/nats-backbone.md) — owns the subject taxonomy and JetStream replay the viz consumes; the SoA vehicle frame shape was fixed together with ADR-0006.

@@ -20,10 +20,29 @@ type Point struct {
 // SetShape attaches a per-lane centerline polyline with a constant lateral
 // offset (meters, positive = left of the direction of travel; 0 for the
 // per-lane centerlines netconvert emits) and precomputes the arc-length
-// table used by Project. Fewer than 2 points clears the shape (the lane
-// falls back to the placeholder projection).
+// table used by Project. Empty input clears the shape (the lane falls back
+// to the placeholder projection); a single point is a VALID shape — Project
+// sits on it (ok=true, angle 0), which keeps the wire coordinates in the
+// network frame for zero-length junction-internal lanes.
+//
+// Consecutive duplicate points are dropped first: netconvert emits them
+// verbatim (4 of 375 lanes on the I-280 import), and a zero-length segment
+// reports tangent 0 (due east) — vehicles whose arc position lands in one
+// visibly flip east for a frame or two. Dedup is display-only like the rest
+// of this file: geometry never feeds dynamics, so the CRC is unaffected.
+// An all-coincident polyline dedups to its single distinct point (kept, per
+// above) — clearing it would drop the lane to the synthetic placeholder
+// chain and teleport its vehicles off-network on the wire.
 func (l *Lane) SetShape(pts []Point, latOffset float64) {
-	if len(pts) < 2 {
+	deduped := pts[:0:0]
+	for i, p := range pts {
+		if i > 0 && p == pts[i-1] {
+			continue
+		}
+		deduped = append(deduped, p)
+	}
+	pts = deduped
+	if len(pts) == 0 {
 		l.Shape, l.cum, l.LatOffset = nil, nil, 0
 		return
 	}
@@ -42,17 +61,19 @@ func (l *Lane) SetShape(pts []Point, latOffset float64) {
 // perpendicular-left by LatOffset. s is clamped to the lane; when the
 // polyline's arc length differs from Lane.Length (SUMO sometimes shortens
 // lanes at junctions), s maps proportionally so the lane end always lands
-// on the polyline end. ok=false when the lane has no usable polyline.
+// on the polyline end. A 1-point shape sits on its point with angle 0.
+// ok=false only when the lane has no polyline at all.
 func (l *Lane) Project(s float64) (x, y, angle float64, ok bool) {
 	n := len(l.Shape)
-	if n < 2 {
+	if n == 0 {
 		return 0, 0, 0, false
 	}
-	shapeLen := l.cum[n-1]
-	if shapeLen == 0 {
-		// Degenerate all-coincident polyline: sit on the point, face +x.
+	if n == 1 {
+		// Degenerate point shape (zero-length junction-internal lane): sit
+		// on the point, face +x.
 		return l.Shape[0].X, l.Shape[0].Y, 0, true
 	}
+	shapeLen := l.cum[n-1]
 	arc := s
 	if l.Length > 0 {
 		arc = s * shapeLen / l.Length

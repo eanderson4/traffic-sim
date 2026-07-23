@@ -79,3 +79,54 @@ export function diffVehicles(
   if (remove.length > 0) diff.remove = remove;
   return diff;
 }
+
+// RenderedTrailer is the viz-inferred trailer body (artic.ts): center
+// position + heading are all the trailers layer needs. Keyed on the same
+// vehicle id as the tractor in the vehicles source.
+export interface RenderedTrailer {
+  lngLat: LngLat;
+  angle: number;
+}
+
+// diffTrailers mirrors diffVehicles for the trailers source — same
+// add/update/remove vocabulary, but angle is the only styled property
+// (icon-image/color are constants of the layer).
+export function diffTrailers(
+  prev: ReadonlyMap<number, RenderedTrailer>,
+  next: ReadonlyMap<number, RenderedTrailer>,
+): SourceDiff {
+  const diff: SourceDiff = {};
+  const add: NonNullable<SourceDiff["add"]> = [];
+  const update: FeatureDiff[] = [];
+  const remove: number[] = [];
+
+  for (const [id, t] of next) {
+    const p = prev.get(id);
+    if (p === undefined) {
+      add.push({
+        type: "Feature",
+        id,
+        properties: { id, angle: t.angle },
+        geometry: { type: "Point", coordinates: t.lngLat },
+      });
+    } else if (p.lngLat[0] !== t.lngLat[0] || p.lngLat[1] !== t.lngLat[1]) {
+      // Position-only predicate — safe because the trailer center is a
+      // pure function of the trailer angle (artic.ts, same render pass),
+      // so an angle-only change is impossible TODAY. If that coupling ever
+      // breaks (e.g. angle smoothing decouples center from angle), add
+      // angle to this predicate or stale rotations will linger.
+      update.push({
+        id,
+        newGeometry: { type: "Point", coordinates: t.lngLat },
+        addOrUpdateProperties: [{ key: "angle", value: t.angle }],
+      });
+    }
+  }
+  for (const id of prev.keys()) {
+    if (!next.has(id)) remove.push(id);
+  }
+  if (add.length > 0) diff.add = add;
+  if (update.length > 0) diff.update = update;
+  if (remove.length > 0) diff.remove = remove;
+  return diff;
+}

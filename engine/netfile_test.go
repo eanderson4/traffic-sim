@@ -99,7 +99,6 @@ func TestCompileNetFileRejects(t *testing.T) {
 		{"zero length", func(nf *NetFile) { nf.Lanes[0].Length = 0 }, "length"},
 		{"zero speed", func(nf *NetFile) { nf.Lanes[0].SpeedLimit = 0 }, "speedLimit"},
 		{"negative width", func(nf *NetFile) { nf.Lanes[0].Width = -1 }, "width"},
-		{"one-point shape", func(nf *NetFile) { nf.Lanes[0].Shape = [][2]float64{{0, 0}} }, "shape"},
 		{"duplicate edge index", func(nf *NetFile) { nf.Lanes[1].EdgeIndex = 0 }, "duplicate lane index"},
 		{"unequal lateral lengths", func(nf *NetFile) { nf.Lanes[1].Length = 90 }, "differ in length"},
 		{"self successor", func(nf *NetFile) { nf.Lanes[0].Successors = []string{"nE0_0"} }, "self-successor"},
