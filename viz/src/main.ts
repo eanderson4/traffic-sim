@@ -39,6 +39,7 @@ import { LaneIndex, laneSpeedRatios } from "./congestion.ts";
 import { subscribeSnapshots } from "./nats-client.ts";
 import { Hud } from "./status.ts";
 import { Legend } from "./legend.ts";
+import { DemoSwitcher, demoIdFromNetUrl } from "./switcher.ts";
 import { THEME, glyphByCls } from "./theme.ts";
 import { bodyImages, glyphImageId, TRACTOR_IMAGE_ID, TRAILER_IMAGE_ID, ICON_SIZE_STOPS } from "./glyphs.ts";
 import { Articulator } from "./artic.ts";
@@ -63,6 +64,12 @@ async function main(): Promise<void> {
   const cfg = loadConfig(location.search, location.hostname);
   const hud = new Hud("status", "inspect");
   const legend = new Legend("legend");
+  // In-map demo swap; hides itself when no demosrv answers (detached —
+  // the map must not wait on the probe).
+  void new DemoSwitcher(
+    document.getElementById("switcher")!,
+    demoIdFromNetUrl(cfg.networkUrl),
+  ).init();
 
   const res = await fetch(cfg.networkUrl);
   if (!res.ok) throw new Error(`fetch ${cfg.networkUrl}: ${res.status} ${res.statusText}`);

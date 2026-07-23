@@ -37,6 +37,15 @@
       .legend-ramp-labels { display: flex; justify-content: space-between; font-size: 10px; color: #9fb2e8; }
       .legend-caption { font-size: 10px; color: #9fb2e8; }
       .legend-clock { font-variant-numeric: tabular-nums; }
+      /* Demo switcher — in-map demosrv control (switcher.ts). Interactive
+         (overrides .hud's pointer-events: none); hidden unless the
+         demosrv API answers. */
+      #switcher { top: 10px; left: 50%; transform: translateX(-50%); pointer-events: auto; cursor: pointer; user-select: none; min-width: 140px; }
+      #switcher .sw-toggle { font-weight: 700; letter-spacing: 0.08em; }
+      #switcher .sw-row { margin-top: 4px; padding: 3px 6px; border-radius: 3px; white-space: normal; }
+      #switcher .sw-row:hover { background: rgba(46, 91, 255, 0.25); }
+      #switcher .sw-current { color: #1e9e6a; }
+      #switcher .sw-menu { color: #9fb2e8; }
     </style>
   </head>
   <body>
@@ -44,6 +53,7 @@
     <div id="status" class="hud">connecting…</div>
     <div id="inspect" class="hud"></div>
     <div id="legend" class="hud"></div>
+    <div id="switcher" class="hud"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
