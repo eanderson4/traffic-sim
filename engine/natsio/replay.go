@@ -105,55 +105,22 @@ func ReplayFromStream(js nats.JetStreamContext, meta *RunMeta, target uint64) (*
 	if err != nil {
 		return nil, err
 	}
-
-	intents := map[uint64][]engine.KeyedIntent{}
-	verbs := map[uint64][]engine.SpawnDirective{}
-	crcs := map[uint64]uint64{}
-	var lastLoggedTick uint64
-	for _, m := range msgs {
-		tick, err := msgTick(m)
-		if err != nil {
-			return nil, err
-		}
-		if tick > lastLoggedTick {
-			lastLoggedTick = tick
-		}
-		switch m.Subject {
-		case SubjectLogIntent(run):
-			k, err := decodeLoggedIntent(m.Data)
-			if err != nil {
-				return nil, err
-			}
-			intents[k.Tick] = append(intents[k.Tick], k.KeyedIntent)
-		case SubjectLogVerb(run):
-			s, err := decodeLoggedVerb(m.Data)
-			if err != nil {
-				return nil, err
-			}
-			verbs[s.Tick] = append(verbs[s.Tick], s.SpawnDirective)
-		case SubjectLogCRC(run):
-			crc, err := decodeLoggedCRC(m.Data)
-			if err != nil {
-				return nil, err
-			}
-			crcs[tick] = crc
-		case SubjectLogKeyframe(run):
-			// Mid-stream keyframes are for later seeks; the CRC chain
-			// already verifies the state they capture.
-		}
+	idx, err := indexLogMsgs(msgs, run)
+	if err != nil {
+		return nil, err
 	}
-	if target > lastLoggedTick {
-		return nil, fmt.Errorf("stream %s ends at tick %d before target %d", stream, lastLoggedTick, target)
+	if target > idx.lastTick {
+		return nil, fmt.Errorf("stream %s ends at tick %d before target %d", stream, idx.lastTick, target)
 	}
 
 	rep := &ReplayReport{Run: run, KeyframeTick: kf.tick, KeyframeSeq: kf.seq}
 	for e.Tick < target {
 		next := e.Tick + 1
-		for _, k := range intents[next] {
+		for _, k := range idx.intents[next] {
 			e.EnqueueIntent(k)
 			rep.IntentsReplayed++
 		}
-		for _, d := range verbs[next] {
+		for _, d := range idx.verbs[next] {
 			// The verb was validated when first accepted; re-resolution
 			// against the same spec is deterministic and cannot newly fail
 			// — a failure here means the record and spec disagree.
@@ -163,7 +130,7 @@ func ReplayFromStream(js nats.JetStreamContext, meta *RunMeta, target uint64) (*
 			rep.VerbsReplayed++
 		}
 		e.Step()
-		if want, ok := crcs[next]; ok {
+		if want, ok := idx.crcs[next]; ok {
 			if e.CRC() != want {
 				return nil, fmt.Errorf("replay divergence at tick %d: crc %016x, logged %016x",
 					next, e.CRC(), want)
@@ -174,6 +141,65 @@ func ReplayFromStream(js nats.JetStreamContext, meta *RunMeta, target uint64) (*
 	rep.ToTick = e.Tick
 	rep.FinalCRC = e.CRC()
 	return rep, nil
+}
+
+// logIndex is the materialized per-tick view of a run's log stream:
+// arbitrated intents and director verbs by applied tick, rolling CRCs by
+// tick, the keyframe ticks in stream order, and the highest tick stamped on
+// any message. ReplayFromStream and the Player share it — the Player
+// materializes the whole immutable recording up front and re-enqueues from
+// the index instead of re-reading the stream per tick.
+type logIndex struct {
+	intents   map[uint64][]engine.KeyedIntent
+	verbs     map[uint64][]engine.SpawnDirective
+	crcs      map[uint64]uint64
+	keyframes []uint64 // keyframe ticks, stream order (for cadence derivation)
+	lastTick  uint64   // highest tick header seen on any message
+}
+
+// indexLogMsgs buckets log-stream messages (stream order) by tick. Same
+// decoding and errors as the loop ReplayFromStream ran inline before the
+// extraction; the only addition is recording keyframe ticks.
+func indexLogMsgs(msgs []*nats.Msg, run string) (*logIndex, error) {
+	idx := &logIndex{
+		intents: map[uint64][]engine.KeyedIntent{},
+		verbs:   map[uint64][]engine.SpawnDirective{},
+		crcs:    map[uint64]uint64{},
+	}
+	for _, m := range msgs {
+		tick, err := msgTick(m)
+		if err != nil {
+			return nil, err
+		}
+		if tick > idx.lastTick {
+			idx.lastTick = tick
+		}
+		switch m.Subject {
+		case SubjectLogIntent(run):
+			k, err := decodeLoggedIntent(m.Data)
+			if err != nil {
+				return nil, err
+			}
+			idx.intents[k.Tick] = append(idx.intents[k.Tick], k.KeyedIntent)
+		case SubjectLogVerb(run):
+			s, err := decodeLoggedVerb(m.Data)
+			if err != nil {
+				return nil, err
+			}
+			idx.verbs[s.Tick] = append(idx.verbs[s.Tick], s.SpawnDirective)
+		case SubjectLogCRC(run):
+			crc, err := decodeLoggedCRC(m.Data)
+			if err != nil {
+				return nil, err
+			}
+			idx.crcs[tick] = crc
+		case SubjectLogKeyframe(run):
+			// Mid-stream keyframes are for later seeks; the CRC chain
+			// already verifies the state they capture.
+			idx.keyframes = append(idx.keyframes, tick)
+		}
+	}
+	return idx, nil
 }
 
 // keyframeRef is one logged keyframe located by the scan.

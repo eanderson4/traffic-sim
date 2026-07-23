@@ -61,6 +61,12 @@ type LiveRun struct {
 // clarification: the idm harness policy exists only where no bus is
 // attached); an empty policy is upgraded, an explicit idm is refused.
 func RunLive(nc *nats.Conn, js nats.JetStreamContext, run string, spec engine.RunSpec, recCfg RecorderConfig, contractCfgs ...ContractConfig) (*LiveRun, error) {
+	// Live runs occupy the live/record namespace; the -replay suffix is
+	// reserved for replay planes (player.go), so refuse it before anything
+	// is built or recorded.
+	if err := validRunID(run); err != nil {
+		return nil, err
+	}
 	switch spec.Scen.UncontrolledPolicy {
 	case "":
 		spec.Scen.UncontrolledPolicy = engine.PolicyHoldLast

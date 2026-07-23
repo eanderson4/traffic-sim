@@ -73,7 +73,7 @@ const (
 
 // NewRecorder creates (or adopts) the per-run stream.
 func NewRecorder(js nats.JetStreamContext, run string, cfg RecorderConfig) (*Recorder, error) {
-	if err := validToken("run id", run); err != nil {
+	if err := validRunID(run); err != nil {
 		return nil, err
 	}
 	r := &Recorder{js: js, run: run, cfg: cfg.withDefaults(), stream: StreamName(run)}

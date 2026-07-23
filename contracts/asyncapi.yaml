@@ -478,7 +478,7 @@ operations:
 components:
   parameters:
     runId:
-      description: Run id — the aggregate boundary. Single NATS token [A-Za-z0-9_-].
+      description: Run id — the aggregate boundary. Single NATS token [A-Za-z0-9_-]. Ids ending in `-replay` are reserved for the replay plane and refused at record entry points (ADR-0006 addendum 2026-07-23).
     controllerId:
       description: Controller id. Single NATS token [A-Za-z0-9_-]. A controller may publish only its own intent subject.
 

@@ -2,6 +2,7 @@ package natsio
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -175,6 +176,25 @@ func validToken(kind, s string) error {
 		default:
 			return fmt.Errorf("%s %q: character %q not allowed (single NATS token: [A-Za-z0-9_-])", kind, s, c)
 		}
+	}
+	return nil
+}
+
+// replayRunSuffix is the reserved suffix of replay-plane run ids: the VCR
+// player (player.go) publishes run foo's replay under foo+replayRunSuffix.
+// A live run recorded AS "foo-replay" would collide with foo's replay
+// plane, so the suffix is refused at every live/record entry point.
+const replayRunSuffix = "-replay"
+
+// validRunID enforces the id discipline for LIVE/RECORDED runs: a single
+// token (validToken) outside the reserved replay namespace. (Replay-plane
+// ids themselves — which do end in the suffix — go through validToken.)
+func validRunID(s string) error {
+	if err := validToken("run id", s); err != nil {
+		return err
+	}
+	if strings.HasSuffix(s, replayRunSuffix) {
+		return fmt.Errorf("run id %q ends in %q — reserved for replay planes", s, replayRunSuffix)
 	}
 	return nil
 }

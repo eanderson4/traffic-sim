@@ -163,14 +163,9 @@ type Bus struct {
 // and prepares the snapshot projection. The engine pointer is used only for
 // the (static) network geometry.
 func NewBus(nc *nats.Conn, run string, e *engine.Engine) (*Bus, error) {
-	if err := validToken("run id", run); err != nil {
+	b, err := NewPublishBus(nc, run, e)
+	if err != nil {
 		return nil, err
-	}
-	b := &Bus{
-		nc:       nc,
-		run:      run,
-		geoms:    LaneGeoms(e.Net),
-		lastAppl: map[string]uint64{},
 	}
 	sub, err := nc.Subscribe(SubjectCtlIntentAll(run), b.onIntent)
 	if err != nil {
@@ -178,6 +173,22 @@ func NewBus(nc *nats.Conn, run string, e *engine.Engine) (*Bus, error) {
 	}
 	b.sub = sub
 	return b, nil
+}
+
+// NewPublishBus attaches a PUBLISH-only live plane for a run — no intent
+// subscription, for publishers with no contract plane (the replay Player).
+// It is the single Bus construction site (NewBus builds on it), so future
+// Bus fields initialize here, not at some hand-rolled literal.
+func NewPublishBus(nc *nats.Conn, run string, e *engine.Engine) (*Bus, error) {
+	if err := validToken("run id", run); err != nil {
+		return nil, err
+	}
+	return &Bus{
+		nc:       nc,
+		run:      run,
+		geoms:    LaneGeoms(e.Net),
+		lastAppl: map[string]uint64{},
+	}, nil
 }
 
 // onIntent buffers a raw intent with its controller identity. Called on a

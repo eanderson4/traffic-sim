@@ -259,3 +259,45 @@ needs; Synadia's Cybervet runs embedded NATS + 10 ms tick + KV + WebSocket at
   its job: (content-hash, seed) is recorded so two runs of "the same
   scenario" are comparable across machines and checkouts. Documented in
   `contracts/asyncapi.yaml` (RunMetaView).
+
+## Addendum (2026-07-23, VCR replay driver: `-replay` namespace + demo HTTP control plane)
+
+The replay milestone (podcast compare-variants; `engine/cmd/replay` +
+`natsio.Player`) re-simulates a recorded run from its durable JetStream
+record plane and republishes the LIVE plane at a configurable pace. Two
+contract-surface decisions, both surfaced by the external reviewers and
+recorded here per rule 5:
+
+- **The `-replay` run-id suffix is RESERVED.** The player publishes the
+  existing TSSF/TSSG frame schemas (no payload change) on
+  `ts.{run}-replay.state.snap` / `ts.{run}-replay.state.sig` — a fresh run
+  id, so replay never collides with a live or recorded `{run}` on the same
+  broker. To make that collision-free in both directions, `RunLive` and
+  `NewRecorder` now REFUSE source run ids ending in `-replay` (a recorded
+  `foo-replay` would squat on `foo`'s replay plane). Migration note: such
+  ids were previously accepted; none exist in the wild (local-first, no
+  published consumers), and AsyncAPI never constrained the run-id token, so
+  no schema change. Replay runs are deliberately registry-less and
+  contract-less: no Recorder (no OCC, no second record plane), no KV run
+  meta, no controllers — consumers must not expect registry entries for
+  `-replay` runs. The player IS CRC-audited against the record as it plays
+  (divergences are logged and counted, playback continues — demo policy,
+  distinct from the audit path's abort).
+- **The demo control plane is localhost HTTP, and ADR-0002 stands.**
+  pause/resume/speed/seek are served by the replay child over loopback HTTP
+  (`Player.Handler()`, stdlib) for the viz's replay panel, proxied by
+  demosrv. This is the same carve-out as demosrv's own orchestration HTTP
+  (process babysitting/operator console, documented at its introduction):
+  ADR-0002 governs the sim service planes — world state, controller
+  intents, demand, metrics — which remain NATS-only. The player is
+  publish-only; it consumes no intents and holds no authority over any
+  live run's state, so engine authority is untouched. If replay control
+  ever needs to cross a trust or machine boundary, it moves to
+  `ts.{run}-replay.ctl.*` subjects; loopback demo tooling does not.
+- **Playback horizon:** a record marked `done` in the run registry ran to
+  `spec.Ticks`, so the player re-sims to `spec.Ticks` even when the log's
+  last message precedes it (sparse-cadence records; every logged input is
+  replayed, so the tail is the original run's tail). A record not marked
+  `done` was killed or truncated: playback holds at the last logged tick —
+  continuing would invent an under-controlled tail the original run never
+  produced. Both horizons are exposed in the player's status.
