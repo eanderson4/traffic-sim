@@ -98,6 +98,7 @@ links its source synthesis for traceability.
 - [x] [ADR-0013](decisions/ADR-0013-external-review-gate.md) — external multi-model review (Claude Fable + GPT-5.6-sol) as a pre-commit gate: tree-hash stamp proves review happened, triage stays the committer's job, fail-closed with a loud skip hatch
 - [x] [ADR-0014](decisions/ADR-0014-observability-metrics.md) — observability: trajectory-first metric kernel (trip records incl. horizon partials, lane-interval Edie q/k/u), contract-pinned definitions, dedicated metrics JetStream stream + simrun file sink, scenario metrics bindings, paired-seed sweep protocol, LOS as presentation skin
 - [x] [ADR-0015](decisions/ADR-0015-keyframe-chunking.md) — record-plane keyframes larger than 768 KiB are chunked into consecutive log messages (`kf_chunk: "i/n"` header); seek anchors on the last chunk; schema stays v2, old recordings read unchanged — unblocks city-scale past the 1 MiB max_payload wall hit at ~10.9k vehicles
+- [ ] [ADR-0016](decisions/ADR-0016-tssg-chunking.md) — PROPOSED (implementation pending, theme session): live-plane signal tables (TSSG) chunked like ADR-0015 (`sig_chunk`/`sig_gen` headers, per-chunk-valid frames), publish-once + request-reply catch-up replacing the 20-tick rebroadcast, max_payload 64MB→4MB as documented headroom
 
 ---
 *Last distilled: 2026-07-17 | 18 articles from 56 raw research files*
@@ -105,4 +106,5 @@ links its source synthesis for traceability.
 *ADR-0013 ratified 2026-07-21 (external-review workflow, following the M11 round)*
 *ADR-0014 ratified 2026-07-21 (observability design; Fable+Sol review round, M13 implementation next)*
 *ADR-0015 ratified 2026-07-24 (keyframe chunking, after the WQ-4 stress test hit the max_payload wall)*
+*ADR-0016 drafted 2026-07-24 (TSSG chunking + pull resync, after the LA busy-tab slow-consumer incident; Fable+Sol design round settled)*
 *Run `/update-kb` to check freshness*

@@ -1,0 +1,801 @@
+diff --git a/docs/kb/articles/podcast-demo-workqueue.md b/docs/kb/articles/podcast-demo-workqueue.md
+index 03f6f98706095705ecbd9397a61439f13fe7cf67..4a04c00c6e62f65939466310a2afb68a48c79069 100644
+--- a/docs/kb/articles/podcast-demo-workqueue.md
++++ b/docs/kb/articles/podcast-demo-workqueue.md
+@@ -215,6 +215,29 @@ loudly after the dwell. Belongs with the WQ-5 driver-model ADR-level pass.
+ Context: the gate arming at all is an operator sizing error (WQ-4 ran
+ -capacity 50000 so it never arms); the escape exists for demo-liveness.
+ 
++### WQ-15: Kernel hot-spot fixes from the 180 ms/tick profile (2026-07-24)
++CPU profile of the stress-dtla kernel (scratch harness, pprof): `boundaries()`
++was 67% of Step — an O(lanes × vehicles) sweep (39,971 lanes × 14.5k vehicles
++≈ 581M iterations/tick) to find the few hundred vehicles past a lane end;
++`TotalLaneKm` 5.7% (40k-lane sum recomputed per density check). Fixes: bucket
++past-end vehicles by lane in one O(vehicles) pass (state-identical — per-
++vehicle handling is independent; crossers re-enter not-yet-visited buckets
++exactly as the sweep re-scanned them), and a lazy cached `totalLaneKm` on
++Network (fixed slice order = bit-identical). `leaderAt` (7%) is legitimate
++car-following. Full fixture suite (CRC-pinned) green. Before/after stress-net
++bench (7200 ticks, seed 42): final CRC `280df03591679821` IDENTICAL both ways;
++wall 4m57.7 → 48.3 s (41.4 → 6.7 ms/tick avg, 2.4× → 14.9× realtime at the
++harness's 3.9k-vehicle peak — the removed work scales lanes×vehicles, so the
++14.5k-vehicle live Step (~180 ms) should drop to ~50 ms). Tool: `metview`
++(engine/cmd/metview) — run-comparison dashboard for M13 metrics JSONs
++(totals side-by-side, worst lanes by time loss/k/occ/stops, trips by type);
++verified against the four i280-pod variants. Parallel-kernel discussion
++(14 cores): kernel is single-threaded by design (ADR-0005 bit-exact
++determinism); deterministic phased parallelism is an ADR-level option AFTER
++accidental quadratics are gone. Controller-side compute (routing, planning)
++is already offloaded — controllers are NATS processes/goroutines off the
++tick path; the tick is ~92% kernel Step, so Step fixes dominate offloads.
++
+ ### WQ-6: Roundabout circulation
+ Directive expiry + yield conservatism; ADR-level. Fixture: `engine/fixture_roundabout_test.go`
+ (Circulation SKIP-guarded). Not podcast-blocking.
+diff --git a/engine/cmd/metview/index.html b/engine/cmd/metview/index.html
+new file mode 100644
+index 0000000000000000000000000000000000000000..b6d81b448ed21d156d3be7e6418e631ab2d1b977
+--- /dev/null
++++ b/engine/cmd/metview/index.html
+@@ -0,0 +1,121 @@
++<!doctype html>
++<html lang="en">
++<head>
++<meta charset="utf-8">
++<title>metview — sim metrics</title>
++<style>
++  :root { color-scheme: dark; }
++  body { font: 14px/1.45 system-ui, sans-serif; background: #14171c; color: #d8dee6; margin: 0; padding: 24px; max-width: 1180px; }
++  h1 { font-size: 18px; margin: 0 0 4px; }
++  h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .08em; color: #8b96a3; margin: 28px 0 8px; }
++  .sub { color: #8b96a3; margin-bottom: 16px; }
++  .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
++  .chip { padding: 4px 12px; border-radius: 999px; background: #232930; border: 1px solid #39424d; cursor: pointer; user-select: none; }
++  .chip.on { background: #2f6db3; border-color: #2f6db3; color: #fff; }
++  table { border-collapse: collapse; width: 100%; }
++  th, td { text-align: right; padding: 5px 10px; border-bottom: 1px solid #232930; white-space: nowrap; }
++  th { color: #8b96a3; font-weight: 600; cursor: pointer; }
++  th:first-child, td:first-child { text-align: left; }
++  .bar { display: inline-block; height: 9px; background: #e07840; border-radius: 2px; vertical-align: middle; margin-right: 8px; }
++  .num { font-variant-numeric: tabular-nums; }
++</style>
++</head>
++<body>
++<h1>metview</h1>
++<div class="sub" id="subtitle">M13 metric-kernel output (ADR-0014)</div>
++
++<h2>Run comparison</h2>
++<table id="summary"><thead></thead><tbody></tbody></table>
++
++<h2>Trips by vehicle type</h2>
++<div class="chips" id="tripChips"></div>
++<table id="trips"><thead></thead><tbody></tbody></table>
++
++<h2>Worst lanes</h2>
++<div class="chips" id="laneChips"></div>
++<div class="chips" id="setChips"></div>
++<div class="chips" id="sortChips">
++  <span class="chip on" data-sort="loss">time loss</span>
++  <span class="chip" data-sort="k">density k</span>
++  <span class="chip" data-sort="occ">occupancy</span>
++  <span class="chip" data-sort="stops">stops</span>
++</div>
++<table id="lanes"><thead></thead><tbody></tbody></table>
++
++<script>
++const $ = s => document.querySelector(s);
++const fmt = (x, d=1) => x == null ? '—' : Number(x).toLocaleString(undefined, {maximumFractionDigits: d});
++const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
++let state = { file: 0, sort: 'loss', set: '' };
++let summary = [];
++
++async function loadSummary() {
++  summary = await (await fetch('/api/summary')).json();
++  $('#subtitle').textContent = summary.map(r => r.name).join('  ·  ');
++  const cols = [
++    ['name','run'], ['ticks','ticks'], ['dt','dt s'], ['completed_trips','trips done'], ['active_at_horizon','active'],
++    ['vmt_km','VMT km'], ['vht_h','VHT h'], ['mean_speed_kmh','mean km/h'],
++    ['total_time_loss_h','time loss h'], ['mean_time_loss_s','loss/veh s'],
++    ['denied_wait_h','denied h'], ['denied_pending','denied pend'],
++  ];
++  $('#summary thead').innerHTML = '<tr>' + cols.map(c => `<th>${c[1]}</th>`).join('') + '</tr>';
++  // Neutral viewer (ADR-0014 §7): no best/worst highlighting — rankings
++  // from a single seed are not conclusions; the paired-seed sweep protocol
++  // owns ranking. Numbers only.
++  $('#summary tbody').innerHTML = summary.map(row =>
++    '<tr>' + cols.map(([k]) =>
++      `<td>${k === 'name' ? esc(row[k]) : fmt(row[k], k === 'dt' ? 2 : 1)}</td>`).join('') + '</tr>').join('');
++  // file chips (trips + lanes sections share state.file)
++  for (const id of ['tripChips','laneChips']) {
++    document.getElementById(id).innerHTML = summary.map((r,i) =>
++      `<span class="chip${i===state.file?' on':''}" data-file="${i}">${esc(r.name)}</span>`).join('');
++  }
++  document.querySelectorAll('.chip[data-file]').forEach(c => c.onclick = () => {
++    state.file = +c.dataset.file;
++    document.querySelectorAll('.chip[data-file]').forEach(x =>
++      x.classList.toggle('on', +x.dataset.file === state.file));
++    loadTrips(); loadLanes();
++  });
++}
++
++async function loadTrips() {
++  const rows = await (await fetch(`/api/trips?file=${state.file}`)).json();
++  const cols = [['type','type'],['count','trips'],['completed','done'],['censored','cens.'],['mean_dist_m','dist m'],
++    ['mean_time_s','time s'],['mean_speed_kmh','km/h'],['mean_loss_s','loss s'],['mean_stops','stops']];
++  $('#trips thead').innerHTML = '<tr>' + cols.map(c => `<th>${c[1]}</th>`).join('') + '</tr>';
++  $('#trips tbody').innerHTML = rows.map(r =>
++    '<tr>' + cols.map(([k]) => `<td>${k==='type'?esc(r[k]):fmt(r[k])}</td>`).join('') + '</tr>').join('');
++}
++
++async function loadLanes() {
++  const data = await (await fetch(`/api/lanes?file=${state.file}&sort=${state.sort}&set=${encodeURIComponent(state.set)}`)).json();
++  state.set = data.set;
++  $('#setChips').innerHTML = (data.sets.length > 1 ? data.sets : []).map(s =>
++    `<span class="chip${s===data.set?' on':''}" data-set="${esc(s)}">${esc(s)}</span>`).join('');
++  document.querySelectorAll('.chip[data-set]').forEach(c => c.onclick = () => {
++    state.set = c.dataset.set; loadLanes();
++  });
++  const rows = data.rows;
++  const cols = [['lane_id','lane'],['time_loss_s','time loss s'],['mean_k','k veh/km'],
++    ['mean_occ','occ'],['stops','stops'],['vmt_m','VMT m'],['vht_s','VHT s']];
++  const maxLoss = Math.max(...rows.map(r => r.time_loss_s), 1);
++  const note = data.dropped_partials ? ` — ${fmt(data.dropped_partials,0)} horizon-partial intervals dropped (ADR-0014 §3)` : '';
++  $('#lanes thead').innerHTML = '<tr>' + cols.map((c,i) => i===0 ? `<th>${c[1]}${esc(note)}</th>` : `<th>${c[1]}</th>`).join('') + '</tr>';
++  $('#lanes tbody').innerHTML = rows.map(r =>
++    '<tr>' + cols.map(([k],i) => {
++      if (k === 'lane_id') return `<td>${esc(r[k])}</td>`;
++      if (k === 'time_loss_s') return `<td class="num"><span class="bar" style="width:${60*r[k]/maxLoss}px"></span>${fmt(r[k],0)}</td>`;
++      return `<td class="num">${fmt(r[k], k.startsWith('mean') ? 2 : 0)}</td>`;
++    }).join('') + '</tr>').join('');
++}
++
++document.querySelectorAll('.chip[data-sort]').forEach(c => c.onclick = () => {
++  state.sort = c.dataset.sort;
++  document.querySelectorAll('.chip[data-sort]').forEach(x => x.classList.toggle('on', x === c));
++  loadLanes();
++});
++
++loadSummary().then(() => { loadTrips(); loadLanes(); });
++</script>
++</body>
++</html>
+diff --git a/engine/cmd/metview/main.go b/engine/cmd/metview/main.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..db16f0e16b3fbe2c3020498171c847d0c8ed5258
+--- /dev/null
++++ b/engine/cmd/metview/main.go
+@@ -0,0 +1,364 @@
++// metview is a read-only viewer for M13 metric-kernel JSON output
++// (serve/simrun -metrics-out, ADR-0014 §6). It loads one or more metrics
++// files — typically a baseline plus upgrade variants of the same scenario —
++// and serves a local comparison dashboard: run totals side by side, the
++// worst lanes by time loss / density / flow, and trip-time breakdowns by
++// vehicle type. No frameworks, no build step: a single embedded page.
++//
++//	metview -addr 127.0.0.1:8910 base.metrics.json meter.metrics.json
++package main
++
++import (
++	_ "embed"
++	"encoding/json"
++	"flag"
++	"fmt"
++	"net"
++	"net/http"
++	"os"
++	"sort"
++	"strings"
++)
++
++//go:embed index.html
++var indexHTML []byte
++
++// metricsFile mirrors the simrun file-sink schema v1 (engine/metrics.go §6).
++// Hand-duplicated by design (read-only dev tool); a sink rename zeroes
++// fields here — check against a real file when the sink schema changes.
++// Known limitation: the sink emits interval q/k/occupancy/stops/time_loss_s
++// as *float64 omitempty (absent when the measurement group is off); the
++// scalar fields here decode absence as 0, indistinguishable from a true
++// zero. Every current binding enables all groups — if a group-off file ever
++// appears, these need pointers and the UI needs to suppress the column.
++type metricsFile struct {
++	SchemaVersion int `json:"schema_version"`
++	Ticks         uint64
++	Dt            float64
++	// Intervals are per-(set, lane) Edie q/k/u accumulations over a tick
++	// window; a run can carry several overlapping measurement sets. The
++	// horizon-truncated final window is flagged partial — ADR-0014 §3
++	// requires comparison tooling to drop partials.
++	Intervals []struct {
++		SetID     string  `json:"set_id"`
++		LaneID    string  `json:"lane_id"`
++		BeginTick uint64  `json:"begin_tick"`
++		EndTick   uint64  `json:"end_tick"`
++		Partial   bool    `json:"partial"`
++		SumDistM  float64 `json:"sum_dist_m"`
++		SumTimeS  float64 `json:"sum_time_s"`
++		Q         float64 `json:"q"`
++		K         float64 `json:"k"`
++		Occupancy float64 `json:"occupancy"`
++		Stops     float64 `json:"stops"`
++		TimeLossS float64 `json:"time_loss_s"`
++	} `json:"intervals"`
++	Trips []struct {
++		VehicleID uint64  `json:"vehicle_id"`
++		Type      string  `json:"type"`
++		EntryTick uint64  `json:"entry_tick"`
++		ExitTick  uint64  `json:"exit_tick"`
++		DistanceM float64 `json:"distance_m"`
++		TimeLossS float64 `json:"time_loss_s"`
++		Stops     int     `json:"stops"`
++		Completed bool    `json:"completed"`
++	} `json:"trips"`
++	Totals struct {
++		CompletedTrips  int     `json:"completed_trips"`
++		ActiveAtHorizon int     `json:"active_at_horizon"`
++		VMT             float64 `json:"vmt"`
++		VHT             float64 `json:"vht"`
++		TotalTimeLossS  float64 `json:"total_time_loss_s"`
++		MeanTimeLossS   float64 `json:"mean_time_loss_s"`
++		DeniedWaitS     float64 `json:"denied_wait_s"`
++		DeniedPending   float64 `json:"denied_pending"` // fractional vehicle backlog
++		DeniedServed    int     `json:"denied_served"`
++	} `json:"totals"`
++}
++
++type loadedRun struct {
++	name string
++	m    *metricsFile
++	sets []string // measurement set ids, sorted
++}
++
++var runs []loadedRun
++
++func main() {
++	addr := flag.String("addr", "127.0.0.1:8910", "listen address (loopback only)")
++	flag.Parse()
++	if flag.NArg() == 0 {
++		fmt.Fprintln(os.Stderr, "usage: metview [-addr host:port] metrics.json [more.metrics.json ...]")
++		os.Exit(2)
++	}
++	host, _, err := net.SplitHostPort(*addr)
++	if err != nil || host == "" || (!strings.HasPrefix(host, "127.") && host != "localhost" && host != "::1") {
++		fmt.Fprintln(os.Stderr, "metview: -addr must name a loopback host (e.g. 127.0.0.1:8910)")
++		os.Exit(2)
++	}
++	for _, path := range flag.Args() {
++		data, err := os.ReadFile(path)
++		if err != nil {
++			fmt.Fprintln(os.Stderr, "metview:", err)
++			os.Exit(1)
++		}
++		var m metricsFile
++		if err := json.Unmarshal(data, &m); err != nil {
++			fmt.Fprintf(os.Stderr, "metview: %s: %v\n", path, err)
++			os.Exit(1)
++		}
++		if m.SchemaVersion != 1 {
++			fmt.Fprintf(os.Stderr, "metview: %s: unsupported schema_version %d (this build reads v1)\n", path, m.SchemaVersion)
++			os.Exit(1)
++		}
++		name := path
++		if i := strings.LastIndex(name, "/"); i >= 0 {
++			name = name[i+1:]
++		}
++		sets := map[string]bool{}
++		for _, iv := range m.Intervals {
++			sets[iv.SetID] = true
++		}
++		lr := loadedRun{name: name, m: &m}
++		for s := range sets {
++			lr.sets = append(lr.sets, s)
++		}
++		sort.Strings(lr.sets)
++		runs = append(runs, lr)
++		fmt.Printf("metview: %s — %d intervals over %v, %d trips, %d ticks\n",
++			name, len(m.Intervals), lr.sets, len(m.Trips), m.Ticks)
++		if m.Ticks != runs[0].m.Ticks || m.Dt != runs[0].m.Dt {
++			fmt.Fprintf(os.Stderr, "metview: WARNING: %s has ticks=%d dt=%g but %s has ticks=%d dt=%g — cross-run comparison may be invalid\n",
++				name, m.Ticks, m.Dt, runs[0].name, runs[0].m.Ticks, runs[0].m.Dt)
++		}
++	}
++
++	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path != "/" {
++			http.NotFound(w, r)
++			return
++		}
++		_, _ = w.Write(indexHTML)
++	})
++	http.HandleFunc("/api/summary", handleSummary)
++	http.HandleFunc("/api/lanes", handleLanes)
++	http.HandleFunc("/api/trips", handleTrips)
++	fmt.Printf("metview: http://%s\n", *addr)
++	if err := http.ListenAndServe(*addr, nil); err != nil {
++		fmt.Fprintln(os.Stderr, "metview:", err)
++		os.Exit(1)
++	}
++}
++
++// summaryRow is one run's headline numbers for the comparison table.
++type summaryRow struct {
++	Name            string  `json:"name"`
++	Ticks           uint64  `json:"ticks"`
++	Dt              float64 `json:"dt"`
++	CompletedTrips  int     `json:"completed_trips"`
++	ActiveAtHorizon int     `json:"active_at_horizon"`
++	VMTkm           float64 `json:"vmt_km"`
++	VHT             float64 `json:"vht_h"`
++	MeanSpeedKMH    float64 `json:"mean_speed_kmh"`
++	TotalTimeLossH  float64 `json:"total_time_loss_h"`
++	MeanTimeLossS   float64 `json:"mean_time_loss_s"`
++	DeniedWaitH     float64 `json:"denied_wait_h"`
++	DeniedPending   float64 `json:"denied_pending"`
++}
++
++func handleSummary(w http.ResponseWriter, r *http.Request) {
++	out := make([]summaryRow, 0, len(runs))
++	for _, lr := range runs {
++		t := lr.m.Totals
++		row := summaryRow{
++			Name: lr.name, Ticks: lr.m.Ticks, Dt: lr.m.Dt,
++			CompletedTrips: t.CompletedTrips, ActiveAtHorizon: t.ActiveAtHorizon,
++			VMTkm: t.VMT / 1000, VHT: t.VHT / 3600,
++			TotalTimeLossH: t.TotalTimeLossS / 3600, MeanTimeLossS: t.MeanTimeLossS,
++			DeniedWaitH: t.DeniedWaitS / 3600, DeniedPending: t.DeniedPending,
++		}
++		if t.VHT > 0 {
++			row.MeanSpeedKMH = t.VMT / t.VHT * 3.6
++		}
++		out = append(out, row)
++	}
++	writeJSON(w, out)
++}
++
++// laneRow aggregates one lane's intervals within one measurement set.
++type laneRow struct {
++	LaneID    string  `json:"lane_id"`
++	VMTm      float64 `json:"vmt_m"`
++	VHTs      float64 `json:"vht_s"`
++	TimeLossS float64 `json:"time_loss_s"`
++	Stops     float64 `json:"stops"`
++	MeanK     float64 `json:"mean_k"` // window-weighted density (veh/km)
++	MeanOcc   float64 `json:"mean_occ"`
++}
++
++// lanesResponse lists the run's measurement sets plus the selected set's
++// worst lanes. Aggregating per (set, lane) keeps overlapping sets from
++// double-counting; density/occupancy normalize by the lane's covered
++// window, not the run horizon. Horizon-partial intervals are dropped per
++// ADR-0014 §3 (counted in DroppedPartials — a run shorter than one full
++// window has no complete intervals and its table is legitimately empty).
++type lanesResponse struct {
++	Sets            []string  `json:"sets"`
++	Set             string    `json:"set"`
++	DroppedPartials int       `json:"dropped_partials"`
++	Rows            []laneRow `json:"rows"`
++}
++
++func handleLanes(w http.ResponseWriter, r *http.Request) {
++	lr := runs[fileIdx(r)]
++	set := r.URL.Query().Get("set")
++	if set == "" {
++		set = "default"
++	}
++	found := false
++	for _, s := range lr.sets {
++		if s == set {
++			found = true
++			break
++		}
++	}
++	if !found && len(lr.sets) > 0 {
++		set = lr.sets[0]
++	}
++	type accum struct {
++		dist, tim, loss, stops, kw, occw, covered float64
++	}
++	byLane := map[string]*accum{}
++	dropped := 0
++	for _, iv := range lr.m.Intervals {
++		if iv.SetID != set {
++			continue
++		}
++		if iv.Partial {
++			dropped++
++			continue
++		}
++		a := byLane[iv.LaneID]
++		if a == nil {
++			a = &accum{}
++			byLane[iv.LaneID] = a
++		}
++		a.dist += iv.SumDistM
++		a.tim += iv.SumTimeS
++		a.loss += iv.TimeLossS
++		a.stops += iv.Stops
++		w := float64(iv.EndTick - iv.BeginTick)
++		a.kw += iv.K * w
++		a.occw += iv.Occupancy * w
++		a.covered += w
++	}
++	rows := make([]laneRow, 0, len(byLane))
++	for id, a := range byLane {
++		row := laneRow{LaneID: id, VMTm: a.dist, VHTs: a.tim, TimeLossS: a.loss, Stops: a.stops}
++		if a.covered > 0 {
++			row.MeanK = a.kw / a.covered
++			row.MeanOcc = a.occw / a.covered
++		}
++		rows = append(rows, row)
++	}
++	// Deterministic order: metric desc, lane id as the tie-break.
++	switch r.URL.Query().Get("sort") {
++	case "k":
++		sort.Slice(rows, func(i, j int) bool { return less(rows, i, j, rows[i].MeanK, rows[j].MeanK) })
++	case "occ":
++		sort.Slice(rows, func(i, j int) bool { return less(rows, i, j, rows[i].MeanOcc, rows[j].MeanOcc) })
++	case "stops":
++		sort.Slice(rows, func(i, j int) bool { return less(rows, i, j, rows[i].Stops, rows[j].Stops) })
++	default: // time loss
++		sort.Slice(rows, func(i, j int) bool { return less(rows, i, j, rows[i].TimeLossS, rows[j].TimeLossS) })
++	}
++	if len(rows) > 100 {
++		rows = rows[:100]
++	}
++	writeJSON(w, lanesResponse{Sets: lr.sets, Set: set, DroppedPartials: dropped, Rows: rows})
++}
++
++func less(rows []laneRow, i, j int, a, b float64) bool {
++	if a != b {
++		return a > b
++	}
++	return rows[i].LaneID < rows[j].LaneID
++}
++
++// tripBucket aggregates trips by vehicle type for one run. Means cover
++// COMPLETED trips only: horizon-censored trips (completed: false, exit =
++// horizon) are truncated journeys whose inclusion biases time/loss means
++// low, and the bias scales with active_at_horizon — which is exactly what
++// differs between variants (ADR-0014 §3 partial discipline, applied to
++// trips as to intervals). The censored count is reported alongside.
++type tripBucket struct {
++	Type         string  `json:"type"`
++	Count        int     `json:"count"`
++	Completed    int     `json:"completed"`
++	Censored     int     `json:"censored"` // horizon-partial trips, excluded from the means
++	MeanDistM    float64 `json:"mean_dist_m"`
++	MeanTimeS    float64 `json:"mean_time_s"`
++	MeanSpeedKMH float64 `json:"mean_speed_kmh"`
++	MeanLossS    float64 `json:"mean_loss_s"`
++	MeanStops    float64 `json:"mean_stops"`
++}
++
++func handleTrips(w http.ResponseWriter, r *http.Request) {
++	lr := runs[fileIdx(r)]
++	type accum struct {
++		n, done, stops  int
++		dist, tim, loss float64
++	}
++	byType := map[string]*accum{}
++	censored := map[string]int{}
++	for _, tr := range lr.m.Trips {
++		if !tr.Completed {
++			censored[tr.Type]++
++			continue
++		}
++		a := byType[tr.Type]
++		if a == nil {
++			a = &accum{}
++			byType[tr.Type] = a
++		}
++		a.n++
++		a.done++
++		a.dist += tr.DistanceM
++		a.tim += float64(tr.ExitTick-tr.EntryTick) * lr.m.Dt
++		a.loss += tr.TimeLossS
++		a.stops += tr.Stops
++	}
++	out := make([]tripBucket, 0, len(byType)+len(censored))
++	for typ, a := range byType {
++		b := tripBucket{
++			Type: typ, Count: a.n + censored[typ], Completed: a.done, Censored: censored[typ],
++			MeanDistM: a.dist / float64(a.n), MeanTimeS: a.tim / float64(a.n),
++			MeanLossS: a.loss / float64(a.n), MeanStops: float64(a.stops) / float64(a.n),
++		}
++		if a.tim > 0 {
++			b.MeanSpeedKMH = a.dist / a.tim * 3.6
++		}
++		out = append(out, b)
++	}
++	for typ, c := range censored {
++		if _, ok := byType[typ]; !ok {
++			out = append(out, tripBucket{Type: typ, Count: c, Censored: c})
++		}
++	}
++	sort.Slice(out, func(i, j int) bool { return out[i].Type < out[j].Type })
++	writeJSON(w, out)
++}
++
++func fileIdx(r *http.Request) int {
++	i := 0
++	_, _ = fmt.Sscanf(r.URL.Query().Get("file"), "%d", &i)
++	if i < 0 || i >= len(runs) {
++		i = 0
++	}
++	return i
++}
++
++func writeJSON(w http.ResponseWriter, v any) {
++	w.Header().Set("Content-Type", "application/json")
++	_ = json.NewEncoder(w).Encode(v)
++}
+diff --git a/engine/cmd/metview/main_test.go b/engine/cmd/metview/main_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..08a890d60f742f1e153f386bc06beef35c832951
+--- /dev/null
++++ b/engine/cmd/metview/main_test.go
+@@ -0,0 +1,152 @@
++package main
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++)
++
++// metview_test.go — the aggregation handlers over a tiny two-lane fixture:
++// summary derives speed from VMT/VHT, lanes aggregate intervals per lane and
++// sort by time loss, trips bucket by vehicle type.
++
++func fixture() *metricsFile {
++	var m metricsFile
++	m.SchemaVersion = 1
++	m.Ticks = 100
++	m.Dt = 0.1
++	type interval = struct {
++		SetID     string  `json:"set_id"`
++		LaneID    string  `json:"lane_id"`
++		BeginTick uint64  `json:"begin_tick"`
++		EndTick   uint64  `json:"end_tick"`
++		Partial   bool    `json:"partial"`
++		SumDistM  float64 `json:"sum_dist_m"`
++		SumTimeS  float64 `json:"sum_time_s"`
++		Q         float64 `json:"q"`
++		K         float64 `json:"k"`
++		Occupancy float64 `json:"occupancy"`
++		Stops     float64 `json:"stops"`
++		TimeLossS float64 `json:"time_loss_s"`
++	}
++	m.Intervals = append(m.Intervals,
++		interval{SetID: "default", LaneID: "a_0", EndTick: 100, SumDistM: 1000, SumTimeS: 100, K: 10, Occupancy: 0.5, Stops: 2, TimeLossS: 50},
++		interval{SetID: "default", LaneID: "b_0", EndTick: 100, SumDistM: 500, SumTimeS: 50, K: 40, Occupancy: 0.9, Stops: 9, TimeLossS: 300},
++		interval{SetID: "alt", LaneID: "b_0", EndTick: 50, SumDistM: 999, SumTimeS: 99, K: 99, Occupancy: 0.99, Stops: 99, TimeLossS: 999},
++		// Horizon-partial tail of the default set: dropped per ADR-0014 §3.
++		interval{SetID: "default", LaneID: "a_0", BeginTick: 100, EndTick: 137, Partial: true, SumDistM: 777, SumTimeS: 77, K: 77, Occupancy: 0.77, Stops: 77, TimeLossS: 777},
++	)
++	m.Totals.VMT = 1500
++	m.Totals.VHT = 150
++	m.Totals.CompletedTrips = 3
++	return &m
++}
++
++func get[T any](t *testing.T, path string, out *T) {
++	t.Helper()
++	rec := httptest.NewRecorder()
++	req := httptest.NewRequest("GET", path, nil)
++	mux := http.NewServeMux()
++	mux.HandleFunc("/api/summary", handleSummary)
++	mux.HandleFunc("/api/lanes", handleLanes)
++	mux.HandleFunc("/api/trips", handleTrips)
++	mux.ServeHTTP(rec, req)
++	if rec.Code != 200 {
++		t.Fatalf("%s: status %d", path, rec.Code)
++	}
++	if err := json.Unmarshal(rec.Body.Bytes(), out); err != nil {
++		t.Fatalf("%s: %v", path, err)
++	}
++}
++
++func TestSummaryDerivesSpeed(t *testing.T) {
++	runs = []loadedRun{{name: "f1", m: fixture()}}
++	var rows []summaryRow
++	get(t, "/api/summary", &rows)
++	if len(rows) != 1 || rows[0].MeanSpeedKMH != 36 {
++		t.Fatalf("summary = %+v, want mean speed 36 km/h (1500 m / 150 s)", rows)
++	}
++	if rows[0].VMTkm != 1.5 || rows[0].VHT != 150.0/3600.0 {
++		t.Fatalf("summary conversions wrong: %+v", rows[0])
++	}
++}
++
++func TestLanesAggregateAndSort(t *testing.T) {
++	runs = []loadedRun{{name: "f1", m: fixture(), sets: []string{"alt", "default"}}}
++	var resp lanesResponse
++	get(t, "/api/lanes?file=0&sort=loss", &resp)
++	rows := resp.Rows
++	if resp.Set != "default" || len(resp.Sets) != 2 {
++		t.Fatalf("set selection = %q over %v, want default over [alt default]", resp.Set, resp.Sets)
++	}
++	if len(rows) != 2 || rows[0].LaneID != "b_0" {
++		t.Fatalf("lanes = %+v, want b_0 (300 s loss) first, alt set excluded", rows)
++	}
++	if rows[0].MeanK != 40 || rows[1].MeanOcc != 0.5 {
++		t.Fatalf("window-weighted means wrong: %+v", rows)
++	}
++	// The horizon-partial interval is dropped (ADR-0014 §3), not merged
++	// into a_0's complete window.
++	if resp.DroppedPartials != 1 || rows[1].TimeLossS != 50 || rows[1].VMTm != 1000 {
++		t.Fatalf("partial handling wrong: dropped=%d rows=%+v", resp.DroppedPartials, rows)
++	}
++	// The alt set aggregates independently (its 999 s loss must not leak
++	// into the default set, and selects on request).
++	get(t, "/api/lanes?file=0&set=alt", &resp)
++	if len(resp.Rows) != 1 || resp.Rows[0].TimeLossS != 999 || resp.Rows[0].MeanK != 99 {
++		t.Fatalf("alt set = %+v, want the single alt interval", resp.Rows)
++	}
++}
++
++func TestFileIdxClamps(t *testing.T) {
++	runs = []loadedRun{{name: "f1", m: fixture()}}
++	req := httptest.NewRequest("GET", "/api/lanes?file=99", nil)
++	if got := fileIdx(req); got != 0 {
++		t.Fatalf("fileIdx(99) = %d, want clamped 0", got)
++	}
++}
++
++func TestTripsCompletedOnlyMeans(t *testing.T) {
++	m := fixture()
++	m.Trips = append(m.Trips,
++		struct {
++			VehicleID uint64  `json:"vehicle_id"`
++			Type      string  `json:"type"`
++			EntryTick uint64  `json:"entry_tick"`
++			ExitTick  uint64  `json:"exit_tick"`
++			DistanceM float64 `json:"distance_m"`
++			TimeLossS float64 `json:"time_loss_s"`
++			Stops     int     `json:"stops"`
++			Completed bool    `json:"completed"`
++		}{VehicleID: 1, Type: "car", EntryTick: 0, ExitTick: 100, DistanceM: 1000, TimeLossS: 10, Stops: 2, Completed: true},
++		struct {
++			VehicleID uint64  `json:"vehicle_id"`
++			Type      string  `json:"type"`
++			EntryTick uint64  `json:"entry_tick"`
++			ExitTick  uint64  `json:"exit_tick"`
++			DistanceM float64 `json:"distance_m"`
++			TimeLossS float64 `json:"time_loss_s"`
++			Stops     int     `json:"stops"`
++			Completed bool    `json:"completed"`
++		}{VehicleID: 2, Type: "car", EntryTick: 90, ExitTick: 100, DistanceM: 50, TimeLossS: 1, Stops: 0, Completed: false},
++	)
++	runs = []loadedRun{{name: "f1", m: m}}
++	var rows []tripBucket
++	get(t, "/api/trips?file=0", &rows)
++	if len(rows) != 1 {
++		t.Fatalf("trips = %+v, want one car bucket", rows)
++	}
++	b := rows[0]
++	if b.Count != 2 || b.Completed != 1 || b.Censored != 1 {
++		t.Fatalf("counts = %+v, want 2 total / 1 done / 1 censored", b)
++	}
++	// Means cover the completed trip only: 1000 m over 100 ticks at dt 0.1
++	// = 10 s → 360 km/h; censored 50 m trip must not dilute them.
++	if b.MeanDistM != 1000 || b.MeanTimeS != 10 || b.MeanLossS != 10 || b.MeanStops != 2 {
++		t.Fatalf("means = %+v, want completed-only (1000 m, 10 s, 10 s loss, 2 stops)", b)
++	}
++	if b.MeanSpeedKMH != 360 {
++		t.Fatalf("mean speed = %v, want 360 km/h", b.MeanSpeedKMH)
++	}
++}
+diff --git a/engine/engine.go b/engine/engine.go
+index da2d0f01b006a5bec31a06b867ab283360e528f8..8d95c104bc24344ee80e8dd60a73a5a15214e5bb 100644
+--- a/engine/engine.go
++++ b/engine/engine.go
+@@ -409,17 +409,41 @@ func (e *Engine) integrate() {
+ }
+ 
+ // boundaries handles end-of-lane handoff, downstream lanes first so a
+-// vehicle crosses at most one boundary per tick:
++// vehicle crosses at most one boundary per tick (a crosser re-enters only
++// when its successor has a LOWER lane index — not yet visited):
+ //
+ //	Exit lane:        despawn (left the network)
+ //	lane w/ successor: cross over, s -= lane.Length — a held turn intent
+ //	                  (ADR-0008 §2) chooses the successor and is consumed
+ //	EndWall lane:     clamp at the wall (pathology guard; counted)
++//
++// Vehicles past their lane end are bucketed by lane in one O(vehicles)
++// pass — the previous lanes×vehicles sweep cost ~2/3 of the tick at city
++// scale (WQ-15 profile, 2026-07-24). Bucketing is state-identical ONLY
++// because per-vehicle boundary handling is order-independent today (no
++// RNG, pickSuccessor is pure per-vehicle, Stats commute, despawn
++// compaction runs after the loop) — a future order-dependent step here
++// (e.g. junction entry-capacity gating) must preserve the old sweep's
++// e.order scan order instead. A crosser appended to a not-yet-visited
++// bucket is reconsidered there as the sweep re-scanned it — appended at
++// the bucket tail rather than encountered at its e.order position, which
++// is equivalent only via the order-independence above.
+ func (e *Engine) boundaries() {
++	past := map[*Lane][]*Vehicle{}
++	for _, v := range e.order {
++		if v.S > v.Lane.Length {
++			past[v.Lane] = append(past[v.Lane], v)
++		}
++	}
+ 	despawned := false
+ 	for i := len(e.Net.Lanes) - 1; i >= 0; i-- {
+ 		lane := e.Net.Lanes[i]
+-		for _, v := range e.order {
++		vs := past[lane]
++		if vs == nil {
++			continue
++		}
++		delete(past, lane)
++		for _, v := range vs {
+ 			if v.Lane != lane || v.S <= lane.Length {
+ 				continue
+ 			}
+@@ -440,6 +464,13 @@ func (e *Engine) boundaries() {
+ 				if next.Internal {
+ 					v.stopDone = false
+ 				}
++				// A successor not yet visited (lower index) re-checks the
++				// crosser this tick — hops can chain while each successor's
++				// index keeps decreasing, exactly as the old sweep's
++				// re-scan reached them.
++				if next.Index < i && v.S > next.Length {
++					past[next] = append(past[next], v)
++				}
+ 			case lane.EndWall:
+ 				v.S = lane.Length
+ 				v.V = 0
+diff --git a/engine/network.go b/engine/network.go
+index ba2ce4af4e2abae46242034f077a20949fa8cc95..5668a28825c807c52f50102cbfefc6e438e059c9 100644
+--- a/engine/network.go
++++ b/engine/network.go
+@@ -7,9 +7,12 @@ import "fmt"
+ // Lanes are built in code (BuildNet test networks) or loaded from a
+ // compiled network file (netfile.go, format v1).
+ type Lane struct {
+-	ID         string
+-	Section    string // "ring" | "A" | "B" | "main" | edge id — metrics/tests group by this
+-	Index      int    // fixed position in Network.Lanes; canonical for CRC
++	ID      string
++	Section string // "ring" | "A" | "B" | "main" | edge id — metrics/tests group by this
++	Index   int    // fixed position in Network.Lanes; canonical for CRC
++	// Length is immutable for a run's lifetime: TotalLaneKm's cache and
++	// routing's memoized tables are filled from it (a mid-run mutation
++	// would silently keep the stale values).
+ 	Length     float64
+ 	SpeedLimit float64
+ 	Width      float64 // m; 0 on the in-code test networks (geometry only)
+@@ -60,6 +63,10 @@ type Network struct {
+ 	// order; nil on networks without signalized junctions.
+ 	Signals []*SignalProgram
+ 	byID    map[string]*Lane
++	// totalLaneKm caches TotalLaneKm (lazy; callers are run-loop goroutine
++	// only — the per-tick density checks). Slice order is fixed, so the
++	// cached value is bit-identical to recomputation.
++	totalLaneKm float64
+ }
+ 
+ // LaneByID looks up a lane by ID (lookup only, never iterated).
+@@ -79,11 +86,14 @@ func (n *Network) OriginByID(id string) *Lane {
+ 
+ // TotalLaneKm is the total lane length in kilometres (density denominator).
+ func (n *Network) TotalLaneKm() float64 {
+-	var l float64
+-	for _, ln := range n.Lanes {
+-		l += ln.Length
++	if n.totalLaneKm == 0 {
++		var l float64
++		for _, ln := range n.Lanes {
++			l += ln.Length
++		}
++		n.totalLaneKm = l / 1000
+ 	}
+-	return l / 1000
++	return n.totalLaneKm
+ }
+ 
+ // NetSpec parameterizes the in-code test networks and file-loaded networks.

@@ -12,17 +12,44 @@
 > recording Sol's failure count in the commit message.) Do not skip the script
 > itself — that would bypass Fable too. Never push.
 
-## Operational state (2026-07-23 evening)
+## Operational state (2026-07-24 afternoon)
 
-- Engine + all fixtures green at `0f14d1f` (see freshness notes (c)–(g) in
-  `gaps-and-roadmap.md` for the full found/fixed bug history).
-- demosrv serves the demo menu + built viz on http://localhost:8900/.
-  Rebuild/restart: `cd engine && go build -o /tmp/demosrv ./cmd/demosrv && /tmp/demosrv`
-  (run from repo root; it serves `viz/dist`, so `cd viz && pnpm build` first for viz changes).
-- Headless verification: `cd viz && node scripts/screenshot.mjs "<url>" /tmp/x.png <waitMs>`;
-  scripted all-demo verification lived at `/tmp/verify-demos.mjs` (NOT committed — gone
-  on reboot; regenerate from the recipe in freshness note (d) if needed).
-- Demo registry: `data/scenarios/demos.json` (10 imported networks + 4 behavior fixtures).
+- Engine + all fixtures green. Kernel is ~6× faster post-WQ-15 (41.4 →
+  6.7 ms/tick avg on the stress bench; sim hour at 14.7k vehicles:
+  905 s → 246 s wall). Realtime ceiling now ~25-30k vehicles (est).
+- Recording wall GONE: ADR-0015 keyframe chunking validated to 14.5k
+  vehicles (was a run-killer at 10.9k). Commits: 8fbb5a1 (code),
+  4026902/6b3ae4b (docs), WQ-15 + metview committed 7dfe5bb (r8 gate clean).
+- metview (engine/cmd/metview): `metview -addr 127.0.0.1:8910 *.metrics.json`
+  — server-rendered comparison dashboard (neutral per ADR-0014 §7; no
+  single-seed ranking colors).
+- THEME SESSION owns and has dirty: `viz/src/*`, `engine/cmd/demosrv/*`,
+  `engine/geojson.go*`, `engine/natsio/driver/driver.go` (+ new
+  router.go/router_test.go/driver_test.go), `engine/cmd/{serve,replay}/main.go`,
+  `engine/natsio/bus.go`, untracked `scripts/` importers + `viz/src/{stopsign,layertoggles,netload}.ts`.
+  Its arc (from the owner): stop signs + paper theme → 6-city re-import with
+  control nodes → LA-scale bugs (heap Dijkstra, 64MB max_payload — REVERTING
+  to ~4MB + chunked TSSG table per owner directive, DESIGN PENDING a
+  Fable+Sol design round — see below). Demos on :8931. DO NOT stage its files.
+- TSSG v2 design brief DELIVERED (2026-07-24, this session):
+  `docs/kb/decisions/ADR-0016-tssg-chunking.md` (PROPOSED) — chunked TSSG via
+  `sig_chunk: "i/n"` + `sig_gen` headers mirroring ADR-0015 (no-header = whole
+  table, no schema bump), per-chunk-valid frames, publish-once-at-start +
+  request-reply catch-up (`ts.{run}.state.sig.req`, pull not push — the actual
+  busy-tab fix), 20-tick rebroadcast + paused-replay table firehose removed,
+  loud publish errors on BOTH live frames, max_payload 64MB→4MB as documented
+  headroom (ADR-0006 §5 doctrine amendment), TSSF + TSOB recorded as the next
+  unbounded frames. Theme session implements, runs its own Fable+Sol round,
+  flips the ADR to ACCEPTED, updates asyncapi + the serve size comment.
+- Scratch artifacts in /tmp (regenerable): ts-stress + ts-wq15 (HEAD/patched
+  extracts), serve-stress/serve-wq15/metview binaries, wq4store3 +
+  wq15store (stress recordings), wq4prof* (kernel bench + pprof profiles),
+  chkstress (recording verifier). /tmp/wq4srv = WQ-4 instrumented serve.
+- data/ is gitignored: podcast variants + recordings + demos.json never
+  touch git.
+- Old operational notes (2026-07-23): demosrv :8900 recipe, headless
+  screenshot recipe, demo registry — still valid; /tmp verify-demos.mjs
+  gone on reboot (regenerate from freshness note (d)).
 
 ## Open issues (viz, from live viewing)
 
@@ -78,6 +105,34 @@
   verified only — no headless assertion on the shared-id feature-state
   path; (f) legend still says "one per movement" — update to "one per
   approach + stop bar" (legend.ts was mid-refactor by the theme session).
+
+- **metview round deferrals (Fable + Sol r3–r8, 2026-07-24):** (a) sink
+  interval q/k/occupancy/time_loss_s are `*float64` and stops `*int`, all
+  omitempty — a group-off file decodes as real zeros (raised 5× by Sol incl.
+  the r7 blocker; HELD — documented at the struct; no current binding
+  disables groups, so no such file exists; fix = pointers + column
+  suppression when such a file exists); (b) two files sharing a basename
+  render indistinguishable chips (use paths or a dedup suffix if it bites);
+  (c) the past-map/bucket slices reallocate per tick — Engine-owned scratch
+  if GC ever shows (it hasn't); (d) metview's basename→label uses
+  filepath.Base; the JSON /api is human-local scripting under the ADR-0002
+  loopback carve-out (documented in the package doc, NOT an inter-service
+  boundary); (e) `denied_by_lane` is intentionally NOT mirrored into metview
+  (per-lane array; the summary already carries the denied-* aggregates —
+  Fable r7 question answered); (f) no focused regression test for the WQ-15
+  boundary bucketing (Sol r7 should-fix — deferred; the CRC-pinned fixture
+  suite + the bit-exact stress bench are the current coverage; add
+  lower-index multi-hop/higher-index deferral cases when boundaries() is
+  next touched); (g) censored trips are excluded from per-type distance/
+  time/loss/stop aggregates (Sol r8 should-fix — survivorship-bias reading
+  of ADR-0014; completed-only is cemented by main_test.go, so this needs
+  an ADR-0014 interpretation before changing v1 semantics — likely answer:
+  surface a censored-inclusive time-loss bound column rather than folding
+  partial trips into means); (h) no test asserts the dropped_crossings
+  passthrough (Fable r8 nit — one fixture line when next touched). FIXED in r7: `dropped_crossings` mirrored into the totals
+  struct + summary column (Sol r7 blocker — ADR-0014's loud integrity
+  signal), stale schema-pointer comments, single-seed caution line on the
+  comparison page.
 
 - **Keyframe-chunking round deferrals (Fable r3 + Sol r2/r3, commit 8fbb5a1):**
   (a) MaxAge retention expires messages individually — a chunk group
@@ -237,6 +292,15 @@ determinism); deterministic phased parallelism is an ADR-level option AFTER
 accidental quadratics are gone. Controller-side compute (routing, planning)
 is already offloaded — controllers are NATS processes/goroutines off the
 tick path; the tick is ~92% kernel Step, so Step fixes dominate offloads.
+
+### WQ-16: TSSG v2 — chunked signal table + request-reply resync (THEME SESSION owns)
+Design: `docs/kb/decisions/ADR-0016-tssg-chunking.md` (PROPOSED, 2026-07-24,
+settled by a Fable+Sol design round). Kills the 64MB max_payload stopgap
+(→ 4MB headroom), chunks LA's 7.3MB table into ~10 ≤768KiB messages, and
+replaces the wall-clock-blind 20-tick rebroadcast with pull-based catch-up
+(`ts.{run}.state.sig.req`) — the piece that actually fixes busy-tab
+slow-consumer drops. Implementation + its review round + asyncapi update are
+the theme session's; flip the ADR to ACCEPTED when it ships.
 
 ### WQ-6: Roundabout circulation
 Directive expiry + yield conservatism; ADR-level. Fixture: `engine/fixture_roundabout_test.go`
