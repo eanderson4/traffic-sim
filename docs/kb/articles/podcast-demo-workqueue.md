@@ -50,15 +50,36 @@
   `"kind"` as an input field and overwrites it — should be rejected by the strict
   fence or moved to an output DTO; (d) the panel's divergence warning shows
   crcErrors only — surface verbErrors too.
+- **Signal-head round-3 deferrals (Fable + Sol, 2026-07-23, commit 62b6237):**
+  (a) the late-join test's freshness bound measures from the watcher's last
+  observed tick, not the subscribe instant — flake window on a loaded box
+  (re-sample after subscribe or widen); (b) `signalCatchUpEvery` is
+  tick-denominated — the "~2 s catch-up" promise assumes dt = 0.1; at
+  ADR-0005's dt = 1 s ceiling it is 20 s. Derive the cadence from dt or drop
+  the wall-time wording if dt ever varies; (c) the duplicate-keyframe
+  dirty-store check compares only the first index pair (pre-existing);
+  (d) asyncapi `info.version` left at 2.1.0 though the documented
+  convergence promise tightened ≤100 → ≤20 ticks (nit); (e) greedy
+  running-centroid clustering can drift (early member ends >75 m from the
+  final centroid; Y-arms within 90° merge) — deterministic, cosmetic,
+  revisit only if a real net shows the artifact.
 
 
-### WQ-1: Spurious/"extra" signal heads at junctions
-Observed 2026-07-23 (screenshot 15-24-54): heads render at lane ends around the
-junction box that look like exit-side stubs / netconvert fragment ends, not true
-stop-line entries. Classify each head's source (true stop-line vs fragment artifact)
-and suppress or re-gate artifacts. Heads are zoom-gated at minzoom 13 (housing +
-3 lens layers, `viz/src/main.ts`). Related: mid-zoom (13–15) clustering at dense
-junctions — consider per-junction declutter (offset or count-badged single head).
+### WQ-1: Spurious/"extra" signal heads at junctions — FIXED (2026-07-23)
+Root cause was per-link duplication, not fragment artifacts: the wire's link
+index is one per SUMO connection (from-lane→to-lane), so wide multi-lane
+approaches rendered a head per lane-movement (~25 heads at one junction).
+Fix in `viz/src/signals.ts`: cluster bound links by (identical state column
+across all phases) AND approach geometry (≤75 m to the running centroid,
+entry bearing within 90° — opposing approaches at symmetric junctions must
+never merge), one head per cluster, set back 3.5 m along the approach
+bearing. Wilshire 3038 → 1404 heads, Manhattan 3256 → ~1.4k. Registration
+delay fixed engine-side: TSSG catch-up republish moved from the keyframe
+cadence (100 ticks = 10 s at 1×) to `signalCatchUpEvery` = 20 ticks
+(`engine/natsio/run.go`; contract + ADR-0006 addendum updated). Residual,
+deferred: mid-zoom (13–15) declutter at dense junction clusters (e.g. the
+San Vicente diagonal) — consider count-badged single heads; greedy-mean
+bearing drift noted by Fable (cosmetic, deterministic).
 
 ### WQ-2: Trailer jackknife physics
 `viz/src/artic.ts` — trailers render perpendicular/detached. Root cause understood

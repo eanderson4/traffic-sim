@@ -1,0 +1,10 @@
+ .../kb/decisions/ADR-0006-nats-message-contract.md |   8 ++-
+ engine/natsio/bus.go                               |   2 +-
+ engine/natsio/player.go                            |  38 +++++-------
+ engine/natsio/player_test.go                       |  14 ++---
+ engine/natsio/run.go                               |  20 ++++--
+ engine/natsio/sigframe.go                          |   5 +-
+ engine/natsio/sigframe_test.go                     |  11 ++--
+ viz/src/signals.ts                                 | Bin 2994 -> 5183 bytes
+ viz/test/signals.test.ts                           |  69 ++++++++++++++++-----
+ 9 files changed, 106 insertions(+), 61 deletions(-)
