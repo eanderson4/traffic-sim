@@ -227,18 +227,36 @@ async function main(): Promise<void> {
     if (key === sigSourceKey) return;
     sigSourceKey = key;
     prevSigStates.clear(); // re-apply every state on the next render pass
-    const features: Feature<Point>[] = heads.map((h) => ({
-      type: "Feature",
-      id: h.id,
-      properties: { id: h.id },
-      geometry: { type: "Point", coordinates: project(h.x, h.y) },
-    }));
+    // Two features per head — the housing POINT and the stop-bar LINE —
+    // sharing the head id so ONE setFeatureState colors both (signals.ts
+    // doc). The `kind` property keeps symbol/circle layers off the lines
+    // and the line layer off the points.
+    const features: Array<Feature<Point | LineString>> = [];
+    for (const h of heads) {
+      features.push({
+        type: "Feature",
+        id: h.id,
+        properties: { id: h.id, kind: "head" },
+        geometry: { type: "Point", coordinates: project(h.x, h.y) },
+      });
+      if (h.bar !== null) {
+        features.push({
+          type: "Feature",
+          id: h.id,
+          properties: { id: h.id, kind: "bar" },
+          geometry: {
+            type: "LineString",
+            coordinates: [project(h.bar[0], h.bar[1]), project(h.bar[2], h.bar[3])],
+          },
+        });
+      }
+    }
     (map.getSource("signals") as maplibregl.GeoJSONSource).setData({
       type: "FeatureCollection",
       features,
     });
     sigPoints.length = 0;
-    for (const f of features) sigPoints.push(f.geometry.coordinates as [number, number]);
+    for (const h of heads) sigPoints.push(project(h.x, h.y));
   }
 
   // updateSignals derives per-head light colors at the render tick (the
@@ -363,20 +381,49 @@ async function main(): Promise<void> {
         "icon-halo-width": 1,
       },
     });
-    // Signal lights (M9): one head per signalized MOVEMENT (grouped
-    // stop-lines, signals.ts) — the housing sprite carries three dim
-    // lenses and one circle layer per lens position paints the active
-    // light, gated by feature-state "sig" (off = no lit lens). Zoom-gated
+    // Signal lights (M9): one head per signalized APPROACH (state-column +
+    // geometry clustering, signals.ts) — the housing sprite carries three
+    // dim lenses and one circle layer per lens position paints the active
+    // light, gated by feature-state "sig" (off = no lit lens). The stop
+    // bar line under each head (added below, same feature id) marks WHICH
+    // lanes the head governs. Zoom-gated
     // to ≥13: at city zooms the heads blob into clutter that hides the
     // network itself (zoomed-out detail is the congestion channel's job).
     map.addSource("signals", { type: "geojson", data: EMPTY_FC, promoteId: "id" });
     const sigHeadImg = signalHeadImage();
     map.addImage(SIGNAL_HEAD_IMAGE_ID, sigHeadImg.image, { pixelRatio: sigHeadImg.pixelRatio });
+    // Stop bars: the "which approach" cue — one line across each head's
+    // bound lanes, sharing the head's feature id, so the feature-state
+    // color always matches a lens. Off = the no-data lane tone: the bar
+    // still marks the signalized stop line when no lens is lit.
+    map.addLayer({
+      id: "signals-bars",
+      type: "line",
+      source: "signals",
+      minzoom: 13,
+      filter: ["==", ["get", "kind"], "bar"],
+      paint: {
+        "line-color": [
+          "match",
+          ["coalesce", ["feature-state", "sig"], "off"],
+          "green",
+          THEME.signalGreen,
+          "amber",
+          THEME.signalAmber,
+          "red",
+          THEME.signalRed,
+          THEME.noData,
+        ],
+        "line-width": ["interpolate", ["linear"], ["zoom"], 13, 2, 17, 5],
+        "line-opacity": 0.9,
+      },
+    });
     map.addLayer({
       id: "signals-housing",
       type: "symbol",
       source: "signals",
       minzoom: 13,
+      filter: ["==", ["get", "kind"], "head"],
       layout: {
         "icon-image": SIGNAL_HEAD_IMAGE_ID,
         "icon-allow-overlap": true,
@@ -397,6 +444,7 @@ async function main(): Promise<void> {
         type: "circle",
         source: "signals",
         minzoom: 13,
+        filter: ["==", ["get", "kind"], "head"],
         paint: {
           "circle-color": lens.fill,
           "circle-opacity": [

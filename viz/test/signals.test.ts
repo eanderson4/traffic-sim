@@ -165,6 +165,77 @@ test("signalHeads: same-link lanes split by geometry still get unique ids", () =
   assert.equal(states.get("p:0#1"), "green");
 });
 
+test("signalHeads: skewed arms 60° apart are distinct approaches (the Wilshire X)", () => {
+  // Same column, bearings 60° apart — inside the old 90° cone these
+  // merged into one head; the 45° cone keeps skew-junction arms separate.
+  const t: SignalTable = {
+    tick: 0,
+    programs: [
+      {
+        id: "p",
+        junction: "p",
+        offsetTicks: 0,
+        phases: [{ durationTicks: 4, state: "GG" }],
+        links: [
+          { linkIdx: 0, laneId: "a" },
+          { linkIdx: 1, laneId: "b" },
+        ],
+      },
+    ],
+  };
+  const shapes = new Map<string, Array<readonly number[]>>([
+    ["a", [[0, 0], [10, 0]]], // 0°
+    ["b", [[60, 0], [65, 8.660254]]], // 60°
+  ]);
+  const heads = signalHeads(t, shapes);
+  assert.equal(heads.length, 2);
+  // Near-parallel lanes (10° apart) DO merge — same approach, curved entry.
+  const shapes2 = new Map<string, Array<readonly number[]>>([
+    ["a", [[0, 0], [10, 0]]], // 0°
+    ["b", [[0, 5], [9.848, 6.736]]], // ~10°
+  ]);
+  assert.equal(signalHeads(t, shapes2).length, 1);
+});
+
+test("signalHeads: the stop bar spans the bound lanes square to the approach", () => {
+  const t: SignalTable = {
+    tick: 0,
+    programs: [
+      {
+        id: "p",
+        junction: "p",
+        offsetTicks: 0,
+        phases: [{ durationTicks: 4, state: "G" }],
+        links: [
+          { linkIdx: 0, laneId: "a" },
+          { linkIdx: 0, laneId: "b" },
+        ],
+      },
+    ],
+  };
+  const shapes = new Map<string, Array<readonly number[]>>([
+    ["a", [[0, 0], [10, 0]]],
+    ["b", [[6, 0], [16, 0]]],
+  ]);
+  const heads = signalHeads(t, shapes);
+  assert.equal(heads.length, 1);
+  // Bearing +x → bar vertical through the centroid (3,0), entries collapse
+  // to one point on the perpendicular axis → exactly ±BAR_EXTEND_M.
+  assert.deepEqual(heads[0]!.bar, [3, -1.6, 3, 1.6]);
+  // Laterally separated lanes: the bar spans the full lane group, not
+  // just the extension — entries (0,0) and (0,6) → bar (0,-1.6)–(0,7.6).
+  const shapesWide = new Map<string, Array<readonly number[]>>([
+    ["a", [[0, 0], [10, 0]]],
+    ["b", [[0, 6], [10, 6]]],
+  ]);
+  const wide = signalHeads(t, shapesWide)[0]!.bar!;
+  const want = [0, -1.6, 0, 7.6];
+  for (let i = 0; i < 4; i++) assert.ok(Math.abs(wide[i]! - want[i]!) < 1e-9, `bar[${i}] = ${wide[i]}, want ${want[i]}`);
+  // No usable bearings → no bar (the head still renders).
+  const shapes3 = new Map<string, Array<readonly number[]>>([["a", [[0, 0]]], ["b", [[6, 0]]]]);
+  assert.equal(signalHeads(t, shapes3)[0]!.bar, null);
+});
+
 test("signalHeads: lanes sharing a link index merge to one centroid head", () => {
   const t: SignalTable = {
     tick: 0,

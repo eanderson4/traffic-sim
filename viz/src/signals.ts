@@ -13,14 +13,22 @@
 // symmetric fixed-time junction share a column too, and merging them
 // would centroid the head into the middle of the intersection — so a
 // cluster additionally requires spatial and directional agreement (close
-// to the cluster centroid, entry bearing within 90°). Manhattan 3256 →
-// 1100 heads, Wilshire 3038 → 824, stress-DTLA 6025 → 1625.
+// to the cluster centroid, entry bearing within ~45° of the running mean
+// — a per-join gate, so a bridging lane can still chain arms farther
+// apart; deterministic given the wire's link order). Skewed junctions
+// have arms entering 45–90° apart and those are distinct approaches.
+// Measured head counts (per-link → column-only → +approach split):
+// Manhattan 3256 → 1100 → 1180, Wilshire 3038 → 824 → 1407, Boston
+// 1085 → 438 → 536, stress-DTLA 6025 → 1625 → 2514.
 //
 // Placement: the head sits at the centroid of its cluster's stop-line
 // entries, set back HEAD_SETBACK_M out of the junction box along the mean
 // approach bearing (the reverse of the internal lanes' entry direction),
 // so heads read as standing over their own approach instead of floating
-// inside the intersection.
+// inside the intersection. The STOP BAR (SignalHead.bar) draws the
+// complementary cue: a line across the cluster's bound lanes at the stop
+// line, sharing the head's feature id so one setFeatureState colors both —
+// the bar says WHICH lanes, the housing says WHAT color.
 
 import { sigColorOf, stateCharAt, type SigColor, type SigProgram, type SignalTable } from "./tssg.ts";
 
@@ -28,6 +36,12 @@ export interface SignalHead {
   id: string; // `${programId}:${repLinkIdx}` (+ `#N` if the rep repeats) — unique feature id AND feature-state key
   x: number; // local metric frame, centroid of the cluster's stop-line entries, set back
   y: number;
+  // Stop bar across the cluster's bound lanes: [x1, y1, x2, y2] through
+  // the entry points, perpendicular to the mean entry bearing — the "which
+  // approach does this head govern" cue (same feature id, so one
+  // setFeatureState colors head and bar together). Null when no lane in
+  // the cluster carries a usable bearing.
+  bar: readonly [number, number, number, number] | null;
   program: SigProgram; // derivation input for headStatesAtTick
   linkIdx: number; // representative link of the cluster (all members derive identically)
 }
@@ -42,6 +56,11 @@ export const HEAD_SETBACK_M = 3.5;
 // approach's width (a 5-lane stop line spans ~20 m), well under the
 // distance between distinct junctions sharing a program.
 const CLUSTER_RADIUS_M = 75;
+
+// BAR_EXTEND_M extends the stop bar half a lane width past the outermost
+// entry points so the bar reads as spanning the lanes, not connecting
+// their centerpoints.
+const BAR_EXTEND_M = 1.6;
 
 // columnKey is the light-state signature: the link's state char in every
 // phase. Absent chars (link index past the state string) join as NUL so
@@ -75,18 +94,48 @@ interface Cluster {
   bx: number; // entry-bearing sums (mean direction = normalize(b*))
   by: number;
   n: number;
+  pts: Array<readonly number[]>; // entry points (the stop bar spans them)
 }
 
 // sameApproach: a lane joins a cluster only when it sits near the running
-// centroid AND its entry bearing agrees with the cluster's mean (dot > 0
-// ⇔ within 90°). A directionless lane or a not-yet-directed cluster
-// cannot veto on bearing — distance still gates.
+// centroid AND its entry bearing agrees with the cluster's mean within
+// ~45°. The tight cone matters at SKEWED junctions (Wilshire's diagonals):
+// two arms can enter 45–90° apart, and the looser 90° gate merged them
+// into one head — Eric's "too few heads" at the X-junctions. Lanes of one
+// true approach are near-parallel (≤ ~20° of curve at the stop line), so
+// the 45° cone splits approaches, never lanes. A directionless lane or a
+// not-yet-directed cluster cannot veto on bearing — distance still gates.
 function sameApproach(c: Cluster, x: number, y: number, b: [number, number] | null): boolean {
   if (Math.hypot(x - c.sx / c.n, y - c.sy / c.n) > CLUSTER_RADIUS_M) return false;
   if (b === null) return true;
   const bl = Math.hypot(c.bx, c.by);
   if (bl <= 1e-6) return true;
-  return (c.bx / bl) * b[0] + (c.by / bl) * b[1] > 0;
+  return (c.bx / bl) * b[0] + (c.by / bl) * b[1] > Math.SQRT1_2; // cos 45°
+}
+
+// stopBar spans the cluster's stop-line entries perpendicular to the mean
+// entry bearing: project the entries onto the perpendicular axis, extend
+// the extremes by BAR_EXTEND_M. Null when no lane carried a bearing (the
+// head still renders; there is no direction to square a bar against).
+function stopBar(c: Cluster): readonly [number, number, number, number] | null {
+  const bl = Math.hypot(c.bx, c.by);
+  if (bl <= 1e-6) return null;
+  const ux = c.bx / bl;
+  const uy = c.by / bl;
+  const nx = -uy; // perpendicular (left of the entry direction)
+  const ny = ux;
+  const cx = c.sx / c.n;
+  const cy = c.sy / c.n;
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const pt of c.pts) {
+    const d = (pt[0]! - cx) * nx + (pt[1]! - cy) * ny;
+    if (d < lo) lo = d;
+    if (d > hi) hi = d;
+  }
+  lo -= BAR_EXTEND_M;
+  hi += BAR_EXTEND_M;
+  return [cx + nx * lo, cy + ny * lo, cx + nx * hi, cy + ny * hi];
 }
 
 // signalHeads resolves the table's bound lanes against the static network
@@ -112,12 +161,13 @@ export function signalHeads(
       const b = entryBearing(shape);
       let c = clusters.find((c) => c.key === key && sameApproach(c, first[0]!, first[1]!, b));
       if (c === undefined) {
-        c = { key, rep: l.linkIdx, sx: 0, sy: 0, bx: 0, by: 0, n: 0 };
+        c = { key, rep: l.linkIdx, sx: 0, sy: 0, bx: 0, by: 0, n: 0, pts: [] };
         clusters.push(c);
       }
       c.sx += first[0];
       c.sy += first[1];
       c.n += 1;
+      c.pts.push(first);
       if (b !== null) {
         c.bx += b[0];
         c.by += b[1];
@@ -138,6 +188,7 @@ export function signalHeads(
         id,
         x: c.sx / c.n - (c.bx / (bl || 1)) * back,
         y: c.sy / c.n - (c.by / (bl || 1)) * back,
+        bar: stopBar(c),
         program: p,
         linkIdx: c.rep,
       });
