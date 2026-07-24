@@ -163,16 +163,20 @@ measured numbers (report §Follow-ups item 5). Run artifacts:
 `data/scenarios/stress-dtla-high/`, `data/recordings/wq4-stress{,2}/` +
 `wq4-stress2.metrics.json` (19.5 MB).
 
-### WQ-11: Keyframe chunking — DONE (2026-07-24, ADR-0015)
+### WQ-11: Keyframe chunking — DONE + VALIDATED (2026-07-24, ADR-0015)
 Keyframes > `KeyframeChunkMax` (default 768 KiB) are split into consecutive
 `ts.{run}.log.keyframe` messages with a `kf_chunk: "i/n"` header; no header =
 whole keyframe (old recordings unchanged); the seek anchor is the keyframe's
 LAST message so re-sim resumes at seq+1. `findKeyframe` reassembles + fails
-loud on malformed groups; `indexLogMsgs` counts one entry per keyframe.
-SchemaVersion stays 2. Tests: `engine/natsio/keyframe_chunk_test.go`
-(round-trip CRC-verified replay through chunked keyframes; malformed group
-errors). Remaining validation: re-run the WQ-4 stress scenario past 10.9k
-vehicles.
+loud on malformed/out-of-sequence/stream-non-consecutive groups;
+`indexLogMsgs` counts one entry per keyframe. SchemaVersion stays 2. Tests:
+`engine/natsio/keyframe_chunk_test.go`. **Production validation:** the WQ-4
+stress scenario re-run from 8fbb5a1 (`wq4-stress3`, same config as the Run A
+abort) completed all 7200 ticks, status done, 14,537 vehicles at horizon
+(+34% past the 10,862 wall); 31 chunked keyframes (n=2) on the stream;
+CRC-verified replay to tick 7200 through a chunked anchor. Store:
+`/tmp/wq4store3` (517 MB), metrics `/tmp/wq4-stress3.metrics.json` (both
+/tmp — regenerate with `-store` into data/recordings/ if worth keeping).
 
 ### WQ-12: Replay materialization footprint vs demosrv readiness timeout
 Found wiring the podcast recordings: the replay child materializes a
