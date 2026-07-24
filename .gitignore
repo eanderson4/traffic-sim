@@ -7,3 +7,4 @@ data/
 analysis/ngsim/ngsim-xt
 tools/
 viz/public/network.geojson
+__pycache__/

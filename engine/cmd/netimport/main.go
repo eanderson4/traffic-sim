@@ -23,11 +23,13 @@ func main() {
 	out := flag.String("out", "", "output network JSON (format v1)")
 	name := flag.String("name", "", "network name (default: input file name)")
 	source := flag.String("source", "", "provenance stamp, e.g. \"netimport (netconvert 1.27.1 .net.xml)\"")
+	sourceFile := flag.String("source-file", "", "provenance sourceFile value; default: the -in path. Record a checkout-independent name (the value feeds the ADR-0012 content hash)")
 	bbox := flag.String("bbox", "", "OSM extract bbox \"S,W,N,E\" (provenance)")
+	imported := flag.String("imported", "", "provenance import timestamp (RFC3339, e.g. the extract's OSM base date); default: now. Pin it for reproducible imports — the value feeds the ADR-0012 content hash via the canonical network JSON")
 	report := flag.String("report", "", "optional path for the JSON import report")
 	flag.Parse()
 	if *in == "" || *out == "" {
-		fmt.Fprintln(os.Stderr, "usage: netimport -in file.net.xml -out net.json [-name n] [-source s] [-bbox S,W,N,E] [-report report.json]")
+		fmt.Fprintln(os.Stderr, "usage: netimport -in file.net.xml -out net.json [-name n] [-source s] [-source-file f] [-bbox S,W,N,E] [-imported RFC3339] [-report report.json]")
 		os.Exit(2)
 	}
 	data, err := os.ReadFile(*in)
@@ -39,11 +41,24 @@ func main() {
 	if src == "" {
 		src = "netimport (.net.xml)"
 	}
+	stamp := *imported
+	if stamp == "" {
+		stamp = time.Now().UTC().Format(time.RFC3339)
+	} else if t, err := time.Parse(time.RFC3339, stamp); err != nil {
+		fmt.Fprintln(os.Stderr, "netimport: -imported must be RFC3339:", err)
+		os.Exit(2)
+	} else {
+		stamp = t.UTC().Format(time.RFC3339) // canonical: Z and +00:00 must hash identically
+	}
+	srcFile := *sourceFile
+	if srcFile == "" {
+		srcFile = *in
+	}
 	nf, rep, err := netimport.Convert(data, netimport.Options{
 		Name:       *name,
-		SourceFile: *in,
+		SourceFile: srcFile,
 		Source:     src,
-		Imported:   time.Now().UTC().Format(time.RFC3339),
+		Imported:   stamp,
 		OSMBbox:    *bbox,
 	})
 	if err != nil {

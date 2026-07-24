@@ -43,6 +43,9 @@ from day one.
    `restriction:conditional` relations ignored-with-flag; turn restrictions
    applied after way-splitting to the correct segment; the orphan-lane
    invariant (never strip a lane's last turn) outranks any tag.
+   *(Superseded in part for the ep-03 city-scale imports: ADR-0017 imports
+   no relations at all — including turn restrictions — pending a
+   restriction-aware extract.)*
 7. **Network variants are authored delta patches** anchored on our durable
    IDs (grammar owned by the scenario format): small op set, fail-loud
    validation at apply time, derived artifacts (conflict sets, internal

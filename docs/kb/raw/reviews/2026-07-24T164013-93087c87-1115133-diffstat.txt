@@ -1,0 +1,16 @@
+ .gitignore                                         |   1 +
+ contracts/network-format-v1.md                     |  44 +++-
+ docs/kb/INDEX.md                                   |   2 +-
+ docs/kb/articles/decisions/adrs.md                 |   2 +
+ .../kb/decisions/ADR-0017-city-import-decisions.md |  60 +++++
+ engine/cmd/netimport/main.go                       |  19 +-
+ scripts/import-city.sh                             |  98 +++++++
+ scripts/osm-stop-nodes.py                          | 283 +++++++++++++++++++++
+ scripts/overpass-lean.py                           |  63 +++++
+ scripts/overpass2osm.py                            | 127 +++++++++
+ scripts/render-city.py                             | 202 +++++++++++++++
+ scripts/test_osm_stop_nodes.py                     | 268 +++++++++++++++++++
+ scripts/test_overpass2osm.py                       | 125 +++++++++
+ scripts/testdata/old-shape-golden.osm              |  20 ++
+ scripts/testdata/old-shape.json                    |  27 ++
+ 15 files changed, 1335 insertions(+), 6 deletions(-)

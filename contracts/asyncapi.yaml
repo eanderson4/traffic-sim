@@ -121,10 +121,36 @@ channels:
       convergence, never corrupts state. An empty program_count means the
       run has no signalized junctions (explicit — distinguishable from
       "no table received yet").
+
+      **Chunking (additive; ADR-0016):** a table over ~768 KiB is
+      published as n consecutive messages on this subject, each a
+      COMPLETE v1 TSSG frame (program_count = programs in THIS chunk)
+      carrying a `sig_chunk: "i/n"` header (1-based, the ADR-0015
+      kf_chunk idiom). Absent header = whole table. Clients accumulate
+      1..n (publish order), reset the partial set on any gap or
+      regression, and install only a complete generation; recovery is the
+      request/reply channel stateSigReq, not waiting out a round.
     parameters:
       run: { $ref: '#/components/parameters/runId' }
     messages:
       signalTable: { $ref: '#/components/messages/SignalTable' }
+
+  stateSigReq:
+    address: ts.{run}.state.sig.req
+    description: |
+      Signal-table resync, request/reply (ADR-0016 §3): a request (EMPTY
+      payload) is answered by the run with the full CACHED TSSG chunk set
+      on the reply inbox — the pull-when-ready catch-up for a client that
+      dropped a chunk (slow-consumer) or attached mid-run and refuses to
+      wait out a 20-tick catch-up round. Queue-served by the run (the
+      replay player answers identically on the -replay namespace). Each
+      reply message is a stateSig frame with the same headers (tick,
+      schema_version, sig_chunk when the table is chunked).
+    parameters:
+      run: { $ref: '#/components/parameters/runId' }
+    messages:
+      signalTableRequest: { $ref: '#/components/messages/SignalTableRequest' }
+      signalTableReply: { $ref: '#/components/messages/SignalTable' }
 
   ctlIntent:
     address: ts.{run}.ctl.intent.{controller_id}
@@ -521,11 +547,19 @@ components:
         binding — the derivation inputs for light states, NOT the states
         themselves (ADR-0011 §1; ADR-0006 2026-07-20 M9 addendum). Layout:
         engine/natsio/sigframe.go ("TSSG", version 1).
-      headers: { $ref: '#/components/schemas/TickHeaders' }
+      headers: { $ref: '#/components/schemas/SigChunkHeaders' }
       payload:
         schemaFormat: application/octet-stream
         $ref: '#/components/schemas/SignalFrame'
       x-json-view: '#/components/schemas/SignalView'
+
+    SignalTableRequest:
+      name: signalTableRequest
+      title: Signal-table resync request (ADR-0016; EMPTY payload)
+      summary: |
+        The request itself is the signal — an empty payload on
+        ts.{run}.state.sig.req; the run answers with the full cached
+        chunk set on the reply inbox (each a SignalTable message).
 
     ControlIntent:
       name: controlIntent
@@ -718,6 +752,16 @@ components:
       properties:
         tick: { type: integer, minimum: 0, description: 'Simulation tick (ADR-0005: the tick count IS the clock).' }
         schema_version: { type: integer, const: 2 }
+
+    SigChunkHeaders:
+      allOf:
+        - $ref: '#/components/schemas/TickHeaders'
+        - type: object
+          properties:
+            sig_chunk:
+              type: string
+              pattern: '^\d+/\d+$'
+              description: 'Chunk i of n of one signal table (1-based; ADR-0016). Absent: the message IS the whole table. Chunks of one publish round are consecutive on the subject; each chunk is a complete v1 TSSG frame (program_count = programs in THIS chunk).'
 
     SchemaHeaders:
       type: object

@@ -1,0 +1,12 @@
+ .gitignore                            |   1 +
+ contracts/network-format-v1.md        |  40 ++++++
+ scripts/import-city.sh                |  86 ++++++++++++
+ scripts/osm-stop-nodes.py             | 239 ++++++++++++++++++++++++++++++++
+ scripts/overpass-lean.py              |  57 ++++++++
+ scripts/overpass2osm.py               | 120 ++++++++++++++++
+ scripts/render-city.py                | 202 +++++++++++++++++++++++++++
+ scripts/test_osm_stop_nodes.py        | 254 ++++++++++++++++++++++++++++++++++
+ scripts/test_overpass2osm.py          | 125 +++++++++++++++++
+ scripts/testdata/old-shape-golden.osm |  20 +++
+ scripts/testdata/old-shape.json       |  27 ++++
+ 11 files changed, 1171 insertions(+)

@@ -1,0 +1,27 @@
+{
+  "version": 0.6,
+  "generator": "Overpass API 0.7.62.7 3fa2e19a",
+  "elements": [
+    {
+      "type": "way",
+      "id": 8910112,
+      "nodes": [101, 102, 103],
+      "geometry": [
+        {"lat": 37.7749, "lon": -122.4194},
+        {"lat": 37.7750, "lon": -122.4180},
+        {"lat": 37.7751, "lon": -122.4166}
+      ],
+      "tags": {"highway": "primary", "name": "Market & \"4th\" St", "oneway": "yes"}
+    },
+    {
+      "type": "way",
+      "id": 8910113,
+      "nodes": [103, 104],
+      "geometry": [
+        {"lat": 37.7751, "lon": -122.4166},
+        {"lat": 37.7760, "lon": -122.4160}
+      ],
+      "tags": {"highway": "residential"}
+    }
+  ]
+}

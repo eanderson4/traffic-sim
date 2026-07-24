@@ -1,0 +1,10 @@
+ scripts/import-city.sh                |  74 +++++++++++++
+ scripts/osm-stop-nodes.py             | 145 ++++++++++++++++++++++++
+ scripts/overpass-lean.py              |  57 ++++++++++
+ scripts/overpass2osm.py               | 101 +++++++++++++++++
+ scripts/render-city.py                | 201 ++++++++++++++++++++++++++++++++++
+ scripts/test_osm_stop_nodes.py        | 121 ++++++++++++++++++++
+ scripts/test_overpass2osm.py          | 125 +++++++++++++++++++++
+ scripts/testdata/old-shape-golden.osm |  20 ++++
+ scripts/testdata/old-shape.json       |  27 +++++
+ 9 files changed, 871 insertions(+)

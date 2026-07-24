@@ -34,7 +34,7 @@ type NetFile struct {
 type NetProvenance struct {
 	Source     string     `json:"source,omitempty"`     // importer, e.g. "netimport (netconvert 1.27.1 .net.xml)"
 	SourceFile string     `json:"sourceFile,omitempty"` // e.g. "i280.net.xml"
-	Imported   string     `json:"imported,omitempty"`   // RFC 3339 import date
+	Imported   string     `json:"imported,omitempty"`   // RFC 3339 identity timestamp: extract OSM base date when pinned (-imported), else import wall time (ADR-0017)
 	OSMBbox    string     `json:"osmBbox,omitempty"`    // Overpass bbox "S,W,N,E" when OSM-derived
 	Projection string     `json:"projection,omitempty"` // projParameter of the local metric frame
 	NetOffset  [2]float64 `json:"netOffset,omitempty"`  // netOffset of the local frame (m)

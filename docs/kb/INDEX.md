@@ -50,7 +50,7 @@ back to it.
 - [Chicago Metro](articles/chicago-metro.md) — zoned Geofabrik→netconvert pipeline, portal-weighted napkin demand, driver exit-routing + serve attach barrier it required
 
 ### Decisions
-- [ADR Index](articles/decisions/adrs.md) — ADR-0001..0015 table with rationales, research basis, and pending-ADR queue
+- [ADR Index](articles/decisions/adrs.md) — ADR-0001..0017 table with rationales, research basis, and pending-ADR queue
 
 ## Raw Research
 

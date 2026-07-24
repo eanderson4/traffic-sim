@@ -35,7 +35,9 @@
 ```
 
 `version` must be `1`. `provenance` is the import recipe: importer stamp,
-source file, import date (RFC 3339), the OSM extract bbox `S,W,N,E` when
+source file, the import's identity timestamp (RFC 3339 — the extract's OSM
+base date when pinned via `-imported` for reproducible content hashes, else
+the import wall time; ADR-0017), the OSM extract bbox `S,W,N,E` when
 OSM-derived, and the local metric frame (`projection` + `netOffset`, copied
 from the `.net.xml` `location` element). Lane order in the file is canonical:
 it fixes `Lane.Index`, which the state CRC hashes — re-imports produce new
@@ -161,6 +163,24 @@ placeholder projection (chain-offset × 3.5 m slot).
 
 ## Bootstrap recipe (Overpass → netconvert → netimport)
 
+The canned form of this recipe is **`scripts/import-city.sh`** (Overpass
+JSON → .osm → two-pass netconvert → netimport → scenario dir). It adds two
+things to the manual flow below: `scripts/overpass2osm.py` converts
+Overpass JSON (including tagged stop/signal nodes) to .osm, and
+`scripts/osm-stop-nodes.py` emits a PlainXML node override for a SECOND
+netconvert pass that re-types stop-controlled junctions — netconvert
+(verified on 1.27.1) ignores OSM `highway=stop` nodes on import
+(eclipse-sumo issue #5244), so without the override every junction comes
+out `priority` and no `row: "stop"` lanes exist. The lean/full road-class
+cuts come from `scripts/overpass-lean.py`.
+
+Two deliberate exceptions, recorded in **ADR-0017** (city-scale import
+decisions): no `--junctions.join` (the stop override keys junctions by OSM
+node id, which joining rewrites) and `priority_stop` as a whole-junction
+approximation (netconvert picks the stopped connections by road priority).
+The ADR also covers un-imported OSM relations (turn restrictions) and the
+directionless-stop default.
+
 Requirements: a local netconvert. The reference import used a
 working-directory-local PyPI install (no system install):
 
@@ -183,6 +203,10 @@ NC=tools/sumo-venv/lib/python3.12/site-packages/sumo/bin/netconvert
 
    `curl -sG --data-urlencode data@query.txt https://overpass-api.de/api/interpreter -o region.osm`
 
+   For city-scale imports with stop signs and traffic signals, query JSON
+   instead (ways AND tagged nodes: `highway~"^(stop|give_way|traffic_signals)$"`)
+   and convert with `scripts/overpass2osm.py` — see `scripts/import-city.sh`.
+
 2. **Compile with netconvert** (metric shapes via `--proj.utm`;
    `--no-turnarounds` is what opens the map boundary — with default
    turnarounds every clipped way ends in a U-turn loop and the network has
@@ -192,14 +216,30 @@ NC=tools/sumo-venv/lib/python3.12/site-packages/sumo/bin/netconvert
    $NC --osm-files region.osm -o region.net.xml --proj.utm --no-turnarounds
    ```
 
+   Stop-sign overlay (only when the extract carries `highway=stop` nodes):
+
+   ```sh
+   python3 scripts/osm-stop-nodes.py overpass.json stops.nod.xml
+   $NC --sumo-net-file region.net.xml --node-files stops.nod.xml --no-turnarounds -o region.final.net.xml
+   ```
+
 3. **Convert to our format** (`engine/` is its own Go module — run from there):
 
    ```sh
-   cd engine && go run ./cmd/netimport -in ../data/networks/region/region.net.xml \
+   cd engine && go run ./cmd/netimport -in ../data/networks/region/region.final.net.xml \
      -out ../data/networks/region/region.json \
      -name region -source "netimport (netconvert 1.27.1 .net.xml)" \
+     -source-file region.final.net.xml -imported "2026-07-18T00:00:00Z" \
      -bbox "S,W,N,E" -report ../data/networks/region/import-report.json
    ```
+
+   (Single-pass imports read `region.net.xml`; the two-pass stop overlay
+   writes `region.final.net.xml` — read whichever your flow produced.)
+
+   Pin `-source-file` (checkout-independent) and `-imported` (the extract's
+   OSM base date) — both feed provenance and therefore the ADR-0012 content
+   hash; the defaults (the `-in` path, wall clock) make identical inputs
+   hash differently.
 
 4. **Run:**
 
