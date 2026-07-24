@@ -215,6 +215,29 @@ loudly after the dwell. Belongs with the WQ-5 driver-model ADR-level pass.
 Context: the gate arming at all is an operator sizing error (WQ-4 ran
 -capacity 50000 so it never arms); the escape exists for demo-liveness.
 
+### WQ-15: Kernel hot-spot fixes from the 180 ms/tick profile (2026-07-24)
+CPU profile of the stress-dtla kernel (scratch harness, pprof): `boundaries()`
+was 67% of Step — an O(lanes × vehicles) sweep (39,971 lanes × 14.5k vehicles
+≈ 581M iterations/tick) to find the few hundred vehicles past a lane end;
+`TotalLaneKm` 5.7% (40k-lane sum recomputed per density check). Fixes: bucket
+past-end vehicles by lane in one O(vehicles) pass (state-identical — per-
+vehicle handling is independent; crossers re-enter not-yet-visited buckets
+exactly as the sweep re-scanned them), and a lazy cached `totalLaneKm` on
+Network (fixed slice order = bit-identical). `leaderAt` (7%) is legitimate
+car-following. Full fixture suite (CRC-pinned) green. Before/after stress-net
+bench (7200 ticks, seed 42): final CRC `280df03591679821` IDENTICAL both ways;
+wall 4m57.7 → 48.3 s (41.4 → 6.7 ms/tick avg, 2.4× → 14.9× realtime at the
+harness's 3.9k-vehicle peak — the removed work scales lanes×vehicles, so the
+14.5k-vehicle live Step (~180 ms) should drop to ~50 ms). Tool: `metview`
+(engine/cmd/metview) — run-comparison dashboard for M13 metrics JSONs
+(totals side-by-side, worst lanes by time loss/k/occ/stops, trips by type);
+verified against the four i280-pod variants. Parallel-kernel discussion
+(14 cores): kernel is single-threaded by design (ADR-0005 bit-exact
+determinism); deterministic phased parallelism is an ADR-level option AFTER
+accidental quadratics are gone. Controller-side compute (routing, planning)
+is already offloaded — controllers are NATS processes/goroutines off the
+tick path; the tick is ~92% kernel Step, so Step fixes dominate offloads.
+
 ### WQ-6: Roundabout circulation
 Directive expiry + yield conservatism; ADR-level. Fixture: `engine/fixture_roundabout_test.go`
 (Circulation SKIP-guarded). Not podcast-blocking.

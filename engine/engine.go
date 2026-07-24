@@ -2,6 +2,7 @@ package engine
 
 import (
 	"encoding/binary"
+	"fmt"
 	"hash/fnv"
 	"math"
 	"sort"
@@ -97,6 +98,21 @@ func NewEngine(spec RunSpec) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Construction invariant the WQ-15 bucketed boundaries() routes by:
+	// Lane.Index IS the slice position. The old sweep reached lanes by
+	// position; the new one routes crossers by next.Index — a violated
+	// invariant would silently defer crossers instead of failing here.
+	// Eagerly fill the TotalLaneKm cache in the same loop (deletes the
+	// lazy-write-on-read race class for any future off-goroutine caller).
+	var laneLen float64
+	for i, ln := range net.Lanes {
+		if ln.Index != i {
+			return nil, fmt.Errorf("lane %d (%s) has Index %d — Index must be the Lanes slice position", i, ln.ID, ln.Index)
+		}
+		laneLen += ln.Length
+	}
+	net.totalLaneKm = laneLen / 1000
+	net.totalLaneKmSet = true
 	// Fixed-time signal programs (ADR-0011): durations ride in seconds in
 	// the file; the tick grid is known only here. No-op without programs.
 	if err := net.compileSignalTicks(spec.Params.Dt); err != nil {
@@ -408,18 +424,44 @@ func (e *Engine) integrate() {
 	}
 }
 
-// boundaries handles end-of-lane handoff, downstream lanes first so a
-// vehicle crosses at most one boundary per tick:
+// boundaries handles end-of-lane handoff, downstream lanes first: a
+// crosser re-enters this tick only when its successor has a LOWER lane
+// index (not yet visited), so descending-index successor chains can hop
+// more than once per tick — the same reach the old lanes×vehicles sweep
+// had:
 //
 //	Exit lane:        despawn (left the network)
 //	lane w/ successor: cross over, s -= lane.Length — a held turn intent
 //	                  (ADR-0008 §2) chooses the successor and is consumed
 //	EndWall lane:     clamp at the wall (pathology guard; counted)
+//
+// Vehicles past their lane end are bucketed by lane in one O(vehicles)
+// pass — the previous lanes×vehicles sweep cost ~2/3 of the tick at city
+// scale (WQ-15 profile, 2026-07-24). Bucketing is state-identical ONLY
+// because per-vehicle boundary handling is order-independent today (no
+// RNG, pickSuccessor is pure per-vehicle, Stats commute, despawn
+// compaction runs after the loop) — a future order-dependent step here
+// (e.g. junction entry-capacity gating) must preserve the old sweep's
+// e.order scan order instead. A crosser appended to a not-yet-visited
+// bucket is reconsidered there as the sweep re-scanned it — appended at
+// the bucket tail rather than encountered at its e.order position, which
+// is equivalent only via the order-independence above.
 func (e *Engine) boundaries() {
+	past := map[*Lane][]*Vehicle{}
+	for _, v := range e.order {
+		if v.S > v.Lane.Length {
+			past[v.Lane] = append(past[v.Lane], v)
+		}
+	}
 	despawned := false
 	for i := len(e.Net.Lanes) - 1; i >= 0; i-- {
 		lane := e.Net.Lanes[i]
-		for _, v := range e.order {
+		vs := past[lane]
+		if vs == nil {
+			continue
+		}
+		delete(past, lane)
+		for _, v := range vs {
 			if v.Lane != lane || v.S <= lane.Length {
 				continue
 			}
@@ -439,6 +481,13 @@ func (e *Engine) boundaries() {
 				// is consumed, or stubbed stop junctions double-stop.
 				if next.Internal {
 					v.stopDone = false
+				}
+				// A successor not yet visited (lower index) re-checks the
+				// crosser this tick — hops can chain while each successor's
+				// index keeps decreasing, exactly as the old sweep's
+				// re-scan reached them.
+				if next.Index < i && v.S > next.Length {
+					past[next] = append(past[next], v)
 				}
 			case lane.EndWall:
 				v.S = lane.Length

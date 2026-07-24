@@ -7,9 +7,13 @@ import "fmt"
 // Lanes are built in code (BuildNet test networks) or loaded from a
 // compiled network file (netfile.go, format v1).
 type Lane struct {
-	ID         string
-	Section    string // "ring" | "A" | "B" | "main" | edge id — metrics/tests group by this
-	Index      int    // fixed position in Network.Lanes; canonical for CRC
+	ID      string
+	Section string // "ring" | "A" | "B" | "main" | edge id — metrics/tests group by this
+	Index   int    // fixed position in Network.Lanes; canonical for CRC
+	// Length is immutable in production paths after NewEngine (a test may
+	// mutate it to provoke a NewKernel reject): TotalLaneKm's cache and
+	// routing's memoized tables are filled from it (a mid-run mutation
+	// would silently keep the stale values).
 	Length     float64
 	SpeedLimit float64
 	Width      float64 // m; 0 on the in-code test networks (geometry only)
@@ -60,6 +64,11 @@ type Network struct {
 	// order; nil on networks without signalized junctions.
 	Signals []*SignalProgram
 	byID    map[string]*Lane
+	// totalLaneKm caches TotalLaneKm (lazy; callers are run-loop goroutine
+	// only — the per-tick density checks). Slice order is fixed, so the
+	// cached value is bit-identical to recomputation.
+	totalLaneKm    float64
+	totalLaneKmSet bool
 }
 
 // LaneByID looks up a lane by ID (lookup only, never iterated).
@@ -79,11 +88,15 @@ func (n *Network) OriginByID(id string) *Lane {
 
 // TotalLaneKm is the total lane length in kilometres (density denominator).
 func (n *Network) TotalLaneKm() float64 {
-	var l float64
-	for _, ln := range n.Lanes {
-		l += ln.Length
+	if !n.totalLaneKmSet {
+		var l float64
+		for _, ln := range n.Lanes {
+			l += ln.Length
+		}
+		n.totalLaneKm = l / 1000
+		n.totalLaneKmSet = true
 	}
-	return l / 1000
+	return n.totalLaneKm
 }
 
 // NetSpec parameterizes the in-code test networks and file-loaded networks.

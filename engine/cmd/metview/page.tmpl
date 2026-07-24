@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>metview — sim metrics</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.45 system-ui, sans-serif; background: #14171c; color: #d8dee6; margin: 0; padding: 24px; max-width: 1180px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .08em; color: #8b96a3; margin: 28px 0 8px; }
+  .sub { color: #8b96a3; margin-bottom: 16px; }
+  .warn { color: #e0a040; margin-bottom: 16px; }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+  .chip { padding: 4px 12px; border-radius: 999px; background: #232930; border: 1px solid #39424d; color: #d8dee6; text-decoration: none; }
+  .chip.on { background: #2f6db3; border-color: #2f6db3; color: #fff; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: right; padding: 5px 10px; border-bottom: 1px solid #232930; white-space: nowrap; }
+  th { color: #8b96a3; font-weight: 600; }
+  th:first-child, td:first-child { text-align: left; }
+  .bar { display: inline-block; height: 9px; background: #e07840; border-radius: 2px; vertical-align: middle; margin-right: 8px; }
+  .num { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<h1>metview</h1>
+<div class="sub">{{range .Files}}{{.}} &nbsp;·&nbsp; {{end}}</div>
+<div class="sub">exploratory single-run view — runs here are single-seed; differences are hypotheses, not conclusions (ADR-0014)</div>
+{{if .Mismatch}}<div class="warn">⚠ runs differ in ticks/dt — cross-run comparison may be invalid</div>{{end}}
+
+<h2>Run comparison</h2>
+<table>
+<thead><tr><th>run</th><th>ticks</th><th>dt s</th><th>trips done</th><th>active</th><th>VMT km</th><th>VHT h</th><th>mean km/h</th><th>time loss h</th><th>loss/veh s</th><th>denied h</th><th>denied pend</th><th>dropped xings</th></tr></thead>
+<tbody>{{range .Summary}}<tr><td>{{.Name}}</td><td>{{.Ticks}}</td><td>{{f .Dt 2}}</td><td>{{.CompletedTrips}}</td><td>{{.ActiveAtHorizon}}</td><td>{{f .VMTkm 1}}</td><td>{{f .VHT 1}}</td><td>{{f .MeanSpeedKMH 1}}</td><td>{{f .TotalTimeLossH 1}}</td><td>{{f .MeanTimeLossS 1}}</td><td>{{f .DeniedWaitH 1}}</td><td>{{f .DeniedPending 1}}</td><td>{{.DroppedCrossings}}</td></tr>{{end}}</tbody>
+</table>
+
+<h2>Trips by vehicle type</h2>
+<div class="chips">{{range $i, $n := .Files}}<a class="chip{{if eq $i $.File}} on{{end}}" href="/?file={{$i}}&sort={{$.Sort}}&set={{q $.Set}}">{{$n}}</a>{{end}}</div>
+<table>
+<thead><tr><th>type</th><th>trips</th><th>done</th><th>cens.</th><th>dist m</th><th>time s</th><th>km/h</th><th>loss s</th><th>stops</th></tr></thead>
+<tbody>{{range .Trips}}<tr><td>{{.Type}}</td><td>{{.Count}}</td><td>{{.Completed}}</td><td>{{.Censored}}</td>{{if gt .Completed 0}}<td>{{f .MeanDistM 1}}</td><td>{{f .MeanTimeS 1}}</td><td>{{f .MeanSpeedKMH 1}}</td><td>{{f .MeanLossS 1}}</td><td>{{f .MeanStops 2}}</td>{{else}}<td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>{{end}}</tr>{{end}}</tbody>
+</table>
+
+<h2>Worst lanes</h2>
+<div class="chips">{{range $i, $n := .Files}}<a class="chip{{if eq $i $.File}} on{{end}}" href="/?file={{$i}}&sort={{$.Sort}}&set={{q $.Set}}">{{$n}}</a>{{end}}</div>
+{{if gt (len .Sets) 1}}<div class="chips">{{range .Sets}}<a class="chip{{if eq . $.Set}} on{{end}}" href="/?file={{$.File}}&sort={{$.Sort}}&set={{q .}}">{{.}}</a>{{end}}</div>{{end}}
+<div class="chips">{{range .Sorts}}<a class="chip{{if .On}} on{{end}}" href="/?file={{$.File}}&sort={{.Key}}&set={{q $.Set}}">{{.Label}}</a>{{end}}</div>
+{{if gt .Dropped 0}}<div class="sub">{{.Dropped}} horizon-partial intervals dropped (ADR-0014 §3){{if eq (len .Lanes) 0}} — no complete windows in this run{{end}}</div>{{end}}
+{{if gt .Total (len .Lanes)}}<div class="sub">top {{len .Lanes}} of {{.Total}} lanes{{range .Sorts}}{{if .On}} · bars: {{.Label}}{{end}}{{end}}</div>{{end}}
+<table>
+<thead><tr><th>lane</th><th>time loss s</th><th>k veh/km</th><th>occ</th><th>stops</th><th>VMT m</th><th>VHT s</th></tr></thead>
+<tbody>{{range .Lanes}}<tr><td>{{.LaneID}}</td><td class="num"><span class="bar" style="width:{{f .BarPct 0}}px"></span>{{f .TimeLossS 0}}</td><td class="num">{{f .MeanK 2}}</td><td class="num">{{f .MeanOcc 2}}</td><td class="num">{{f .Stops 0}}</td><td class="num">{{f .VMTm 0}}</td><td class="num">{{f .VHTs 0}}</td></tr>{{end}}</tbody>
+</table>
+</body>
+</html>
