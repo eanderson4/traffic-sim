@@ -41,7 +41,7 @@ export interface ReplayStatus {
   done: boolean;
   dt: number;
   crcErrors: number; // replay-vs-recording divergence count — on-air trust signal
-  verbErrors: number;
+  verbErrors: number; // recorded director/spawn verbs REJECTED during replay — record/spec divergence
 }
 
 // FetchLike is the structural slice of fetch the control plane needs, so
@@ -99,17 +99,24 @@ export interface ReplayView {
   ended: boolean;
   statusLine: string; // "tick 1200 / 36000 · 4×" (| paused | replay ended)
   divergence: number; // crcErrors — render prominently when > 0
+  verbErrors: number; // recorded-verb rejects during replay (record/spec divergence)
+  warnLine: string | null; // composed ⚠ line; null when both counters are 0
 }
 
 export function viewModel(s: ReplayStatus): ReplayView {
   const endpoint = toggleTarget(s);
   const state = s.done ? "replay ended" : s.paused ? "paused" : `${s.speed}×`;
+  const parts: string[] = [];
+  if (s.crcErrors > 0) parts.push(`divergence ${s.crcErrors}`);
+  if (s.verbErrors > 0) parts.push(`verb rejects ${s.verbErrors}`);
   return {
     toggleLabel: endpoint === "resume" ? "⏵ resume" : "⏸ pause",
     toggleEndpoint: endpoint,
     ended: s.done,
     statusLine: `tick ${s.tick} / ${s.endTick} · ${state}`,
     divergence: s.crcErrors,
+    verbErrors: s.verbErrors,
+    warnLine: parts.length > 0 ? `⚠ ${parts.join(" · ")}` : null,
   };
 }
 
@@ -292,6 +299,7 @@ export class ReplayPanel {
   private onSeeking: (() => void) | null;
   private onStatus: ((s: ReplayStatus) => void) | null;
   private pollGate = new FailGate(3); // consecutive failures before hiding
+  private polling = false; // a poll round-trip is in flight — ticks must not stack
   private timer: ReturnType<typeof setInterval> | null = null;
   private dragging = false; // slider thumb held — polls must not move it
   private runEl: HTMLElement | null = null;
@@ -330,16 +338,26 @@ export class ReplayPanel {
   }
 
   private async poll(): Promise<void> {
-    const s = await this.ctl.refresh();
-    if (s === null) {
-      // One transient failure keeps the panel; only a streak means the
-      // replay child is really gone — its chrome goes with it.
-      if (this.pollGate.fail()) this.hide();
-      return;
+    // In-flight guard: a slow poll (3 s fetch timeout vs the 1 s interval)
+    // must not overlap the next tick's — an older response landing LAST
+    // would overwrite newer state. A skipped poll is not a failure and
+    // does not count toward the FailGate.
+    if (this.polling) return;
+    this.polling = true;
+    try {
+      const s = await this.ctl.refresh();
+      if (s === null) {
+        // One transient failure keeps the panel; only a streak means the
+        // replay child is really gone — its chrome goes with it.
+        if (this.pollGate.fail()) this.hide();
+        return;
+      }
+      this.pollGate.ok();
+      this.onStatus?.(s);
+      this.update();
+    } finally {
+      this.polling = false;
     }
-    this.pollGate.ok();
-    this.onStatus?.(s);
-    this.update();
   }
 
   private hide(): void {
@@ -423,8 +441,8 @@ export class ReplayPanel {
     }
     if (this.lineEl) this.lineEl.textContent = v.statusLine;
     if (this.warnEl) {
-      this.warnEl.style.display = v.divergence > 0 ? "" : "none";
-      this.warnEl.textContent = `⚠ divergence ${v.divergence}`;
+      this.warnEl.style.display = v.warnLine === null ? "none" : "";
+      this.warnEl.textContent = v.warnLine ?? "";
     }
     if (this.hintEl) {
       this.hintEl.style.display = this.ctl.hint === "" ? "none" : "";

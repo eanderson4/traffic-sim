@@ -89,16 +89,22 @@ test("viewModel: status line, toggle label, ended state, divergence count", () =
   assert.equal(playing.toggleEndpoint, "pause");
   assert.equal(playing.ended, false);
   assert.equal(playing.divergence, 0);
+  assert.equal(playing.verbErrors, 0);
 
   const paused = viewModel(status({ paused: true }));
   assert.equal(paused.statusLine, "tick 100 / 36000 · paused");
   assert.equal(paused.toggleLabel, "⏵ resume");
   assert.equal(paused.toggleEndpoint, "resume");
 
-  const ended = viewModel(status({ done: true, crcErrors: 3 }));
+  const ended = viewModel(status({ done: true, crcErrors: 3, verbErrors: 2 }));
   assert.equal(ended.statusLine, "tick 100 / 36000 · replay ended");
   assert.equal(ended.ended, true);
   assert.equal(ended.divergence, 3);
+  assert.equal(ended.verbErrors, 2);
+  assert.equal(ended.warnLine, "⚠ divergence 3 · verb rejects 2");
+
+  assert.equal(playing.warnLine, null); // both counters 0 → hidden
+  assert.equal(viewModel(status({ verbErrors: 1 })).warnLine, "⚠ verb rejects 1");
 });
 
 test("refresh: 404 or unreachable → null (the panel hides); 200 stores the status", async () => {
