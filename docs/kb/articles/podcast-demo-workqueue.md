@@ -129,15 +129,51 @@ Candidate: zoom-gate internal lanes to ≥13 like the signal heads. Quick win.
 
 ## Engine trust / architecture
 
-### WQ-4: Big-simulation stress test (owner priority)
-Prove the architecture holds at scale. Scripted elevated-demand run of stress-dtla
-(14.9k lanes, 1202 signals; gridlocked at 1200 veh/h/lane with ~8k peak vehicles,
-~7 ms/tick kernel cost — pacing-bound, note (b)) via demosrv. Quantify: kernel
-ms/tick vs vehicle count curve, NATS/ws pipeline health, viz `updateData` behavior
-at 5–10k vehicles, mean time-loss / VMT sanity. Watch for the known ADR-0008 §6
-pause-gate deadlock on overload runs (resume requires demand ≤ spare capacity;
-jammed runs wedge with zero CPU/log; workaround is raised `-capacity`; needs an
-escape hatch or at least a loud log/metric).
+### WQ-4: Big-simulation stress test (owner priority) — DONE (2026-07-24)
+Full report: `docs/kb/raw/wq4-stress-test-2026-07-24.md`. Verdict: **bounded,
+graceful FAIL** — the architecture holds to ~10.9k live vehicles, then the
+record-plane keyframe exceeds NATS `max_payload` (1 MB) and the run ABORTS
+loudly (registry `aborted`, BENCHMARKS.md §(b) confirmed in production
+conditions: real keyframe ≥92 B/veh vs the 77 B/veh microbench estimate, so
+the wall is ~10.9k not ~13.6k). Headline correction: **kernel Step ≈ 7 ms +
+12.4 µs/vehicle/tick** (linear) — realtime ceiling ~7.5k vehicles on this
+box; the "~7 ms/tick at 8k" figure in gaps-and-roadmap note (b) is wrong by
+~15× (correct it there when the theme session's pending edits to that file
+land). Below the wall: NATS/ws pipeline clean at 276 kB snapshots (1:1 with
+ticks), RSS flat ~2.2–2.8 GB, metrics sane (12.8k vehicles, mean 4.16 km/h
+gridlock, 4.04M s denied-entry wait). Pause-gate deadlock NOT reproduced
+(-capacity 50000 kept the gate unarmed) — the underlying deadlock remains
+unfixed. Follow-ups (new items below): keyframe chunking/Object Store is now
+a DEMONSTRATED run-killer (bump priority — it gates city-scale recordings);
+pause-gate escape/loud-metric; `dropped_crossings` = 83k on stress-dtla-high
+(correlate with `_d2` fragments). WQ-10 benchmark queue can now take the
+measured numbers (report §Follow-ups item 5). Run artifacts:
+`data/scenarios/stress-dtla-high/`, `data/recordings/wq4-stress{,2}/` +
+`wq4-stress2.metrics.json` (19.5 MB).
+
+### WQ-11: Keyframe chunking / Object Store (run-killer at ~10.9k vehicles)
+Demonstrated by WQ-4 Run A: at 10,862 vehicles the tick-6300 keyframe write
+failed `nats: maximum payload exceeded` and the recorder's fail-loud contract
+aborted the run. Any city-scale recording needs this first. Workaround for
+now: raise `-keyframe-every` so only the tick-0 keyframe exists (replay scans
+from tick 0). See the WQ-4 report §Scale ceilings.
+
+### WQ-12: Replay materialization footprint vs demosrv readiness timeout
+Found wiring the podcast recordings: the replay child materializes a
+recording in memory before listening — a 36000-tick i280 recording (3.3 GB)
+took ~40 s and ~23 GB RSS, so demosrv's 10 s child-readiness timeout
+(`supervisor.go` readyTimeout) tears it down ("did not become ready"). A
+9000-tick recording (369 MB) starts in ~5 s at ~2.7 GB RSS — podcast demo
+cards therefore point at 15-minute recordings. Real fixes: stream the
+materialization, or make readyTimeout generous/configurable (supervisor.go
+was mid-refactor by the theme session when found).
+
+### WQ-13: Pause-gate deadlock escape hatch (carried from WQ-4)
+ADR-0008 §6: resume requires demand ≤ spare capacity, but a jammed run's
+active count never drops — wedge with zero CPU/log. WQ-4 could not
+reproduce it only because capacity was raised 50×. Needs the escape hatch
+or at least the loud log/metric (the WQ-4 scratch harness's pause
+engage/release + 10 s heartbeat logger is a candidate shape).
 
 ### WQ-5: Driver-lag divergence (skip-guarded test)
 `TestDifferentialLanedrop` wave-envelope assertion skip-guarded on a documented
