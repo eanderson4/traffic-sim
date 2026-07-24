@@ -218,9 +218,10 @@ func TestSignalFrameEmptyTable(t *testing.T) {
 // a client subscribed only to ts.{run}.state.snap decodes every TSSF v1
 // frame without error — the vehicle path is byte-untouched (M9 addendum).
 // And the late joiner: core NATS has no retention, so a subscriber
-// attaching mid-run misses the tick-0 table; the keyframe-cadence
-// republication converges it (next table ≤ KeyframeEvery ticks later),
-// after which the table alone yields every future state (derivation).
+// attaching mid-run misses the tick-0 table; the signalCatchUpEvery
+// republication converges it (next table ≤ signalCatchUpEvery ticks
+// later), after which the table alone yields every future state
+// (derivation).
 func TestLiveSignalTablePublishAndLateJoin(t *testing.T) {
 	srv := NewTestServer(t)
 	nc, js := srv.JetStream(t)
@@ -265,7 +266,8 @@ func TestLiveSignalTablePublishAndLateJoin(t *testing.T) {
 		sawTick = f.Tick
 	}
 
-	// Late joiner: subscribes the sig subject only now (missed tick 0/50).
+	// Late joiner: subscribes the sig subject only now (missed the tick-0
+	// table and every cadence publish since).
 	late := srv.Connect(t)
 	sigSub, err := late.SubscribeSync(SubjectStateSig(run))
 	if err != nil {
@@ -279,8 +281,13 @@ func TestLiveSignalTablePublishAndLateJoin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("late-join table: %v", err)
 	}
-	if table.Tick < 100 {
-		t.Fatalf("late-join table tick = %d, want ≥ 100 (subscribed past tick 60)", table.Tick)
+	// Core NATS has no retention: any received table is a FRESH cadence
+	// publish — later than the last tick the watcher observed, and within
+	// ~one catch-up cadence of the subscribe instant (3× for connect +
+	// scheduling slack; the old keyframe cadence could take 5× that).
+	if table.Tick <= sawTick || table.Tick > sawTick+3*signalCatchUpEvery {
+		t.Fatalf("late-join table tick = %d, want (%d, %d] (fresh cadence publish after subscribing)",
+			table.Tick, sawTick, sawTick+3*signalCatchUpEvery)
 	}
 	if len(table.Programs) != 2 {
 		t.Fatalf("late-join table programs = %d, want 2", len(table.Programs))

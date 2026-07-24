@@ -243,7 +243,7 @@ func (b *Bus) PublishSnapshot(e *engine.Engine) {
 // ts.{run}.state.sig, fire-and-forget like the snapshot path. The table is
 // self-sufficient: with the tick (header + payload) a client derives every
 // light state by pure integer math (ADR-0011 §1), so republication at the
-// keyframe cadence is the whole late-joiner catch-up story.
+// signalCatchUpEvery cadence is the whole late-joiner catch-up story.
 func (b *Bus) PublishSignals(e *engine.Engine) {
 	msg := nats.NewMsg(SubjectStateSig(b.run))
 	msg.Data = SignalFrame(e)

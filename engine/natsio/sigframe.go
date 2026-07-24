@@ -11,8 +11,9 @@ import (
 // M9 addendum; ADR-0011 §1). Fixed-time light state is a PURE FUNCTION of
 // the tick count and the compiled program, so the wire carries the program
 // TABLE, never per-tick states: one small self-sufficient frame on
-// ts.{run}.state.sig at run start and republished at the keyframe cadence
-// (the late-joiner resync rhythm), and clients derive any tick's states by
+// ts.{run}.state.sig at run start and republished at the
+// signalCatchUpEvery cadence (the late-joiner resync rhythm), and clients
+// derive any tick's states by
 // the same integer math as the kernel (PhaseAt/StateAt mirror
 // engine/signal.go exactly). The 10 Hz vehicle path is untouched — an old
 // client decodes new streams without error: it simply never subscribes the

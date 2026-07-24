@@ -84,8 +84,8 @@ func SubjectStateSnap(run string) string { return Namespace + "." + run + ".stat
 
 // SubjectStateSig is the live-plane signal-program subject: ts.{run}.state.sig
 // (ADR-0006, 2026-07-20 M9 addendum): the fixed-time program table (TSSG v1),
-// published at run start and at the keyframe cadence. Light STATE is never
-// on the wire — it derives from the tick (ADR-0011 §1).
+// published at run start and every signalCatchUpEvery ticks. Light STATE is
+// never on the wire — it derives from the tick (ADR-0011 §1).
 func SubjectStateSig(run string) string { return Namespace + "." + run + ".state.sig" }
 
 // SubjectCtlIntent is one controller's intent subject: ts.{run}.ctl.intent.{controller_id}.

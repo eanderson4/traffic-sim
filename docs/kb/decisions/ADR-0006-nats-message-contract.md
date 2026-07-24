@@ -171,9 +171,11 @@ needs; Synadia's Cybervet runs embedded NATS + 10 ms tick + KV + WebSocket at
   changes need zero messages — the tick already rides every TSSF header.
   Per-tick cost on the vehicle path: unchanged (zero bytes).
 - **Late joiners:** the table publishes at run start and republishes at
-  the keyframe cadence (the §6 resync rhythm); convergence ≤
-  `KeyframeEvery` ticks (default 100 = 10 s at 1×) — never waiting for a
-  phase change (the I-280 cycle is 90 s). Tested in
+  the `signalCatchUpEvery` cadence (20 ticks; originally the §6 keyframe
+  rhythm, shortened 2026-07-23 because a 100-tick wait read as "signals
+  take seconds to appear" after every demo attach); convergence ≤ 20
+  ticks (2 s at 1×) — never waiting for a phase change (the I-280 cycle
+  is 90 s). Tested in
   `engine/natsio/sigframe_test.go`: a subscriber attaching mid-run
   receives the next cadence table and its derivation matches the kernel's
   `PhaseAt` over a full-cycle sweep; an old (snapshots-only) client

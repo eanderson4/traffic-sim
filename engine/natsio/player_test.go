@@ -389,10 +389,10 @@ func TestRunLiveRejectsReplaySuffix(t *testing.T) {
 	}
 }
 
-// TestPlayerZeroCadenceRecordFails: a dirty store with two keyframes at
-// the same tick (cadence 0 — e.g. a re-recorded run id) would panic every
-// modulo downstream. NewPlayer must refuse it loud.
-func TestPlayerZeroCadenceRecordFails(t *testing.T) {
+// TestPlayerDuplicateKeyframeRecordFails: a dirty store with two keyframes
+// at the same tick (e.g. a re-recorded run id) is an ambiguous log.
+// NewPlayer must refuse it loud.
+func TestPlayerDuplicateKeyframeRecordFails(t *testing.T) {
 	srv := NewTestServer(t)
 	nc, js := srv.JetStream(t)
 	spec, err := engine.DefaultSpec("lanedrop", 10, 1)
@@ -414,16 +414,17 @@ func TestPlayerZeroCadenceRecordFails(t *testing.T) {
 		t.Fatalf("forge keyframe: %v", err)
 	}
 	if _, err := NewPlayer(nc, js, PlayerConfig{Run: run}); err == nil {
-		t.Fatal("NewPlayer accepted a record with duplicate tick-0 keyframes (cadence 0)")
-	} else if !strings.Contains(err.Error(), "cadence 0") {
-		t.Fatalf("NewPlayer error = %v, want a cadence-0 corruption report", err)
+		t.Fatal("NewPlayer accepted a record with duplicate tick-0 keyframes")
+	} else if !strings.Contains(err.Error(), "duplicate keyframes") {
+		t.Fatalf("NewPlayer error = %v, want a duplicate-keyframe corruption report", err)
 	}
 }
 
-// TestPlayerSingleKeyframeFallback: a record holding only the tick-0
-// keyframe (run shorter than the keyframe cadence) falls back to the
-// recorder default cadence instead of failing.
-func TestPlayerSingleKeyframeFallback(t *testing.T) {
+// TestPlayerSingleKeyframeRecord: a record holding only the tick-0
+// keyframe (run shorter than the keyframe cadence) plays to completion —
+// the tick-0 keyframe is the seek floor and nothing needs a derived
+// cadence.
+func TestPlayerSingleKeyframeRecord(t *testing.T) {
 	srv := NewTestServer(t)
 	nc, js := srv.JetStream(t)
 	spec, err := engine.DefaultSpec("lanedrop", 50, 3)
@@ -437,9 +438,6 @@ func TestPlayerSingleKeyframeFallback(t *testing.T) {
 	p, err := NewPlayer(nc, js, PlayerConfig{Run: run, Speed: 100})
 	if err != nil {
 		t.Fatalf("NewPlayer: %v", err)
-	}
-	if p.keyframeEvery != 100 {
-		t.Fatalf("keyframeEvery = %d, want the 100 fallback for a single-keyframe record", p.keyframeEvery)
 	}
 	runErr := make(chan error, 1)
 	go func() { runErr <- p.Run() }()

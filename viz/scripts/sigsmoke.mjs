@@ -178,8 +178,8 @@ try {
   check("late joiner received a table", late !== null);
   if (late) {
     check(
-      `catch-up within 15 s (cadence 100 ticks = 10 s; joined ~tick ${late.joinedAtTick})`,
-      late.waitMs <= 15000,
+      `catch-up within 6 s (cadence 20 ticks = 2 s; joined ~tick ${late.joinedAtTick})`,
+      late.waitMs <= 6000,
       `waited ${late.waitMs} ms`,
     );
     const lateStates = junctionStates(late.table, late.table.tick);

@@ -31,6 +31,14 @@ import (
 // loop is gated. Sim time is frozen; this is pure scheduling hygiene.
 const pausePoll = 5 * time.Millisecond
 
+// signalCatchUpEvery is the live-plane signal-table republish cadence in
+// ticks (shared with the replay player). The M9 addendum rode the keyframe
+// cadence, but default KeyframeEvery=100 leaves a browser that attaches
+// just after the run-start publish waiting up to 10 s at 1× pace before
+// any signal head appears; the table is a few hundred bytes, so a 20-tick
+// cadence (≤ 2 s at 1×) costs nothing measurable and keeps heads prompt.
+const signalCatchUpEvery = 20
+
 // RunObserver is an optional read-only observer on the live run loop — the
 // ADR-0014 §1 metric-kernel pattern (the XTField precedent, in-process and
 // caller-driven, never the snapshot plane). Attach runs once right after
@@ -129,7 +137,8 @@ func RunLive(nc *nats.Conn, js nats.JetStreamContext, run string, spec engine.Ru
 		return finish(err)
 	}
 	// Publish the signal-program table at run start (ADR-0006 M9 addendum);
-	// the loop republishes it at the keyframe cadence for late joiners.
+	// the loop republishes it at the signalCatchUpEvery cadence for late
+	// joiners.
 	bus.PublishSignals(e)
 
 	for e.Tick < spec.Ticks {
@@ -156,10 +165,13 @@ func RunLive(nc *nats.Conn, js nats.JetStreamContext, run string, spec engine.Ru
 		if err := rec.LogTick(e); err != nil {
 			return finish(err)
 		}
-		if e.Tick%rec.cfg.KeyframeEvery == 0 {
-			// Signal table catch-up rides the keyframe cadence (the
-			// late-joiner resync rhythm, ADR-0006 §6 + M9 addendum).
+		if e.Tick%signalCatchUpEvery == 0 {
+			// Signal-table catch-up for late joiners (ADR-0006 §6 + M9
+			// addendum) — a shorter cadence than the keyframe rhythm so
+			// heads appear promptly after a browser attaches.
 			bus.PublishSignals(e)
+		}
+		if e.Tick%rec.cfg.KeyframeEvery == 0 {
 			if err := reg.UpdateState(run, e.Tick, rec.lastSeq, e.CRC()); err != nil {
 				return finish(fmt.Errorf("registry state update at tick %d: %w", e.Tick, err))
 			}

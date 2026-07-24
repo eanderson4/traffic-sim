@@ -101,9 +101,8 @@ type Player struct {
 	stream    string
 	log       *log.Logger
 
-	idx           *logIndex
-	keyframeEvery uint64 // derived from the record (signal-table cadence)
-	endTick       uint64 // min(spec.Ticks, last logged tick)
+	idx     *logIndex
+	endTick uint64 // min(spec.Ticks, last logged tick)
 
 	bus *Bus
 	e   *engine.Engine // owned by the Run goroutine
@@ -210,20 +209,12 @@ func NewPlayer(nc *nats.Conn, js nats.JetStreamContext, cfg PlayerConfig) (*Play
 	if err != nil {
 		return nil, err
 	}
-	// The signal-table republication cadence mirrors run.go's keyframe
-	// cadence; the record itself is the source of truth for it. A dirty
-	// store (a run id recorded twice into the same stream) can yield two
-	// keyframes at the same tick — a cadence of 0 would panic every modulo
-	// downstream, so refuse the corrupt record loud and early. A record
-	// with a single (tick-0) keyframe falls back to the recorder default.
-	kfEvery := (&RecorderConfig{}).withDefaults().KeyframeEvery
-	if len(idx.keyframes) >= 2 {
-		delta := idx.keyframes[1] - idx.keyframes[0]
-		if delta == 0 {
-			return nil, fmt.Errorf("run %q: corrupt record: duplicate keyframes at tick %d (cadence 0) — was this run id recorded twice into the same store?",
-				cfg.Run, idx.keyframes[0])
-		}
-		kfEvery = delta
+	// A dirty store (a run id recorded twice into the same stream) can
+	// yield two keyframes at the same tick — refuse the corrupt record
+	// loud and early rather than seeking into an ambiguous log.
+	if len(idx.keyframes) >= 2 && idx.keyframes[1] == idx.keyframes[0] {
+		return nil, fmt.Errorf("run %q: corrupt record: duplicate keyframes at tick %d — was this run id recorded twice into the same store?",
+			cfg.Run, idx.keyframes[0])
 	}
 	// The horizon the record actually covers. The registry completion
 	// status is the proof: a run marked "done" RAN to spec.Ticks — the max
@@ -246,7 +237,7 @@ func NewPlayer(nc *nats.Conn, js nats.JetStreamContext, cfg PlayerConfig) (*Play
 
 	p := &Player{
 		js: js, src: cfg.Run, replayRun: replayRun, spec: spec, stream: stream, log: lg,
-		idx: idx, keyframeEvery: kfEvery, endTick: end,
+		idx: idx, endTick: end,
 		bus: bus, e: e, speed: speed,
 		ctrlCh: make(chan ctrlRequest), runDone: make(chan struct{}),
 	}
@@ -271,9 +262,10 @@ func (p *Player) Stop() { p.stopping.Store(true) }
 // is called; the end of the recording is a hold, not an exit.
 func (p *Player) Run() error {
 	defer close(p.runDone)
-	// Opening frames: the signal table once (republished at the keyframe
-	// cadence from here on, mirroring run.go) and the tick-0 snapshot so a
-	// browser attaching before the first tick already sees the network.
+	// Opening frames: the signal table once (republished at the
+	// signalCatchUpEvery cadence from here on, mirroring run.go) and the
+	// tick-0 snapshot so a browser attaching before the first tick already
+	// sees the network.
 	p.bus.PublishSignals(p.e)
 	p.bus.PublishSnapshot(p.e)
 	p.lastRepublish = time.Now()
@@ -317,8 +309,8 @@ func (p *Player) Run() error {
 		if p.e.Tick%decimation(speed, p.spec.Params.Dt) == 0 {
 			p.bus.PublishSnapshot(p.e)
 		}
-		if p.e.Tick%p.keyframeEvery == 0 {
-			// Signal-table catch-up rides the keyframe cadence (run.go).
+		if p.e.Tick%signalCatchUpEvery == 0 {
+			// Signal-table catch-up for late joiners (run.go's cadence).
 			p.bus.PublishSignals(p.e)
 		}
 		if p.e.Tick >= p.endTick {

@@ -58,8 +58,9 @@ info:
 
     **M9 changes (additive; info version 2.1.0):** new live-plane channel
     `ts.{run}.state.sig` carrying the fixed-time signal-program table
-    (TSSG v1) at run start and at the keyframe cadence (ADR-0006
-    2026-07-20 addendum; ADR-0011). Light STATE stays off the wire — it
+    (TSSG v1) at run start and at the 20-tick catch-up cadence (ADR-0006
+    2026-07-20 addendum, cadence shortened 2026-07-23; ADR-0011). Light
+    STATE stays off the wire — it
     derives from the tick count by the kernel's own integer math, and the
     tick already rides every TSSF header. TSSF v1 and TSKF v2 are
     byte-unchanged: old clients decode new streams without error (they
@@ -104,16 +105,18 @@ channels:
     address: ts.{run}.state.sig
     description: |
       Fixed-time signal-program table (TSSG v1, ADR-0011), published once
-      at run start and republished at the keyframe cadence. The light
+      at run start and republished every 20 ticks (the catch-up cadence;
+      originally the keyframe cadence, shortened 2026-07-23 so attaching
+      browsers see lights within ~2 s at 1× pace). The light
       STATE of an approach is never on the wire: it is a pure function of
       the tick count and the compiled program (ADR-0011 §1), so the table
       plus the tick (the header here, the payload header, and every TSSF
       snapshot's tick) lets a client derive any tick's per-link states by
       the kernel's own integer math (half-open phase windows on the tick
       grid, the cycle wraps, phase 0 begins at offset_ticks). Core NATS
-      has no retention; the keyframe-cadence republication is the entire
-      late-joiner catch-up — convergence ≤ KeyframeEvery ticks (default
-      100), never waiting for a phase change. Self-sufficient like every
+      has no retention; the 20-tick republication is the entire
+      late-joiner catch-up — convergence ≤ 20 ticks, never waiting for a
+      phase change. Self-sufficient like every
       live-plane message: a drop only delays a table-less client's
       convergence, never corrupts state. An empty program_count means the
       run has no signalized junctions (explicit — distinguishable from
