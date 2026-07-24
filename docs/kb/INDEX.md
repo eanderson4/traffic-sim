@@ -47,6 +47,7 @@ back to it.
 ### Integrations
 - [OSM Extraction](articles/integrations/osm-extraction.md) — seven-pass Go importer bootstrapped and oracle-checked by netconvert, defaults-first lane inference, provenance flags (ADR-0009)
 - [MapLibre Realtime Viz](articles/integrations/maplibre-realtime.md) — three rate-split channels into MapLibre, binary SoA wire frames, measured deck.gl escalation ladder (ADR-0003)
+- [Chicago Metro](articles/chicago-metro.md) — zoned Geofabrik→netconvert pipeline, portal-weighted napkin demand, driver exit-routing + serve attach barrier it required
 
 ### Decisions
 - [ADR Index](articles/decisions/adrs.md) — ADR-0001..0014 table with rationales, research basis, and pending-ADR queue

@@ -8,6 +8,9 @@ export interface VizConfig {
   run: string;
   ws: string;
   networkUrl: string;
+  zonesUrl: string;
+  boundariesUrl: string;
+  waterUrl: string;
   bufferMs: number;
   dt: number; // engine timestep, s — sim seconds per tick
 }
@@ -20,6 +23,11 @@ export function loadConfig(search: string, hostname: string): VizConfig {
     run: p.get("run") ?? "demo",
     ws: p.get("ws") ?? `ws://${hostname}:8443`,
     networkUrl: p.get("net") ?? "/network.geojson",
+    // Static WGS84 overlays (demosrv /overlay/); optional — a 404 just
+    // means "no overlay on this demo", the fetch tolerates it.
+    zonesUrl: p.get("zones") ?? "/overlay/zones.geojson",
+    boundariesUrl: p.get("boundaries") ?? "/overlay/boundaries.geojson",
+    waterUrl: p.get("water") ?? "/overlay/water.geojson",
     bufferMs: Number.isFinite(buffer) && buffer >= 0 ? buffer : 250,
     dt: Number.isFinite(dt) && dt > 0 ? dt : 0.1,
   };

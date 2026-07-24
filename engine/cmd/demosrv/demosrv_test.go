@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -424,5 +425,65 @@ func TestHTTPEndpoints(t *testing.T) {
 	_, body = get("/api/status")
 	if body["active"] != nil {
 		t.Fatalf("status after stop = %v, want idle", body)
+	}
+}
+
+// TestOverlayEndpoints covers /overlay/{file}.geojson: static WGS84 overlay
+// files from -overlaydir, name-gated by the registry id charset, 404 for
+// anything else (traversal, non-geojson, missing dir/file — overlays are
+// optional, so absence is never a 500).
+func TestOverlayEndpoints(t *testing.T) {
+	dir := t.TempDir()
+	const body = `{"type":"FeatureCollection","features":[]}`
+	if err := os.WriteFile(filepath.Join(dir, "zones.geojson"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv := &server{overlays: dir}
+	ts := httptest.NewServer(srv.routes())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/overlay/zones.geojson")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("GET /overlay/zones.geojson = %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/geo+json" {
+		t.Errorf("Content-Type = %q, want application/geo+json", ct)
+	}
+	if string(got) != body {
+		t.Errorf("body = %q, want the file verbatim", got)
+	}
+
+	for _, path := range []string{
+		"/overlay/zones.json",          // only .geojson is served
+		"/overlay/zones",               // suffix required
+		"/overlay/..%2F..%2Fx.geojson", // traversal never reaches the fs
+		"/overlay/missing.geojson",     // absent file
+	} {
+		resp, err := http.Get(ts.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("GET %s = %d, want 404", path, resp.StatusCode)
+		}
+	}
+
+	// A missing overlay directory is a clean 404, not a 500.
+	srv2 := &server{overlays: filepath.Join(t.TempDir(), "nope")}
+	ts2 := httptest.NewServer(srv2.routes())
+	defer ts2.Close()
+	resp, err = http.Get(ts2.URL + "/overlay/zones.geojson")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("missing overlaydir: GET = %d, want 404", resp.StatusCode)
 	}
 }

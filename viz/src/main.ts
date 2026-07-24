@@ -26,6 +26,7 @@ import "maplibre-gl/dist/maplibre-gl.css";
 import type { Feature, FeatureCollection, LineString, Point } from "geojson";
 
 import { loadConfig } from "./config.ts";
+import { parseOverlay, prepareZones } from "./overlays.ts";
 import { decodeFrame } from "./tssf.ts";
 import { decodeSignalFrame, type SigColor, type SignalTable } from "./tssg.ts";
 import { headStatesAtTick, signalHeads, type SignalHead } from "./signals.ts";
@@ -63,6 +64,9 @@ const EMPTY_FC: FeatureCollection = { type: "FeatureCollection", features: [] };
 // Navy canvas per the project design tokens (math-900, theme.ts).
 const DARK_STYLE: maplibregl.StyleSpecification = {
   version: 8,
+  // Vendored SDF font (viz/public/fonts) — text symbol layers (overlay
+  // labels) need a glyphs URL, and local-first rules out a font service.
+  glyphs: "/fonts/{fontstack}/{range}.pbf",
   sources: {},
   layers: [{ id: "background", type: "background", paint: { "background-color": THEME.bg } }],
 };
@@ -126,6 +130,26 @@ async function main(): Promise<void> {
   }
   if (!net.frame) throw new Error(`${cfg.networkUrl}: missing "frame" descriptor`);
   const project = makeProjector(net.frame);
+
+  // Optional static overlays (zones + admin boundaries): already WGS84
+  // lon/lat, so unlike the network they go to MapLibre unprojected. A 404
+  // (demos without overlays) or a garbage doc just means "no overlay" —
+  // parseOverlay/prepareZones (overlays.ts) also stamp the style
+  // classification (zkind/zrun) that the zone layers filter on.
+  const fetchOverlay = async (url: string): Promise<FeatureCollection | null> => {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      return parseOverlay(await res.json());
+    } catch {
+      return null;
+    }
+  };
+  const [zonesFC, boundariesFC, waterFC] = await Promise.all([
+    fetchOverlay(cfg.zonesUrl).then((fc) => (fc === null ? null : prepareZones(fc))),
+    fetchOverlay(cfg.boundariesUrl),
+    fetchOverlay(cfg.waterUrl),
+  ]);
 
   // Static channel: project lane polylines once (local metric → WGS84).
   // Engine export guarantees [x, y] pairs (engine/geojson.go) — validated.
@@ -273,6 +297,17 @@ async function main(): Promise<void> {
   }
 
   map.on("load", () => {
+    // Water FIRST: the fill must sit under the road lines (the other
+    // overlays — boundaries/zones — are added after the roads instead).
+    if (waterFC) {
+      map.addSource("water", { type: "geojson", data: waterFC });
+      map.addLayer({
+        id: "water-fill",
+        type: "fill",
+        source: "water",
+        paint: { "fill-color": THEME.water },
+      });
+    }
     map.addSource("network", { type: "geojson", data: networkFC, promoteId: "id" });
     map.addSource("vehicles", { type: "geojson", data: EMPTY_FC, promoteId: "id" });
     map.addLayer({
@@ -314,6 +349,103 @@ async function main(): Promise<void> {
         "line-width": ["interpolate", ["linear"], ["zoom"], 11, 1.8, 14, 4, 17, 8],
       },
     });
+    // Static overlays: ABOVE the road lines (added after them) but BELOW
+    // vehicles/signal heads (added before them). Both sources are optional
+    // — null when /overlay/ 404'd at startup. Styling deliberately quieter
+    // than the congestion channel (theme.ts); zone kind/status arrive as
+    // stamped properties (zkind/zrun, overlays.ts) because line-dasharray
+    // is not data-driven in MapLibre.
+    if (boundariesFC) {
+      map.addSource("boundaries", { type: "geojson", data: boundariesFC });
+      map.addLayer({
+        id: "boundaries-line",
+        type: "line",
+        source: "boundaries",
+        paint: {
+          "line-color": THEME.boundary,
+          "line-opacity": 0.55,
+          // Higher admin levels (county 6, township 7) read a touch heavier
+          // than municipal (8).
+          "line-width": ["match", ["get", "admin_level"], 6, 1.6, 7, 1.2, 0.9],
+          "line-dasharray": [1.5, 2],
+        },
+      });
+      // Zoom-gated like the signal heads (minzoom 13): municipality names
+      // at city zoom are pure clutter.
+      map.addLayer({
+        id: "boundaries-labels",
+        type: "symbol",
+        source: "boundaries",
+        minzoom: 13,
+        layout: {
+          "text-field": ["get", "name"],
+          "text-font": ["open-sans-semibold"],
+          "text-size": 11,
+        },
+        paint: {
+          "text-color": THEME.boundary,
+          "text-halo-color": THEME.bg,
+          "text-halo-width": 1,
+        },
+      });
+    }
+    if (zonesFC) {
+      map.addSource("zones", { type: "geojson", data: zonesFC });
+      map.addLayer({
+        id: "zones-fill",
+        type: "fill",
+        source: "zones",
+        filter: ["==", ["get", "zkind"], "district"],
+        paint: { "fill-color": THEME.district, "fill-opacity": 0.05 },
+      });
+      // Runnable zones are solid and prominent; import-pending drops to a
+      // muted trace (zrun, overlays.ts).
+      map.addLayer({
+        id: "zones-district",
+        type: "line",
+        source: "zones",
+        filter: ["==", ["get", "zkind"], "district"],
+        paint: {
+          "line-color": THEME.district,
+          "line-opacity": ["case", ["==", ["get", "zrun"], 1], 0.85, 0.3],
+          "line-width": ["interpolate", ["linear"], ["zoom"], 10, 1.4, 14, 2.2],
+        },
+      });
+      map.addLayer({
+        id: "zones-corridor",
+        type: "line",
+        source: "zones",
+        filter: ["==", ["get", "zkind"], "corridor"],
+        paint: {
+          "line-color": THEME.corridor,
+          "line-opacity": ["case", ["==", ["get", "zrun"], 1], 0.8, 0.3],
+          "line-width": ["interpolate", ["linear"], ["zoom"], 10, 1.4, 14, 2.2],
+          "line-dasharray": [2.5, 1.5],
+        },
+      });
+      map.addLayer({
+        id: "zones-labels",
+        type: "symbol",
+        source: "zones",
+        minzoom: 10,
+        layout: {
+          "text-field": ["get", "label"],
+          "text-font": ["open-sans-semibold"],
+          "text-size": ["interpolate", ["linear"], ["zoom"], 10, 11, 14, 14],
+        },
+        paint: {
+          "text-color": [
+            "match",
+            ["get", "zkind"],
+            "corridor",
+            THEME.corridor,
+            THEME.district,
+          ],
+          "text-halo-color": THEME.bg,
+          "text-halo-width": 1,
+        },
+      });
+    }
     // Vehicle glyphs (2026-07-22 legibility pass): one SDF rectangle per
     // BODY (car, truck tractor, truck trailer — true aspect ratios),
     // tinted and rotated to the wire heading; trucks render articulated,

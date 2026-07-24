@@ -44,6 +44,7 @@ func main() {
 	demosPath := flag.String("demos", "data/scenarios/demos.json", "demos registry (repo-root-relative paths inside)")
 	vizDir := flag.String("viz", "viz/dist", "built viz to serve (cd viz && pnpm build): demos.html (menu) + index.html (map app)")
 	netcacheDir := flag.String("netcache", "data/networks/.geojson-cache", "per-demo network GeoJSON cache")
+	overlayDir := flag.String("overlaydir", "data/networks/overlays", "static overlay GeoJSON directory (zones/boundaries, WGS84) — a missing dir just 404s /overlay/*")
 	flag.Parse()
 
 	reg, err := LoadRegistry(*demosPath)
@@ -82,7 +83,7 @@ func main() {
 	lg := log.New(os.Stderr, "", log.LstdFlags)
 	sup := newSupervisor(childSpawner(serveBin, replayBin, lg))
 	srv := &server{
-		reg: reg, sup: sup, viz: *vizDir, nets: &netCache{dir: *netcacheDir},
+		reg: reg, sup: sup, viz: *vizDir, nets: &netCache{dir: *netcacheDir}, overlays: *overlayDir,
 		replayCtl: "http://" + replayCtlAddr, ctlTimeout: ctlTimeout, seekTimeout: seekTimeout,
 	}
 	hs := &http.Server{Addr: *addr, Handler: srv.routes()}
@@ -190,6 +191,10 @@ type server struct {
 	sup  *supervisor
 	viz  string
 	nets *netCache
+	// overlays is the static WGS84 overlay directory (zones/boundaries);
+	// served read-only under /overlay/{file}.geojson. Unlike netcache it is
+	// NEVER created — overlays are optional, a missing dir is a 404.
+	overlays string
 	// replayCtl is the replay child's control-plane base URL (loopback;
 	// overridable in tests to point at an httptest stub). ctlTimeout covers
 	// status/pause/resume/speed; seek gets seekTimeout (its re-simulation
@@ -224,6 +229,9 @@ func (s *server) routes() *http.ServeMux {
 	// Go's ServeMux wildcards are whole segments, so the .geojson suffix is
 	// parsed out of {file} in the handler.
 	mux.HandleFunc("GET /net/{file}", s.handleNet)
+	// Same whole-segment wildcard as /net — the .geojson suffix is parsed
+	// out of {file} in the handler.
+	mux.HandleFunc("GET /overlay/{file}", s.handleOverlay)
 	// Everything else (the vite /assets/… bundles) is static viz output.
 	mux.Handle("GET /", http.FileServer(http.Dir(s.viz)))
 	return mux
@@ -320,4 +328,19 @@ func (s *server) handleNet(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/geo+json")
 	http.ServeFile(w, r, path)
+}
+
+// handleOverlay serves a static overlay GeoJSON file (zones, boundaries —
+// already WGS84, the viz adds them to MapLibre directly) from -overlaydir.
+// Read-only and name-gated by the registry id charset: no suffix, a bad
+// token, a missing directory, or a missing file are all a plain 404 —
+// overlays are optional, the viz renders fine without them.
+func (s *server) handleOverlay(w http.ResponseWriter, r *http.Request) {
+	name, ok := strings.CutSuffix(r.PathValue("file"), ".geojson")
+	if !ok || !validID(name) {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("not an overlay geojson path"))
+		return
+	}
+	w.Header().Set("Content-Type", "application/geo+json")
+	http.ServeFile(w, r, filepath.Join(s.overlays, name+".geojson"))
 }

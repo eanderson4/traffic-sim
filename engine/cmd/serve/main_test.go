@@ -4,8 +4,13 @@ package main
 // (default 1 keeps the pre-flag one-tick floor exactly; 0 is unpaced batch
 // mode; negative/NaN is a usage error) and store-dir selection (empty =
 // temp dir cleaned up on exit; named = created if missing, kept on exit).
+// Plus the client-attach barrier: every expected client must report before
+// the start gate opens, and failures name the client (the old maxClientPace
+// cap and -pace 0 refusal went away with the barrier — any pace is allowed
+// once clients are attached before tick 0).
 
 import (
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
@@ -60,26 +65,54 @@ func TestPaceFloor(t *testing.T) {
 	}
 }
 
-// checkPaceClients: pace above maxClientPace is refused while async clients
-// (driver and/or demand director) are attached; at or under the cap, and
-// with no clients, anything goes.
-func TestCheckPaceClients(t *testing.T) {
-	for _, c := range []struct {
-		pace           float64
-		driver, demand bool
-		wantErr        bool
-	}{
-		{1, true, false, false},
-		{maxClientPace, true, true, false},
-		{maxClientPace + 1, true, false, true},
-		{maxClientPace + 1, false, true, true},
-		{100, false, false, false}, // driverless batch: unbounded
-	} {
-		err := checkPaceClients(c.pace, c.driver, c.demand)
-		if (err != nil) != c.wantErr {
-			t.Errorf("pace=%g driver=%v demand=%v: err=%v, wantErr=%v",
-				c.pace, c.driver, c.demand, err, c.wantErr)
-		}
+// waitBarrier: the happy path collects one report per expected client; a
+// client failure is named verbatim (the attach-failure path serve exits
+// with); a timeout names the clients still pending; a dead run names the
+// pending clients too. No deadlock: every path returns.
+func TestWaitBarrier(t *testing.T) {
+	// Happy path: both clients report, in either order.
+	barrier := make(chan attachOutcome, 2)
+	runErr := make(chan error, 1)
+	barrier <- attachOutcome{client: "demand director", desc: "1 demand file(s)"}
+	barrier <- attachOutcome{client: "default driver", desc: "id ctl-1"}
+	got, err := waitBarrier(barrier, []string{"default driver", "demand director"}, runErr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("happy path: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("happy path: %d reports, want 2", len(got))
+	}
+
+	// Client failure (e.g. an impossible run id): the error names the
+	// failing client.
+	barrier = make(chan attachOutcome, 1)
+	barrier <- attachOutcome{client: "default driver",
+		err: errors.New(`driver: run "nope" not found in the registry within 30s`)}
+	_, err = waitBarrier(barrier, []string{"default driver"}, runErr, 5*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "default driver failed to attach") ||
+		!strings.Contains(err.Error(), `run "nope" not found`) {
+		t.Fatalf("failure path: %v — want the failing client named", err)
+	}
+
+	// Timeout: the clients still pending are named.
+	_, err = waitBarrier(make(chan attachOutcome), []string{"default driver", "demand director"},
+		runErr, 20*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "attach timeout") ||
+		!strings.Contains(err.Error(), "default driver") || !strings.Contains(err.Error(), "demand director") {
+		t.Fatalf("timeout path: %v — want the pending clients named", err)
+	}
+
+	// The run died (or finished) before the barrier completed.
+	runErr2 := make(chan error, 1)
+	runErr2 <- errors.New("registry start: bad run id")
+	_, err = waitBarrier(make(chan attachOutcome), []string{"default driver"}, runErr2, 5*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "run aborted") || !strings.Contains(err.Error(), "default driver") {
+		t.Fatalf("run-death path: %v", err)
+	}
+
+	// No clients expected: returns immediately, nil error.
+	if got, err := waitBarrier(make(chan attachOutcome), nil, runErr, time.Millisecond); err != nil || len(got) != 0 {
+		t.Fatalf("no clients: %v %v", got, err)
 	}
 }
 

@@ -15,6 +15,16 @@ export const THEME = {
   signalGreen: "#2ecc71",
   signalAmber: "#f5b301",
   signalRed: "#e5484d",
+  // Static WGS84 overlays (main.ts, overlays.ts): admin boundary lines and
+  // zone partition — deliberately quieter than the congestion channel, the
+  // traffic must stay the loudest thing on the map.
+  boundary: "#5c6ba8", // muted slate: admin boundary line + label
+  district: "#5f8dff", // zone district outline/fill
+  corridor: "#f5b301", // zone corridor outline (amber — distinct from districts)
+  // Water fill (Lake Michigan, rivers) — sits UNDER the road lines, a
+  // shade off the math-900 canvas so the shoreline reads without
+  // competing with the congestion channel.
+  water: "#122a70",
 } as const;
 
 export interface GlyphSpec {
