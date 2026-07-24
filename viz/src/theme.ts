@@ -21,6 +21,10 @@ export const THEME = {
   boundary: "#5c6ba8", // muted slate: admin boundary line + label
   district: "#5f8dff", // zone district outline/fill
   corridor: "#f5b301", // zone corridor outline (amber — distinct from districts)
+  // Water fill (Lake Michigan, rivers) — sits UNDER the road lines, a
+  // shade off the math-900 canvas so the shoreline reads without
+  // competing with the congestion channel.
+  water: "#122a70",
 } as const;
 
 export interface GlyphSpec {

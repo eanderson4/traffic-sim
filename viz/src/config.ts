@@ -10,6 +10,7 @@ export interface VizConfig {
   networkUrl: string;
   zonesUrl: string;
   boundariesUrl: string;
+  waterUrl: string;
   bufferMs: number;
   dt: number; // engine timestep, s — sim seconds per tick
 }
@@ -26,6 +27,7 @@ export function loadConfig(search: string, hostname: string): VizConfig {
     // means "no overlay on this demo", the fetch tolerates it.
     zonesUrl: p.get("zones") ?? "/overlay/zones.geojson",
     boundariesUrl: p.get("boundaries") ?? "/overlay/boundaries.geojson",
+    waterUrl: p.get("water") ?? "/overlay/water.geojson",
     bufferMs: Number.isFinite(buffer) && buffer >= 0 ? buffer : 250,
     dt: Number.isFinite(dt) && dt > 0 ? dt : 0.1,
   };

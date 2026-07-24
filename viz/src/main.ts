@@ -145,9 +145,10 @@ async function main(): Promise<void> {
       return null;
     }
   };
-  const [zonesFC, boundariesFC] = await Promise.all([
+  const [zonesFC, boundariesFC, waterFC] = await Promise.all([
     fetchOverlay(cfg.zonesUrl).then((fc) => (fc === null ? null : prepareZones(fc))),
     fetchOverlay(cfg.boundariesUrl),
+    fetchOverlay(cfg.waterUrl),
   ]);
 
   // Static channel: project lane polylines once (local metric → WGS84).
@@ -278,6 +279,17 @@ async function main(): Promise<void> {
   }
 
   map.on("load", () => {
+    // Water FIRST: the fill must sit under the road lines (the other
+    // overlays — boundaries/zones — are added after the roads instead).
+    if (waterFC) {
+      map.addSource("water", { type: "geojson", data: waterFC });
+      map.addLayer({
+        id: "water-fill",
+        type: "fill",
+        source: "water",
+        paint: { "fill-color": THEME.water },
+      });
+    }
     map.addSource("network", { type: "geojson", data: networkFC, promoteId: "id" });
     map.addSource("vehicles", { type: "geojson", data: EMPTY_FC, promoteId: "id" });
     map.addLayer({

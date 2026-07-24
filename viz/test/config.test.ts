@@ -24,7 +24,9 @@ test("overlay URLs default to the demosrv /overlay/ route, overridable", () => {
   const def = loadConfig("", "localhost");
   assert.equal(def.zonesUrl, "/overlay/zones.geojson");
   assert.equal(def.boundariesUrl, "/overlay/boundaries.geojson");
-  const custom = loadConfig("?zones=/o/z.geojson&boundaries=/o/b.geojson", "localhost");
+  assert.equal(def.waterUrl, "/overlay/water.geojson");
+  const custom = loadConfig("?zones=/o/z.geojson&boundaries=/o/b.geojson&water=/o/w.geojson", "localhost");
   assert.equal(custom.zonesUrl, "/o/z.geojson");
   assert.equal(custom.boundariesUrl, "/o/b.geojson");
+  assert.equal(custom.waterUrl, "/o/w.geojson");
 });
