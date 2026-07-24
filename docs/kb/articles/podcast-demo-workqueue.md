@@ -329,10 +329,13 @@ What an intersection IS in the sim (stop lines, conflict points, signal programs
 rendered/explained for the episode. Needs design thought; ADR-0003 (MapLibre-first,
 no UI framework) governs.
 
-### WQ-10: Benchmark queue items unblocked by the stress test
-Feed WQ-4 measurements into the Benchmark Queue table in `gaps-and-roadmap.md`
-(per-vehicle wire size at 10k vehicles, nats.ws throughput, MapLibre updateData
-fleet ceiling, GC jitter in paced loops).
+### WQ-10: Benchmark queue items unblocked by the stress test — DONE (2026-07-24)
+WQ-4/WQ-15 measurements fed into the Benchmark Queue in `gaps-and-roadmap.md`
+(dated status block under the table): per-vehicle wire size (24 B/veh TSSF,
+≥92 B/veh keyframe), keyframe wall ~10.9k + ADR-0015 resolution, ws delivery
+1:1 @276 kB, MapLibre fleet-vs-static-load ceiling split, kernel Step slope,
+memory footprint. Also corrected the ~15×-wrong "~7 ms/tick at 8k" figure in
+freshness notes (b)/(g). Still-open rows listed in the status block.
 
 ## Done recently (for orientation, newest first)
 
