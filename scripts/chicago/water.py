@@ -119,12 +119,19 @@ def main():
             w.area(obj)
 
     feats = []
+    skipped_gc = 0
     for name, kind, geom in w.feats:
         g = transform(TO_UTM, geom)
         if g.area < args.min_area_m2:
             continue  # sliver from clipping or insignificant pond
         g = transform(TO_WGS, g.simplify(args.simplify_m))
         geo = mapping(g)
+        if "coordinates" not in geo:
+            # GeometryCollection from a polygon-touch clip degeneracy. It
+            # CAN carry polygon members — counted and reported below rather
+            # than dropped silently.
+            skipped_gc += 1
+            continue
         geo["coordinates"] = round_coords(geo["coordinates"])
         feats.append({
             "type": "Feature",
@@ -137,6 +144,8 @@ def main():
     with open(args.out, "w") as f:
         json.dump(doc, f)
     print(f"water: {len(feats)} features -> {args.out}")
+    if skipped_gc:
+        print(f"  ({skipped_gc} GeometryCollection degeneracies skipped — may contain polygon members)")
     kinds = {}
     for ft in feats:
         kind = ft["properties"]["kind"]

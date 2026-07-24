@@ -1,0 +1,25 @@
+ contracts/asyncapi.yaml                            |  11 +-
+ docs/kb/articles/chicago-metro.md                  |  30 ++++-
+ docs/kb/articles/gaps-and-roadmap.md               |   2 +
+ .../kb/decisions/ADR-0006-nats-message-contract.md |  39 ++++++
+ .../raw/reviews/2026-07-24-chicago-metro-brief.md  | 100 +++++++++++++++
+ .../2026-07-24-chicago-metro-claude-fable.md       |  55 +++++++++
+ .../2026-07-24-chicago-metro-gpt-5.6-sol.md        |  19 +++
+ engine/cmd/portals/main.go                         |  14 ++-
+ engine/engine.go                                   |  28 +++--
+ engine/fixture_stopcontrol_test.go                 |   2 +-
+ engine/natsio/driver/destinations.go               |  63 +++++++---
+ engine/natsio/driver/destinations_test.go          |  52 ++++++--
+ engine/natsio/driver/driver.go                     |  64 ++++------
+ engine/natsio/driver/router.go                     |  60 ---------
+ engine/natsio/driver/router_test.go                |  53 --------
+ engine/rightofway.go                               |   4 +-
+ engine/rng.go                                      |  11 ++
+ engine/routing.go                                  | 136 +++++++++++++++++++++
+ engine/routing_test.go                             | 118 ++++++++++++++++++
+ scripts/chicago/boundaries.py                      |   5 +-
+ scripts/chicago/mkdemand.py                        |   6 +-
+ scripts/chicago/scorecard.py                       |  30 +++--
+ scripts/chicago/water.py                           |   4 +
+ scripts/chicago/zones.geojson                      |   6 +-
+ 24 files changed, 700 insertions(+), 212 deletions(-)

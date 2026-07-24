@@ -57,6 +57,17 @@ func deriveStreamDomain(domain string, seed, id uint64) *Stream {
 // behaviorally invisible and live-run determinism survives failover.
 func DeriveStream(seed, vehicleID uint64) *Stream { return deriveStream(seed, vehicleID) }
 
+// DeriveStreamDomain derives a stream under an explicit domain label. A
+// controller-side draw that is a separate concern from the vehicle's live
+// policy stream (DeriveStream) must derive under its own label — the same
+// discipline as the kernel's spawn-attr side stream. Reusing the main
+// stream's domain for a separate concern replays the main stream's exact
+// draw sequence, coupling the two concerns fleet-wide (chicago-metro
+// review, 2026-07-24).
+func DeriveStreamDomain(domain string, seed, id uint64) *Stream {
+	return deriveStreamDomain(domain, seed, id)
+}
+
 // Float64 draws a uniform in [0,1).
 func (s *Stream) Float64() float64 { s.n++; return s.r.Float64() }
 

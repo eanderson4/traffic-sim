@@ -91,12 +91,8 @@ func main() {
 		if !l.Origin && !l.Exit {
 			continue
 		}
-		kind := "origin"
-		if l.Exit {
-			kind = "exit"
-		}
 		p := portal{
-			ID: l.ID, Kind: kind, Edge: l.Section,
+			ID: l.ID, Edge: l.Section,
 			Class:  classByEdge[l.Section],
 			Length: l.Length, SpeedLimit: l.SpeedLimit, Width: l.Width,
 			Fragment: l.Length < *fragLen,
@@ -105,9 +101,15 @@ func main() {
 			p.Start = l.Shape[0]
 			p.End = l.Shape[len(l.Shape)-1]
 		}
+		// Clip-boundary stubs are routinely BOTH origin and exit (no
+		// predecessors AND no successors): emit one record per role so the
+		// kind always agrees with the array holding it.
 		if l.Origin {
+			p.Kind = "origin"
 			origins = append(origins, p)
-		} else {
+		}
+		if l.Exit {
+			p.Kind = "exit"
 			exits = append(exits, p)
 		}
 	}

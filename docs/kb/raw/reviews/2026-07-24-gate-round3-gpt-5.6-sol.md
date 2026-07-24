@@ -1,0 +1,6 @@
+- **should-fix** — `engine/routing.go:56`: each distinct valid destination permanently retains an `O(lanes)` next-hop table. At the documented ~56k-lane zone size that is ~224 KB per destination; exit routing or a controller cycling route IDs can retain hundreds or thousands of tables. Bound/evict the cache or constrain destination cardinality.
+- **should-fix** — `engine/routing.go:31`: reaching a non-exit destination only disables routing while the vehicle remains on that lane. Because `Vehicle.Route` is never cleared, routing reactivates after departure and can send the vehicle back toward the already-reached destination on cyclic city networks. Persist an arrived state or consume/clear the route at arrival.
+- **should-fix** — `docs/kb/articles/concepts/vehicle-controller-interface.md:96`: the KB still says field semantics never change in place, while the ADR-0006 addendum explicitly changes routed trajectories under contract v2 and declares an exception. Update this governing article to record the exception; the current staged KB contradicts itself on a sacred contract rule.
+- **question** — Tests could not run because the environment denied creation of Go’s `/tmp/go-build*` directory; findings are static-review results.
+
+REVIEW-COMPLETE

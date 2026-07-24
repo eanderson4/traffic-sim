@@ -322,3 +322,55 @@ The replay player's HTTP status payload (demo control plane, not a NATS
 subject) carries the recorded run's ADR-0012 scenario `hash` (omitempty) so
 demosrv can bind display metadata to the recording; additive to that
 localhost JSON contract.
+
+## Addendum (2026-07-24, chicago-metro review round: Route axis made real + batch-mode liveness documented)
+
+Two contract-SEMANTICS clarifications from the chicago-metro milestone
+external review (Fable + GPT-5.6-sol, archive
+`docs/kb/raw/reviews/2026-07-24-chicago-metro-*`). No wire change: subjects,
+payload layouts, and versions are untouched; both items document behavior
+the wire already carried.
+
+- **The Route intent axis is now followed engine-side.** The intent
+  vocabulary always declared `route` (bit4, destination lane id) a
+  PERSISTENT axis, and keyframes/obs frames round-tripped it — but the
+  kernel never resolved it (successor choice was held-turn-or-default, so a
+  once-sent route steered at most the first fork, and middle successors of
+  3+-way forks were inexpressible through the ±1 turn axis). The kernel now
+  resolves a set Route at every multi-successor lane via memoized
+  reverse-Dijkstra next-hop tables (`engine/routing.go`): shortest path by
+  lane length, an explicit held turn wins the crossing, unknown or
+  unreachable destinations degrade to the successor default. Resolution is
+  a pure function of (network, vehicle state) — replay re-derives it
+  identically and keyframes need no new state. Determinism behavior note:
+  runs whose vehicles carry Route intents change trajectory versus the
+  pre-fix kernel; runs carrying TURN intents (no routes) may also change —
+  the right-of-way lookahead now consumes the held turn virtually after
+  the first predicted crossing, matching `boundaries()` (previously every
+  hop of the sight walk re-applied it). Runs with neither route nor turn
+  intents are bit-identical. Durable-binding check (2026-07-24): every
+  extant recording predates Route intents entirely, so all kept recordings
+  replay bit-identically under the new kernel.
+  Versioning note (formal supersession of the in-place-semantics rule for
+  this case): the wire is untouched — no frame layout, subject, or field
+  meaning changed (`route` was always "destination lane id; persistent");
+  the engine now HONORS the documented axis. Engine behavior fixes change
+  trajectories without versioning the contract — the 2026-07-23
+  fixture-found fixes (boxBlocked, red-onset, origin injection) are the
+  precedent. Contract versions version the WIRE, not the world model.
+  asyncapi `IntentView.route` description updated.
+- **Batch-mode liveness exception is now contract text.** The
+  chicago-metro milestone made the detach sweep conditional — skipped when
+  `PaceFloor == 0` (tick time outruns any client's wall-clock reaction
+  unpaced, so the tick-space budget detached healthy clients and the pause
+  gate then wedged the run for good) — but `ctlHeartbeat`'s description
+  still stated the budget unconditionally, a rule-5 violation by omission.
+  asyncapi now records the exception. Review answer to "is no-liveness the
+  intended batch regime": yes for v1 — batch mode is for offline runs with
+  embedded clients; an external controller that attaches to a `-pace 0`
+  run and dies keeps its claims (its vehicles ride hold-last-then-default
+  to the horizon) and nothing signals the degradation. The rejected
+  alternative — a wall-clock silence budget for batch mode — stays
+  rejected while pace is an unrecorded, client-invisible run condition
+  (recording pace in run meta is already queued in the KB work-queue; a
+  wall-clock budget can be reconsidered then).

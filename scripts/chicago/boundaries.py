@@ -85,7 +85,10 @@ def main():
     with open(args.out, "w") as f:
         json.dump(doc, f)
     print(f"boundaries: {len(feats)} features -> {args.out}")
-    for name, level, _ in sorted(b.feats):
+    # Sort by (name, level) only — two features sharing both (duplicate
+    # township names across counties are real in Illinois) would otherwise
+    # fall through to comparing shapely geometries, which raises TypeError.
+    for name, level, _ in sorted(b.feats, key=lambda f: f[:2]):
         print(f"  L{level} {name}")
 
 
