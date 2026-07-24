@@ -1,0 +1,8 @@
+ engine/cmd/serve/main.go      | 76 ++++++++++++++++++++++++++++++++-------
+ engine/cmd/serve/main_test.go | 83 +++++++++++++++++++++++++++++++++++++++++++
+ viz/src/config.ts             |  7 +++-
+ viz/src/main.ts               |  2 +-
+ viz/src/snapshots.ts          | 16 ++++++---
+ viz/test/config.test.ts       | 21 +++++++++++
+ viz/test/snapshots.test.ts    | 35 ++++++++++++++++++
+ 7 files changed, 222 insertions(+), 18 deletions(-)

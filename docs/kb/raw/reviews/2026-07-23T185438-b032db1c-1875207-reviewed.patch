@@ -1,0 +1,2732 @@
+diff --git a/engine/cmd/demosrv/demos.example.json b/engine/cmd/demosrv/demos.example.json
+index f735a92f4c2fd2f904d98148a8e5f5bb26f47de4..30a9c6c4c860612a8445c83fb71621d22fa7e02c 100644
+--- a/engine/cmd/demosrv/demos.example.json
++++ b/engine/cmd/demosrv/demos.example.json
+@@ -1,5 +1,5 @@
+ {
+-  "_placeholder": "Template for data/scenarios/demos.json (JSON has no comments; remove this key before use — demosrv rejects unknown fields). scenarioDir is REPO-ROOT-relative (run demosrv from the repo root). run is a single NATS token matching [A-Za-z0-9_-]+ (it also rides the app URL raw). seed/ticks are OPTIONAL: they override the scenario manifest for this demo (serve's -seed/-ticks); omit them to run the manifest as authored. capacity is OPTIONAL: driver claim capacity (serve's -capacity, default 1000) — raise it for dense/overload demos, since ADR-0008's pause gate pauses the run when live unclaimed vehicles exceed spare capacity.",
++  "_placeholder": "Template for data/scenarios/demos.json (JSON has no comments; remove the _-prefixed keys (_placeholder, _recordings_note) before use — demosrv rejects unknown fields). scenarioDir and store are REPO-ROOT-relative (run demosrv from the repo root). run is a single NATS token matching [A-Za-z0-9_-]+ (it also rides the app URL raw) and must NOT end in \"-replay\" (ADR-0006 reserves that suffix for replay-plane ids). seed/ticks are OPTIONAL: they override the scenario manifest for this demo (serve's -seed/-ticks); omit them to run the manifest as authored. capacity is OPTIONAL: driver claim capacity (serve's -capacity, default 1000) — raise it for dense/overload demos, since ADR-0008's pause gate pauses the run when live unclaimed vehicles exceed spare capacity. recordings is OPTIONAL: VCR entries replayed by engine/cmd/replay — store is the durable JetStream store dir written by serve -store (the recording serve must have EXITED; demosrv's kill-before-spawn enforces store exclusivity), run is the recorded run id (the live plane is {run}-replay), scenarioDir is the scenario the recording was made from (network GeoJSON + dt hint). ids are unique ACROSS demos and recordings (they share /net/{id}). At least one demo is required (recordings-only registries are not supported).",
+   "demos": [
+     {
+       "id": "i280-baseline",
+@@ -19,5 +19,16 @@
+       "scenarioDir": "data/scenarios/my-scenario",
+       "run": "my-run"
+     }
++  ],
++  "_recordings_note": "A recording's scenarioDir supplies the display network + dt at start time; do not edit the scenario after recording (the recorded run meta is authoritative for execution, the scenario for display).",
++  "recordings": [
++    {
++      "id": "my-recording",
++      "title": "My scenario — recorded run (VCR replay)",
++      "blurb": "Replays a run recorded earlier with serve -store. Pause/resume/speed/seek from the replay panel.",
++      "store": "data/recordings/my-run-store",
++      "run": "my-run",
++      "scenarioDir": "data/scenarios/my-scenario"
++    }
+   ]
+ }
+diff --git a/engine/cmd/demosrv/demosrv_test.go b/engine/cmd/demosrv/demosrv_test.go
+index 9f662a01e5aa40654b3698c1f21580bfb662f983..d4b01efc94db52cfef9ced7a9b8f9fd352d4e350 100644
+--- a/engine/cmd/demosrv/demosrv_test.go
++++ b/engine/cmd/demosrv/demosrv_test.go
+@@ -9,6 +9,7 @@ package main
+ import (
+ 	"encoding/json"
+ 	"fmt"
++	"net"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"os"
+@@ -92,13 +93,16 @@ func TestLoadRegistryValidation(t *testing.T) {
+ 		{"run with wildcard", `[
+ 			{"id":"a","title":"t","scenarioDir":%q,"run":"wild>*"}
+ 		]`, "must match [A-Za-z0-9_-]+"},
++		{"run with replay suffix", `[
++			{"id":"a","title":"t","scenarioDir":%q,"run":"foo-replay"}
++		]`, "reserved replay-plane suffix"},
+ 		{"bad id", `[
+ 			{"id":"a/b","title":"t","scenarioDir":%q,"run":"r1"}
+ 		]`, "id"},
+ 		{"missing title", `[
+ 			{"id":"a","scenarioDir":%q,"run":"r1"}
+ 		]`, "title"},
+-		{"empty registry", `[]`, "no demos"},
++		{"empty registry", `[]`, "at least one demo"},
+ 	}
+ 	for _, tc := range cases {
+ 		t.Run(tc.name, func(t *testing.T) {
+@@ -139,11 +143,11 @@ func TestLoadRegistryValidation(t *testing.T) {
+ 	}
+ }
+ 
+-// sleepSpawner returns a spawn stub: a plain `sleep 30` per demo, tracked
++// sleepSpawner returns a spawn stub: a plain `sleep 30` per target, tracked
+ // so the test can assert on kills. The stub carries no scenario semantics —
+ // it exists to be killed and reaped.
+ func sleepSpawner(cmds *[]*exec.Cmd, mu *sync.Mutex) spawnFunc {
+-	return func(d *Demo) (*exec.Cmd, error) {
++	return func(t spawnTarget) (*exec.Cmd, error) {
+ 		cmd := exec.Command("sleep", "30")
+ 		if err := cmd.Start(); err != nil {
+ 			return nil, err
+@@ -175,8 +179,8 @@ func TestSupervisorLifecycle(t *testing.T) {
+ 	sup := newSupervisor(sleepSpawner(&cmds, &mu))
+ 	sup.ready = func() error { return nil } // sleep never opens a port
+ 
+-	d1 := &Demo{ID: "demo-one", Run: "r1"}
+-	d2 := &Demo{ID: "demo-two", Run: "r2"}
++	d1 := spawnTarget{Kind: "demo", Demo: &Demo{ID: "demo-one", Run: "r1"}}
++	d2 := spawnTarget{Kind: "demo", Demo: &Demo{ID: "demo-two", Run: "r2"}}
+ 
+ 	if err := sup.start(d1); err != nil {
+ 		t.Fatalf("start d1: %v", err)
+@@ -219,7 +223,7 @@ func TestSupervisorReadyTimeoutLeavesNoZombie(t *testing.T) {
+ 	sup.readyTimeout = 500 * time.Millisecond
+ 
+ 	start := time.Now()
+-	err := sup.start(&Demo{ID: "never-ready", Run: "r1"})
++	err := sup.start(spawnTarget{Kind: "demo", Demo: &Demo{ID: "never-ready", Run: "r1"}})
+ 	if err == nil {
+ 		t.Fatal("start succeeded with no listener; want readiness error")
+ 	}
+@@ -238,6 +242,64 @@ func TestSupervisorReadyTimeoutLeavesNoZombie(t *testing.T) {
+ 	waitDead(t, cmds[0], "child after failed start")
+ }
+ 
++// Replay-kind spawns are ready only when BOTH the ws port and the HTTP
++// control port accept — replay's ws listener opens before its control
++// plane binds, and the start response sends the viz at the control plane.
++// Stub TCP listeners stand in for the child's two ports; the child itself
++// is the usual `sleep`.
++func TestSupervisorReplayWaitsForBothPorts(t *testing.T) {
++	var mu sync.Mutex
++	var cmds []*exec.Cmd
++	sup := newSupervisor(sleepSpawner(&cmds, &mu))
++	sup.readyTimeout = 500 * time.Millisecond
++	rec := spawnTarget{Kind: "replay", Rec: &Recording{ID: "rec1", Run: "r1"}}
++
++	wsLn, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer wsLn.Close()
++	sup.wsAddr = wsLn.Addr().String()
++
++	// ws up, control port down: start must fail on the CONTROL port probe
++	// (and leave no process behind, like any readiness failure).
++	sup.ctlAddr = "127.0.0.1:1"
++	err = sup.start(rec)
++	if err == nil {
++		t.Fatal("replay start succeeded with the control port down")
++	}
++	if !strings.Contains(err.Error(), "127.0.0.1:1") || !strings.Contains(err.Error(), "did not accept connections") {
++		t.Errorf("error %q, want the control-port probe failure", err)
++	}
++	if _, _, _, ok := sup.status(); ok {
++		t.Fatal("status after failed start = active, want idle")
++	}
++	mu.Lock()
++	n := len(cmds)
++	c0 := cmds[0]
++	mu.Unlock()
++	if n != 1 {
++		t.Fatalf("%d spawns, want 1", n)
++	}
++	waitDead(t, c0, "replay child after failed start")
++
++	// Both ports up: start succeeds.
++	ctlLn, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer ctlLn.Close()
++	sup.ctlAddr = ctlLn.Addr().String()
++	if err := sup.start(rec); err != nil {
++		t.Fatalf("replay start with both ports up: %v", err)
++	}
++	sup.stop()
++	mu.Lock()
++	c1 := cmds[1]
++	mu.Unlock()
++	waitDead(t, c1, "replay child after stop")
++}
++
+ func TestHTTPEndpoints(t *testing.T) {
+ 	var mu sync.Mutex
+ 	var cmds []*exec.Cmd
+diff --git a/engine/cmd/demosrv/geojson.go b/engine/cmd/demosrv/geojson.go
+index 036db84c0d3dbefd9814ffa79f1579503ba96b32..e8634fc308867416414b8ece14e8190f0ce2b6f6 100644
+--- a/engine/cmd/demosrv/geojson.go
++++ b/engine/cmd/demosrv/geojson.go
+@@ -27,9 +27,10 @@ type netCache struct {
+ 	mu  sync.Mutex // generation is rare and cheap; one at a time is plenty
+ }
+ 
+-// path returns the cached GeoJSON file for d, generating it on first use.
+-func (c *netCache) path(d *Demo) (string, error) {
+-	path := filepath.Join(c.dir, d.ID+".geojson")
++// path returns the cached GeoJSON file for a demo or recording id,
++// generating it on first use from the entry's scenario directory.
++func (c *netCache) path(id, scenarioDir string) (string, error) {
++	path := filepath.Join(c.dir, id+".geojson")
+ 	if _, err := os.Stat(path); err == nil {
+ 		return path, nil
+ 	}
+@@ -39,7 +40,7 @@ func (c *netCache) path(d *Demo) (string, error) {
+ 	if _, err := os.Stat(path); err == nil {
+ 		return path, nil
+ 	}
+-	scen, err := scenario.Load(d.ScenarioDir)
++	scen, err := scenario.Load(scenarioDir)
+ 	if err != nil {
+ 		return "", err
+ 	}
+diff --git a/engine/cmd/demosrv/main.go b/engine/cmd/demosrv/main.go
+index 3e64321775d8715339165224fa5065bd66be22f0..78ce39e5a9fb3b703e7f71b63868d71d7242c4bc 100644
+--- a/engine/cmd/demosrv/main.go
++++ b/engine/cmd/demosrv/main.go
+@@ -1,6 +1,7 @@
+ // demosrv is the local demo launcher: ONE Go process that serves the demo
+-// menu page and the built viz (viz/dist), and spawns/kills `serve` engine
+-// processes on demand. It is localhost process orchestration in the spirit
++// menu page and the built viz (viz/dist), and spawns/kills engine children
++// on demand — `serve` for live demos, `replay` (the VCR driver) for
++// recorded runs. It is localhost process orchestration in the spirit
+ // of `pnpm dev` — plain HTTP to the browser, NO NATS here (ADR-0002 covers
+ // the service planes; the demo's engine child still exposes its own
+ // WebSocket listener for the live snapshot stream, ADR-0006 §8 unchanged).
+@@ -10,13 +11,13 @@
+ // after 2 s) — one engine at a time on the fixed WebSocket port
+ // 127.0.0.1:8443, which is also the viz client's default ?ws= target.
+ //
+-// Paths — the registry's scenarioDir values and the -demos/-viz/-netcache
+-// defaults — are REPO-ROOT-relative: run demosrv from the repository root
+-// (go run ./engine/cmd/demosrv), or pass explicit flags. The serve binary
+-// is built ONCE at startup (pre-warm: the first demo start is then a
+-// process exec, not a cold compile, and there is no `go run` wrapper
+-// between demosrv and the engine to eat signals). SIGINT/SIGTERM to
+-// demosrv kills the active child too.
++// Paths — the registry's scenarioDir/store values and the -demos/-viz/
++// -netcache defaults — are REPO-ROOT-relative: run demosrv from the
++// repository root (go run ./engine/cmd/demosrv), or pass explicit flags.
++// The serve and replay binaries are built ONCE at startup (pre-warm: the
++// first demo start is then a process exec, not a cold compile, and there
++// is no `go run` wrapper between demosrv and the engine to eat signals).
++// SIGINT/SIGTERM to demosrv kills the active child too.
+ package main
+ 
+ import (
+@@ -57,27 +58,33 @@ func main() {
+ 		log.Fatalf("demosrv: %v", err)
+ 	}
+ 
+-	// Pre-warm: build serve once. Startup cost is ~1 s on a warm build
+-	// cache; every demo start after that is an exec of THIS binary, so
+-	// SIGTERM/SIGKILL reach the engine directly.
++	// Pre-warm: build serve and replay once. Startup cost is ~1 s each on a
++	// warm build cache; every demo/replay start after that is an exec of
++	// THIS binary, so SIGTERM/SIGKILL reach the engine directly.
+ 	binDir, err := os.MkdirTemp("", "traffic-sim-demosrv-")
+ 	if err != nil {
+ 		log.Fatalf("demosrv: %v", err)
+ 	}
+ 	defer os.RemoveAll(binDir)
+ 	serveBin := filepath.Join(binDir, "serve")
+-	log.Printf("demosrv: building serve (go build ./cmd/serve in %s/)", engineDir)
+-	build := exec.Command("go", "build", "-o", serveBin, "./cmd/serve")
+-	build.Dir = engineDir
+-	build.Stdout = os.Stderr
+-	build.Stderr = os.Stderr
+-	if err := build.Run(); err != nil {
+-		log.Fatalf("demosrv: go build ./cmd/serve: %v", err)
++	replayBin := filepath.Join(binDir, "replay")
++	for _, b := range []struct{ bin, pkg string }{{serveBin, "./cmd/serve"}, {replayBin, "./cmd/replay"}} {
++		log.Printf("demosrv: building %s (go build %s in %s/)", filepath.Base(b.bin), b.pkg, engineDir)
++		build := exec.Command("go", "build", "-o", b.bin, b.pkg)
++		build.Dir = engineDir
++		build.Stdout = os.Stderr
++		build.Stderr = os.Stderr
++		if err := build.Run(); err != nil {
++			log.Fatalf("demosrv: go build %s: %v", b.pkg, err)
++		}
+ 	}
+ 
+ 	lg := log.New(os.Stderr, "", log.LstdFlags)
+-	sup := newSupervisor(serveSpawner(serveBin, lg))
+-	srv := &server{reg: reg, sup: sup, viz: *vizDir, nets: &netCache{dir: *netcacheDir}}
++	sup := newSupervisor(childSpawner(serveBin, replayBin, lg))
++	srv := &server{
++		reg: reg, sup: sup, viz: *vizDir, nets: &netCache{dir: *netcacheDir},
++		replayCtl: "http://" + replayCtlAddr, ctlTimeout: ctlTimeout, seekTimeout: seekTimeout,
++	}
+ 	hs := &http.Server{Addr: *addr, Handler: srv.routes()}
+ 
+ 	sig := make(chan os.Signal, 1)
+@@ -92,7 +99,8 @@ func main() {
+ 	if _, err := os.Stat(filepath.Join(*vizDir, "demos.html")); err != nil {
+ 		log.Printf("demosrv: warning: %s/demos.html not found — build the viz first (cd viz && pnpm build)", *vizDir)
+ 	}
+-	log.Printf("demosrv: %d demo(s) on http://%s/ — single active run, engine ws %s", len(reg.Demos), *addr, wsListenAddr)
++	log.Printf("demosrv: %d demo(s), %d recording(s) on http://%s/ — single active run, engine ws %s",
++		len(reg.Demos), len(reg.Recordings), *addr, wsListenAddr)
+ 	if err := hs.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+ 		log.Fatalf("demosrv: %v", err)
+ 	}
+@@ -111,23 +119,22 @@ func findEngineDir() (string, error) {
+ 	return "", errors.New("cannot locate the engine module — run from the repo root, or from engine/ with explicit -demos/-viz/-netcache")
+ }
+ 
+-// serveSpawner is the real spawnFunc: exec the prebuilt serve binary with
+-// the demo's scenario/run (+ optional seed/ticks overrides), output teed
+-// into demosrv's log with a [id] prefix so child lines stay attributable.
+-func serveSpawner(bin string, lg *log.Logger) spawnFunc {
+-	return func(d *Demo) (*exec.Cmd, error) {
+-		args := []string{"-scenario", d.ScenarioDir, "-run", d.Run, "-ws", wsListenAddr}
+-		if d.Seed != nil {
+-			args = append(args, "-seed", strconv.FormatUint(*d.Seed, 10))
+-		}
+-		if d.Ticks != nil {
+-			args = append(args, "-ticks", strconv.FormatUint(*d.Ticks, 10))
+-		}
+-		if d.Capacity != nil {
+-			args = append(args, "-capacity", strconv.FormatUint(*d.Capacity, 10))
++// childSpawner is the real spawnFunc: exec the prebuilt serve or replay
++// binary for the target, output teed into demosrv's log with a [id] prefix
++// so child lines stay attributable.
++func childSpawner(serveBin, replayBin string, lg *log.Logger) spawnFunc {
++	return func(t spawnTarget) (*exec.Cmd, error) {
++		var bin string
++		var args []string
++		if t.Kind == "replay" {
++			bin = replayBin
++			args = []string{"-store", t.Rec.Store, "-run", t.Rec.Run,
++				"-ws", wsListenAddr, "-http", replayCtlAddr}
++		} else {
++			bin, args = serveBin, serveArgs(t.Demo)
+ 		}
+ 		cmd := exec.Command(bin, args...)
+-		w := &prefixWriter{lg: lg, prefix: "[" + d.ID + "] "}
++		w := &prefixWriter{lg: lg, prefix: "[" + t.id() + "] "}
+ 		cmd.Stdout = w
+ 		cmd.Stderr = w
+ 		if err := cmd.Start(); err != nil {
+@@ -137,6 +144,22 @@ func serveSpawner(bin string, lg *log.Logger) spawnFunc {
+ 	}
+ }
+ 
++// serveArgs builds the serve command line for a live demo: scenario/run
++// plus the optional seed/ticks/capacity overrides.
++func serveArgs(d *Demo) []string {
++	args := []string{"-scenario", d.ScenarioDir, "-run", d.Run, "-ws", wsListenAddr}
++	if d.Seed != nil {
++		args = append(args, "-seed", strconv.FormatUint(*d.Seed, 10))
++	}
++	if d.Ticks != nil {
++		args = append(args, "-ticks", strconv.FormatUint(*d.Ticks, 10))
++	}
++	if d.Capacity != nil {
++		args = append(args, "-capacity", strconv.FormatUint(*d.Capacity, 10))
++	}
++	return args
++}
++
+ // prefixWriter tees child output into demosrv's log line-by-line with a
+ // [id] prefix. A trailing partial line (no \n before exit) is dropped —
+ // cosmetic only.
+@@ -167,6 +190,13 @@ type server struct {
+ 	sup  *supervisor
+ 	viz  string
+ 	nets *netCache
++	// replayCtl is the replay child's control-plane base URL (loopback;
++	// overridable in tests to point at an httptest stub). ctlTimeout covers
++	// status/pause/resume/speed; seek gets seekTimeout (its re-simulation
++	// can take ~1 s+ on big records).
++	replayCtl   string
++	ctlTimeout  time.Duration
++	seekTimeout time.Duration
+ }
+ 
+ func (s *server) routes() *http.ServeMux {
+@@ -181,6 +211,16 @@ func (s *server) routes() *http.ServeMux {
+ 	mux.HandleFunc("POST /api/demo/{id}/start", s.handleStart)
+ 	mux.HandleFunc("GET /api/demo/{id}/params", s.handleParams)
+ 	mux.HandleFunc("POST /api/demo/stop", s.handleStop)
++	mux.HandleFunc("POST /api/replay/{id}/start", s.handleReplayStart)
++	mux.HandleFunc("GET /api/replay/status", s.handleReplayStatus)
++	// The four control verbs are registered explicitly (no {action}
++	// wildcard — it would conflict with /api/replay/{id}/start over paths
++	// like /api/replay/ctl/start): the proxy stays dumb, not open-ended,
++	// and unknown verbs 404 at the mux.
++	mux.HandleFunc("POST /api/replay/ctl/pause", s.ctlRoute("/pause", false))
++	mux.HandleFunc("POST /api/replay/ctl/resume", s.ctlRoute("/resume", false))
++	mux.HandleFunc("POST /api/replay/ctl/speed", s.ctlRoute("/speed", false))
++	mux.HandleFunc("POST /api/replay/ctl/seek", s.ctlRoute("/seek", true))
+ 	// Go's ServeMux wildcards are whole segments, so the .geojson suffix is
+ 	// parsed out of {file} in the handler.
+ 	mux.HandleFunc("GET /net/{file}", s.handleNet)
+@@ -239,7 +279,7 @@ func (s *server) handleStart(w http.ResponseWriter, r *http.Request) {
+ 		writeErr(w, http.StatusNotFound, fmt.Errorf("unknown demo %q", id))
+ 		return
+ 	}
+-	if err := s.sup.start(d); err != nil {
++	if err := s.sup.start(spawnTarget{Kind: "demo", Demo: d}); err != nil {
+ 		writeErr(w, http.StatusBadGateway, err)
+ 		return
+ 	}
+@@ -261,12 +301,19 @@ func (s *server) handleNet(w http.ResponseWriter, r *http.Request) {
+ 		writeErr(w, http.StatusNotFound, fmt.Errorf("not a network geojson path"))
+ 		return
+ 	}
+-	d := s.reg.byID(id)
+-	if d == nil {
+-		writeErr(w, http.StatusNotFound, fmt.Errorf("unknown demo %q", id))
++	// Both namespaces share /net/{id}: a recording's scenarioDir is the
++	// scenario the recording was made from, so the same generation path
++	// serves it.
++	scenarioDir := ""
++	if d := s.reg.byID(id); d != nil {
++		scenarioDir = d.ScenarioDir
++	} else if rec := s.reg.recByID(id); rec != nil {
++		scenarioDir = rec.ScenarioDir
++	} else {
++		writeErr(w, http.StatusNotFound, fmt.Errorf("unknown demo or recording %q", id))
+ 		return
+ 	}
+-	path, err := s.nets.path(d)
++	path, err := s.nets.path(id, scenarioDir)
+ 	if err != nil {
+ 		writeErr(w, http.StatusInternalServerError, err)
+ 		return
+diff --git a/engine/cmd/demosrv/registry.go b/engine/cmd/demosrv/registry.go
+index 94f367e04e35945302c25b9ef1e51725ed6df80b..1bc594613073f1d07212e11ec03b987cf5048f44 100644
+--- a/engine/cmd/demosrv/registry.go
++++ b/engine/cmd/demosrv/registry.go
+@@ -15,6 +15,7 @@ import (
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
++	"strings"
+ )
+ 
+ // Demo is one menu entry. Seed and Ticks, when present, override the
+@@ -35,11 +36,33 @@ type Demo struct {
+ 	Seed        *uint64  `json:"seed,omitempty"`
+ 	Ticks       *uint64  `json:"ticks,omitempty"`
+ 	Capacity    *uint64  `json:"capacity,omitempty"`
++	// Kind is OUTPUT-ONLY (the /api/demos discriminator, "demo"); Load
++	// overwrites whatever the JSON carried.
++	Kind string `json:"kind"`
++}
++
++// Recording is one VCR menu entry (optional "recordings" array): a durable
++// JetStream store written by serve -store, replayed by engine/cmd/replay
++// with the live plane under {run}-replay. Store is repo-root-relative like
++// ScenarioDir (validated and made absolute at load); ScenarioDir is the
++// scenario the recording was made from, reused for the network GeoJSON and
++// the dt deep-link hint (the recording's own RunMeta is authoritative at
++// playback time — this is the menu-side path).
++type Recording struct {
++	ID          string `json:"id"`
++	Title       string `json:"title"`
++	Blurb       string `json:"blurb"`
++	Store       string `json:"store"`
++	Run         string `json:"run"`
++	ScenarioDir string `json:"scenarioDir"`
++	// Kind is OUTPUT-ONLY, like Demo.Kind ("replay").
++	Kind string `json:"kind"`
+ }
+ 
+ // Registry is the top-level demos.json document.
+ type Registry struct {
+-	Demos []*Demo `json:"demos"`
++	Demos      []*Demo      `json:"demos"`
++	Recordings []*Recording `json:"recordings,omitempty"`
+ }
+ 
+ // byID looks a demo up for the /api/demo/{id}/ and /net/{id} routes.
+@@ -52,11 +75,25 @@ func (r *Registry) byID(id string) *Demo {
+ 	return nil
+ }
+ 
++// recByID looks a recording up for the /api/replay/{id}/ and /net/{id}
++// routes.
++func (r *Registry) recByID(id string) *Recording {
++	for _, rec := range r.Recordings {
++		if rec.ID == id {
++			return rec
++		}
++	}
++	return nil
++}
++
+ // LoadRegistry reads and validates the registry: strict JSON (unknown
+-// fields are errors), unique URL-safe ids, existing scenario directories
+-// (resolved to absolute paths against the CURRENT WORKING DIRECTORY — run
+-// demosrv from the repo root or use absolute paths), and single-NATS-token
+-// run ids (they become NATS subjects inside serve).
++// fields are errors), unique URL-safe ids ACROSS demos and recordings
++// (they share the /net/{id} namespace), existing scenario directories and
++// recording store dirs (resolved to absolute paths against the CURRENT
++// WORKING DIRECTORY — run demosrv from the repo root or use absolute
++// paths), and single-NATS-token run ids OUTSIDE the reserved "-replay"
++// namespace (they become NATS subjects inside serve/replay; ADR-0006
++// reserves the suffix for replay-plane ids).
+ func LoadRegistry(path string) (*Registry, error) {
+ 	data, err := os.ReadFile(path)
+ 	if err != nil {
+@@ -69,44 +106,104 @@ func LoadRegistry(path string) (*Registry, error) {
+ 		return nil, fmt.Errorf("demos registry %s: %w", path, err)
+ 	}
+ 	if len(reg.Demos) == 0 {
+-		return nil, fmt.Errorf("demos registry %s: no demos", path)
++		return nil, fmt.Errorf("demos registry %s: at least one demo is required (recordings-only registries are not supported)", path)
+ 	}
+-	seen := make(map[string]bool, len(reg.Demos))
++	seen := make(map[string]bool, len(reg.Demos)+len(reg.Recordings))
+ 	for i, d := range reg.Demos {
+ 		where := fmt.Sprintf("%s demos[%d]", path, i)
+-		if !validID(d.ID) {
+-			return nil, fmt.Errorf("demos registry %s: id %q must match [A-Za-z0-9_-]+ (it appears in URL paths)", where, d.ID)
++		if err := checkID(seen, &where, d.ID); err != nil {
++			return nil, err
+ 		}
+-		where += " (" + d.ID + ")"
+-		if seen[d.ID] {
+-			return nil, fmt.Errorf("demos registry %s: duplicate id", where)
+-		}
+-		seen[d.ID] = true
+ 		if d.Title == "" {
+ 			return nil, fmt.Errorf("demos registry %s: missing title", where)
+ 		}
+-		if !validRunToken(d.Run) {
+-			return nil, fmt.Errorf("demos registry %s: run %q must match [A-Za-z0-9_-]+ (it becomes a NATS subject and a raw URL query value)", where, d.Run)
++		if err := checkRun(where, d.Run); err != nil {
++			return nil, err
+ 		}
+ 		if d.Capacity != nil && *d.Capacity == 0 {
+ 			return nil, fmt.Errorf("demos registry %s: capacity must be > 0", where)
+ 		}
+-		abs, err := filepath.Abs(d.ScenarioDir)
++		abs, err := checkDir(where, "scenarioDir", d.ScenarioDir)
+ 		if err != nil {
+-			return nil, fmt.Errorf("demos registry %s: scenarioDir: %w", where, err)
++			return nil, err
+ 		}
+-		st, err := os.Stat(abs)
++		d.ScenarioDir = abs
++		d.Kind = "demo"
++	}
++	for i, rec := range reg.Recordings {
++		where := fmt.Sprintf("%s recordings[%d]", path, i)
++		if err := checkID(seen, &where, rec.ID); err != nil {
++			return nil, err
++		}
++		if rec.Title == "" {
++			return nil, fmt.Errorf("demos registry %s: missing title", where)
++		}
++		if err := checkRun(where, rec.Run); err != nil {
++			return nil, err
++		}
++		abs, err := checkDir(where, "store", rec.Store)
+ 		if err != nil {
+-			return nil, fmt.Errorf("demos registry %s: scenarioDir %s: %w", where, d.ScenarioDir, err)
++			return nil, err
+ 		}
+-		if !st.IsDir() {
+-			return nil, fmt.Errorf("demos registry %s: scenarioDir %s is not a directory", where, d.ScenarioDir)
++		rec.Store = abs
++		abs, err = checkDir(where, "scenarioDir", rec.ScenarioDir)
++		if err != nil {
++			return nil, err
+ 		}
+-		d.ScenarioDir = abs
++		rec.ScenarioDir = abs
++		rec.Kind = "replay"
+ 	}
+ 	return &reg, nil
+ }
+ 
++// checkRun validates a demo's or recording's run id: a single NATS token
++// (it becomes a NATS subject and rides the app URL raw) AND outside the
++// reserved replay namespace — ADR-0006 reserves the "-replay" suffix for
++// replay-plane ids (natsio.RunLive/NewRecorder refuse such ids at
++// activation, so without this check a registry entry would load fine and
++// fail only when started; the registry fails loud at load instead).
++func checkRun(where, run string) error {
++	if !validRunToken(run) {
++		return fmt.Errorf("demos registry %s: run %q must match [A-Za-z0-9_-]+ (it becomes a NATS subject and a raw URL query value)", where, run)
++	}
++	if strings.HasSuffix(run, "-replay") {
++		return fmt.Errorf("demos registry %s: run %q must not end in \"-replay\" (reserved replay-plane suffix, ADR-0006)", where, run)
++	}
++	return nil
++}
++
++// checkID validates id and registers it in the seen set (ids are unique
++// across demos AND recordings). On success it appends " (id)" to *where
++// for the following field errors.
++func checkID(seen map[string]bool, where *string, id string) error {
++	if !validID(id) {
++		return fmt.Errorf("demos registry %s: id %q must match [A-Za-z0-9_-]+ (it appears in URL paths)", *where, id)
++	}
++	*where += " (" + id + ")"
++	if seen[id] {
++		return fmt.Errorf("demos registry %s: duplicate id", *where)
++	}
++	seen[id] = true
++	return nil
++}
++
++// checkDir validates that p names an existing directory and returns its
++// absolute path.
++func checkDir(where, field, p string) (string, error) {
++	abs, err := filepath.Abs(p)
++	if err != nil {
++		return "", fmt.Errorf("demos registry %s: %s: %w", where, field, err)
++	}
++	st, err := os.Stat(abs)
++	if err != nil {
++		return "", fmt.Errorf("demos registry %s: %s %s: %w", where, field, p, err)
++	}
++	if !st.IsDir() {
++		return "", fmt.Errorf("demos registry %s: %s %s is not a directory", where, field, p)
++	}
++	return abs, nil
++}
++
+ // validID gates the id that appears in /api/demo/{id}/start and
+ // /net/{id}.geojson paths.
+ func validID(s string) bool {
+diff --git a/engine/cmd/demosrv/replay.go b/engine/cmd/demosrv/replay.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..a7cb52081becd1e183c18356cb14bc418630a3d8
+--- /dev/null
++++ b/engine/cmd/demosrv/replay.go
+@@ -0,0 +1,131 @@
++package main
++
++// replay.go — VCR replay wiring: start a recorded run under the supervisor
++// (engine/cmd/replay child on the fixed ws + control ports) and proxy the
++// child's loopback control plane so the viz panel talks ONLY to demosrv.
++// The proxy is deliberately dumb: request bodies go in, status codes and
++// the player's status JSON come back out, no caching, no reshaping. The
++// timeouts are short because the child is loopback — except seek, whose
++// re-simulation can take ~1 s+ on big records.
++
++import (
++	"context"
++	"fmt"
++	"io"
++	"net/http"
++	"time"
++
++	"traffic-sim/engine/scenario"
++)
++
++const (
++	// ctlTimeout bounds status/pause/resume/speed proxy calls.
++	ctlTimeout = 2 * time.Second
++	// seekTimeout bounds seek proxy calls (synchronous re-simulation from
++	// the last keyframe — the child answers 200 only after landing).
++	seekTimeout = 10 * time.Second
++)
++
++// scenarioDT resolves dt for the replay deep link exactly as serve's hint
++// prints it (scenario.Load → RunSpec → spec.Params.Dt, cmd/serve/main.go's
++// ?dt=%g). The replay child's /status also carries the AUTHORITATIVE dt
++// from the record plane's RunMeta; this one is the menu-side hint so the
++// viz renders at the right pace from the first frame.
++func scenarioDT(scenarioDir string) (float64, error) {
++	sc, err := scenario.Load(scenarioDir)
++	if err != nil {
++		return 0, err
++	}
++	spec, err := sc.RunSpec(typeReg)
++	if err != nil {
++		return 0, err
++	}
++	return spec.Params.Dt, nil
++}
++
++// handleReplayStart swaps the active child for a replay of the recording
++// and returns the same deep-link shape as demo start, with run={run}-replay
++// (the replay's live plane) and dt from the recording's scenario.
++func (s *server) handleReplayStart(w http.ResponseWriter, r *http.Request) {
++	id := r.PathValue("id")
++	rec := s.reg.recByID(id)
++	if rec == nil {
++		writeErr(w, http.StatusNotFound, fmt.Errorf("unknown recording %q", id))
++		return
++	}
++	dt, err := scenarioDT(rec.ScenarioDir)
++	if err != nil {
++		writeErr(w, http.StatusInternalServerError, err)
++		return
++	}
++	if err := s.sup.start(spawnTarget{Kind: "replay", Rec: rec}); err != nil {
++		writeErr(w, http.StatusBadGateway, err)
++		return
++	}
++	writeJSON(w, http.StatusOK, map[string]string{
++		"url": fmt.Sprintf("/app/?run=%s-replay&net=/net/%s.geojson&dt=%g", rec.Run, rec.ID, dt),
++	})
++}
++
++// replayActive gates the control proxy: 404 unless the live child is a
++// replay (idle, or a live demo running, both read as "nothing to control").
++func (s *server) replayActive() bool {
++	kind, ok := s.sup.activeKind()
++	return ok && kind == "replay"
++}
++
++func (s *server) handleReplayStatus(w http.ResponseWriter, r *http.Request) {
++	s.proxyCtl(w, r, "/status", s.ctlTimeout)
++}
++
++// ctlRoute proxies one control verb to the replay child. seek gets the
++// longer timeout (synchronous re-simulation); the rest the short one.
++func (s *server) ctlRoute(path string, isSeek bool) http.HandlerFunc {
++	timeout := s.ctlTimeout
++	if isSeek {
++		timeout = s.seekTimeout
++	}
++	return func(w http.ResponseWriter, r *http.Request) {
++		s.proxyCtl(w, r, path, timeout)
++	}
++}
++
++// proxyCtl forwards one request to the replay child's control plane and
++// copies the response back verbatim: status code, content type, body (the
++// player's status JSON, or its plain-text error). A child that cannot be
++// reached in time (or at all) is a 502 — demosrv's own error, not the
++// child's, so it does not masquerade as a player response.
++func (s *server) proxyCtl(w http.ResponseWriter, r *http.Request, path string, timeout time.Duration) {
++	if !s.replayActive() {
++		writeErr(w, http.StatusNotFound, fmt.Errorf("no active replay"))
++		return
++	}
++	ctx, cancel := context.WithTimeout(r.Context(), timeout)
++	defer cancel()
++	req, err := http.NewRequestWithContext(ctx, r.Method, s.replayCtl+path, r.Body)
++	if err != nil {
++		writeErr(w, http.StatusInternalServerError, err)
++		return
++	}
++	if ct := r.Header.Get("Content-Type"); ct != "" {
++		req.Header.Set("Content-Type", ct)
++	}
++	// No client.Timeout: the request context carries the deadline (per-call
++	// — seek gets longer than the rest).
++	resp, err := http.DefaultClient.Do(req)
++	if err != nil {
++		writeErr(w, http.StatusBadGateway, err)
++		return
++	}
++	defer resp.Body.Close()
++	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
++	if err != nil {
++		writeErr(w, http.StatusBadGateway, err)
++		return
++	}
++	if ct := resp.Header.Get("Content-Type"); ct != "" {
++		w.Header().Set("Content-Type", ct)
++	}
++	w.WriteHeader(resp.StatusCode)
++	w.Write(body)
++}
+diff --git a/engine/cmd/demosrv/replay_test.go b/engine/cmd/demosrv/replay_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..341afec29c0f920d773189a8c006d49625011518
+--- /dev/null
++++ b/engine/cmd/demosrv/replay_test.go
+@@ -0,0 +1,428 @@
++package main
++
++// replay_test.go — the VCR wiring: registry validation for "recordings"
++// (strict fields, store paths, cross-namespace id uniqueness), the replay
++// start/stop lifecycle against the `sleep` spawn stub, /net for recording
++// ids, and the control proxy against an httptest stub standing in for the
++// replay child's loopback control plane. The real replay binary is never
++// spawned (covered by engine/cmd/replay's own tests).
++
++import (
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"traffic-sim/engine"
++)
++
++// writeScenarioDir builds a minimal on-disk scenario (one origin lane →
++// one exit lane, dt pinned to 0.05) for the recording's scenarioDir: the
++// replay start handler loads it for the dt hint, /net for the GeoJSON.
++func writeScenarioDir(t *testing.T) string {
++	t.Helper()
++	dir := t.TempDir()
++	nf := engine.NetFile{
++		Version: 1,
++		Name:    "rec-test",
++		Lanes: []engine.NetLane{
++			{ID: "a_0", Section: "a", Length: 500, SpeedLimit: 15, Width: 3.2,
++				Shape: [][2]float64{{0, 0}, {500, 0}}, Successors: []string{"b_0"}, Origin: true},
++			{ID: "b_0", Section: "b", Length: 500, SpeedLimit: 15, Width: 3.2,
++				Shape: [][2]float64{{500, 0}, {1000, 0}}, Exit: true},
++		},
++	}
++	data, err := json.Marshal(nf)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(dir, "network.json"), data, 0o644); err != nil {
++		t.Fatal(err)
++	}
++	manifest := `format_version: 1
++id: rec-test
++seed: 7
++ticks: 300
++network: network.json
++types: [car]
++params:
++  dt: 0.05
++spawner:
++  rate_per_lane_h: 600
++`
++	if err := os.WriteFile(filepath.Join(dir, "scenario.yaml"), []byte(manifest), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	return dir
++}
++
++// writeRecordingRegistry writes a registry file with one demo and one
++// recording, both backed by real dirs (scenarioDir loadable, store an
++// empty dir), and returns (registryPath, scenarioDir, storeDir).
++func writeRecordingRegistry(t *testing.T, recJSON string) string {
++	t.Helper()
++	dir := t.TempDir()
++	scen := writeScenarioDir(t)
++	store := filepath.Join(dir, "store")
++	if err := os.Mkdir(store, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if recJSON == "" {
++		recJSON = `[{
++			"id": "rec1", "title": "Recorded run", "blurb": "b",
++			"store": %q, "run": "recrun", "scenarioDir": %q
++		}]`
++	}
++	// %q slots alternate store, scenarioDir (store, scenarioDir, ...).
++	n := strings.Count(recJSON, "%q")
++	args := make([]any, 0, n)
++	for i := 0; i < n; i++ {
++		if i%2 == 0 {
++			args = append(args, store)
++		} else {
++			args = append(args, scen)
++		}
++	}
++	recJSON = fmt.Sprintf(recJSON, args...)
++	body := fmt.Sprintf(`{"demos": [{
++		"id": "d1", "title": "Demo", "scenarioDir": %q, "run": "liverun"
++	}], "recordings": %s}`, scen, recJSON)
++	path := filepath.Join(dir, "demos.json")
++	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	return path
++}
++
++func TestLoadRegistryRecordings(t *testing.T) {
++	reg, err := LoadRegistry(writeRecordingRegistry(t, ""))
++	if err != nil {
++		t.Fatalf("LoadRegistry: %v", err)
++	}
++	if len(reg.Recordings) != 1 {
++		t.Fatalf("got %d recordings, want 1", len(reg.Recordings))
++	}
++	rec := reg.Recordings[0]
++	if rec.ID != "rec1" || rec.Run != "recrun" || rec.Title == "" {
++		t.Errorf("recording decoded wrong: %+v", rec)
++	}
++	if rec.Kind != "replay" {
++		t.Errorf("recording kind = %q, want replay", rec.Kind)
++	}
++	if reg.Demos[0].Kind != "demo" {
++		t.Errorf("demo kind = %q, want demo", reg.Demos[0].Kind)
++	}
++	if !filepath.IsAbs(rec.Store) || !filepath.IsAbs(rec.ScenarioDir) {
++		t.Errorf("paths not made absolute: %+v", rec)
++	}
++	if reg.recByID("rec1") != rec || reg.recByID("d1") != nil || reg.byID("rec1") != nil {
++		t.Errorf("namespace lookups crossed: recByID/byID must stay separate")
++	}
++}
++
++func TestLoadRegistryRecordingValidation(t *testing.T) {
++	cases := []struct {
++		name string
++		rec  string // raw "recordings" array; %q slots: store, scenarioDir
++		want string
++	}{
++		{"unknown field", `[{"id":"r","title":"t","store":%q,"run":"x","scenarioDir":%q,"bogus":1}]`, "unknown field"},
++		{"missing store", `[{"id":"r","title":"t","store":"/no/such/store-anywhere","run":"x","scenarioDir":%q}]`, "store"},
++		{"duplicate id across kinds", `[{"id":"d1","title":"t","store":%q,"run":"x","scenarioDir":%q}]`, "duplicate id"},
++		{"duplicate recording id", `[
++			{"id":"r","title":"t","store":%q,"run":"x","scenarioDir":%q},
++			{"id":"r","title":"t","store":%q,"run":"y","scenarioDir":%q}
++		]`, "duplicate id"},
++		{"missing title", `[{"id":"r","store":%q,"run":"x","scenarioDir":%q}]`, "title"},
++		{"run with dot", `[{"id":"r","title":"t","store":%q,"run":"bad.token","scenarioDir":%q}]`, "must match [A-Za-z0-9_-]+"},
++		{"run with replay suffix", `[{"id":"r","title":"t","store":%q,"run":"x-replay","scenarioDir":%q}]`, "reserved replay-plane suffix"},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			path := writeRecordingRegistry(t, tc.rec)
++			_, err := LoadRegistry(path)
++			if err == nil {
++				t.Fatalf("LoadRegistry succeeded, want error containing %q", tc.want)
++			}
++			if !strings.Contains(err.Error(), tc.want) {
++				t.Errorf("error %q does not contain %q", err, tc.want)
++			}
++		})
++	}
++}
++
++// newReplayTestServer wires a server with the sleep spawn stub and (when
++// ctl is non-nil) the stub control plane as the proxy target.
++func newReplayTestServer(t *testing.T, ctlURL string) (*server, *[]*exec.Cmd, *sync.Mutex) {
++	t.Helper()
++	var mu sync.Mutex
++	var cmds []*exec.Cmd
++	sup := newSupervisor(sleepSpawner(&cmds, &mu))
++	sup.ready = func() error { return nil }
++	srv := &server{
++		reg: &Registry{}, sup: sup, viz: t.TempDir(), nets: &netCache{dir: t.TempDir()},
++		replayCtl: ctlURL, ctlTimeout: 2 * time.Second, seekTimeout: 10 * time.Second,
++	}
++	return srv, &cmds, &mu
++}
++
++func TestReplayStartStopAndNet(t *testing.T) {
++	scen := writeScenarioDir(t)
++	srv, cmds, mu := newReplayTestServer(t, "http://127.0.0.1:1")
++	srv.reg = &Registry{
++		Demos:      []*Demo{{ID: "d1", Title: "Demo", Run: "liverun", ScenarioDir: scen, Kind: "demo"}},
++		Recordings: []*Recording{{ID: "rec1", Title: "Rec", Run: "recrun", Store: t.TempDir(), ScenarioDir: scen, Kind: "replay"}},
++	}
++	ts := httptest.NewServer(srv.routes())
++	defer ts.Close()
++
++	post := func(path string) (int, map[string]any) {
++		t.Helper()
++		resp, err := http.Post(ts.URL+path, "", nil)
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer resp.Body.Close()
++		var v map[string]any
++		if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
++			t.Fatalf("POST %s: %v", path, err)
++		}
++		return resp.StatusCode, v
++	}
++
++	// Unknown recording.
++	if code, _ := post("/api/replay/nope/start"); code != http.StatusNotFound {
++		t.Fatalf("start unknown recording = %d, want 404", code)
++	}
++
++	// Start the recording: deep link carries {run}-replay and the
++	// scenario's dt (%g, like serve's hint).
++	code, body := post("/api/replay/rec1/start")
++	if code != 200 {
++		t.Fatalf("replay start = %d (%v)", code, body)
++	}
++	if want := "/app/?run=recrun-replay&net=/net/rec1.geojson&dt=0.05"; body["url"] != want {
++		t.Errorf("replay start url = %v, want %s", body["url"], want)
++	}
++
++	// /net serves the recording's scenario network as GeoJSON.
++	resp, err := http.Get(ts.URL + "/net/rec1.geojson")
++	if err != nil {
++		t.Fatal(err)
++	}
++	resp.Body.Close()
++	if resp.StatusCode != 200 || !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/geo+json") {
++		t.Errorf("GET /net/rec1.geojson = %d %q", resp.StatusCode, resp.Header.Get("Content-Type"))
++	}
++
++	// The swap is symmetric: starting a demo kills the replay child.
++	if code, body := post("/api/demo/d1/start"); code != 200 {
++		t.Fatalf("demo start after replay = %d (%v)", code, body)
++	}
++	mu.Lock()
++	recCmd := (*cmds)[0]
++	mu.Unlock()
++	waitDead(t, recCmd, "replay child after demo start")
++
++	// And back: starting a replay kills the demo child; stop kills the
++	// replay child too (the supervisor is generic over kinds).
++	if code, body := post("/api/replay/rec1/start"); code != 200 {
++		t.Fatalf("replay restart = %d (%v)", code, body)
++	}
++	mu.Lock()
++	demoCmd := (*cmds)[1]
++	mu.Unlock()
++	waitDead(t, demoCmd, "demo child after replay restart")
++	if code, _ := post("/api/demo/stop"); code != 200 {
++		t.Fatalf("stop = %d", code)
++	}
++	mu.Lock()
++	recCmd2 := (*cmds)[2]
++	n := len(*cmds)
++	mu.Unlock()
++	waitDead(t, recCmd2, "replay child after stop")
++	if n != 3 {
++		t.Fatalf("%d spawns, want 3", n)
++	}
++}
++
++// stubCtl is an httptest server standing in for the replay child's control
++// plane: /status answers a canned player status, the control verbs record
++// their bodies and answer the (configurable) status code with the status
++// JSON, like natsio.Player.Handler.
++type stubCtl struct {
++	srv       *httptest.Server
++	code      atomic.Int32
++	seekDelay atomic.Int64 // ms to sleep before answering /seek
++	lastBody  atomic.Value // string of the last control body
++}
++
++func newStubCtl(t *testing.T) *stubCtl {
++	t.Helper()
++	st := &stubCtl{}
++	st.code.Store(200)
++	mux := http.NewServeMux()
++	status := `{"run":"recrun","replayRun":"recrun-replay","tick":10,"ticks":300,"endTick":300,"speed":1,"paused":false,"done":false,"dt":0.05,"crcErrors":0,"verbErrors":0}`
++	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		io.WriteString(w, status)
++	})
++	for _, verb := range []string{"pause", "resume", "speed", "seek"} {
++		mux.HandleFunc("POST /"+verb, func(w http.ResponseWriter, r *http.Request) {
++			body, _ := io.ReadAll(r.Body)
++			st.lastBody.Store(verb + ":" + string(body))
++			if verb == "seek" && st.seekDelay.Load() > 0 {
++				time.Sleep(time.Duration(st.seekDelay.Load()) * time.Millisecond)
++			}
++			w.Header().Set("Content-Type", "application/json")
++			w.WriteHeader(int(st.code.Load()))
++			io.WriteString(w, status)
++		})
++	}
++	st.srv = httptest.NewServer(mux)
++	t.Cleanup(st.srv.Close)
++	return st
++}
++
++// startSleepReplay puts a (sleep-stub) replay child under the supervisor so
++// the proxy's active-kind gate opens.
++func startSleepReplay(t *testing.T, srv *server) {
++	t.Helper()
++	if err := srv.sup.start(spawnTarget{Kind: "replay", Rec: &Recording{ID: "rec1", Run: "recrun"}}); err != nil {
++		t.Fatalf("start replay stub: %v", err)
++	}
++	t.Cleanup(srv.sup.stop)
++}
++
++func TestReplayProxy(t *testing.T) {
++	stub := newStubCtl(t)
++	srv, _, _ := newReplayTestServer(t, stub.srv.URL)
++	ts := httptest.NewServer(srv.routes())
++	defer ts.Close()
++
++	// Idle: nothing to control.
++	resp, err := http.Get(ts.URL + "/api/replay/status")
++	if err != nil {
++		t.Fatal(err)
++	}
++	resp.Body.Close()
++	if resp.StatusCode != http.StatusNotFound {
++		t.Fatalf("status while idle = %d, want 404", resp.StatusCode)
++	}
++
++	// Live demo active: still nothing to control.
++	if err := srv.sup.start(spawnTarget{Kind: "demo", Demo: &Demo{ID: "d1", Run: "r1"}}); err != nil {
++		t.Fatal(err)
++	}
++	resp, err = http.Get(ts.URL + "/api/replay/status")
++	if err != nil {
++		t.Fatal(err)
++	}
++	resp.Body.Close()
++	if resp.StatusCode != http.StatusNotFound {
++		t.Fatalf("status while demo active = %d, want 404", resp.StatusCode)
++	}
++
++	startSleepReplay(t, srv)
++
++	// Status passes through verbatim.
++	resp, err = http.Get(ts.URL + "/api/replay/status")
++	if err != nil {
++		t.Fatal(err)
++	}
++	body, _ := io.ReadAll(resp.Body)
++	resp.Body.Close()
++	if resp.StatusCode != 200 {
++		t.Fatalf("proxied status = %d", resp.StatusCode)
++	}
++	var st map[string]any
++	if err := json.Unmarshal(body, &st); err != nil {
++		t.Fatalf("status body: %v", err)
++	}
++	if st["replayRun"] != "recrun-replay" || st["dt"] != 0.05 || st["tick"] != 10.0 {
++		t.Errorf("status not passed through: %s", body)
++	}
++
++	// Control verbs: body forwarded, status code + JSON passed through.
++	for _, tc := range []struct{ path, body string }{
++		{"/api/replay/ctl/pause", ""},
++		{"/api/replay/ctl/resume", ""},
++		{"/api/replay/ctl/speed", `{"speed": 4}`},
++		{"/api/replay/ctl/seek", `{"tick": 120}`},
++	} {
++		resp, err := http.Post(ts.URL+tc.path, "application/json", strings.NewReader(tc.body))
++		if err != nil {
++			t.Fatal(err)
++		}
++		rb, _ := io.ReadAll(resp.Body)
++		resp.Body.Close()
++		if resp.StatusCode != 200 {
++			t.Errorf("POST %s = %d, want 200", tc.path, resp.StatusCode)
++		}
++		if !strings.Contains(string(rb), `"replayRun"`) {
++			t.Errorf("POST %s body = %s, want the player status JSON", tc.path, rb)
++		}
++		if tc.body != "" {
++			if got := stub.lastBody.Load().(string); !strings.HasSuffix(got, ":"+tc.body) {
++				t.Errorf("POST %s forwarded body %q, want %q", tc.path, got, tc.body)
++			}
++		}
++	}
++
++	// The child's non-200 (409 while done, e.g. resume-after-end) passes
++	// through too.
++	stub.code.Store(http.StatusConflict)
++	resp, err = http.Post(ts.URL+"/api/replay/ctl/resume", "application/json", nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	resp.Body.Close()
++	if resp.StatusCode != http.StatusConflict {
++		t.Errorf("resume with child 409 = %d, want 409", resp.StatusCode)
++	}
++	stub.code.Store(200)
++
++	// Unknown verbs are rejected by demosrv, never reach the child. (405,
++	// not 404: no ctl pattern matches and the GET / static catch-all claims
++	// the path for the wrong method.)
++	resp, err = http.Post(ts.URL+"/api/replay/ctl/explode", "application/json", nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	resp.Body.Close()
++	if resp.StatusCode != http.StatusMethodNotAllowed {
++		t.Errorf("unknown ctl verb = %d, want 405", resp.StatusCode)
++	}
++}
++
++func TestReplaySeekTimeout(t *testing.T) {
++	stub := newStubCtl(t)
++	stub.seekDelay.Store(300)
++	srv, _, _ := newReplayTestServer(t, stub.srv.URL)
++	srv.seekTimeout = 50 * time.Millisecond // shrink the 10 s default for the test
++	ts := httptest.NewServer(srv.routes())
++	defer ts.Close()
++	startSleepReplay(t, srv)
++
++	start := time.Now()
++	resp, err := http.Post(ts.URL+"/api/replay/ctl/seek", "application/json", strings.NewReader(`{"tick": 1}`))
++	if err != nil {
++		t.Fatal(err)
++	}
++	resp.Body.Close()
++	if resp.StatusCode != http.StatusBadGateway {
++		t.Errorf("seek past the proxy timeout = %d, want 502", resp.StatusCode)
++	}
++	if elapsed := time.Since(start); elapsed > 3*time.Second {
++		t.Errorf("seek blocked %s, want ~seekTimeout", elapsed)
++	}
++}
+diff --git a/engine/cmd/demosrv/supervisor.go b/engine/cmd/demosrv/supervisor.go
+index 234f2b0da45f5038344309758c7989f2c039696c..853c4de889207abc43ae7501204ecc3e677b1d13 100644
+--- a/engine/cmd/demosrv/supervisor.go
++++ b/engine/cmd/demosrv/supervisor.go
+@@ -1,10 +1,11 @@
+ package main
+ 
+-// supervisor.go — single-active-run lifecycle for `serve` engine children:
+-// spawn, wait for the WebSocket port to accept TCP (the menu's "you may
+-// navigate" signal — the viz opens its socket immediately on load), and
+-// SIGTERM→SIGKILL(2s) on replace/stop. One mutex serializes start/stop; the
+-// injectable spawnFunc keeps the tests on `sleep`, never the real engine.
++// supervisor.go — single-active-run lifecycle for engine children (`serve`
++// for live demos, `replay` for VCR recordings): spawn, wait for the
++// WebSocket port to accept TCP (the menu's "you may navigate" signal — the
++// viz opens its socket immediately on load), and SIGTERM→SIGKILL(2s) on
++// replace/stop. One mutex serializes start/stop; the injectable spawnFunc
++// keeps the tests on `sleep`, never the real engine.
+ 
+ import (
+ 	"fmt"
+@@ -21,6 +22,10 @@ const (
+ 	// (viz/src/config.ts) already points here, so the menu's deep link never
+ 	// has to carry it.
+ 	wsListenAddr = "127.0.0.1:8443"
++	// replayCtlAddr is the ONE replay control-plane port (engine/cmd/replay
++	// -http), fixed for the same reason as the ws port: single active run
++	// makes conflicts impossible. demosrv proxies it under /api/replay/.
++	replayCtlAddr = "127.0.0.1:8901"
+ 	// readyTimeout bounds the wait for the engine's listener. The binary is
+ 	// prebuilt at demosrv startup, so this covers process exec + embedded
+ 	// broker startup, not a compile.
+@@ -31,12 +36,28 @@ const (
+ 	killGrace = 2 * time.Second
+ )
+ 
+-// spawnFunc starts the demo's engine process and returns the running
++// spawnTarget identifies the child to exec: a live demo (Kind "demo",
++// serve) or a VCR recording (Kind "replay", engine/cmd/replay). Exactly
++// one of Demo/Rec is non-nil, matching Kind.
++type spawnTarget struct {
++	Kind string
++	Demo *Demo
++	Rec  *Recording
++}
++
++func (t spawnTarget) id() string {
++	if t.Kind == "replay" {
++		return t.Rec.ID
++	}
++	return t.Demo.ID
++}
++
++// spawnFunc starts the target's engine process and returns the running
+ // command (cmd.Start already called).
+-type spawnFunc func(d *Demo) (*exec.Cmd, error)
++type spawnFunc func(t spawnTarget) (*exec.Cmd, error)
+ 
+ type activeRun struct {
+-	demo      *Demo
++	target    spawnTarget
+ 	cmd       *exec.Cmd
+ 	startedAt time.Time
+ 	done      chan struct{} // closed by the reaper when the process exits
+@@ -52,6 +73,7 @@ type supervisor struct {
+ 	// keep the real probe for the timeout case).
+ 	ready        func() error
+ 	wsAddr       string
++	ctlAddr      string // replay control-plane port (replay-kind probes only)
+ 	readyTimeout time.Duration
+ 	killGrace    time.Duration
+ }
+@@ -60,23 +82,27 @@ func newSupervisor(spawn spawnFunc) *supervisor {
+ 	return &supervisor{
+ 		spawn:        spawn,
+ 		wsAddr:       wsListenAddr,
++		ctlAddr:      replayCtlAddr,
+ 		readyTimeout: readyTimeout,
+ 		killGrace:    killGrace,
+ 	}
+ }
+ 
+-// start replaces any active run with d's engine and blocks until its
+-// WebSocket port accepts TCP. A spawn or readiness failure leaves NO
+-// process behind (the just-started child is killed on the way out).
+-func (s *supervisor) start(d *Demo) error {
++// start replaces any active child with the target's engine and blocks
++// until the child is ready (see waitReady). Kill-before-spawn covers BOTH
++// kinds: a replay child must die before a serve starts and vice versa
++// (JetStream store-dir exclusivity + the single ws port). A spawn or
++// readiness failure leaves NO process behind (the just-started child is
++// killed on the way out).
++func (s *supervisor) start(t spawnTarget) error {
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
+ 	s.stopLocked()
+-	cmd, err := s.spawn(d)
++	cmd, err := s.spawn(t)
+ 	if err != nil {
+-		return fmt.Errorf("spawn %s: %w", d.ID, err)
++		return fmt.Errorf("spawn %s: %w", t.id(), err)
+ 	}
+-	a := &activeRun{demo: d, cmd: cmd, startedAt: time.Now(), done: make(chan struct{})}
++	a := &activeRun{target: t, cmd: cmd, startedAt: time.Now(), done: make(chan struct{})}
+ 	go func() {
+ 		// Reap. The exit error is expected (SIGTERM/SIGKILL is the normal
+ 		// way out) and the child's own log carries anything interesting.
+@@ -86,7 +112,7 @@ func (s *supervisor) start(d *Demo) error {
+ 	s.active = a
+ 	if err := s.waitReady(a); err != nil {
+ 		s.stopLocked()
+-		return fmt.Errorf("%s did not become ready: %w", d.ID, err)
++		return fmt.Errorf("%s did not become ready: %w", t.id(), err)
+ 	}
+ 	return nil
+ }
+@@ -129,14 +155,45 @@ func (s *supervisor) status() (id string, pid int, startedAt time.Time, ok bool)
+ 		return "", 0, time.Time{}, false
+ 	default:
+ 	}
+-	return a.demo.ID, a.cmd.Process.Pid, a.startedAt, true
++	return a.target.id(), a.cmd.Process.Pid, a.startedAt, true
+ }
+ 
++// activeKind reports the live child's kind ("demo"/"replay") — the replay
++// control proxy 404s unless a replay is the active child. Same corpse
++// discipline as status.
++func (s *supervisor) activeKind() (string, bool) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	a := s.active
++	if a == nil {
++		return "", false
++	}
++	select {
++	case <-a.done:
++		return "", false
++	default:
++	}
++	return a.target.Kind, true
++}
++
++// waitReady probes the child's readiness. A live demo is ready when its
++// WebSocket port accepts TCP. A REPLAY child is ready only when BOTH the
++// WebSocket port and its HTTP control port accept: replay's ws listener
++// (the embedded broker) opens before NewPlayer has indexed the recording
++// and before the control listener binds (engine/cmd/replay), and demosrv's
++// start response sends the viz straight at the control plane — answering
++// early would race the replay panel's first probe.
+ func (s *supervisor) waitReady(a *activeRun) error {
+ 	if s.ready != nil {
+ 		return s.ready()
+ 	}
+-	return waitPort(s.wsAddr, s.readyTimeout, a.done)
++	if err := waitPort(s.wsAddr, s.readyTimeout, a.done); err != nil {
++		return err
++	}
++	if a.target.Kind == "replay" {
++		return waitPort(s.ctlAddr, s.readyTimeout, a.done)
++	}
++	return nil
+ }
+ 
+ // waitPort polls until addr accepts a TCP connection or the timeout
+diff --git a/engine/cmd/serve/main.go b/engine/cmd/serve/main.go
+index b4ab1dcf32e6740b6da74cb0eef9bc2b613501c0..b0cee799b410dc6620f22c128529aa1fafff0eb5 100644
+--- a/engine/cmd/serve/main.go
++++ b/engine/cmd/serve/main.go
+@@ -26,6 +26,7 @@ import (
+ 	"net"
+ 	"os"
+ 	"os/signal"
++	"path/filepath"
+ 	"strconv"
+ 	"strings"
+ 	"syscall"
+@@ -144,6 +145,14 @@ func main() {
+ 		}
+ 	}
+ 
++	// Absolutize the network path: the run meta (registry + durable record)
++	// carries spec.Net.Path verbatim, and a relative path makes the recording
++	// unreadable from any other working directory (the replay child hit this:
++	// recorded from engine/, replayed from the repo root).
++	if abs, err := filepath.Abs(spec.Net.Path); err == nil {
++		spec.Net.Path = abs
++	}
++
+ 	// Pacing (ADR-0005 §4 — pacing is a wrapper's business; the loop itself
+ 	// never blocks on input): default 1 keeps PaceFloor = one tick of wall
+ 	// time, today's behavior exactly.
+diff --git a/viz/demos.html b/viz/demos.html
+index 3e4df570295a83b689dea1d6d0a88d4283467c58..e272e2852e06ce75cc322a46eb24ab1bfc64a796 100644
+--- a/viz/demos.html
++++ b/viz/demos.html
+@@ -36,6 +36,11 @@
+       }
+       .card:hover { border-color: #7e9dff; background: rgba(18, 40, 129, 0.75); transform: translateY(-1px); }
+       .card.running { border-color: #1e9e6a; }
++      /* Recordings (kind "replay", demos-core.ts): dashed border + amber
++         REPLAY chip — a replayed run must read differently from a live
++         one at a glance. */
++      .card.replay { border-style: dashed; }
++      .chip.replay { color: #e8b43a; border-color: rgba(232, 180, 58, 0.55); }
+       .card h2 { margin: 0; font-size: 15px; color: #eaf0ff; padding-right: 90px; }
+       .card .blurb { margin: 8px 0 12px; color: #9fb2e8; font-size: 12px; }
+       .tags { display: flex; flex-wrap: wrap; gap: 6px; }
+diff --git a/viz/index.html b/viz/index.html
+index 6ad90e2ce19942b05ba6f74d85022b1734c5515c..a463e6bb072de7f47d854a40d07a56f9a1a9fd5f 100644
+--- a/viz/index.html
++++ b/viz/index.html
+@@ -93,6 +93,22 @@
+       #model .mp-row { display: flex; gap: 10px; margin-top: 2px; font-size: 11px; }
+       #model .mp-row span:first-child { color: #9fb2e8; flex: none; }
+       #model .mp-row span:last-child { margin-left: auto; text-align: right; }
++      /* Replay controls — replay-driver control plane (replaypanel.ts).
++         Interactive; bottom-center; hides unless demosrv's replay proxy
++         answers (a plain live demo gets a 404 → the panel never shows).
++         Colors are the theme.ts tokens as CSS-local literals (same
++         convention as #status .ok/.bad and .sw-current). */
++      #replay { bottom: 10px; left: 50%; transform: translateX(-50%); pointer-events: auto; user-select: none; min-width: 300px; white-space: normal; }
++      #replay .rp-head { display: flex; align-items: baseline; gap: 8px; font-weight: 700; letter-spacing: 0.08em; }
++      #replay .rp-run { margin-left: auto; color: #9fb2e8; font-weight: 400; letter-spacing: 0; }
++      #replay .rp-controls { display: flex; gap: 6px; margin-top: 5px; }
++      #replay .rp-btn { padding: 1px 8px; border: 1px solid rgba(46, 91, 255, 0.55); border-radius: 3px; cursor: pointer; }
++      #replay .rp-btn:hover { background: rgba(46, 91, 255, 0.25); }
++      #replay .rp-btn.rp-on { color: #1e9e6a; border-color: #1e9e6a; }
++      #replay input[type="range"] { width: 100%; margin-top: 7px; accent-color: #2e5bff; }
++      #replay .rp-line { margin-top: 4px; font-variant-numeric: tabular-nums; }
++      #replay .rp-warn { color: #e5484d; font-weight: 700; }
++      #replay .rp-hint { color: #e8b43a; }
+     </style>
+   </head>
+   <body>
+@@ -102,6 +118,7 @@
+     <div id="legend" class="hud"></div>
+     <div id="switcher" class="hud"></div>
+     <div id="model" class="hud"></div>
++    <div id="replay" class="hud"></div>
+     <div id="loading"><div class="spin"></div><div id="loading-msg">loading…</div></div>
+     <script type="module" src="/src/main.ts"></script>
+   </body>
+diff --git a/viz/src/demos-core.ts b/viz/src/demos-core.ts
+index f23bd2d2742004aded5a7544d643b5e8cfb5aa66..f9466d128b3d9eb3773cc1020c2df899c7d05d8d 100644
+--- a/viz/src/demos-core.ts
++++ b/viz/src/demos-core.ts
+@@ -1,6 +1,13 @@
+ // demos-core.ts — pure, DOM-free helpers for the demosrv menu page
+-// (demos.ts). Kept separate so node --test can import them exactly like
+-// theme.ts/proj.ts: no fetch, no document.
++// (demos.ts) and the in-map switcher (switcher.ts). Kept separate so
++// node --test can import them exactly like theme.ts/proj.ts: no fetch, no
++// document.
++
++// EntryKind is demosrv's output-only discriminator (engine/cmd/demosrv
++// registry.go — Load overwrites whatever the JSON carried, so the API
++// payload always has it): "demo" spawns serve, "replay" spawns the replay
++// driver over a recorded store.
++export type EntryKind = "demo" | "replay";
+ 
+ // DemoInfo mirrors one entry of the demosrv registry (demos.json — the Go
+ // type Demo in engine/cmd/demosrv/registry.go). seed/ticks are optional
+@@ -14,10 +21,30 @@ export interface DemoInfo {
+   run: string;
+   seed?: number;
+   ticks?: number;
++  kind: EntryKind; // always "demo" in API payloads
++}
++
++// RecordingInfo mirrors one "recordings" entry (the Go type Recording): a
++// durable JetStream store replayed under the live plane {run}-replay. No
++// tags/seed/ticks — a recording replays its store as written; scenarioDir
++// is reused for the network GeoJSON (ids are unique ACROSS kinds, they
++// share /net/{id}).
++export interface RecordingInfo {
++  id: string;
++  title: string;
++  blurb: string;
++  store: string;
++  run: string;
++  scenarioDir: string;
++  kind: EntryKind; // always "replay" in API payloads
+ }
+ 
++// MenuEntry is anything the menu/switcher can activate.
++export type MenuEntry = DemoInfo | RecordingInfo;
++
+ // RunStatus mirrors demosrv's GET /api/status payload; active is the
+-// running demo's id, or null when no engine is up.
++// running child's id (demo OR recording — the supervisor is generic over
++// kinds), or null when no engine is up.
+ export interface RunStatus {
+   active: string | null;
+   pid: number;
+@@ -33,3 +60,24 @@ export interface RunStatus {
+ export function buildAppURL(demo: Pick<DemoInfo, "id" | "run">): string {
+   return `/app/?run=${demo.run}&net=/net/${demo.id}.geojson`;
+ }
++
++// buildReplayURL is the already-running RECORDING card's deep link — the
++// shape demosrv returns from POST /api/replay/{id}/start MINUS the dt hint
++// (the registry carries no dt; config.ts's 0.1 default applies). A
++// NON-running recording never takes this path: its activation POSTs
++// startPath and navigates on the response, which carries the dt.
++export function buildReplayURL(rec: Pick<RecordingInfo, "id" | "run">): string {
++  return `/app/?run=${rec.run}-replay&net=/net/${rec.id}.geojson`;
++}
++
++// deepLinkURL picks the running-card navigation URL by kind.
++export function deepLinkURL(entry: Pick<MenuEntry, "id" | "run" | "kind">): string {
++  return entry.kind === "replay" ? buildReplayURL(entry) : buildAppURL(entry);
++}
++
++// startPath routes an activation POST by kind: demos spawn serve,
++// recordings spawn the replay driver (engine/cmd/demosrv main.go — the
++// routes are distinct, the {url} response shape is the same).
++export function startPath(entry: Pick<MenuEntry, "id" | "kind">): string {
++  return entry.kind === "replay" ? `/api/replay/${entry.id}/start` : `/api/demo/${entry.id}/start`;
++}
+diff --git a/viz/src/demos.ts b/viz/src/demos.ts
+index 7509a35d41f6cf75bdddb29b3a2d8e071488bd4c..c1fdde8820f8947b904985639cd5dbfd86bd799d 100644
+--- a/viz/src/demos.ts
++++ b/viz/src/demos.ts
+@@ -1,11 +1,13 @@
+ // demos.ts — controller for the demosrv menu page (demos.html): renders
+-// the registry as a card grid, polls /api/status every 3 s for the running
+-// badge, and turns a card click into POST /api/demo/{id}/start → the live
+-// map. Single-active-run is demosrv's rule (starting a demo kills the
+-// previous engine); this page only reflects it. Pure helpers live in
+-// demos-core.ts so node --test can reach them.
++// the registry as a card grid (demos AND recordings — replay entries carry
++// a REPLAY chip and a dashed border), polls /api/status every 3 s for the
++// running badge, and turns a card click into a start POST (routed by kind:
++// /api/demo/{id}/start vs /api/replay/{id}/start — demos-core.ts
++// startPath) → the live map. Single-active-run is demosrv's rule (starting
++// an entry kills the previous engine); this page only reflects it. Pure
++// helpers live in demos-core.ts so node --test can reach them.
+ 
+-import { buildAppURL, type DemoInfo, type RunStatus } from "./demos-core.ts";
++import { deepLinkURL, startPath, type DemoInfo, type MenuEntry, type RecordingInfo, type RunStatus } from "./demos-core.ts";
+ 
+ function must(id: string): HTMLElement {
+   const el = document.getElementById(id);
+@@ -16,6 +18,7 @@ const grid = must("grid");
+ const notice = must("notice");
+ 
+ let demos: DemoInfo[] = [];
++let recordings: RecordingInfo[] = [];
+ let status: RunStatus = { active: null, pid: 0 };
+ const starting = new Set<string>(); // start POST in flight — keep the spinner across re-renders
+ 
+@@ -33,13 +36,14 @@ function showError(err: unknown): void {
+   notice.style.display = "block";
+ }
+ 
+-function card(d: DemoInfo): HTMLElement {
++function card(d: MenuEntry): HTMLElement {
+   const el = document.createElement("article");
+   el.className = "card";
+   const running = status.active === d.id;
+   const isStarting = starting.has(d.id);
+   if (running) el.classList.add("running");
+   if (isStarting) el.classList.add("starting");
++  if (d.kind === "replay") el.classList.add("replay");
+ 
+   const title = document.createElement("h2");
+   title.textContent = d.title;
+@@ -59,7 +63,15 @@ function card(d: DemoInfo): HTMLElement {
+ 
+   const tags = document.createElement("div");
+   tags.className = "tags";
+-  for (const t of d.tags) {
++  // Kind chip first: a recording must read as a replay, not a live run.
++  if (d.kind === "replay") {
++    const chip = document.createElement("span");
++    chip.className = "chip replay";
++    chip.textContent = "REPLAY";
++    tags.append(chip);
++  }
++  // Recordings carry no tags (they replay their store as written).
++  for (const t of "tags" in d ? d.tags : []) {
+     const chip = document.createElement("span");
+     chip.className = "chip";
+     chip.textContent = t;
+@@ -83,23 +95,25 @@ function card(d: DemoInfo): HTMLElement {
+ }
+ 
+ function render(): void {
+-  grid.replaceChildren(...demos.map(card));
++  grid.replaceChildren(...demos.map(card), ...recordings.map(card));
+ }
+ 
+-// activate starts the demo's engine (demosrv kills any previous run) and
+-// navigates to the live map. The already-running card skips the start
+-// round-trip via the pure buildAppURL — same URL shape as the start
+-// response, pinned in test/demos.test.ts.
+-async function activate(d: DemoInfo): Promise<void> {
++// activate starts the entry's engine (demosrv kills any previous run) and
++// navigates to the live map — the start POST is routed by kind (demos
++// spawn serve, recordings spawn the replay driver; same {url} response).
++// The already-running card skips the start round-trip via the pure
++// deepLinkURL — same URL shape as the start response, pinned in
++// test/demos.test.ts.
++async function activate(d: MenuEntry): Promise<void> {
+   if (starting.has(d.id)) return;
+   if (status.active === d.id) {
+-    location.href = buildAppURL(d);
++    location.href = deepLinkURL(d);
+     return;
+   }
+   starting.add(d.id);
+   render();
+   try {
+-    const resp = await fetchJSON<{ url: string }>(`/api/demo/${d.id}/start`, { method: "POST" });
++    const resp = await fetchJSON<{ url: string }>(startPath(d), { method: "POST" });
+     location.href = resp.url;
+   } catch (err) {
+     starting.delete(d.id);
+@@ -127,8 +141,9 @@ async function refreshStatus(): Promise<void> {
+ }
+ 
+ async function main(): Promise<void> {
+-  const reg = await fetchJSON<{ demos: DemoInfo[] }>("/api/demos");
+-  demos = reg.demos;
++  const reg = await fetchJSON<{ demos?: DemoInfo[]; recordings?: RecordingInfo[] }>("/api/demos");
++  demos = reg.demos ?? [];
++  recordings = reg.recordings ?? [];
+   await refreshStatus(); // refreshStatus renders; covers the first paint too
+   setInterval(() => void refreshStatus(), 3000);
+ }
+diff --git a/viz/src/main.ts b/viz/src/main.ts
+index 3c2ac63208b3fca7d213965439c6523abac9dc82..39b7ebbd2afe56295170cf13096ab5230e2f7450 100644
+--- a/viz/src/main.ts
++++ b/viz/src/main.ts
+@@ -31,7 +31,7 @@ import { decodeSignalFrame, type SigColor, type SignalTable } from "./tssg.ts";
+ import { headStatesAtTick, signalHeads, type SignalHead } from "./signals.ts";
+ import { SIGNAL_HEAD, SIGNAL_HEAD_IMAGE_ID, signalHeadImage } from "./signalhead.ts";
+ import { makeProjector, type LocalFrame } from "./proj.ts";
+-import { SnapshotBuffer } from "./snapshots.ts";
++import { SnapshotBuffer, SeekGate } from "./snapshots.ts";
+ import {
+   diffVehicles,
+   diffTrailers,
+@@ -46,6 +46,7 @@ import { Hud } from "./status.ts";
+ import { Legend } from "./legend.ts";
+ import { DemoSwitcher, demoIdFromNetUrl } from "./switcher.ts";
+ import { ModelPanel } from "./modelpanel.ts";
++import { ReplayPanel } from "./replaypanel.ts";
+ import { THEME, glyphByCls } from "./theme.ts";
+ import { bodyImages, glyphImageId, TRACTOR_IMAGE_ID, TRAILER_IMAGE_ID, ICON_SIZE_STOPS } from "./glyphs.ts";
+ import { Articulator } from "./artic.ts";
+@@ -188,6 +189,7 @@ async function main(): Promise<void> {
+   map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-right");
+ 
+   const buffer = new SnapshotBuffer(cfg.bufferMs, cfg.dt);
++  const seekGate = new SeekGate();
+   const applied = new Map<number, RenderedVehicle>();
+   const appliedTrailers = new Map<number, RenderedTrailer>();
+   const artic = new Articulator();
+@@ -449,7 +451,20 @@ async function main(): Promise<void> {
+     cfg.run,
+     (data) => {
+       try {
+-        buffer.push(decodeFrame(data), performance.now());
++        const frame = decodeFrame(data);
++        // Replay seek (replaypanel.ts): the stream jumps — BACKWARD to a
++        // lower tick, or FORWARD past SeekGate's maxJump on a scrub-ahead.
++        // The buffered history belongs to states the seek abandoned — drop
++        // it (a lerp across the jump would smear vehicles and derive bogus
++        // speeds), wipe the congestion overlay's tick-derived
++        // feature-state (lanes keep stale colors otherwise), and land on
++        // the new frame. Duplicate ticks (paused republication) are not
++        // seeks; push's own drop handles them.
++        if (seekGate.observe(frame.tick)) {
++          buffer.reset();
++          clearCongestion();
++        }
++        buffer.push(frame, performance.now());
+       } catch (err) {
+         hud.setConnection(false, String(err));
+       }
+@@ -481,6 +496,18 @@ async function main(): Promise<void> {
+   // updates are a per-snapshot cadence channel, not per render frame).
+   let prevRatios = new Map<string, number>();
+   let lastCongestionMs = 0;
++  // clearCongestion wipes every painted lane ratio (a replay seek abandons
++  // the states they describe): removeFeatureState with no key drops the
++  // feature's whole state, so lanes fall back to the no-data color until
++  // the post-seek stream repaints them.
++  function clearCongestion(): void {
++    if (mapReady) {
++      for (const laneId of prevRatios.keys()) {
++        map.removeFeatureState({ source: "network", id: laneId });
++      }
++    }
++    prevRatios = new Map();
++  }
+   function updateCongestion(nowMs: number): void {
+     if (!mapReady || nowMs - lastCongestionMs < 1000) return;
+     lastCongestionMs = nowMs;
+@@ -506,6 +533,39 @@ async function main(): Promise<void> {
+     prevRatios = ratios;
+   }
+ 
++  // Replay controls (replaypanel.ts); same probe discipline as the other
++  // panels — hides unless demosrv's replay proxy answers, so plain live
++  // demos never see it. Mounted HERE (not with the other panels) because
++  // its two hooks reach into the stream pipeline declared above:
++  //   onSeeked — the panel KNOWS when a seek landed; SeekGate's heuristic
++  //     (backward, or forward jump > maxJump) misses forward scrubs
++  //     ≤ maxJump, so a successful panel seek resets the buffer + the
++  //     congestion overlay explicitly (the gate stays as backstop for
++  //     non-panel seeks);
++  //   onStatus — the status dt is the RECORDED run's authoritative
++  //     timestep (the ?dt= URL hint comes from the mutable scenario, and
++  //     running-replay deep links carry no dt at all), so it wins on the
++  //     first probe. If it differs, speeds already rendered were off for
++  //     one buffer-fill — acceptable; warn and re-target.
++  let dtSynced = false;
++  void new ReplayPanel(document.getElementById("replay")!, {
++    onSeeked: () => {
++      buffer.reset();
++      clearCongestion();
++    },
++    onStatus: (s) => {
++      if (dtSynced || s.dt <= 0) return;
++      dtSynced = true;
++      if (s.dt !== buffer.simDt) {
++        console.warn(
++          `replay status dt ${s.dt} ≠ config dt ${buffer.simDt} — ` +
++            `adopting the recorded run's authoritative dt (speeds rendered so far were off)`,
++        );
++        buffer.setSimDt(s.dt);
++      }
++    },
++  }).init();
++
+   // Render loop: interpolate behind the buffer, apply updateData diffs once
+   // per rAF frame — never per incoming message.
+   function frame(nowMs: number): void {
+diff --git a/viz/src/replaypanel.ts b/viz/src/replaypanel.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..74378cefd8ef30b6a656f7b209fe893b199ae207
+--- /dev/null
++++ b/viz/src/replaypanel.ts
+@@ -0,0 +1,387 @@
++// replaypanel.ts — control panel for the replay driver (a recorded run
++// republished faster than realtime under run id "{src}-replay"). demosrv
++// proxies the replay child's control plane:
++//
++//   GET  /api/replay/status → status JSON; 404 when no replay is active
++//   POST /api/replay/ctl/pause | /resume (409 while done — seek back first)
++//   POST /api/replay/ctl/speed  body {"speed":N}
++//   POST /api/replay/ctl/seek   body {"tick":T} (synchronous — 200 after landing)
++//
++// Every ctl POST returns the status JSON on success. The panel follows the
++// switcher/modelpanel probe discipline: init probes the status (5 tries,
++// 1 s apart — a startup hiccup must not hide the panel for the session)
++// and hides only after the last failure (404 included), so a normal live
++// demo never shows replay chrome. The stream side of a seek
++// (non-monotonic ticks) is handled in the snapshot pipeline — SeekGate in
++// snapshots.ts, wired in main.ts.
++//
++// Split per the repo convention (demos-core.ts/modelpanel.ts): the DOM-free
++// half — ReplayControl plus parseStatus/toggleTarget/viewModel — carries
++// every state transition so node --test can drive it with a stubbed fetch;
++// ReplayPanel is the thin DOM shell.
++
++export interface ReplayStatus {
++  run: string; // source run id
++  replayRun: string; // published run id ("{src}-replay")
++  tick: number;
++  ticks: number;
++  endTick: number;
++  speed: number;
++  paused: boolean;
++  done: boolean;
++  dt: number;
++  crcErrors: number; // replay-vs-recording divergence count — on-air trust signal
++  verbErrors: number;
++}
++
++// FetchLike is the structural slice of fetch the control plane needs, so
++// tests inject a stub and the panel defaults to the real thing.
++export type FetchLike = (
++  input: string,
++  init?: { method?: string; body?: string; signal?: AbortSignal },
++) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
++
++// parseStatus validates the demosrv payload defensively — a malformed body
++// is treated like a failed probe (the panel hides).
++export function parseStatus(body: unknown): ReplayStatus | null {
++  if (typeof body !== "object" || body === null) return null;
++  const b = body as Record<string, unknown>;
++  const tick = b["tick"];
++  const endTick = b["endTick"];
++  const speed = b["speed"];
++  const paused = b["paused"];
++  const done = b["done"];
++  const crcErrors = b["crcErrors"];
++  if (
++    typeof tick !== "number" ||
++    typeof endTick !== "number" ||
++    typeof speed !== "number" ||
++    typeof paused !== "boolean" ||
++    typeof done !== "boolean" ||
++    typeof crcErrors !== "number"
++  ) {
++    return null;
++  }
++  return {
++    run: typeof b["run"] === "string" ? b["run"] : "",
++    replayRun: typeof b["replayRun"] === "string" ? b["replayRun"] : "",
++    tick,
++    ticks: typeof b["ticks"] === "number" ? b["ticks"] : 0,
++    endTick,
++    speed,
++    paused,
++    done,
++    dt: typeof b["dt"] === "number" ? b["dt"] : 0,
++    crcErrors,
++    verbErrors: typeof b["verbErrors"] === "number" ? b["verbErrors"] : 0,
++  };
++}
++
++// toggleTarget picks the ctl endpoint for the play/pause button: paused or
++// done resumes (done → 409 until the user seeks back), playing pauses.
++export function toggleTarget(s: Pick<ReplayStatus, "paused" | "done">): "pause" | "resume" {
++  return s.paused || s.done ? "resume" : "pause";
++}
++
++export interface ReplayView {
++  toggleLabel: string;
++  toggleEndpoint: "pause" | "resume";
++  ended: boolean;
++  statusLine: string; // "tick 1200 / 36000 · 4×" (| paused | replay ended)
++  divergence: number; // crcErrors — render prominently when > 0
++}
++
++export function viewModel(s: ReplayStatus): ReplayView {
++  const endpoint = toggleTarget(s);
++  const state = s.done ? "replay ended" : s.paused ? "paused" : `${s.speed}×`;
++  return {
++    toggleLabel: endpoint === "resume" ? "⏵ resume" : "⏸ pause",
++    toggleEndpoint: endpoint,
++    ended: s.done,
++    statusLine: `tick ${s.tick} / ${s.endTick} · ${state}`,
++    divergence: s.crcErrors,
++  };
++}
++
++// Speed selector options (× realtime). SeekGate's maxJump = 240
++// (snapshots.ts) assumes this cap stays ≤ 8× at dt 0.1: per-frame tick
++// increments run speed · dt⁻¹ / 10 (8 ticks/frame at 8×, 10 Hz delivery) —
++// far below 240, so only deliberate scrubs trip the gate.
++export const SPEEDS: readonly number[] = [1, 2, 4, 8];
++
++export const SEEK_BACK_HINT = "replay ended — seek back first";
++
++// probeWithRetry gives the control plane a startup grace window: a
++// one-shot probe that catches demosrv or the replay child mid-hiccup
++// would hide the panel for the whole session. probe runs up to `attempts`
++// times, `retryMs` apart, and null is returned only after the LAST failure
++// — a plain live demo 404s every attempt and still hides, just a few
++// seconds later.
++export async function probeWithRetry(
++  probe: () => Promise<ReplayStatus | null>,
++  attempts: number,
++  retryMs: number,
++): Promise<ReplayStatus | null> {
++  for (let i = 1; ; i++) {
++    const s = await probe();
++    if (s !== null || i >= attempts) return s;
++    await new Promise((resolve) => setTimeout(resolve, retryMs));
++  }
++}
++
++// ReplayControl is the DOM-free state machine over the control plane. The
++// panel renders it; tests drive it with a stubbed FetchLike.
++export class ReplayControl {
++  // NOTE: erasable-syntax only (node strip-only mode loads this directly —
++  // no parameter properties).
++  status: ReplayStatus | null = null;
++  hint = ""; // transient operator message ("seek back first", ctl failures)
++  seekBusy = false; // a /seek round-trip is in flight — the slider disables
++  private fetchFn: FetchLike;
++
++  constructor(fetchFn: FetchLike) {
++    this.fetchFn = fetchFn;
++  }
++
++  // refresh GETs the status once; null on ANY failure (no replay active,
++  // backend gone, malformed body). The caller hides the panel on null.
++  async refresh(): Promise<ReplayStatus | null> {
++    try {
++      const resp = await this.fetchFn("/api/replay/status", { signal: AbortSignal.timeout(3000) });
++      if (!resp.ok) return null;
++      this.status = parseStatus(await resp.json());
++      return this.status;
++    } catch {
++      return null;
++    }
++  }
++
++  // toggle posts pause/resume per the current state.
++  async toggle(): Promise<void> {
++    if (this.status === null) return;
++    await this.ctl(toggleTarget(this.status));
++  }
++
++  async setSpeed(speed: number): Promise<void> {
++    await this.ctl("speed", { speed });
++  }
++
++  // seek lands the replay at tick (synchronous server-side) and returns
++  // whether it LANDED — the caller (main.ts via the panel's onSeeked hook)
++  // resets the stream pipeline only on success. Reentry while a round-trip
++  // is in flight is ignored — the slider stays disabled.
++  async seek(tick: number): Promise<boolean> {
++    if (this.seekBusy) return false;
++    this.seekBusy = true;
++    try {
++      return await this.ctl("seek", { tick });
++    } finally {
++      this.seekBusy = false;
++    }
++  }
++
++  // ctl posts one control verb; true when the response carried a fresh
++  // status (success), false on 409/failure (hint set instead).
++  private async ctl(path: string, body?: unknown): Promise<boolean> {
++    try {
++      const resp = await this.fetchFn(
++        `/api/replay/ctl/${path}`,
++        body === undefined ? { method: "POST" } : { method: "POST", body: JSON.stringify(body) },
++      );
++      if (resp.status === 409) {
++        this.hint = SEEK_BACK_HINT;
++        return false;
++      }
++      if (!resp.ok) {
++        this.hint = `${path} failed (${resp.status})`;
++        return false;
++      }
++      const s = parseStatus(await resp.json());
++      if (s !== null) {
++        this.status = s;
++        this.hint = "";
++        return true;
++      }
++      return false;
++    } catch {
++      this.hint = "control plane unreachable";
++      return false;
++    }
++  }
++}
++
++export interface ReplayPanelOptions {
++  fetchFn?: FetchLike;
++  pollMs?: number;
++  // onSeeked fires after a panel-driven seek LANDS (successful POST). The
++  // stream pipeline must reset explicitly: SeekGate's heuristic (backward,
++  // or forward jump > maxJump) misses forward scrubs ≤ maxJump, and the
++  // panel KNOWS it sought.
++  onSeeked?: () => void;
++  // onStatus fires on every successful status refresh. The status dt is
++  // the RECORDED run's authoritative timestep — the ?dt= URL hint comes
++  // from the (mutable) scenario and running-replay deep links carry none.
++  onStatus?: (s: ReplayStatus) => void;
++}
++
++export class ReplayPanel {
++  // NOTE: erasable-syntax only (node strip-only mode loads this directly).
++  private root: HTMLElement;
++  private ctl: ReplayControl;
++  private pollMs: number;
++  private onSeeked: (() => void) | null;
++  private onStatus: ((s: ReplayStatus) => void) | null;
++  private timer: ReturnType<typeof setInterval> | null = null;
++  private dragging = false; // slider thumb held — polls must not move it
++  private runEl: HTMLElement | null = null;
++  private toggleBtn: HTMLElement | null = null;
++  private speedEls = new Map<number, HTMLElement>();
++  private slider: HTMLInputElement | null = null;
++  private lineEl: HTMLElement | null = null;
++  private warnEl: HTMLElement | null = null;
++  private hintEl: HTMLElement | null = null;
++
++  constructor(root: HTMLElement, opts: ReplayPanelOptions = {}) {
++    this.root = root;
++    this.ctl = new ReplayControl(opts.fetchFn ?? ((input, init) => fetch(input, init)));
++    this.pollMs = opts.pollMs ?? 1000;
++    this.onSeeked = opts.onSeeked ?? null;
++    this.onStatus = opts.onStatus ?? null;
++  }
++
++  // init probes the replay status; on persistent failure the panel hides —
++  // a normal live demo must be unaffected (the switcher idiom). The probe
++  // retries (5×, 1 s apart) so a startup hiccup doesn't hide the panel for
++  // the session. Runs detached — the map must not wait on it.
++  async init(): Promise<void> {
++    const s = await probeWithRetry(() => this.ctl.refresh(), 5, 1000);
++    if (s === null) {
++      this.root.style.display = "none";
++      return;
++    }
++    this.onStatus?.(s); // first successful probe — the authoritative dt
++    this.build();
++    this.update();
++    this.timer = setInterval(() => void this.poll(), this.pollMs);
++  }
++
++  private async poll(): Promise<void> {
++    const s = await this.ctl.refresh();
++    if (s === null) {
++      this.hide(); // the replay child is gone — its chrome goes with it
++      return;
++    }
++    this.onStatus?.(s);
++    this.update();
++  }
++
++  private hide(): void {
++    if (this.timer !== null) {
++      clearInterval(this.timer);
++      this.timer = null;
++    }
++    this.root.style.display = "none";
++  }
++
++  private build(): void {
++    this.root.textContent = "";
++    const head = document.createElement("div");
++    head.className = "rp-head";
++    const title = document.createElement("span");
++    title.textContent = "⏯ replay";
++    head.appendChild(title);
++    this.runEl = document.createElement("span");
++    this.runEl.className = "rp-run";
++    head.appendChild(this.runEl);
++    this.root.appendChild(head);
++
++    const controls = document.createElement("div");
++    controls.className = "rp-controls";
++    this.toggleBtn = document.createElement("div");
++    this.toggleBtn.className = "rp-btn";
++    this.toggleBtn.onclick = () => void this.onToggle();
++    controls.appendChild(this.toggleBtn);
++    for (const sp of SPEEDS) {
++      const b = document.createElement("div");
++      b.className = "rp-btn rp-speed";
++      b.textContent = `${sp}×`;
++      b.onclick = () => void this.onSpeed(sp);
++      this.speedEls.set(sp, b);
++      controls.appendChild(b);
++    }
++    this.root.appendChild(controls);
++
++    this.slider = document.createElement("input");
++    this.slider.type = "range";
++    this.slider.min = "0";
++    this.slider.step = "1";
++    this.slider.addEventListener("pointerdown", () => {
++      this.dragging = true;
++    });
++    this.slider.addEventListener("pointerup", () => {
++      this.dragging = false;
++    });
++    this.slider.addEventListener("pointercancel", () => {
++      this.dragging = false; // a cancelled touch-drag must not stick the thumb
++    });
++    // "change" fires on release (and per arrow-key step) — the seek POSTs
++    // there, never mid-drag ("input").
++    this.slider.addEventListener("change", () => void this.onSeek());
++    this.root.appendChild(this.slider);
++
++    this.lineEl = document.createElement("div");
++    this.lineEl.className = "rp-line";
++    this.root.appendChild(this.lineEl);
++    this.warnEl = document.createElement("div");
++    this.warnEl.className = "rp-line rp-warn";
++    this.root.appendChild(this.warnEl);
++    this.hintEl = document.createElement("div");
++    this.hintEl.className = "rp-line rp-hint";
++    this.root.appendChild(this.hintEl);
++  }
++
++  private update(): void {
++    const s = this.ctl.status;
++    if (s === null) return;
++    const v = viewModel(s);
++    if (this.runEl) this.runEl.textContent = v.ended ? `${s.run} — replay ended` : s.run;
++    if (this.toggleBtn) this.toggleBtn.textContent = v.toggleLabel;
++    for (const [sp, el] of this.speedEls) el.classList.toggle("rp-on", sp === s.speed);
++    if (this.slider) {
++      this.slider.max = String(s.endTick);
++      this.slider.disabled = this.ctl.seekBusy;
++      // The slider follows the sim while playing — except mid-drag or
++      // mid-seek, when the user's thumb owns the position.
++      if (!this.dragging && !this.ctl.seekBusy) this.slider.value = String(s.tick);
++    }
++    if (this.lineEl) this.lineEl.textContent = v.statusLine;
++    if (this.warnEl) {
++      this.warnEl.style.display = v.divergence > 0 ? "" : "none";
++      this.warnEl.textContent = `⚠ divergence ${v.divergence}`;
++    }
++    if (this.hintEl) {
++      this.hintEl.style.display = this.ctl.hint === "" ? "none" : "";
++      this.hintEl.textContent = this.ctl.hint;
++    }
++  }
++
++  private async onToggle(): Promise<void> {
++    await this.ctl.toggle();
++    this.update();
++  }
++
++  private async onSpeed(speed: number): Promise<void> {
++    await this.ctl.setSpeed(speed);
++    this.update();
++  }
++
++  private async onSeek(): Promise<void> {
++    this.dragging = false;
++    if (this.slider === null) return;
++    const tick = Number(this.slider.value);
++    this.slider.disabled = true; // no slider moves during the round-trip
++    const landed = await this.ctl.seek(tick);
++    if (landed) this.onSeeked?.(); // the panel KNOWS it sought — reset explicitly
++    this.update();
++  }
++}
+diff --git a/viz/src/snapshots.ts b/viz/src/snapshots.ts
+index 384a7db2a57c6252cc0628119f539f1a47ebe0da..87be994e811550bb08fa663dc640cd702bb7d29e 100644
+--- a/viz/src/snapshots.ts
++++ b/viz/src/snapshots.ts
+@@ -46,7 +46,7 @@ function lerpAngle(a: number, b: number, t: number): number {
+ export class SnapshotBuffer {
+   private frames: TimedFrame[] = [];
+   readonly bufferMs: number;
+-  readonly simDt: number; // engine timestep, s — sim seconds per tick
++  simDt: number; // engine timestep, s — sim seconds per tick (see setSimDt)
+   private readonly maxFrames: number;
+ 
+   // NOTE: erasable-syntax only (node strip-only mode loads this directly).
+@@ -56,9 +56,20 @@ export class SnapshotBuffer {
+     this.maxFrames = maxFrames;
+   }
+ 
++  // setSimDt re-targets the sim seconds-per-tick behind speed derivation.
++  // On a replay the status payload carries the RECORDED run's authoritative
++  // dt — the ?dt= URL hint comes from the (mutable) scenario — so the
++  // replay panel pushes the status value down on its first probe (main.ts).
++  setSimDt(dt: number): void {
++    this.simDt = dt;
++  }
++
+   // push appends a decoded frame stamped with its receipt time. Out-of-order
+   // or duplicate ticks are dropped (core NATS is at-most-once; reordering is
+-  // not expected on a single subscriber, and the buffer is not a resync tool).
++  // not expected on a single subscriber, and the buffer is not a resync
++  // tool). A replay seek never reaches here as a drop or a jump: the caller
++  // detects it first (SeekGate below — backward tick or forward jump), resets
++  // the buffer, and the landing frame then pushes fresh.
+   push(frame: SnapshotFrame, recvMs: number): void {
+     const last = this.frames[this.frames.length - 1];
+     if (last && frame.tick <= last.frame.tick) return;
+@@ -68,6 +79,14 @@ export class SnapshotBuffer {
+     }
+   }
+ 
++  // reset drops every buffered frame. A replay seek abandons the buffered
++  // states — lerping the landing frame against them would smear vehicles
++  // across the jump — so the caller resets here and pushes the landing
++  // frame fresh (it renders as-is until the next frame arrives).
++  reset(): void {
++    this.frames = [];
++  }
++
+   // sample interpolates the render set for wall time nowMs. Returns null
+   // before the first frame arrives.
+   sample(nowMs: number): Sample | null {
+@@ -127,3 +146,36 @@ export class SnapshotBuffer {
+     return { vehicles, tick: newer.frame.tick, starved };
+   }
+ }
++
++// SeekGate detects seeks on a replay stream. A live run publishes strictly
++// increasing ticks; the replay control plane (demosrv /api/replay/ctl/seek)
++// restarts publication at the seek target, and paused replay republishes
++// the SAME tick. Two shapes are seeks: a tick DECREASE (scrub back) and a
++// forward jump beyond maxJump (scrub ahead — accepted-as-progression would
++// lerp across unrelated states and derive bogus speeds). The gate records
++// every observed tick and reports whether the stream jumped, so the caller
++// (main.ts) can drop the interpolation history (SnapshotBuffer.reset) and
++// wipe tick-derived overlay state before accepting the landing frame.
++// Equal ticks (paused republication) and normal increments report false —
++// push's own duplicate drop handles the former.
++export class SeekGate {
++  private lastTick: number | null = null;
++  private readonly maxJump: number;
++
++  // maxJump is the largest forward tick increment still treated as normal
++  // progression. Default 240 ticks = 24 sim-seconds at dt 0.1 — far beyond
++  // any decimated-frame increment or plausible delivery stall at demo
++  // paces, so only a deliberate scrub-ahead trips it.
++  constructor(maxJump = 240) {
++    this.maxJump = maxJump;
++  }
++
++  // observe records tick and returns true when it moved BACKWARD vs the
++  // previously observed tick or JUMPED forward past maxJump.
++  observe(tick: number): boolean {
++    const seek =
++      this.lastTick !== null && (tick < this.lastTick || tick - this.lastTick > this.maxJump);
++    this.lastTick = tick;
++    return seek;
++  }
++}
+diff --git a/viz/src/switcher.ts b/viz/src/switcher.ts
+index e1889417e665a05465e559a5d9a87ac517253b25..cd02f866b9d166580dd5d9b7e8cf1243de56c041 100644
+--- a/viz/src/switcher.ts
++++ b/viz/src/switcher.ts
+@@ -1,12 +1,14 @@
+ // switcher.ts — in-map demo switcher. When the map is served BY demosrv
+ // (engine/cmd/demosrv, port 8900) the viewer can swap demos without
+-// returning to the menu: the panel lists the registry, starts the picked
+-// engine through the same /api/demo endpoints the menu page uses, and
+-// navigates to the fresh run. The demosrv API probe doubles as the
+-// feature detect — standalone `pnpm dev` viewing (no backend in front)
+-// hides the switcher entirely rather than offering dead buttons.
++// returning to the menu: the panel lists the registry (demos AND
++// recordings — replay rows are suffixed "· REPLAY"), starts the picked
++// engine through the kind-routed start endpoint (demos-core.ts startPath —
++// the same routes the menu page uses), and navigates to the fresh run.
++// The demosrv API probe doubles as the feature detect — standalone
++// `pnpm dev` viewing (no backend in front) hides the switcher entirely
++// rather than offering dead buttons.
+ 
+-import type { DemoInfo } from "./demos-core.ts";
++import { startPath, type MenuEntry } from "./demos-core.ts";
+ 
+ // demoIdFromNetUrl recovers the demo id from a ?net=/net/{id}.geojson URL
+ // (the shape demosrv's start response and buildAppURL both produce).
+@@ -16,7 +18,7 @@ export function demoIdFromNetUrl(netUrl: string): string | null {
+ }
+ 
+ export class DemoSwitcher {
+-  private demos: DemoInfo[] = [];
++  private entries: MenuEntry[] = [];
+   // NOTE: erasable-syntax only (node strip-only mode loads this directly —
+   // no parameter properties).
+   private root: HTMLElement;
+@@ -33,8 +35,8 @@ export class DemoSwitcher {
+     try {
+       const resp = await fetch("/api/demos", { signal: AbortSignal.timeout(3000) });
+       if (!resp.ok) throw new Error(String(resp.status));
+-      const body = (await resp.json()) as { demos?: DemoInfo[] };
+-      this.demos = body.demos ?? [];
++      const body = (await resp.json()) as { demos?: MenuEntry[]; recordings?: MenuEntry[] };
++      this.entries = [...(body.demos ?? []), ...(body.recordings ?? [])];
+     } catch {
+       this.root.style.display = "none";
+       return;
+@@ -58,10 +60,11 @@ export class DemoSwitcher {
+     head.textContent = "☰ demos ▾";
+     head.onclick = () => this.renderCollapsed();
+     this.root.appendChild(head);
+-    for (const d of this.demos) {
++    for (const d of this.entries) {
+       const row = document.createElement("div");
+       row.className = "sw-row" + (d.id === this.currentId ? " sw-current" : "");
+-      row.textContent = d.title + (d.id === this.currentId ? " ●" : "");
++      row.textContent =
++        d.title + (d.kind === "replay" ? " · REPLAY" : "") + (d.id === this.currentId ? " ●" : "");
+       row.onclick = () => void this.pick(d, row);
+       this.root.appendChild(row);
+     }
+@@ -74,16 +77,17 @@ export class DemoSwitcher {
+     this.root.appendChild(menu);
+   }
+ 
+-  // pick starts the demo's engine via demosrv (which kills the previous
+-  // run — single-active-run) and navigates once the start URL arrives;
+-  // the POST already blocks until the new engine's port accepts, so the
+-  // fresh page opens a live socket.
+-  private async pick(d: DemoInfo, row: HTMLElement): Promise<void> {
++  // pick starts the entry's engine via demosrv (which kills the previous
++  // run — single-active-run), routed by kind (startPath: /api/demo/{id}
++  // vs /api/replay/{id}), and navigates once the start URL arrives; the
++  // POST already blocks until the new engine's port accepts, so the fresh
++  // page opens a live socket.
++  private async pick(d: MenuEntry, row: HTMLElement): Promise<void> {
+     if (d.id === this.currentId) return;
+     for (const el of this.root.querySelectorAll<HTMLElement>(".sw-row")) el.onclick = null;
+     row.textContent = d.title + " — starting…";
+     try {
+-      const resp = await fetch(`/api/demo/${d.id}/start`, { method: "POST" });
++      const resp = await fetch(startPath(d), { method: "POST" });
+       if (!resp.ok) throw new Error(String(resp.status));
+       const body = (await resp.json()) as { url: string };
+       location.href = body.url;
+diff --git a/viz/test/demos.test.ts b/viz/test/demos.test.ts
+index 9f2c135d07a50bb05a45d9788d5822d0880c75c9..dfa9b07c7a1ddf12d7e6ee8dc66d6f63b9c4ed38 100644
+--- a/viz/test/demos.test.ts
++++ b/viz/test/demos.test.ts
+@@ -6,7 +6,7 @@
+ import { test } from "node:test";
+ import assert from "node:assert/strict";
+ 
+-import { buildAppURL } from "../src/demos-core.ts";
++import { buildAppURL, buildReplayURL, deepLinkURL, startPath } from "../src/demos-core.ts";
+ import { demoIdFromNetUrl } from "../src/switcher.ts";
+ 
+ test("demoIdFromNetUrl recovers the demo id from the cache URL", () => {
+@@ -34,3 +34,26 @@ test("buildAppURL keys the map off run and the network cache off id", () => {
+   assert.ok(url.includes("run=seed-7"), "run id feeds ?run= (the NATS subject)");
+   assert.ok(url.includes("net=/net/i280-evening.geojson"), "demo id feeds the cached network");
+ });
++
++test("startPath routes activation by kind (demo → serve, replay → replay driver)", () => {
++  assert.equal(startPath({ id: "i280-baseline", kind: "demo" }), "/api/demo/i280-baseline/start");
++  assert.equal(startPath({ id: "rec1", kind: "replay" }), "/api/replay/rec1/start");
++});
++
++test("buildReplayURL deep-links the replay live plane ({run}-replay, no dt hint)", () => {
++  assert.equal(
++    buildReplayURL({ id: "rec1", run: "baseline" }),
++    "/app/?run=baseline-replay&net=/net/rec1.geojson",
++  );
++});
++
++test("deepLinkURL picks the running-card URL by kind", () => {
++  assert.equal(
++    deepLinkURL({ id: "i280-baseline", run: "baseline", kind: "demo" }),
++    "/app/?run=baseline&net=/net/i280-baseline.geojson",
++  );
++  assert.equal(
++    deepLinkURL({ id: "rec1", run: "baseline", kind: "replay" }),
++    "/app/?run=baseline-replay&net=/net/rec1.geojson",
++  );
++});
+diff --git a/viz/test/replaypanel.test.ts b/viz/test/replaypanel.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..22e7963cfa5b30d1cac8c4a84c4308aa51b16631
+--- /dev/null
++++ b/viz/test/replaypanel.test.ts
+@@ -0,0 +1,283 @@
++// replaypanel.test.ts — the DOM-free half of the replay panel (the repo
++// convention: pure/control logic is tested, the DOM shell is not — see
++// modelpanel.test.ts): status parsing, the view model, and the
++// ReplayControl state transitions (probe → hide, toggle → pause/resume,
++// 409 → seek-back hint, seek round-trip busy flag) against a stubbed
++// fetch.
++
++import { test } from "node:test";
++import assert from "node:assert/strict";
++
++import {
++  ReplayControl,
++  SEEK_BACK_HINT,
++  parseStatus,
++  probeWithRetry,
++  toggleTarget,
++  viewModel,
++  type FetchLike,
++  type ReplayStatus,
++} from "../src/replaypanel.ts";
++import { SeekGate, SnapshotBuffer } from "../src/snapshots.ts";
++import type { SnapshotFrame } from "../src/tssf.ts";
++
++function status(over: Partial<ReplayStatus> = {}): ReplayStatus {
++  return {
++    run: "baseline",
++    replayRun: "baseline-replay",
++    tick: 100,
++    ticks: 36000,
++    endTick: 36000,
++    speed: 4,
++    paused: false,
++    done: false,
++    dt: 0.1,
++    crcErrors: 0,
++    verbErrors: 0,
++    ...over,
++  };
++}
++
++interface Call {
++  url: string;
++  method: string;
++  body?: string;
++}
++
++// stubFetch records calls and answers from handler; handler may throw to
++// simulate an unreachable backend.
++function stubFetch(handler: (url: string, body?: string) => { status: number; json?: unknown }): {
++  fn: FetchLike;
++  calls: Call[];
++} {
++  const calls: Call[] = [];
++  const fn: FetchLike = (input, init) => {
++    calls.push({ url: input, method: init?.method ?? "GET", ...(init?.body !== undefined ? { body: init.body } : {}) });
++    const r = handler(input, init?.body);
++    return Promise.resolve({
++      ok: r.status >= 200 && r.status < 300,
++      status: r.status,
++      json: () => Promise.resolve(r.json),
++    });
++  };
++  return { fn, calls };
++}
++
++test("parseStatus: validates the demosrv payload, tolerates optional fields", () => {
++  const s = parseStatus({ tick: 5, endTick: 100, speed: 2, paused: true, done: false, crcErrors: 1 });
++  assert.ok(s);
++  assert.equal(s.tick, 5);
++  assert.equal(s.run, ""); // missing optional string → default
++  assert.equal(s.crcErrors, 1);
++  assert.equal(parseStatus(null), null);
++  assert.equal(parseStatus({ nope: 1 }), null);
++  assert.equal(parseStatus({ tick: "5", endTick: 100, speed: 2, paused: true, done: false, crcErrors: 0 }), null);
++});
++
++test("toggleTarget: playing pauses; paused or done resumes", () => {
++  assert.equal(toggleTarget(status({ paused: false, done: false })), "pause");
++  assert.equal(toggleTarget(status({ paused: true })), "resume");
++  assert.equal(toggleTarget(status({ done: true })), "resume");
++});
++
++test("viewModel: status line, toggle label, ended state, divergence count", () => {
++  const playing = viewModel(status({ tick: 1200, endTick: 36000, speed: 4 }));
++  assert.equal(playing.statusLine, "tick 1200 / 36000 · 4×");
++  assert.equal(playing.toggleLabel, "⏸ pause");
++  assert.equal(playing.toggleEndpoint, "pause");
++  assert.equal(playing.ended, false);
++  assert.equal(playing.divergence, 0);
++
++  const paused = viewModel(status({ paused: true }));
++  assert.equal(paused.statusLine, "tick 100 / 36000 · paused");
++  assert.equal(paused.toggleLabel, "⏵ resume");
++  assert.equal(paused.toggleEndpoint, "resume");
++
++  const ended = viewModel(status({ done: true, crcErrors: 3 }));
++  assert.equal(ended.statusLine, "tick 100 / 36000 · replay ended");
++  assert.equal(ended.ended, true);
++  assert.equal(ended.divergence, 3);
++});
++
++test("refresh: 404 or unreachable → null (the panel hides); 200 stores the status", async () => {
++  const missing = new ReplayControl(stubFetch(() => ({ status: 404 })).fn);
++  assert.equal(await missing.refresh(), null);
++  assert.equal(missing.status, null);
++
++  const down = new ReplayControl(
++    stubFetch(() => {
++      throw new Error("connection refused");
++    }).fn,
++  );
++  assert.equal(await down.refresh(), null);
++
++  const up = new ReplayControl(stubFetch(() => ({ status: 200, json: status({ tick: 42 }) })).fn);
++  const s = await up.refresh();
++  assert.equal(s?.tick, 42);
++  assert.equal(up.status?.speed, 4);
++
++  const malformed = new ReplayControl(stubFetch(() => ({ status: 200, json: { nope: 1 } })).fn);
++  assert.equal(await malformed.refresh(), null);
++});
++
++test("toggle: posts pause when playing, resume when paused; applies the returned status", async () => {
++  const { fn, calls } = stubFetch((url) =>
++    url.endsWith("/pause") ? { status: 200, json: status({ paused: true }) } : { status: 200, json: status({ paused: false }) },
++  );
++  const c = new ReplayControl(fn);
++  c.status = status({ paused: false });
++  await c.toggle();
++  assert.equal(calls[0]!.url, "/api/replay/ctl/pause");
++  assert.equal(calls[0]!.method, "POST");
++  assert.equal(c.status?.paused, true);
++  await c.toggle();
++  assert.equal(calls[1]!.url, "/api/replay/ctl/resume");
++  assert.equal(c.status?.paused, false);
++  assert.equal(c.hint, "");
++});
++
++test("toggle: 409 while done sets the seek-back hint and keeps the old status", async () => {
++  const { fn, calls } = stubFetch(() => ({ status: 409 }));
++  const c = new ReplayControl(fn);
++  c.status = status({ done: true });
++  await c.toggle();
++  assert.equal(calls[0]!.url, "/api/replay/ctl/resume");
++  assert.equal(c.hint, SEEK_BACK_HINT);
++  assert.equal(c.status.done, true); // unchanged — no status JSON on a 409
++  // A successful ctl afterwards clears the hint.
++  const ok = new ReplayControl(stubFetch(() => ({ status: 200, json: status({ tick: 7 }) })).fn);
++  ok.status = status({ done: true });
++  ok.hint = SEEK_BACK_HINT;
++  await ok.seek(7);
++  assert.equal(ok.hint, "");
++  assert.equal(ok.status.tick, 7);
++});
++
++test("setSpeed posts the speed body; seek posts the tick body", async () => {
++  const { fn, calls } = stubFetch(() => ({ status: 200, json: status() }));
++  const c = new ReplayControl(fn);
++  await c.setSpeed(8);
++  assert.equal(calls[0]!.url, "/api/replay/ctl/speed");
++  assert.equal(calls[0]!.body, JSON.stringify({ speed: 8 }));
++  await c.seek(500);
++  assert.equal(calls[1]!.url, "/api/replay/ctl/seek");
++  assert.equal(calls[1]!.body, JSON.stringify({ tick: 500 }));
++});
++
++test("seek: busy during the round-trip (slider disables), reentry ignored", async () => {
++  let release: () => void = () => {};
++  const gate = new Promise<void>((resolve) => {
++    release = resolve;
++  });
++  const calls: string[] = [];
++  const fn: FetchLike = (input) => {
++    calls.push(input);
++    return gate.then(() => ({ ok: true, status: 200, json: () => Promise.resolve(status({ tick: 500 })) }));
++  };
++  const c = new ReplayControl(fn);
++  const p = c.seek(500);
++  assert.equal(c.seekBusy, true); // the panel disables the slider now
++  await c.seek(600); // reentry mid-flight — must not POST
++  assert.deepEqual(calls, ["/api/replay/ctl/seek"]);
++  release();
++  await p;
++  assert.equal(c.seekBusy, false);
++  assert.equal(c.status?.tick, 500);
++});
++
++test("ctl failures surface as hints, never throw into the panel", async () => {
++  const server500 = new ReplayControl(stubFetch(() => ({ status: 500 })).fn);
++  server500.status = status();
++  await server500.toggle();
++  assert.match(server500.hint, /pause failed \(500\)/);
++
++  const offline = new ReplayControl(
++    stubFetch(() => {
++      throw new Error("down");
++    }).fn,
++  );
++  offline.status = status();
++  await offline.setSpeed(2);
++  assert.equal(offline.hint, "control plane unreachable");
++});
++
++test("probeWithRetry: retries past startup hiccups, gives up only after the last attempt", async () => {
++  // Fails twice, then the control plane answers — the panel must show.
++  let calls = 0;
++  const flaky = (): Promise<ReplayStatus | null> => {
++    calls++;
++    return Promise.resolve(calls < 3 ? null : status({ tick: 42 }));
++  };
++  const s = await probeWithRetry(flaky, 5, 1);
++  assert.equal(s?.tick, 42);
++  assert.equal(calls, 3);
++
++  // A plain live demo 404s every attempt — null after exactly 5 tries
++  // (the panel hides, a few seconds later than before).
++  let fails = 0;
++  const dead = (): Promise<ReplayStatus | null> => {
++    fails++;
++    return Promise.resolve(null);
++  };
++  assert.equal(await probeWithRetry(dead, 5, 1), null);
++  assert.equal(fails, 5);
++
++  // An immediate success wastes no retries.
++  let once = 0;
++  const first = (): Promise<ReplayStatus | null> => {
++    once++;
++    return Promise.resolve(status());
++  };
++  await probeWithRetry(first, 5, 1);
++  assert.equal(once, 1);
++});
++
++test("seek returns whether it LANDED (false on 409/failure — no reset callback fires)", async () => {
++  const conflict = new ReplayControl(stubFetch(() => ({ status: 409 })).fn);
++  conflict.status = status({ done: true });
++  assert.equal(await conflict.seek(5), false);
++  assert.equal(conflict.hint, SEEK_BACK_HINT);
++
++  const ok = new ReplayControl(stubFetch(() => ({ status: 200, json: status({ tick: 5 }) })).fn);
++  ok.status = status();
++  assert.equal(await ok.seek(5), true);
++});
++
++test("panel-driven forward seek (≤ maxJump) resets via the explicit callback — no smear", async () => {
++  // Mirrors main.ts wiring: ReplayControl.seek landed → onSeeked →
++  // buffer.reset() (+ congestion clear). +99 ticks is UNDER SeekGate's
++  // maxJump (240), so the gate alone would lerp across the jump — the
++  // explicit callback is the only thing that prevents the smear.
++  const b = new SnapshotBuffer(250);
++  const g = new SeekGate();
++  let gateResets = 0;
++  let explicitResets = 0;
++  const pushTick = (tick: number, recvMs: number): void => {
++    const f: SnapshotFrame = { tick, vehicles: [{ id: 1, x: tick, y: 0, angle: 0, cls: 0 }] };
++    if (g.observe(f.tick)) {
++      b.reset();
++      gateResets++;
++    }
++    b.push(f, recvMs);
++  };
++  pushTick(1000, 1000);
++  pushTick(1001, 1100);
++  const c = new ReplayControl(stubFetch(() => ({ status: 200, json: status({ tick: 1100 }) })).fn);
++  c.status = status();
++  const landed = await c.seek(1100); // +99 — under the gate's maxJump
++  assert.equal(landed, true);
++  if (landed) {
++    b.reset(); // main.ts's onSeeked
++    explicitResets++;
++  }
++  pushTick(1100, 1200); // the landing frame
++  assert.equal(gateResets, 0); // the gate alone would have missed this seek
++  assert.equal(explicitResets, 1);
++  const s = b.sample(1500)!;
++  assert.equal(s.tick, 1100);
++  assert.equal(s.vehicles[0]!.x, 1100); // as-is — never lerped toward 1001
++  assert.equal(s.vehicles[0]!.speed, 0); // no bogus cross-jump speed
++  // The gate stays armed as backstop: a backward seek still resets.
++  pushTick(500, 1300);
++  assert.equal(gateResets, 1);
++});
+diff --git a/viz/test/snapshots.test.ts b/viz/test/snapshots.test.ts
+index e3dcfc7be48d787252ec5b352917a9bd8a04b2cf..5923676ee62e43d27ab384b2c6be946a0d08ed02 100644
+--- a/viz/test/snapshots.test.ts
++++ b/viz/test/snapshots.test.ts
+@@ -5,7 +5,7 @@
+ import { test } from "node:test";
+ import assert from "node:assert/strict";
+ 
+-import { SnapshotBuffer } from "../src/snapshots.ts";
++import { SnapshotBuffer, SeekGate } from "../src/snapshots.ts";
+ import type { SnapshotFrame } from "../src/tssf.ts";
+ 
+ function frame(tick: number, vehicles: Array<[number, number, number]>): SnapshotFrame {
+@@ -141,3 +141,115 @@ test("custom dt scales the sim-time speed", () => {
+   // 2 ticks × 0.05 s = 0.1 s sim span → 10 m/s
+   assert.ok(Math.abs(b.sample(1300)!.vehicles[0]!.speed - 10) < 1e-9);
+ });
++
++// --- Replay seek handling (SeekGate + SnapshotBuffer.reset, wired in ---
++// --- main.ts's snapshot callback) ----------------------------------------
++
++test("SeekGate: backward and forward-jump are seeks; first/duplicate/normal ticks are not", () => {
++  const g = new SeekGate();
++  assert.equal(g.observe(10), false); // first frame — nothing to compare
++  assert.equal(g.observe(11), false); // normal increment
++  assert.equal(g.observe(11), false); // duplicate (paused republication)
++  assert.equal(g.observe(250), false); // +240 — the boundary, still progression
++  assert.equal(g.observe(491), true); // +241 — forward scrub-ahead seek
++  assert.equal(g.observe(492), false); // normal increment after landing
++  assert.equal(g.observe(4), true); // backward seek
++  assert.equal(g.observe(5), false); // forward from the landing tick
++  assert.equal(g.observe(0), true); // seek to the start
++});
++
++test("SeekGate: maxJump is configurable", () => {
++  const g = new SeekGate(5);
++  assert.equal(g.observe(10), false);
++  assert.equal(g.observe(15), false); // exactly +5 — progression
++  assert.equal(g.observe(21), true); // +6 — jump
++});
++
++test("replay seek: buffer resets and renders the landing frame; duplicates don't reset", () => {
++  const b = new SnapshotBuffer(250);
++  const g = new SeekGate();
++  // The harness mirrors main.ts's snapshot callback: on a seek, reset the
++  // buffer and fire the overlay clear; then push the landing frame.
++  let clears = 0;
++  const onFrame = (tick: number, recvMs: number): void => {
++    const f = frame(tick, [[1, tick * 10, 0]]);
++    if (g.observe(f.tick)) {
++      b.reset();
++      clears++;
++    }
++    b.push(f, recvMs);
++  };
++  onFrame(10, 1000);
++  onFrame(11, 1100);
++  onFrame(4, 1200); // backward seek
++  assert.equal(clears, 1);
++  // The landing frame renders as-is — never lerped against tick 11's
++  // abandoned future (x 110).
++  const s = b.sample(1500)!;
++  assert.equal(s.tick, 4);
++  assert.equal(s.vehicles[0]!.x, 40);
++  onFrame(4, 1300); // paused republication: duplicate tick, no reset
++  assert.equal(clears, 1);
++  onFrame(5, 1400); // forward: no reset
++  assert.equal(clears, 1);
++  const s2 = b.sample(1700)!; // starved-hold on the (4, 5) pair
++  assert.equal(s2.tick, 5);
++  assert.equal(s2.vehicles[0]!.x, 50);
++});
++
++test("replay seek: forward stream after a backward seek lerps normally", () => {
++  const b = new SnapshotBuffer(250);
++  const g = new SeekGate();
++  const onFrame = (tick: number, recvMs: number): void => {
++    const f = frame(tick, [[1, tick * 10, 0]]);
++    if (g.observe(f.tick)) b.reset();
++    b.push(f, recvMs);
++  };
++  onFrame(10, 1000);
++  onFrame(11, 1100);
++  onFrame(4, 1200); // seek
++  onFrame(5, 1300); // replay resumes forward
++  // renderAt = 1250 → t = 0.5 between the landing frame and the next one.
++  const s = b.sample(1500)!;
++  assert.equal(s.tick, 5);
++  assert.equal(s.vehicles[0]!.x, 45);
++});
++
++test("replay forward scrub: buffer resets, no lerp across the jump", () => {
++  const b = new SnapshotBuffer(250);
++  const g = new SeekGate();
++  let clears = 0;
++  const onFrame = (tick: number, recvMs: number): void => {
++    const f = frame(tick, [[1, tick * 10, 0]]);
++    if (g.observe(f.tick)) {
++      b.reset();
++      clears++;
++    }
++    b.push(f, recvMs);
++  };
++  onFrame(10, 1000);
++  onFrame(11, 1100);
++  onFrame(1000, 1200); // scrub ahead — +989 ticks, past SeekGate's maxJump
++  assert.equal(clears, 1);
++  // The landing frame renders as-is — never lerped against tick 11 (x 110),
++  // and no bogus speed is derived across the jump.
++  const s = b.sample(1500)!;
++  assert.equal(s.tick, 1000);
++  assert.equal(s.vehicles[0]!.x, 10000);
++  assert.equal(s.vehicles[0]!.speed, 0);
++  onFrame(1001, 1300); // resumes forward — no reset
++  assert.equal(clears, 1);
++});
++
++test("setSimDt re-targets speed derivation (the recorded run's authoritative dt wins)", () => {
++  // main.ts's onStatus hook: the replay status dt overrides the ?dt= URL
++  // hint on the first probe — already-buffered frames then derive speeds
++  // against the corrected timestep.
++  const b = new SnapshotBuffer(250, 0.1);
++  b.push(frame(1, [[1, 0, 0]]), 1000);
++  b.push(frame(2, [[1, 1, 0]]), 1100);
++  assert.ok(Math.abs(b.sample(1300)!.vehicles[0]!.speed - 10) < 1e-9);
++  b.setSimDt(0.05); // the recording was made at dt 0.05, not the URL's 0.1
++  assert.ok(Math.abs(b.sample(1300)!.vehicles[0]!.speed - 20) < 1e-9);
++  assert.equal(b.simDt, 0.05);
++});

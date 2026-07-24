@@ -1,0 +1,21 @@
+ engine/cmd/demosrv/demos.example.json |  13 +-
+ engine/cmd/demosrv/demosrv_test.go    |  74 +++++-
+ engine/cmd/demosrv/geojson.go         |   9 +-
+ engine/cmd/demosrv/main.go            | 131 +++++++----
+ engine/cmd/demosrv/registry.go        | 143 ++++++++++--
+ engine/cmd/demosrv/replay.go          | 131 +++++++++++
+ engine/cmd/demosrv/replay_test.go     | 428 ++++++++++++++++++++++++++++++++++
+ engine/cmd/demosrv/supervisor.go      |  93 ++++++--
+ engine/cmd/serve/main.go              |   9 +
+ viz/demos.html                        |   5 +
+ viz/index.html                        |  17 ++
+ viz/src/demos-core.ts                 |  54 ++++-
+ viz/src/demos.ts                      |  51 ++--
+ viz/src/main.ts                       |  64 ++++-
+ viz/src/replaypanel.ts                | 387 ++++++++++++++++++++++++++++++
+ viz/src/snapshots.ts                  |  56 ++++-
+ viz/src/switcher.ts                   |  38 +--
+ viz/test/demos.test.ts                |  25 +-
+ viz/test/replaypanel.test.ts          | 283 ++++++++++++++++++++++
+ viz/test/snapshots.test.ts            | 114 ++++++++-
+ 20 files changed, 1987 insertions(+), 138 deletions(-)

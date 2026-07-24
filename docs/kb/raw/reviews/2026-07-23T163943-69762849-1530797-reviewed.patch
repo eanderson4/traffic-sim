@@ -1,0 +1,1097 @@
+diff --git a/engine/cmd/replay/main.go b/engine/cmd/replay/main.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..1b0353972cad82fd81e43ca332dd6cfd830d8a90
+--- /dev/null
++++ b/engine/cmd/replay/main.go
+@@ -0,0 +1,131 @@
++// replay is the VCR driver for recorded runs: it re-simulates a run from
++// its durable JetStream record plane (written earlier by serve -store DIR)
++// and PUBLISHES the live plane — snapshots and the signal table under the
++// fresh run id {run}-replay — at a configurable pace, with an HTTP control
++// plane (pause/resume/speed/seek) for the demo UI. The MapLibre viz
++// subscribes ts.{run}-replay.state.snap / ts.{run}-replay.state.sig over
++// the broker's WebSocket listener and renders whatever arrives.
++//
++// STORE EXCLUSIVITY: exactly one broker may open a JetStream store dir at
++// a time (no locking exists). The serve that recorded the run must have
++// EXITED before replay starts — demosrv enforces this by kill-before-spawn.
++//
++// CRC divergence policy: log loudly and continue (counted in /status) — a
++// demo must not die on air; natsio.ReplayFromStream remains the strict
++// audit path. At the end of the recording the player holds position: it
++// stays up, paused at the final tick, still serving /status and /seek.
++package main
++
++import (
++	"flag"
++	"fmt"
++	"net"
++	"net/http"
++	"os"
++	"os/signal"
++	"strconv"
++	"syscall"
++	"time"
++
++	server "github.com/nats-io/nats-server/v2/server"
++	"github.com/nats-io/nats.go"
++
++	"traffic-sim/engine/natsio"
++)
++
++func main() {
++	store := flag.String("store", "", "durable JetStream store dir written by serve -store (required); the recording serve must have exited first — one broker per store dir")
++	run := flag.String("run", "", "recorded run id to replay (required); the live plane is published under {run}-replay")
++	speed := flag.Float64("speed", 1, "playback pace multiplier (1 = realtime; snapshots decimate to ~10 Hz wall at any pace)")
++	wsAddr := flag.String("ws", "127.0.0.1:8443", "WebSocket listen address for browser clients (host:port)")
++	httpAddr := flag.String("http", "127.0.0.1:8901", "HTTP control-plane listen address (host:port)")
++	flag.Parse()
++
++	if *store == "" {
++		fmt.Fprintln(os.Stderr, "replay: -store is required")
++		os.Exit(2)
++	}
++	if *run == "" {
++		fmt.Fprintln(os.Stderr, "replay: -run is required")
++		os.Exit(2)
++	}
++	host, portStr, err := net.SplitHostPort(*wsAddr)
++	if err != nil {
++		fmt.Fprintln(os.Stderr, "replay: -ws:", err)
++		os.Exit(2)
++	}
++	port, err := strconv.Atoi(portStr)
++	if err != nil || port <= 0 || port > 65535 {
++		fmt.Fprintf(os.Stderr, "replay: -ws: bad port %q\n", portStr)
++		os.Exit(2)
++	}
++
++	// Embedded broker on the recorded store (ADR-0006 §8 single-binary
++	// demo): no client-port listener, WebSocket listener for the browser
++	// plane. The recording serve must have exited — the store is
++	// single-server.
++	ns, err := server.NewServer(&server.Options{
++		DontListen: true,
++		JetStream:  true,
++		StoreDir:   *store,
++		Websocket:  server.WebsocketOpts{Host: host, Port: port, NoTLS: true},
++	})
++	if err != nil {
++		fmt.Fprintln(os.Stderr, "replay: nats-server:", err)
++		os.Exit(1)
++	}
++	ns.Start()
++	if !ns.ReadyForConnections(10 * time.Second) {
++		fmt.Fprintln(os.Stderr, "replay: nats-server not ready")
++		os.Exit(1)
++	}
++	defer ns.Shutdown()
++
++	nc, err := nats.Connect(nats.DefaultURL, nats.InProcessServer(ns), nats.Name("replay"))
++	if err != nil {
++		fmt.Fprintln(os.Stderr, "replay: connect:", err)
++		os.Exit(1)
++	}
++	defer nc.Close()
++	js, err := nc.JetStream()
++	if err != nil {
++		fmt.Fprintln(os.Stderr, "replay: JetStream:", err)
++		os.Exit(1)
++	}
++
++	player, err := natsio.NewPlayer(nc, js, natsio.PlayerConfig{Run: *run, Speed: *speed})
++	if err != nil {
++		fmt.Fprintln(os.Stderr, "replay:", err)
++		os.Exit(1)
++	}
++
++	httpSrv := &http.Server{
++		Addr:              *httpAddr,
++		Handler:           player.Handler(),
++		ReadHeaderTimeout: 5 * time.Second,
++	}
++	go func() {
++		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
++			fmt.Fprintln(os.Stderr, "replay: http control plane:", err)
++		}
++	}()
++	go func() { _ = player.Run() }()
++
++	wsURL := fmt.Sprintf("ws://%s:%d", host, port)
++	if host == "" || host == "0.0.0.0" {
++		wsURL = fmt.Sprintf("ws://127.0.0.1:%d", port)
++	}
++	st := player.Status()
++	fmt.Printf("replay: run %q → %q (%d ticks @ %gx)\n", st.Run, st.ReplayRun, st.Ticks, st.Speed)
++	fmt.Printf("replay: snapshots on %s — point the viz at it (?run=%s&ws=%s)\n",
++		natsio.SubjectStateSnap(st.ReplayRun), st.ReplayRun, wsURL)
++	fmt.Printf("replay: control plane on http://%s (POST /pause /resume /speed /seek, GET /status)\n", *httpAddr)
++
++	sig := make(chan os.Signal, 1)
++	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
++	<-sig
++	fmt.Println("\nreplay: interrupted")
++	player.Stop()
++	<-player.Done()
++	_ = httpSrv.Close()
++}
+diff --git a/engine/natsio/player.go b/engine/natsio/player.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..fc8f219442c2ee98f3d49911be2f0c3facd2dadd
+--- /dev/null
++++ b/engine/natsio/player.go
+@@ -0,0 +1,439 @@
++package natsio
++
++import (
++	"encoding/json"
++	"fmt"
++	"log"
++	"math"
++	"net/http"
++	"os"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/nats-io/nats.go"
++	"traffic-sim/engine"
++)
++
++// player.go — the VCR driver: a paced, PUBLISHING replay of a recorded run.
++// Where ReplayFromStream is the read-only audit path (verify, abort on
++// divergence, publish nothing), the Player re-simulates the same record for
++// a demo audience: it publishes the live plane (snapshots on
++// ts.{run}-replay.state.snap, the signal table on ts.{run}-replay.state.sig)
++// under a FRESH run id at a configurable pace, with an HTTP control plane
++// (pause/resume/speed/seek) for the demo UI.
++//
++// Deliberate departures from the audit path:
++//   - CRC divergence is logged loudly (stderr) and counted in /status, and
++//     playback CONTINUES — a demo must not die on air. ReplayFromStream's
++//     abort semantics are untouched.
++//   - The Player has no Recorder, no Contract, no demand director, and no
++//     driver — non-attachment is structural (there are no such fields).
++//     The bus is assembled without its intent subscription.
++//
++// Concurrency: the engine is single-goroutine. The Run goroutine is the
++// only one that touches it; HTTP handlers only flip mutex-protected control
++// state (pause/speed) or hand a seek request over a channel that Run
++// services between ticks.
++//
++// End of recording: at spec.Ticks (or log exhaustion) the Player holds
++// position — it stays up, paused at the final tick, still serving the
++// control plane (a seek moves the playhead back; resume replays from
++// there).
++
++// PlayerConfig configures a Player.
++type PlayerConfig struct {
++	// Run is the recorded run id to replay (required, single token).
++	Run string
++	// Speed is the initial playback pace multiplier; 0 means 1 (realtime).
++	Speed float64
++	// Log receives divergence and operational lines (default: stderr).
++	Log *log.Logger
++}
++
++// PlayerStatus is the GET /status body and the response body of every
++// control POST.
++type PlayerStatus struct {
++	Run       string  `json:"run"`
++	ReplayRun string  `json:"replayRun"`
++	Tick      uint64  `json:"tick"`
++	Ticks     uint64  `json:"ticks"`
++	Speed     float64 `json:"speed"`
++	Paused    bool    `json:"paused"`
++	CRCErrors uint64  `json:"crcErrors"`
++}
++
++// Player is the paced, publishing replay engine driver.
++type Player struct {
++	js        nats.JetStreamContext
++	src       string // recorded run id
++	replayRun string // src + "-replay"
++	spec      engine.RunSpec
++	stream    string
++	log       *log.Logger
++
++	idx           *logIndex
++	keyframeEvery uint64 // derived from the record (signal-table cadence)
++	endTick       uint64 // min(spec.Ticks, last logged tick)
++
++	bus *Bus
++	e   *engine.Engine // owned by the Run goroutine
++
++	mu     sync.Mutex // guards paused, speed
++	paused bool
++	speed  float64
++
++	curTick  atomic.Uint64 // mirror of e.Tick for the control plane
++	crcErrs  atomic.Uint64
++	done     atomic.Bool // holding at endTick
++	stopping atomic.Bool
++
++	seekCh  chan seekRequest
++	runDone chan struct{} // closed when Run returns
++}
++
++// seekRequest is a /seek call handed to the Run goroutine; ack carries the
++// outcome back to the HTTP handler once the seek has executed.
++type seekRequest struct {
++	tick uint64
++	ack  chan error
++}
++
++// NewPlayer prepares a replay of the recorded run cfg.Run: it reads the run
++// registry meta (fail loud if the run is unknown to this store), restores
++// the tick-0 keyframe, and materializes the whole log — the recording is
++// immutable once the serving broker has exited, so per-tick re-enqueue
++// reads the index, never the stream (seek keyframes are re-fetched on
++// demand). Nothing is published and nothing steps until Run.
++func NewPlayer(nc *nats.Conn, js nats.JetStreamContext, cfg PlayerConfig) (*Player, error) {
++	if err := validToken("run id", cfg.Run); err != nil {
++		return nil, err
++	}
++	replayRun := cfg.Run + "-replay"
++	if err := validToken("replay run id", replayRun); err != nil {
++		return nil, fmt.Errorf("cannot derive a replay run id from %q: %w", cfg.Run, err)
++	}
++	speed := cfg.Speed
++	if speed == 0 {
++		speed = 1
++	}
++	if err := checkSpeed(speed); err != nil {
++		return nil, err
++	}
++	lg := cfg.Log
++	if lg == nil {
++		lg = log.New(os.Stderr, "", 0)
++	}
++
++	reg, err := NewRegistry(js)
++	if err != nil {
++		return nil, err
++	}
++	meta, err := reg.Meta(cfg.Run)
++	if err != nil {
++		return nil, fmt.Errorf("no run registry meta for %q (was it recorded to this store?): %w", cfg.Run, err)
++	}
++	spec := meta.Spec
++	if v := spec.Params.Dt / speed * float64(time.Second); math.IsInf(v, 0) || v < 1 || v >= float64(math.MaxInt64) {
++		return nil, fmt.Errorf("speed %g puts the tick floor outside the representable range", speed)
++	}
++	stream := StreamName(cfg.Run)
++
++	// Anchor on the tick-0 keyframe (recorder LogStart guarantees it: every
++	// seek target ≥ 0 then has a keyframe ≤ target).
++	kf, err := findKeyframe(js, stream, cfg.Run, 0)
++	if err != nil {
++		return nil, fmt.Errorf("run %q: %w", cfg.Run, err)
++	}
++	e, err := engine.RestoreState(spec, kf.payload)
++	if err != nil {
++		return nil, fmt.Errorf("run %q: restore tick-0 keyframe: %w", cfg.Run, err)
++	}
++	msgs, err := fetchFrom(js, stream, cfg.Run, 1)
++	if err != nil {
++		return nil, err
++	}
++	idx, err := indexLogMsgs(msgs, cfg.Run)
++	if err != nil {
++		return nil, err
++	}
++	// The signal-table republication cadence mirrors run.go's keyframe
++	// cadence; the record itself is the source of truth for it.
++	kfEvery := uint64(100)
++	if len(idx.keyframes) >= 2 {
++		kfEvery = idx.keyframes[1] - idx.keyframes[0]
++	}
++	end := spec.Ticks
++	if idx.lastTick < end {
++		end = idx.lastTick
++	}
++
++	// The live plane under the fresh replay run id, WITHOUT the intent
++	// subscription NewBus would attach: the player has no contract plane —
++	// it only publishes.
++	bus := &Bus{nc: nc, run: replayRun, geoms: LaneGeoms(e.Net), lastAppl: map[string]uint64{}}
++
++	p := &Player{
++		js: js, src: cfg.Run, replayRun: replayRun, spec: spec, stream: stream, log: lg,
++		idx: idx, keyframeEvery: kfEvery, endTick: end,
++		bus: bus, e: e, speed: speed,
++		seekCh: make(chan seekRequest), runDone: make(chan struct{}),
++	}
++	p.curTick.Store(e.Tick)
++	return p, nil
++}
++
++// ReplayRun is the fresh run id the live plane is published under.
++func (p *Player) ReplayRun() string { return p.replayRun }
++
++// Done closes when the Run loop exits.
++func (p *Player) Done() <-chan struct{} { return p.runDone }
++
++// Stop asks the Run loop to exit (it returns between ticks).
++func (p *Player) Stop() { p.stopping.Store(true) }
++
++// Run drives the playback: publish the opening frames, then loop — service
++// pending seeks, honor pause/end-of-recording holds, re-simulate one tick,
++// publish at the decimated cadence, sleep the remainder of dt/speed. It
++// returns when Stop is called; the end of the recording is a hold, not an
++// exit.
++func (p *Player) Run() error {
++	defer close(p.runDone)
++	// Opening frames: the signal table once (republished at the keyframe
++	// cadence from here on, mirroring run.go) and the tick-0 snapshot so a
++	// browser attaching before the first tick already sees the network.
++	p.bus.PublishSignals(p.e)
++	p.bus.PublishSnapshot(p.e)
++
++	for !p.stopping.Load() {
++		select {
++		case req := <-p.seekCh:
++			req.ack <- p.seek(req.tick)
++		default:
++		}
++
++		p.mu.Lock()
++		paused, speed := p.paused, p.speed
++		p.mu.Unlock()
++
++		if p.e.Tick >= p.endTick {
++			// End of the recording: hold position — stay up, paused, still
++			// serving the control plane (a seek moves the playhead back).
++			if p.done.CompareAndSwap(false, true) {
++				p.mu.Lock()
++				p.paused = true
++				p.mu.Unlock()
++				// Land exactly on the final tick even when the decimation
++				// stride would have skipped it.
++				p.bus.PublishSnapshot(p.e)
++				p.log.Printf("replay: end of recording at tick %d — holding paused (seek to move, stop to quit)", p.e.Tick)
++			}
++			time.Sleep(pausePoll)
++			continue
++		}
++		if paused {
++			time.Sleep(pausePoll)
++			continue
++		}
++
++		tickStart := time.Now()
++		p.stepTick()
++		if p.e.Tick%decimation(speed) == 0 {
++			p.bus.PublishSnapshot(p.e)
++		}
++		if p.e.Tick%p.keyframeEvery == 0 {
++			// Signal-table catch-up rides the keyframe cadence (run.go).
++			p.bus.PublishSignals(p.e)
++		}
++		// Pacing (ADR-0005 §4) is the wrapper's business: sleep the
++		// remainder of dt/speed. Never inside the engine Step path.
++		if floor := tickFloor(p.spec.Params.Dt, speed); floor > 0 {
++			if d := time.Since(tickStart); d < floor {
++				time.Sleep(floor - d)
++			}
++		}
++	}
++	return nil
++}
++
++// stepTick advances one tick: re-enqueue the logged intents and director
++// verbs for the tick, Step, verify the logged CRC. Divergence policy is
++// LOUD-AND-CONTINUE (stderr + the /status counter) — ReplayFromStream
++// remains the strict audit path. Run-goroutine only.
++func (p *Player) stepTick() {
++	next := p.e.Tick + 1
++	for _, k := range p.idx.intents[next] {
++		p.e.EnqueueIntent(k)
++	}
++	for _, d := range p.idx.verbs[next] {
++		if err := p.e.EnqueueSpawn(d); err != nil {
++			p.crcErrs.Add(1)
++			p.log.Printf("replay: verb %q at tick %d rejected (%v) — record and spec disagree; continuing", d.RequestID, next, err)
++		}
++	}
++	p.e.Step()
++	if want, ok := p.idx.crcs[next]; ok && p.e.CRC() != want {
++		n := p.crcErrs.Add(1)
++		p.log.Printf("replay: CRC divergence at tick %d: crc %016x, logged %016x (divergence #%d; continuing)",
++			next, p.e.CRC(), want, n)
++	}
++	p.curTick.Store(p.e.Tick)
++}
++
++// seek moves the playhead to target: nearest keyframe ≤ target (clamped to
++// the tick-0 keyframe floor and to the end of the record), RestoreState,
++// silent re-sim (CRC-verified, nothing published) up to target, then one
++// frame at the landing tick — also while paused, so the user sees where
++// they landed. Cost ≤ the keyframe cadence in ticks (recorder
++// KeyframeEvery, default 100). Run-goroutine only.
++func (p *Player) seek(target uint64) error {
++	if target > p.endTick {
++		target = p.endTick
++	}
++	kf, err := findKeyframe(p.js, p.stream, p.src, target)
++	if err != nil {
++		return err
++	}
++	e, err := engine.RestoreState(p.spec, kf.payload)
++	if err != nil {
++		return fmt.Errorf("restore keyframe tick %d: %w", kf.tick, err)
++	}
++	p.e = e
++	p.curTick.Store(e.Tick)
++	for p.e.Tick < target {
++		p.stepTick()
++	}
++	p.done.Store(false)
++	p.bus.PublishSnapshot(p.e)
++	if p.e.Tick%p.keyframeEvery == 0 {
++		p.bus.PublishSignals(p.e)
++	}
++	return nil
++}
++
++// Status snapshots the player for the control plane.
++func (p *Player) Status() PlayerStatus {
++	p.mu.Lock()
++	paused, speed := p.paused, p.speed
++	p.mu.Unlock()
++	return PlayerStatus{
++		Run:       p.src,
++		ReplayRun: p.replayRun,
++		Tick:      p.curTick.Load(),
++		Ticks:     p.spec.Ticks,
++		Speed:     speed,
++		Paused:    paused,
++		CRCErrors: p.crcErrs.Load(),
++	}
++}
++
++// Handler returns the HTTP control plane (stdlib net/http, JSON, no
++// framework):
++//
++//	POST /pause                  hold the playhead (the viz keeps its last frame)
++//	POST /resume                 continue stepping
++//	POST /speed  {"speed": N}    live pace change; the publish stride is recomputed
++//	POST /seek   {"tick": T}     keyframe ≤ T, silent re-sim, one frame at T
++//	                             (also while paused); 200 once the seek executed
++//	GET  /status                 PlayerStatus JSON
++//
++// Every successful POST answers with the PlayerStatus JSON after the change
++// took effect. Handlers never touch the engine: they set mutex-protected
++// control state or hand the seek to the Run goroutine, which executes it
++// between ticks.
++func (p *Player) Handler() http.Handler {
++	mux := http.NewServeMux()
++	mux.HandleFunc("POST /pause", func(w http.ResponseWriter, _ *http.Request) {
++		p.mu.Lock()
++		p.paused = true
++		p.mu.Unlock()
++		p.writeStatus(w)
++	})
++	mux.HandleFunc("POST /resume", func(w http.ResponseWriter, _ *http.Request) {
++		p.mu.Lock()
++		p.paused = false
++		p.mu.Unlock()
++		p.writeStatus(w)
++	})
++	mux.HandleFunc("POST /speed", func(w http.ResponseWriter, r *http.Request) {
++		var body struct {
++			Speed float64 `json:"speed"`
++		}
++		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++			http.Error(w, `bad JSON body (want {"speed": N})`, http.StatusBadRequest)
++			return
++		}
++		if err := checkSpeed(body.Speed); err != nil {
++			http.Error(w, err.Error(), http.StatusBadRequest)
++			return
++		}
++		if v := p.spec.Params.Dt / body.Speed * float64(time.Second); math.IsInf(v, 0) || v < 1 || v >= float64(math.MaxInt64) {
++			http.Error(w, fmt.Sprintf("speed %g puts the tick floor outside the representable range", body.Speed), http.StatusBadRequest)
++			return
++		}
++		p.mu.Lock()
++		p.speed = body.Speed
++		p.mu.Unlock()
++		p.writeStatus(w)
++	})
++	mux.HandleFunc("POST /seek", func(w http.ResponseWriter, r *http.Request) {
++		var body struct {
++			Tick uint64 `json:"tick"`
++		}
++		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++			http.Error(w, `bad JSON body (want {"tick": T})`, http.StatusBadRequest)
++			return
++		}
++		req := seekRequest{tick: body.Tick, ack: make(chan error, 1)}
++		select {
++		case p.seekCh <- req:
++		case <-p.runDone:
++			http.Error(w, "player stopped", http.StatusServiceUnavailable)
++			return
++		}
++		select {
++		case err := <-req.ack:
++			if err != nil {
++				http.Error(w, "seek failed: "+err.Error(), http.StatusInternalServerError)
++				return
++			}
++		case <-p.runDone:
++			http.Error(w, "player stopped", http.StatusServiceUnavailable)
++			return
++		}
++		p.writeStatus(w)
++	})
++	mux.HandleFunc("GET /status", func(w http.ResponseWriter, _ *http.Request) {
++		p.writeStatus(w)
++	})
++	return mux
++}
++
++func (p *Player) writeStatus(w http.ResponseWriter) {
++	w.Header().Set("Content-Type", "application/json")
++	_ = json.NewEncoder(w).Encode(p.Status())
++}
++
++// decimation is the snapshot publish stride: every k-th tick with
++// k = max(1, round(speed)). With dt = 100 ms the tick rate is 10·speed Hz,
++// so the published rate holds ≈10 Hz wall at any pace (speed 8 → every 8th
++// tick).
++func decimation(speed float64) uint64 {
++	k := uint64(math.Round(speed))
++	if k < 1 {
++		k = 1
++	}
++	return k
++}
++
++// tickFloor is the wall-time budget per tick at the given pace: dt/speed.
++func tickFloor(dt, speed float64) time.Duration {
++	return time.Duration(dt / speed * float64(time.Second))
++}
++
++func checkSpeed(speed float64) error {
++	if math.IsNaN(speed) || math.IsInf(speed, 0) || speed <= 0 {
++		return fmt.Errorf("speed must be a finite value > 0 (got %g)", speed)
++	}
++	return nil
++}
+diff --git a/engine/natsio/player_test.go b/engine/natsio/player_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..0c5b18cf7478d8c0c226d80337b1415368c5359d
+--- /dev/null
++++ b/engine/natsio/player_test.go
+@@ -0,0 +1,367 @@
++package natsio
++
++import (
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	server "github.com/nats-io/nats-server/v2/server"
++	"github.com/nats-io/nats.go"
++	"traffic-sim/engine"
++)
++
++// player_test.go — the VCR round trip: a short live run is recorded into a
++// durable store by one broker, that broker shuts down (store exclusivity),
++// a second broker reopens the store, and the Player re-simulates the record
++// while publishing the live plane under {run}-replay — CRC chain verified,
++// snapshot decimation at pace, signal table, seek, pause/resume, and the
++// end-of-recording hold.
++
++// startStoreBroker is NewTestServer with a caller-chosen store dir, so a
++// test can reopen the same store with a second broker.
++func startStoreBroker(tb testing.TB, dir string) *server.Server {
++	tb.Helper()
++	ns, err := server.NewServer(&server.Options{DontListen: true, JetStream: true, StoreDir: dir})
++	if err != nil {
++		tb.Fatalf("nats-server NewServer: %v", err)
++	}
++	ns.Start()
++	if !ns.ReadyForConnections(10 * time.Second) {
++		tb.Fatal("nats-server not ready")
++	}
++	return ns
++}
++
++func dialJetStream(tb testing.TB, ns *server.Server) (*nats.Conn, nats.JetStreamContext) {
++	tb.Helper()
++	nc, err := nats.Connect(nats.DefaultURL, nats.InProcessServer(ns))
++	if err != nil {
++		tb.Fatalf("in-process connect: %v", err)
++	}
++	js, err := nc.JetStream()
++	if err != nil {
++		tb.Fatalf("JetStream context: %v", err)
++	}
++	return nc, js
++}
++
++func TestPlayerPublishesLivePlane(t *testing.T) {
++	storeDir := t.TempDir()
++	const run = "vcr1"
++	replayRun := run + "-replay"
++	spec, err := engine.DefaultSpec("lanedrop", 120, 7)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	// Phase 1: record a short run into the durable store, then shut the
++	// broker down — only one broker may hold the store dir at a time.
++	ns1 := startStoreBroker(t, storeDir)
++	nc1, js1 := dialJetStream(t, ns1)
++	lr, err := RunLive(nc1, js1, run, spec, RecorderConfig{KeyframeEvery: 50, CRCEvery: 1})
++	if err != nil {
++		t.Fatalf("RunLive: %v", err)
++	}
++	liveCRC := lr.Engine.CRC()
++	nc1.Close()
++	ns1.Shutdown()
++	ns1.WaitForShutdown()
++
++	// Phase 2: a second broker on the same store; the Player re-simulates
++	// and publishes the live plane under vcr1-replay.
++	ns2 := startStoreBroker(t, storeDir)
++	defer ns2.Shutdown()
++	nc2, js2 := dialJetStream(t, ns2)
++	defer nc2.Close()
++
++	var mu sync.Mutex
++	var snapTicks []uint64
++	sub, err := nc2.Subscribe(SubjectStateSnap(replayRun), func(m *nats.Msg) {
++		tick, err := msgTick(m)
++		if err != nil {
++			t.Errorf("snapshot without tick header: %v", err)
++			return
++		}
++		mu.Lock()
++		snapTicks = append(snapTicks, tick)
++		mu.Unlock()
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer func() { _ = sub.Unsubscribe() }()
++	var sigs atomic.Uint64
++	sigSub, err := nc2.Subscribe(SubjectStateSig(replayRun), func(*nats.Msg) { sigs.Add(1) })
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer func() { _ = sigSub.Unsubscribe() }()
++
++	snaps := func() []uint64 {
++		mu.Lock()
++		defer mu.Unlock()
++		return append([]uint64(nil), snapTicks...)
++	}
++	lastSnap := func() uint64 {
++		s := snaps()
++		if len(s) == 0 {
++			return 0
++		}
++		return s[len(s)-1]
++	}
++
++	p, err := NewPlayer(nc2, js2, PlayerConfig{Run: run, Speed: 8})
++	if err != nil {
++		t.Fatalf("NewPlayer: %v", err)
++	}
++	if p.ReplayRun() != replayRun {
++		t.Fatalf("ReplayRun = %q, want %q", p.ReplayRun(), replayRun)
++	}
++	hs := httptest.NewServer(p.Handler())
++	defer hs.Close()
++
++	runErr := make(chan error, 1)
++	go func() { runErr <- p.Run() }()
++	defer func() { p.Stop(); <-p.Done() }()
++
++	waitFor := func(what string, cond func() bool) {
++		t.Helper()
++		deadline := time.Now().Add(20 * time.Second)
++		for !cond() {
++			if time.Now().After(deadline) {
++				t.Fatalf("timed out waiting for %s (last snap %d, status %+v)", what, lastSnap(), p.Status())
++			}
++			time.Sleep(5 * time.Millisecond)
++		}
++	}
++	call := func(method, path, body string) PlayerStatus {
++		t.Helper()
++		var resp *http.Response
++		var err error
++		if method == http.MethodGet {
++			resp, err = hs.Client().Get(hs.URL + path)
++		} else {
++			resp, err = hs.Client().Post(hs.URL+path, "application/json", strings.NewReader(body))
++		}
++		if err != nil {
++			t.Fatalf("%s %s: %v", method, path, err)
++		}
++		defer resp.Body.Close()
++		data, _ := io.ReadAll(resp.Body)
++		if resp.StatusCode != http.StatusOK {
++			t.Fatalf("%s %s: %s: %s", method, path, resp.Status, data)
++		}
++		var st PlayerStatus
++		if err := json.Unmarshal(data, &st); err != nil {
++			t.Fatalf("%s %s: bad status JSON: %v", method, path, err)
++		}
++		return st
++	}
++
++	// (a) Playback at speed 8: let it run past tick 72, then check the
++	// decimation cadence k = round(8) = 8 on everything received so far
++	// (the tick-0 opening frame is 0 ≡ 0 mod 8 too).
++	waitFor("playback past tick 72", func() bool { return p.Status().Tick >= 72 })
++	preSeek := snaps()
++	if len(preSeek) < 2 {
++		t.Fatalf("only %d snapshots received", len(preSeek))
++	}
++	for i, tick := range preSeek {
++		if tick%8 != 0 {
++			t.Fatalf("snapshot %d has tick %d, want a multiple of k=8", i, tick)
++		}
++		if i > 0 && tick <= preSeek[i-1] {
++			t.Fatalf("snapshot ticks not strictly increasing at %d: %v", i, preSeek)
++		}
++	}
++	if got := sigs.Load(); got < 2 {
++		t.Fatalf("signal table published %d times, want ≥ 2 (start + keyframe cadence)", got)
++	}
++
++	// (e) Pause: the tick stream stops; resume: it continues.
++	st := call(http.MethodPost, "/pause", "")
++	if !st.Paused {
++		t.Fatal("/pause did not report paused")
++	}
++	// One tick may already be in flight between the loop's pause check and
++	// its Step — let it land before counting.
++	time.Sleep(100 * time.Millisecond)
++	pausedSnaps := len(snaps())
++	pausedTick := p.Status().Tick
++	time.Sleep(400 * time.Millisecond) // 32 ticks would pass at speed 8
++	if n := len(snaps()); n != pausedSnaps {
++		t.Fatalf("received %d snapshots while paused (had %d)", n, pausedSnaps)
++	}
++	if tk := p.Status().Tick; tk != pausedTick {
++		t.Fatalf("playhead moved while paused: %d → %d", pausedTick, tk)
++	}
++
++	// (d) Seek backwards WHILE PAUSED: lands on the requested tick and
++	// publishes exactly one frame there so the user sees where they landed.
++	st = call(http.MethodPost, "/seek", `{"tick": 40}`)
++	if st.Tick != 40 {
++		t.Fatalf("/seek reported tick %d, want 40", st.Tick)
++	}
++	waitFor("seek landing frame", func() bool { return len(snaps()) == pausedSnaps+1 })
++	if got := lastSnap(); got != 40 {
++		t.Fatalf("seek landing frame tick = %d, want 40", got)
++	}
++	if n := len(snaps()); n != pausedSnaps+1 {
++		t.Fatalf("seek published %d frames, want exactly 1", n-pausedSnaps)
++	}
++	time.Sleep(100 * time.Millisecond)
++	if tk := p.Status().Tick; tk != 40 {
++		t.Fatalf("still paused after seek, but playhead moved to %d", tk)
++	}
++
++	// Resume from the seek point: publishing continues, monotonically
++	// increasing from 40.
++	st = call(http.MethodPost, "/resume", "")
++	if st.Paused {
++		t.Fatal("/resume still reports paused")
++	}
++	waitFor("playback past tick 64 after seek", func() bool { return p.Status().Tick >= 64 })
++
++	// (b) Live pace change: k recomputes.
++	st = call(http.MethodPost, "/speed", `{"speed": 16}`)
++	if st.Speed != 16 {
++		t.Fatalf("/speed reported speed %g, want 16", st.Speed)
++	}
++	if resp, err := hs.Client().Post(hs.URL+"/speed", "application/json", strings.NewReader(`{"speed": 0}`)); err != nil {
++		t.Fatal(err)
++	} else {
++		resp.Body.Close()
++		if resp.StatusCode != http.StatusBadRequest {
++			t.Fatalf("/speed with speed 0: %s, want 400", resp.Status)
++		}
++	}
++
++	// (a cont.) End of recording: the player holds — paused at the final
++	// tick, one exact final frame, CRC chain clean, final CRC = live CRC.
++	waitFor("end-of-recording hold", func() bool {
++		st := p.Status()
++		return st.Tick == spec.Ticks && st.Paused
++	})
++	waitFor("final frame", func() bool { return lastSnap() == spec.Ticks })
++
++	st = call(http.MethodGet, "/status", "")
++	if st.Run != run || st.ReplayRun != replayRun {
++		t.Fatalf("status run ids = %q/%q, want %q/%q", st.Run, st.ReplayRun, run, replayRun)
++	}
++	if st.Ticks != spec.Ticks || st.Tick != spec.Ticks {
++		t.Fatalf("status tick/ticks = %d/%d, want %d/%d", st.Tick, st.Ticks, spec.Ticks, spec.Ticks)
++	}
++	if st.CRCErrors != 0 {
++		t.Fatalf("crcErrors = %d, want 0 (CRC chain must verify)", st.CRCErrors)
++	}
++
++	p.Stop()
++	<-p.Done()
++	if err := <-runErr; err != nil {
++		t.Fatalf("Player.Run: %v", err)
++	}
++	if p.e.CRC() != liveCRC {
++		t.Fatalf("replay final crc %016x != live run's %016x", p.e.CRC(), liveCRC)
++	}
++
++	// Full tick stream shape: strictly increasing except for the single
++	// seek drop to 40.
++	all := snaps()
++	drops := 0
++	for i := 1; i < len(all); i++ {
++		if all[i] <= all[i-1] {
++			drops++
++			if all[i] != 40 {
++				t.Fatalf("unexpected non-monotonic snapshot tick %d after %d", all[i], all[i-1])
++			}
++		}
++	}
++	if drops != 1 {
++		t.Fatalf("%d non-monotonic drops in the snapshot stream, want exactly 1 (the seek)", drops)
++	}
++	t.Logf("replay: %d snapshots, %d signal frames, final crc %016x verified against the live run",
++		len(all), sigs.Load(), liveCRC)
++}
++
++// TestPlayerUnknownRun: the player fails loud when the store has no such
++// run, and on ids that cannot form a single-token replay run id.
++func TestPlayerUnknownRun(t *testing.T) {
++	srv := NewTestServer(t)
++	nc, js := srv.JetStream(t)
++	if _, err := NewPlayer(nc, js, PlayerConfig{Run: "nope"}); err == nil {
++		t.Fatal("NewPlayer accepted an unknown run id")
++	}
++	if _, err := NewPlayer(nc, js, PlayerConfig{Run: "bad.run"}); err == nil {
++		t.Fatal("NewPlayer accepted a non-token run id")
++	}
++	if _, err := NewPlayer(nc, js, PlayerConfig{Run: "x", Speed: -2}); err == nil {
++		t.Fatal("NewPlayer accepted a negative speed")
++	}
++}
++
++// TestPlayerSeekClamps: seek targets beyond the record clamp to the end of
++// the recording rather than fabricating state.
++func TestPlayerSeekClamps(t *testing.T) {
++	srv := NewTestServer(t)
++	nc, js := srv.JetStream(t)
++	spec, err := engine.DefaultSpec("lanedrop", 60, 5)
++	if err != nil {
++		t.Fatal(err)
++	}
++	const run = "vcr2"
++	if _, err := RunLive(nc, js, run, spec, RecorderConfig{KeyframeEvery: 50, CRCEvery: 1}); err != nil {
++		t.Fatalf("RunLive: %v", err)
++	}
++
++	p, err := NewPlayer(nc, js, PlayerConfig{Run: run, Speed: 100})
++	if err != nil {
++		t.Fatalf("NewPlayer: %v", err)
++	}
++	hs := httptest.NewServer(p.Handler())
++	defer hs.Close()
++	runErr := make(chan error, 1)
++	go func() { runErr <- p.Run() }()
++	defer func() { p.Stop(); <-p.Done() }()
++
++	deadline := time.Now().Add(20 * time.Second)
++	for p.Status().Tick < spec.Ticks {
++		if time.Now().After(deadline) {
++			t.Fatalf("playback never reached the end (tick %d)", p.Status().Tick)
++		}
++		time.Sleep(5 * time.Millisecond)
++	}
++
++	// Seek to 40 and let it play to the end again, then seek past the end.
++	seekTo := func(tick uint64, want uint64) {
++		t.Helper()
++		resp, err := hs.Client().Post(hs.URL+"/seek", "application/json",
++			strings.NewReader(fmt.Sprintf(`{"tick": %d}`, tick)))
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer resp.Body.Close()
++		if resp.StatusCode != http.StatusOK {
++			data, _ := io.ReadAll(resp.Body)
++			t.Fatalf("/seek %d: %s: %s", tick, resp.Status, data)
++		}
++		var st PlayerStatus
++		if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
++			t.Fatal(err)
++		}
++		if st.Tick != want {
++			t.Fatalf("/seek %d landed on %d, want %d (clamped)", tick, st.Tick, want)
++		}
++	}
++	seekTo(40, 40)
++	seekTo(9999, spec.Ticks)
++	if st := p.Status(); st.CRCErrors != 0 {
++		t.Fatalf("crcErrors = %d after seeks, want 0", st.CRCErrors)
++	}
++}
+diff --git a/engine/natsio/replay.go b/engine/natsio/replay.go
+index 17e1448442888f71b042d339fb792f1af2deda6b..76d0fa64e23c9953b9b7f3d47215526cec12e225 100644
+--- a/engine/natsio/replay.go
++++ b/engine/natsio/replay.go
+@@ -105,55 +105,22 @@ func ReplayFromStream(js nats.JetStreamContext, meta *RunMeta, target uint64) (*
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-
+-	intents := map[uint64][]engine.KeyedIntent{}
+-	verbs := map[uint64][]engine.SpawnDirective{}
+-	crcs := map[uint64]uint64{}
+-	var lastLoggedTick uint64
+-	for _, m := range msgs {
+-		tick, err := msgTick(m)
+-		if err != nil {
+-			return nil, err
+-		}
+-		if tick > lastLoggedTick {
+-			lastLoggedTick = tick
+-		}
+-		switch m.Subject {
+-		case SubjectLogIntent(run):
+-			k, err := decodeLoggedIntent(m.Data)
+-			if err != nil {
+-				return nil, err
+-			}
+-			intents[k.Tick] = append(intents[k.Tick], k.KeyedIntent)
+-		case SubjectLogVerb(run):
+-			s, err := decodeLoggedVerb(m.Data)
+-			if err != nil {
+-				return nil, err
+-			}
+-			verbs[s.Tick] = append(verbs[s.Tick], s.SpawnDirective)
+-		case SubjectLogCRC(run):
+-			crc, err := decodeLoggedCRC(m.Data)
+-			if err != nil {
+-				return nil, err
+-			}
+-			crcs[tick] = crc
+-		case SubjectLogKeyframe(run):
+-			// Mid-stream keyframes are for later seeks; the CRC chain
+-			// already verifies the state they capture.
+-		}
++	idx, err := indexLogMsgs(msgs, run)
++	if err != nil {
++		return nil, err
+ 	}
+-	if target > lastLoggedTick {
+-		return nil, fmt.Errorf("stream %s ends at tick %d before target %d", stream, lastLoggedTick, target)
++	if target > idx.lastTick {
++		return nil, fmt.Errorf("stream %s ends at tick %d before target %d", stream, idx.lastTick, target)
+ 	}
+ 
+ 	rep := &ReplayReport{Run: run, KeyframeTick: kf.tick, KeyframeSeq: kf.seq}
+ 	for e.Tick < target {
+ 		next := e.Tick + 1
+-		for _, k := range intents[next] {
++		for _, k := range idx.intents[next] {
+ 			e.EnqueueIntent(k)
+ 			rep.IntentsReplayed++
+ 		}
+-		for _, d := range verbs[next] {
++		for _, d := range idx.verbs[next] {
+ 			// The verb was validated when first accepted; re-resolution
+ 			// against the same spec is deterministic and cannot newly fail
+ 			// — a failure here means the record and spec disagree.
+@@ -163,7 +130,7 @@ func ReplayFromStream(js nats.JetStreamContext, meta *RunMeta, target uint64) (*
+ 			rep.VerbsReplayed++
+ 		}
+ 		e.Step()
+-		if want, ok := crcs[next]; ok {
++		if want, ok := idx.crcs[next]; ok {
+ 			if e.CRC() != want {
+ 				return nil, fmt.Errorf("replay divergence at tick %d: crc %016x, logged %016x",
+ 					next, e.CRC(), want)
+@@ -176,6 +143,65 @@ func ReplayFromStream(js nats.JetStreamContext, meta *RunMeta, target uint64) (*
+ 	return rep, nil
+ }
+ 
++// logIndex is the materialized per-tick view of a run's log stream:
++// arbitrated intents and director verbs by applied tick, rolling CRCs by
++// tick, the keyframe ticks in stream order, and the highest tick stamped on
++// any message. ReplayFromStream and the Player share it — the Player
++// materializes the whole immutable recording up front and re-enqueues from
++// the index instead of re-reading the stream per tick.
++type logIndex struct {
++	intents   map[uint64][]engine.KeyedIntent
++	verbs     map[uint64][]engine.SpawnDirective
++	crcs      map[uint64]uint64
++	keyframes []uint64 // keyframe ticks, stream order (for cadence derivation)
++	lastTick  uint64   // highest tick header seen on any message
++}
++
++// indexLogMsgs buckets log-stream messages (stream order) by tick. Same
++// decoding and errors as the loop ReplayFromStream ran inline before the
++// extraction; the only addition is recording keyframe ticks.
++func indexLogMsgs(msgs []*nats.Msg, run string) (*logIndex, error) {
++	idx := &logIndex{
++		intents: map[uint64][]engine.KeyedIntent{},
++		verbs:   map[uint64][]engine.SpawnDirective{},
++		crcs:    map[uint64]uint64{},
++	}
++	for _, m := range msgs {
++		tick, err := msgTick(m)
++		if err != nil {
++			return nil, err
++		}
++		if tick > idx.lastTick {
++			idx.lastTick = tick
++		}
++		switch m.Subject {
++		case SubjectLogIntent(run):
++			k, err := decodeLoggedIntent(m.Data)
++			if err != nil {
++				return nil, err
++			}
++			idx.intents[k.Tick] = append(idx.intents[k.Tick], k.KeyedIntent)
++		case SubjectLogVerb(run):
++			s, err := decodeLoggedVerb(m.Data)
++			if err != nil {
++				return nil, err
++			}
++			idx.verbs[s.Tick] = append(idx.verbs[s.Tick], s.SpawnDirective)
++		case SubjectLogCRC(run):
++			crc, err := decodeLoggedCRC(m.Data)
++			if err != nil {
++				return nil, err
++			}
++			idx.crcs[tick] = crc
++		case SubjectLogKeyframe(run):
++			// Mid-stream keyframes are for later seeks; the CRC chain
++			// already verifies the state they capture.
++			idx.keyframes = append(idx.keyframes, tick)
++		}
++	}
++	return idx, nil
++}
++
+ // keyframeRef is one logged keyframe located by the scan.
+ type keyframeRef struct {
+ 	tick    uint64

@@ -1,0 +1,12 @@
+ contracts/asyncapi.yaml                            |   2 +-
+ .../kb/decisions/ADR-0006-nats-message-contract.md |  42 +
+ engine/cmd/replay/main.go                          | 174 ++++
+ engine/cmd/replay/main_test.go                     |  29 +
+ engine/natsio/bus.go                               |  25 +-
+ engine/natsio/player.go                            | 649 +++++++++++++++
+ engine/natsio/player_test.go                       | 926 +++++++++++++++++++++
+ engine/natsio/recorder.go                          |   2 +-
+ engine/natsio/replay.go                            | 108 ++-
+ engine/natsio/run.go                               |   6 +
+ engine/natsio/server.go                            |  20 +
+ 11 files changed, 1933 insertions(+), 50 deletions(-)

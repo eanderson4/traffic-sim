@@ -1,0 +1,10 @@
+ .../kb/decisions/ADR-0006-nats-message-contract.md |  42 ++
+ engine/cmd/replay/main.go                          | 148 ++++
+ engine/natsio/bus.go                               |  25 +-
+ engine/natsio/player.go                            | 603 +++++++++++++++
+ engine/natsio/player_test.go                       | 834 +++++++++++++++++++++
+ engine/natsio/recorder.go                          |   2 +-
+ engine/natsio/replay.go                            | 108 ++-
+ engine/natsio/run.go                               |   6 +
+ engine/natsio/server.go                            |  20 +
+ 9 files changed, 1739 insertions(+), 49 deletions(-)

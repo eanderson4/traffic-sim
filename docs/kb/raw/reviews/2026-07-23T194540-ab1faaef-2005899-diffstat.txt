@@ -1,0 +1,25 @@
+ .../kb/decisions/ADR-0006-nats-message-contract.md |  14 +
+ engine/cmd/demosrv/demos.example.json              |  13 +-
+ engine/cmd/demosrv/demosrv_test.go                 | 114 ++++-
+ engine/cmd/demosrv/geojson.go                      |   9 +-
+ engine/cmd/demosrv/main.go                         | 131 +++--
+ engine/cmd/demosrv/registry.go                     | 153 +++++-
+ engine/cmd/demosrv/replay.go                       | 250 ++++++++++
+ engine/cmd/demosrv/replay_test.go                  | 534 +++++++++++++++++++++
+ engine/cmd/demosrv/supervisor.go                   | 115 ++++-
+ engine/cmd/serve/main.go                           |   9 +
+ engine/natsio/player.go                            |   5 +
+ viz/demos.html                                     |   5 +
+ viz/index.html                                     |  17 +
+ viz/src/artic.ts                                   |  39 +-
+ viz/src/demos-core.ts                              |  54 ++-
+ viz/src/demos.ts                                   |  51 +-
+ viz/src/main.ts                                    |  84 +++-
+ viz/src/replaypanel.ts                             | 450 +++++++++++++++++
+ viz/src/snapshots.ts                               |  58 ++-
+ viz/src/switcher.ts                                |  38 +-
+ viz/test/artic.test.ts                             |  52 +-
+ viz/test/demos.test.ts                             |  25 +-
+ viz/test/replaypanel.test.ts                       | 358 ++++++++++++++
+ viz/test/snapshots.test.ts                         | 118 ++++-
+ 24 files changed, 2537 insertions(+), 159 deletions(-)
