@@ -19,3 +19,12 @@ test("invalid dt values fall back to 0.1", () => {
   assert.equal(loadConfig("?dt=0", "localhost").dt, 0.1);
   assert.equal(loadConfig("?dt=-1", "localhost").dt, 0.1);
 });
+
+test("overlay URLs default to the demosrv /overlay/ route, overridable", () => {
+  const def = loadConfig("", "localhost");
+  assert.equal(def.zonesUrl, "/overlay/zones.geojson");
+  assert.equal(def.boundariesUrl, "/overlay/boundaries.geojson");
+  const custom = loadConfig("?zones=/o/z.geojson&boundaries=/o/b.geojson", "localhost");
+  assert.equal(custom.zonesUrl, "/o/z.geojson");
+  assert.equal(custom.boundariesUrl, "/o/b.geojson");
+});
