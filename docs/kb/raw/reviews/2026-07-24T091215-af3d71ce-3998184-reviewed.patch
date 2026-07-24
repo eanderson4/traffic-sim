@@ -1,0 +1,256 @@
+diff --git a/viz/src/artic.ts b/viz/src/artic.ts
+index dccbe210af03f259ad8f145e93e6d46ff57d607e..0724339ae12d6623c45defb5a87c6b8cf3965dc7 100644
+--- a/viz/src/artic.ts
++++ b/viz/src/artic.ts
+@@ -25,12 +25,40 @@
+ // aligned (θ_tr = θ_front) and is dropped on despawn via prune(); reset()
+ // drops everything (replay seeks). Pure and DOM-free so node --test can
+ // drive it.
++//
++// Glitch clamp: a hitch angle beyond MAX_HITCH_RAD is not a pose a
++// forward-driving semi reaches (tight intersection turns peak ~45–60°) —
++// it is a lane-hop hitch teleport, a reversed-fragment heading flip, or a
++// curved-spawn artifact. The sine law's recovery from there is repelled
++// through near-perpendicular angles at a rate ∝ v, and if the truck then
++// queues below HOLD_V the angle freezes — the "perpendicular trailer
++// stuck in traffic" artifact. The engine has no jackknife crashes to
++// honor, so the pose re-anchors aligned, on every path including the
++// queued hold.
++//
++// Two false-positive guards on the clamp (Fable + Sol, WQ-2 review): the
++// base threshold sits at 85°, not just past the ~60° a tight turn peaks
++// at — a sub-10 m-radius internal lane can hold a stable ~80°
++// articulation (sin gap = L/r with L = 8 m), and snapping that glues the
++// trailer to the tractor through every legit tight turn. And the
++// pre-integration gap is measured against the NEW θ_front, so it
++// includes the heading the tractor swept during dtS — at 8× replay a 60°
++// steady turn (ω ≈ 62°/s at v = 10) reads ~91° on a 0.5 s frame. The
++// limit therefore widens by the sweep the trailer dynamics allow in dtS,
++// (v/L)·dtS; only true discontinuities (heading flips, hitch teleports)
++// exceed the widened limit. The check runs only on frames with dtS > 0:
++// dtS advances in per-snapshot bursts (integer sample ticks) while the
++// lerped heading advances every render frame, so an interpolated frame's
++// gap growth carries no time credit — but new headings, and therefore
++// glitches, only ever arrive on snapshot frames.
+ 
+ import { TRACTOR_M, TRAILER_M } from "./theme.ts";
+ 
+ const HOLD_V = 0.1; // m/s — below this, hold θ_trailer (queued)
+ const MAX_DT_S = 0.05; // max integration substep, s
+ const MAX_TOTAL_DT_S = 2; // s — beyond this the world jumped: re-anchor, don't step
++const MAX_HITCH_RAD = (85 * Math.PI) / 180; // base glitch threshold, rad
++const MAX_GLITCH_LIMIT_RAD = (170 * Math.PI) / 180; // the widened limit never disables the clamp
+ const TWO_PI = 2 * Math.PI;
+ 
+ // wrapPi folds an angle difference to [−π, π) — the shortest arc.
+@@ -38,6 +66,20 @@ export function wrapPi(d: number): number {
+   return ((((d + Math.PI) % TWO_PI) + TWO_PI) % TWO_PI) - Math.PI;
+ }
+ 
++// glitchLimit is the hitch angle past which a pose is a glitch, widened
++// by the heading the tractor could legitimately sweep during dtS
++// (header): the pre-integration gap is measured against the NEW θ_front,
++// so a legit tight turn at fast replay must not trip the base threshold.
++// dtS is clamped to [0, MAX_TOTAL_DT_S] — negative seeks integrate
++// nothing, and past MAX_TOTAL_DT_S the world-jump path re-anchors anyway.
++// The limit is capped at 170°: |wrapPi| ≤ π, so an uncapped limit (a
++// highway-speed truck on a fat replay frame) would exceed π and disable
++// the clamp exactly when a full heading flip needs it (Sol, WQ-2 round 3).
++function glitchLimit(v: number, dtS: number): number {
++  const dt = Math.min(Math.max(dtS, 0), MAX_TOTAL_DT_S);
++  return Math.min(MAX_HITCH_RAD + (v * dt) / TRAILER_M, MAX_GLITCH_LIMIT_RAD);
++}
++
+ export interface TrailerPose {
+   tractorX: number;
+   tractorY: number;
+@@ -66,6 +108,20 @@ export class Articulator {
+     let tr = this.thetaTrailer.get(id);
+     if (tr === undefined) {
+       tr = thetaFront; // spawn aligned
++    } else if (dtS > 0 && Math.abs(wrapPi(thetaFront - tr)) > glitchLimit(v, dtS)) {
++      // Glitch clamp (header), checked BEFORE the hold/integrate paths: a
++      // large fast-replay delta could integrate a glitched angle back
++      // under the threshold within one frame and keep it.
++      //
++      // Gated on dtS > 0: main.ts derives dtS from the INTEGER sample
++      // tick, which advances in one burst per snapshot while the lerped
++      // heading advances EVERY render frame — on an interpolated (dtS =
++      // 0) frame the gap growth is just lerp advance carrying no time
++      // credit, and clamping there would read a legit tight turn as a
++      // glitch (Sol, WQ-2 round 4). New headings — and therefore
++      // glitches — only ARRIVE on snapshot (dtS > 0) frames, so the
++      // clamp only applies there.
++      tr = thetaFront;
+     } else if (v >= HOLD_V) {
+       if (dtS > MAX_TOTAL_DT_S) {
+         // The world JUMPED (rAF suspension in a backgrounded tab can hand
+diff --git a/viz/test/artic.test.ts b/viz/test/artic.test.ts
+index d29f4b51b989b08db7590c63ef8cde5440dbb29e..4711bc8689225f4bba4120750222a5f1c9121d1d 100644
+--- a/viz/test/artic.test.ts
++++ b/viz/test/artic.test.ts
+@@ -1,7 +1,8 @@
+ // artic.test.ts — the client-side single-track trailer model: spawn
+ // alignment, straight tracking, steady-state articulation in a constant
+ // turn (correct sign — the trailer cuts inside), hold-while-queued, ±π
+-// wrap, sim-dt substep integration, and seek reset.
++// wrap, sim-dt substep integration, seek reset, and the glitch clamp
++// (over-threshold hitch angles re-anchor aligned, even queued).
+ 
+ import { test } from "node:test";
+ import assert from "node:assert/strict";
+@@ -124,6 +125,154 @@ test("large SIM dt integrates in substeps (fast replay), converging like small s
+   assert.equal(neg.update(1, 1, 0, 0.3, 10, -1).trailerAngle, 0);
+ });
+ 
++test("a reversed-fragment heading flip re-anchors instead of jackknifing", () => {
++  const a = new Articulator();
++  a.update(1, 0, 0, 0, 10, DT); // spawn aligned
++  drive(a, 1, 60, (i) => ({ x: 10 * (i + 1) * DT, y: 0, theta: 0, v: 10 }));
++  // Data glitch: θ_front flips ~π in one frame (reversed fragment). The
++  // old law repelled from the ±π equilibrium through perpendicular at a
++  // rate ∝ v; the clamp re-anchors aligned immediately.
++  const pose = a.update(1, 11, 0, Math.PI - 0.1, 10, DT);
++  assert.equal(pose.trailerAngle, Math.PI - 0.1);
++  // …and it KEEPS tracking from there, no residual swing.
++  drive(a, 1, 60, (i) => ({ x: 11 - 10 * (i + 1) * DT, y: 0, theta: Math.PI - 0.1, v: 10 }));
++  assert.equal(a.update(1, 0, 0, Math.PI - 0.1, 10, DT).trailerAngle, Math.PI - 0.1);
++});
++
++test("a glitched perpendicular pose snaps even while queued (hold path)", () => {
++  const a = new Articulator();
++  a.update(1, 0, 0, 0, 10, DT);
++  drive(a, 1, 60, (i) => ({ x: 10 * (i + 1) * DT, y: 0, theta: 0, v: 10 }));
++  // Upset to ~100° while the truck is stopped: the queued hold must not
++  // protect a pose past the glitch clamp.
++  const snapped = a.update(1, 10, 0, 1.8, 0, DT);
++  assert.equal(snapped.trailerAngle, 1.8);
++});
++
++test("legit tight-turn articulation under the clamp is NOT snapped", () => {
++  // Steady turn sharp enough for ~60° articulation (sin gap = ωL/v) —
++  // under the 85° clamp the trailer must keep its lag.
++  const a = new Articulator();
++  const v = 10;
++  const omega = (v * Math.sin((60 * Math.PI) / 180)) / TRAILER_M;
++  let theta = 0;
++  a.update(1, 0, 0, theta, v, DT);
++  let gap = 0;
++  for (let i = 0; i < 3600; i++) {
++    theta += omega * DT;
++    const x = (v / omega) * Math.sin(theta);
++    const y = (v / omega) * (1 - Math.cos(theta));
++    gap = wrapPi(theta - a.update(1, x, y, theta, v, DT).trailerAngle);
++  }
++  assert.ok(gap > (45 * Math.PI) / 180, `tight-turn articulation snapped: gap ${gap}`);
++});
++
++test("a glitched angle snaps even when a fast-replay delta would integrate it under the threshold", () => {
++  // 150° heading flip inside one 0.8 s replay frame at 10 m/s: the
++  // dtS-widened limit (85° + ~38°) still reads it as a discontinuity, and
++  // the pre-integration check snaps before the frame's substeps can
++  // integrate the glitched pose back under the base threshold and keep
++  // it (Sol, WQ-2 review).
++  const a = new Articulator();
++  a.update(1, 0, 0, 0, 10, DT);
++  drive(a, 1, 60, (i) => ({ x: 10 * (i + 1) * DT, y: 0, theta: 0, v: 10 }));
++  const pose = a.update(1, 18, 0, (150 * Math.PI) / 180, 10, 0.8);
++  assert.equal(pose.trailerAngle, (150 * Math.PI) / 180);
++});
++
++test("a legit tight turn does NOT trip the clamp on a large replay frame", () => {
++  // Fable's false-positive case: steady ~60° articulation, then one 0.5 s
++  // 8×-replay frame sweeping ~31° of heading (ω ≈ 62°/s at v = 10) — the
++  // pre-integration gap reads ~91°, under the dtS-widened limit (85° +
++  // ~36°), so no snap.
++  const a = new Articulator();
++  const v = 10;
++  const omega = (v * Math.sin((60 * Math.PI) / 180)) / TRAILER_M;
++  const arc = (th: number) => ({ x: (v / omega) * Math.sin(th), y: (v / omega) * (1 - Math.cos(th)) });
++  let theta = 0;
++  a.update(1, 0, 0, theta, v, DT);
++  for (let i = 0; i < 3600; i++) {
++    theta += omega * DT;
++    const p = arc(theta);
++    a.update(1, p.x, p.y, theta, v, DT);
++  }
++  const bigTheta = theta + omega * 0.5; // one fat replay frame
++  const p = arc(bigTheta);
++  const pose = a.update(1, p.x, p.y, bigTheta, v, 0.5);
++  const gap = wrapPi(bigTheta - pose.trailerAngle);
++  assert.ok(gap > (45 * Math.PI) / 180, `legit articulation snapped on a fat frame: gap ${gap}`);
++});
++
++test("the widened limit never exceeds 170° — a full flip still snaps at highway speed, 16× replay", () => {
++  // Sol's round-3 blocker: at 22.2 m/s with a 1.6 s frame the swept
++  // widening alone would push the limit past π (wrapPi's bound) and
++  // disable the clamp. The cap keeps a ~175° heading flip trippable.
++  const a = new Articulator();
++  const v = 22.2;
++  a.update(1, 0, 0, 0, v, DT);
++  drive(a, 1, 60, (i) => ({ x: v * (i + 1) * DT, y: 0, theta: 0, v }));
++  const flip = (175 * Math.PI) / 180;
++  const pose = a.update(1, 40, 0, flip, v, 1.6);
++  assert.equal(pose.trailerAngle, flip);
++});
++
++test("interpolated (dtS = 0) frames never trip the clamp — the credit arrives on snapshot frames", () => {
++  // Sol's round-4 blocker: main.ts derives dtS from the integer sample
++  // tick — one burst per snapshot — while the lerped heading advances
++  // EVERY render frame. Drive the real cadence: a legit ~60° turn at 4×
++  // replay, 5 interpolated frames (dtS 0) per snapshot frame (dtS 0.4).
++  // The gap sawtooths (≈45°…72° here, ≈34°…89° at 8× — both under the
++  // widened limits) and must never snap to aligned.
++  const a = new Articulator();
++  const v = 10;
++  const omega = (v * Math.sin((60 * Math.PI) / 180)) / TRAILER_M;
++  const arc = (th: number) => ({ x: (v / omega) * Math.sin(th), y: (v / omega) * (1 - Math.cos(th)) });
++  let theta = 0;
++  a.update(1, 0, 0, theta, v, DT);
++  let minGap = Infinity;
++  for (let s = 0; s < 200; s++) {
++    for (let f = 0; f < 6; f++) {
++      theta += (omega * 0.4) / 6;
++      const p = arc(theta);
++      const pose = a.update(1, p.x, p.y, theta, v, f === 5 ? 0.4 : 0);
++      // Skip the spawn transient (the trailer legitimately starts aligned
++      // — a near-zero gap there is not a snap).
++      if (s >= 10) minGap = Math.min(minGap, Math.abs(wrapPi(theta - pose.trailerAngle)));
++    }
++  }
++  assert.ok(minGap > (15 * Math.PI) / 180, `snapped during the interpolated cadence (min gap ${minGap})`);
++});
++
++test("a realistic 8×-replay intersection turn (~100° total) does not trip the clamp", () => {
++  const a = new Articulator();
++  const v = 10;
++  const omega = (v * Math.sin((60 * Math.PI) / 180)) / TRAILER_M;
++  const arc = (th: number) => ({ x: (v / omega) * Math.sin(th), y: (v / omega) * (1 - Math.cos(th)) });
++  let theta = 0;
++  a.update(1, 0, 0, theta, v, DT);
++  let minGap = Infinity;
++  const frames = Math.ceil((100 * Math.PI) / 180 / (omega * 0.8 / 6)); // ~100° of turn
++  for (let i = 0; i < frames; i++) {
++    theta += (omega * 0.8) / 6;
++    const p = arc(theta);
++    const pose = a.update(1, p.x, p.y, theta, v, i % 6 === 5 ? 0.8 : 0);
++    if (i >= 6) minGap = Math.min(minGap, Math.abs(wrapPi(theta - pose.trailerAngle))); // skip spawn
++  }
++  assert.ok(minGap > (10 * Math.PI) / 180, `snapped mid-turn at 8× (min gap ${minGap})`);
++});
++
++test("the clamp is gated on dtS > 0: an interpolated frame holds, the next snapshot frame snaps", () => {
++  const a = new Articulator();
++  a.update(1, 0, 0, 0, 10, DT);
++  drive(a, 1, 60, (i) => ({ x: 10 * (i + 1) * DT, y: 0, theta: 0, v: 10 }));
++  // A 100° gap with dtS = 0 (lerp advance, no time credit): no snap…
++  const held = a.update(1, 10.2, 0, (100 * Math.PI) / 180, 10, 0);
++  assert.ok(Math.abs(wrapPi(held.trailerAngle)) < (10 * Math.PI) / 180, "dtS=0 frame must not clamp");
++  // …the glitch arrives with the next snapshot (dtS > 0): snap.
++  const snapped = a.update(1, 11, 0, (100 * Math.PI) / 180, 10, 0.1);
++  assert.equal(snapped.trailerAngle, (100 * Math.PI) / 180);
++});
++
+ test("wrapPi folds to the shortest arc", () => {
+   assert.ok(Math.abs(wrapPi(0.1) - 0.1) < 1e-12);
+   // Exact ±π multiples land on π or −π — the same physical direction.

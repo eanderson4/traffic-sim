@@ -6,10 +6,11 @@
 >
 > Ground rules: `AGENTS.md` (read `docs/VISION.md`, KB-first, ADRs for consequential
 > decisions). Every non-doc commit: run `scripts/external-review.sh` first and triage
-> Fable's findings (it prints them even when Sol fails). Sol is quota-dead since
-> 2026-07-23; the owner has authorized committing with `EXTERNAL_REVIEW_SKIP=1`
-> after that Fable pass, recording Sol's failure count in the commit message, until
-> Sol recovers. Do not skip the script itself — that would bypass Fable too. Never push.
+> Fable's findings (it prints them even when Sol fails). Sol recovered 2026-07-24
+> morning (credits topped up) — both reviewers live again. (Had Sol still been down,
+> the owner authorized committing with `EXTERNAL_REVIEW_SKIP=1` after the Fable pass,
+> recording Sol's failure count in the commit message.) Do not skip the script
+> itself — that would bypass Fable too. Never push.
 
 ## Operational state (2026-07-23 evening)
 
@@ -45,11 +46,13 @@
 - **Replay-panel deferrals (Sol, C3 final round, 2026-07-23):** (a) trailer
   articulation integrates `sample.tick` which is the newer snapshot's INTEGER tick —
   sim time advances in one burst per snapshot, so trailers jerk instead of following
-  the lerp (cosmetic); (b) panel polls have no in-flight guard — a slow (3 s timeout)
-  poll can overlap the next and overwrite newer state; (c) demosrv registry accepts
-  `"kind"` as an input field and overwrites it — should be rejected by the strict
-  fence or moved to an output DTO; (d) the panel's divergence warning shows
-  crcErrors only — surface verbErrors too.
+  the lerp (cosmetic); (b) ~~panel polls have no in-flight guard~~ FIXED 9cea740;
+  (c) demosrv registry accepts `"kind"` as an input field and overwrites it —
+  should be rejected by the strict fence or moved to an output DTO; (d) ~~the
+  panel's divergence warning shows crcErrors only~~ FIXED 9cea740 (warnLine
+  composes both counters). New from the 9cea740 rounds: (e) poll-vs-control-POST
+  stale-overwrite race (pre-existing, self-heals within ~1 s — fix via request
+  generations when the control plane next changes).
 - **Signal-head round-3 deferrals (Fable + Sol, 2026-07-23, commit 62b6237):**
   (a) the late-join test's freshness bound measures from the watcher's last
   observed tick, not the subscribe instant — flake window on a loaded box
@@ -97,12 +100,28 @@ ADR-0006 addendum updated). Residual, deferred: mid-zoom (13–15) declutter
 at dense junction clusters (e.g. the San Vicente diagonal) — consider
 count-badged single heads.
 
-### WQ-2: Trailer jackknife physics
-`viz/src/artic.ts` — trailers render perpendicular/detached. Root cause understood
-(single-track angle law has a second stable equilibrium at θ_front ± π; a >90° hitch
-upset from lane-hop teleports or curved-fragment spawns flips onto the jackknife
-branch and never recovers). Fix directions in freshness note (f): clamp |Δθ| per
-frame, re-anchor to θ_front on large wraps, smooth hitch on lane hops.
+### WQ-2: Trailer jackknife physics — FIXED (2026-07-24, 1d4b351)
+`viz/src/artic.ts` — trailers rendered perpendicular/detached and never
+recovered: the sine law's recovery from a >90° hitch upset (lane-hop
+teleport, reversed-fragment heading flip) is repelled through
+near-perpendicular at a rate ∝ v, and below HOLD_V the angle froze
+forever. Fix: a glitch clamp re-anchors the trailer aligned when the
+pre-integration hitch angle exceeds `glitchLimit(v, dtS)` — base 85°
+(legit sub-10 m-radius turns hold ~80°), widened by (v/L)·dtS (tight
+turns at 8× replay sweep ~50°/snapshot), capped at 170° (wrapPi's π
+bound), gated on dtS > 0 (dtS bursts per snapshot while the lerped
+heading advances every frame; glitches only arrive on snapshot frames).
+Five Fable+Sol rounds. Deferrals (accepted, early-project triage bar):
+(a) a flip revealed on dtS=0 frames + immediate stream halt leaves the
+pose until resume (Sol r5, rejected-blocker: self-heals, frozen view
+only); (b) starved-buffer samples report v=0, collapsing the widening
+to bare 85° mid-stall (Fable r5); (c) mid-bracket phasing can integrate
+part of a flip before the next burst check (Fable r5 question); (d)
+r < TRAILER_M geometry (no articulation equilibrium) pops repeatedly —
+least-bad rendering of impossible geometry (Fable r4 question);
+(e) >86° unsmoothed polyline vertex steps snap rather than swing
+(Fable r4 question). The lumped-dtS jerk (WQ-0 replay (a)) is the real
+underlying fix for fast-replay articulation accuracy.
 
 ### WQ-3: Junction-interior squiggles at city zoom
 `internal` lanes still draw when zoomed out (squiggle clutter at every junction).

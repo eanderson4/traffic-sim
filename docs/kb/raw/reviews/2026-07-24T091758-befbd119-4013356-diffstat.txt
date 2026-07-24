@@ -1,0 +1,3 @@
+ viz/src/replaypanel.ts       | 40 ++++++++++++++++++++++++++++------------
+ viz/test/replaypanel.test.ts |  4 +++-
+ 2 files changed, 31 insertions(+), 13 deletions(-)
