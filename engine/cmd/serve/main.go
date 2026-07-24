@@ -26,6 +26,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -143,6 +144,20 @@ func main() {
 			Ticks:  *ticks,
 		}
 	}
+
+	// Absolutize the network path: the run meta (registry + durable record)
+	// carries spec.Net.Path verbatim, and a relative path makes the recording
+	// unreadable from any other working directory (the replay child hit this:
+	// recorded from engine/, replayed from the repo root). Fail loud on
+	// error rather than silently keep the relative path — filepath.Abs
+	// essentially never fails, so a failure here is exactly the case to not
+	// paper over.
+	abs, err := filepath.Abs(spec.Net.Path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "serve: network path %s: %v\n", spec.Net.Path, err)
+		os.Exit(2)
+	}
+	spec.Net.Path = abs
 
 	// Pacing (ADR-0005 §4 — pacing is a wrapper's business; the loop itself
 	// never blocks on input): default 1 keeps PaceFloor = one tick of wall

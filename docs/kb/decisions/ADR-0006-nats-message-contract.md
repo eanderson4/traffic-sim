@@ -301,3 +301,22 @@ recorded here per rule 5:
   `done` was killed or truncated: playback holds at the last logged tick —
   continuing would invent an under-controlled tail the original run never
   produced. Both horizons are exposed in the player's status.
+
+### RunMeta Net.Path value note (same milestone)
+
+`serve` now absolutizes `spec.Net.Path` before the run starts, so the
+RunMeta written to the registry and carried by durable recordings holds an
+ABSOLUTE filesystem path (previously it echoed whatever `-netfile`/scenario
+resolution produced — usually relative). Migration note: recordings made
+before this change with relative paths resolve against the replay process's
+working directory (the demosrv child runs from the repo root); recordings
+made after are cwd-independent but checkout/machine-bound — moving a store
+to another machine or relocating the checkout breaks network loading even
+when the scenario hash matches. Acceptable under ADR-0004 (local-first);
+portable network identity (content-addressed network in the store) is
+future work, logged in the KB work-queue.
+
+The replay player's HTTP status payload (demo control plane, not a NATS
+subject) carries the recorded run's ADR-0012 scenario `hash` (omitempty) so
+demosrv can bind display metadata to the recording; additive to that
+localhost JSON contract.

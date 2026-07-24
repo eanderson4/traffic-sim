@@ -14,15 +14,23 @@
 //
 // The sine argument is wrapped to the shortest arc (a ±π crossing is the
 // same physical direction, not a full spin). Below 0.1 m/s the angle is
-// held — no articulation drift while queued. Δt is clamped (tab-switch
-// frame gaps can't kick the trailer). State spawns aligned (θ_tr = θ_front)
-// and is dropped on despawn via prune(). Pure and DOM-free so node --test
-// can drive it.
+// held — no articulation drift while queued. Δt is SIM time (main.ts
+// derives it from the sample's tick progression × dt — at 8× replay the
+// tractor advances 8 sim-seconds per wall second), integrated in substeps
+// of ≤ MAX_DT_S so a large legitimate delta (up to ~1 sim-second per
+// render frame at 8×) converges like the many small steps it replaces. A
+// delta beyond MAX_TOTAL_DT_S means the world JUMPED (rAF suspension in a
+// backgrounded tab): the trailer re-anchors aligned, mini-seek style,
+// instead of stepping through minutes of stale sim time. State spawns
+// aligned (θ_tr = θ_front) and is dropped on despawn via prune(); reset()
+// drops everything (replay seeks). Pure and DOM-free so node --test can
+// drive it.
 
 import { TRACTOR_M, TRAILER_M } from "./theme.ts";
 
 const HOLD_V = 0.1; // m/s — below this, hold θ_trailer (queued)
-const MAX_DT_S = 0.05; // clamp wall-frame dt
+const MAX_DT_S = 0.05; // max integration substep, s
+const MAX_TOTAL_DT_S = 2; // s — beyond this the world jumped: re-anchor, don't step
 const TWO_PI = 2 * Math.PI;
 
 // wrapPi folds an angle difference to [−π, π) — the shortest arc.
@@ -44,7 +52,9 @@ export class Articulator {
 
   // update advances truck id's trailer one frame and returns both body
   // poses in the local metric frame. front = front-bumper point, angles in
-  // radians CCW-from-east (wire convention), v in m/s, dtS in seconds.
+  // radians CCW-from-east (wire convention), v in m/s, dtS in SIM seconds
+  // (main.ts derives it from tick progression — large values from fast
+  // replay are legitimate and integrated in substeps).
   update(
     id: number,
     frontX: number,
@@ -57,8 +67,24 @@ export class Articulator {
     if (tr === undefined) {
       tr = thetaFront; // spawn aligned
     } else if (v >= HOLD_V) {
-      const dt = Math.min(Math.max(dtS, 0), MAX_DT_S);
-      tr += ((v * dt) / TRAILER_M) * Math.sin(wrapPi(thetaFront - tr));
+      if (dtS > MAX_TOTAL_DT_S) {
+        // The world JUMPED (rAF suspension in a backgrounded tab can hand
+        // us minutes of sim time): re-anchor aligned, mini-seek style —
+        // stepping through it would hang the viewer on millions of
+        // substeps, and the stale angle is meaningless anyway.
+        tr = thetaFront;
+      } else {
+        // Substep: explicit Euler with a ~1 s step (8× replay delivers up
+        // to ~1 sim-second per render frame) would overshoot; ≤ MAX_DT_S
+        // steps converge like the per-frame integration they replace. A
+        // negative dt (a seek the caller didn't reset) integrates nothing.
+        let rem = Math.max(dtS, 0);
+        while (rem > 0) {
+          const dt = Math.min(rem, MAX_DT_S);
+          tr += ((v * dt) / TRAILER_M) * Math.sin(wrapPi(thetaFront - tr));
+          rem -= dt;
+        }
+      }
     }
     this.thetaTrailer.set(id, tr);
 
@@ -82,5 +108,14 @@ export class Articulator {
     for (const id of this.thetaTrailer.keys()) {
       if (!live.has(id)) this.thetaTrailer.delete(id);
     }
+  }
+
+  // reset drops ALL trailer state. A replay seek teleports every truck
+  // (ids survive), so persisted angles belong to the abandoned states —
+  // and a paused landing reports speed 0, below HOLD_V, so articulation
+  // would never reconverge. The next update re-spawns each trailer
+  // aligned with its tractor.
+  reset(): void {
+    this.thetaTrailer.clear();
   }
 }

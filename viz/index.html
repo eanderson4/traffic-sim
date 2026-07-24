@@ -93,6 +93,22 @@
       #model .mp-row { display: flex; gap: 10px; margin-top: 2px; font-size: 11px; }
       #model .mp-row span:first-child { color: #9fb2e8; flex: none; }
       #model .mp-row span:last-child { margin-left: auto; text-align: right; }
+      /* Replay controls — replay-driver control plane (replaypanel.ts).
+         Interactive; bottom-center; hides unless demosrv's replay proxy
+         answers (a plain live demo gets a 404 → the panel never shows).
+         Colors are the theme.ts tokens as CSS-local literals (same
+         convention as #status .ok/.bad and .sw-current). */
+      #replay { bottom: 10px; left: 50%; transform: translateX(-50%); pointer-events: auto; user-select: none; min-width: 300px; white-space: normal; }
+      #replay .rp-head { display: flex; align-items: baseline; gap: 8px; font-weight: 700; letter-spacing: 0.08em; }
+      #replay .rp-run { margin-left: auto; color: #9fb2e8; font-weight: 400; letter-spacing: 0; }
+      #replay .rp-controls { display: flex; gap: 6px; margin-top: 5px; }
+      #replay .rp-btn { padding: 1px 8px; border: 1px solid rgba(46, 91, 255, 0.55); border-radius: 3px; cursor: pointer; }
+      #replay .rp-btn:hover { background: rgba(46, 91, 255, 0.25); }
+      #replay .rp-btn.rp-on { color: #1e9e6a; border-color: #1e9e6a; }
+      #replay input[type="range"] { width: 100%; margin-top: 7px; accent-color: #2e5bff; }
+      #replay .rp-line { margin-top: 4px; font-variant-numeric: tabular-nums; }
+      #replay .rp-warn { color: #e5484d; font-weight: 700; }
+      #replay .rp-hint { color: #e8b43a; }
     </style>
   </head>
   <body>
@@ -102,6 +118,7 @@
     <div id="legend" class="hud"></div>
     <div id="switcher" class="hud"></div>
     <div id="model" class="hud"></div>
+    <div id="replay" class="hud"></div>
     <div id="loading"><div class="spin"></div><div id="loading-msg">loading…</div></div>
     <script type="module" src="/src/main.ts"></script>
   </body>

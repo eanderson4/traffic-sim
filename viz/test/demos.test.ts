@@ -6,7 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { buildAppURL } from "../src/demos-core.ts";
+import { buildAppURL, buildReplayURL, deepLinkURL, startPath } from "../src/demos-core.ts";
 import { demoIdFromNetUrl } from "../src/switcher.ts";
 
 test("demoIdFromNetUrl recovers the demo id from the cache URL", () => {
@@ -33,4 +33,27 @@ test("buildAppURL keys the map off run and the network cache off id", () => {
   assert.ok(url.startsWith("/app/?"), "deep link goes to the map app");
   assert.ok(url.includes("run=seed-7"), "run id feeds ?run= (the NATS subject)");
   assert.ok(url.includes("net=/net/i280-evening.geojson"), "demo id feeds the cached network");
+});
+
+test("startPath routes activation by kind (demo → serve, replay → replay driver)", () => {
+  assert.equal(startPath({ id: "i280-baseline", kind: "demo" }), "/api/demo/i280-baseline/start");
+  assert.equal(startPath({ id: "rec1", kind: "replay" }), "/api/replay/rec1/start");
+});
+
+test("buildReplayURL deep-links the replay live plane ({run}-replay, no dt hint)", () => {
+  assert.equal(
+    buildReplayURL({ id: "rec1", run: "baseline" }),
+    "/app/?run=baseline-replay&net=/net/rec1.geojson",
+  );
+});
+
+test("deepLinkURL picks the running-card URL by kind", () => {
+  assert.equal(
+    deepLinkURL({ id: "i280-baseline", run: "baseline", kind: "demo" }),
+    "/app/?run=baseline&net=/net/i280-baseline.geojson",
+  );
+  assert.equal(
+    deepLinkURL({ id: "rec1", run: "baseline", kind: "replay" }),
+    "/app/?run=baseline-replay&net=/net/rec1.geojson",
+  );
 });

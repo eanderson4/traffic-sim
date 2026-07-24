@@ -1,6 +1,13 @@
 // demos-core.ts — pure, DOM-free helpers for the demosrv menu page
-// (demos.ts). Kept separate so node --test can import them exactly like
-// theme.ts/proj.ts: no fetch, no document.
+// (demos.ts) and the in-map switcher (switcher.ts). Kept separate so
+// node --test can import them exactly like theme.ts/proj.ts: no fetch, no
+// document.
+
+// EntryKind is demosrv's output-only discriminator (engine/cmd/demosrv
+// registry.go — Load overwrites whatever the JSON carried, so the API
+// payload always has it): "demo" spawns serve, "replay" spawns the replay
+// driver over a recorded store.
+export type EntryKind = "demo" | "replay";
 
 // DemoInfo mirrors one entry of the demosrv registry (demos.json — the Go
 // type Demo in engine/cmd/demosrv/registry.go). seed/ticks are optional
@@ -14,10 +21,30 @@ export interface DemoInfo {
   run: string;
   seed?: number;
   ticks?: number;
+  kind: EntryKind; // always "demo" in API payloads
 }
 
+// RecordingInfo mirrors one "recordings" entry (the Go type Recording): a
+// durable JetStream store replayed under the live plane {run}-replay. No
+// tags/seed/ticks — a recording replays its store as written; scenarioDir
+// is reused for the network GeoJSON (ids are unique ACROSS kinds, they
+// share /net/{id}).
+export interface RecordingInfo {
+  id: string;
+  title: string;
+  blurb: string;
+  store: string;
+  run: string;
+  scenarioDir: string;
+  kind: EntryKind; // always "replay" in API payloads
+}
+
+// MenuEntry is anything the menu/switcher can activate.
+export type MenuEntry = DemoInfo | RecordingInfo;
+
 // RunStatus mirrors demosrv's GET /api/status payload; active is the
-// running demo's id, or null when no engine is up.
+// running child's id (demo OR recording — the supervisor is generic over
+// kinds), or null when no engine is up.
 export interface RunStatus {
   active: string | null;
   pid: number;
@@ -32,4 +59,25 @@ export interface RunStatus {
 // ([A-Za-z0-9_-]+ ids, NATS-token runs) need no escaping.
 export function buildAppURL(demo: Pick<DemoInfo, "id" | "run">): string {
   return `/app/?run=${demo.run}&net=/net/${demo.id}.geojson`;
+}
+
+// buildReplayURL is the already-running RECORDING card's deep link — the
+// shape demosrv returns from POST /api/replay/{id}/start MINUS the dt hint
+// (the registry carries no dt; config.ts's 0.1 default applies). A
+// NON-running recording never takes this path: its activation POSTs
+// startPath and navigates on the response, which carries the dt.
+export function buildReplayURL(rec: Pick<RecordingInfo, "id" | "run">): string {
+  return `/app/?run=${rec.run}-replay&net=/net/${rec.id}.geojson`;
+}
+
+// deepLinkURL picks the running-card navigation URL by kind.
+export function deepLinkURL(entry: Pick<MenuEntry, "id" | "run" | "kind">): string {
+  return entry.kind === "replay" ? buildReplayURL(entry) : buildAppURL(entry);
+}
+
+// startPath routes an activation POST by kind: demos spawn serve,
+// recordings spawn the replay driver (engine/cmd/demosrv main.go — the
+// routes are distinct, the {url} response shape is the same).
+export function startPath(entry: Pick<MenuEntry, "id" | "kind">): string {
+  return entry.kind === "replay" ? `/api/replay/${entry.id}/start` : `/api/demo/${entry.id}/start`;
 }

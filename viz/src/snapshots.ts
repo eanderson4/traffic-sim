@@ -46,7 +46,7 @@ function lerpAngle(a: number, b: number, t: number): number {
 export class SnapshotBuffer {
   private frames: TimedFrame[] = [];
   readonly bufferMs: number;
-  readonly simDt: number; // engine timestep, s — sim seconds per tick
+  simDt: number; // engine timestep, s — sim seconds per tick (see setSimDt)
   private readonly maxFrames: number;
 
   // NOTE: erasable-syntax only (node strip-only mode loads this directly).
@@ -56,9 +56,20 @@ export class SnapshotBuffer {
     this.maxFrames = maxFrames;
   }
 
+  // setSimDt re-targets the sim seconds-per-tick behind speed derivation.
+  // On a replay the status payload carries the RECORDED run's authoritative
+  // dt — the ?dt= URL hint comes from the (mutable) scenario — so the
+  // replay panel pushes the status value down on its first probe (main.ts).
+  setSimDt(dt: number): void {
+    this.simDt = dt;
+  }
+
   // push appends a decoded frame stamped with its receipt time. Out-of-order
   // or duplicate ticks are dropped (core NATS is at-most-once; reordering is
-  // not expected on a single subscriber, and the buffer is not a resync tool).
+  // not expected on a single subscriber, and the buffer is not a resync
+  // tool). A replay seek never reaches here as a drop or a jump: the caller
+  // detects it first (SeekGate below — backward tick or forward jump), resets
+  // the buffer, and the landing frame then pushes fresh.
   push(frame: SnapshotFrame, recvMs: number): void {
     const last = this.frames[this.frames.length - 1];
     if (last && frame.tick <= last.frame.tick) return;
@@ -66,6 +77,14 @@ export class SnapshotBuffer {
     if (this.frames.length > this.maxFrames) {
       this.frames.splice(0, this.frames.length - this.maxFrames);
     }
+  }
+
+  // reset drops every buffered frame. A replay seek abandons the buffered
+  // states — lerping the landing frame against them would smear vehicles
+  // across the jump — so the caller resets here and pushes the landing
+  // frame fresh (it renders as-is until the next frame arrives).
+  reset(): void {
+    this.frames = [];
   }
 
   // sample interpolates the render set for wall time nowMs. Returns null
@@ -125,5 +144,47 @@ export class SnapshotBuffer {
       });
     }
     return { vehicles, tick: newer.frame.tick, starved };
+  }
+}
+
+// SeekGate detects seeks on a replay stream. A live run publishes strictly
+// increasing ticks; the replay control plane (demosrv /api/replay/ctl/seek)
+// restarts publication at the seek target, and paused replay republishes
+// the SAME tick. Two shapes are seeks: a tick DECREASE (scrub back) and a
+// forward jump beyond maxJump (scrub ahead — accepted-as-progression would
+// lerp across unrelated states and derive bogus speeds). The gate records
+// every observed tick and reports whether the stream jumped, so the caller
+// (main.ts) can drop the interpolation history (SnapshotBuffer.reset) and
+// wipe tick-derived overlay state before accepting the landing frame.
+// Equal ticks (paused republication) and normal increments report false —
+// push's own duplicate drop handles the former.
+export class SeekGate {
+  private lastTick: number | null = null;
+  private maxJump: number;
+
+  // simDt is the engine timestep (s/tick, config.ts ?dt=): the forward-jump
+  // threshold is a 24-sim-second window expressed in ticks — dt 0.1 →
+  // 240, dt 0.001 → 24000 (normal 8× frames advance ~800 ticks there, no
+  // false seeks). 24 sim-seconds is far beyond any decimated-frame
+  // increment or plausible delivery stall at demo paces, so only a
+  // deliberate scrub-ahead trips the gate.
+  constructor(simDt = 0.1) {
+    this.maxJump = Math.ceil(24 / simDt);
+  }
+
+  // setSimDt re-derives the threshold when the recorded run's authoritative
+  // dt replaces the URL hint (mirrors SnapshotBuffer.setSimDt — main.ts's
+  // onStatus re-targets both). Observed ticks are unaffected.
+  setSimDt(simDt: number): void {
+    this.maxJump = Math.ceil(24 / simDt);
+  }
+
+  // observe records tick and returns true when it moved BACKWARD vs the
+  // previously observed tick or JUMPED forward past maxJump.
+  observe(tick: number): boolean {
+    const seek =
+      this.lastTick !== null && (tick < this.lastTick || tick - this.lastTick > this.maxJump);
+    this.lastTick = tick;
+    return seek;
   }
 }

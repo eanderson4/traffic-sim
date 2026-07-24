@@ -80,6 +80,10 @@ type PlayerStatus struct {
 	Paused    bool    `json:"paused"`
 	Done      bool    `json:"done"` // end-of-recording hold
 	Dt        float64 `json:"dt"`   // the recorded run's timestep (authoritative — viz ?dt= override)
+	// Hash is the recorded run's ADR-0012 scenario content hash (empty for
+	// flag-built recordings): demosrv compares it against the scenario it
+	// would display to catch scenario-edited-after-recording.
+	Hash string `json:"hash,omitempty"`
 	// CRCErrors and VerbErrors count divergences during FORWARD PLAYBACK
 	// only. Seek re-sim still verifies every logged CRC and re-enqueues
 	// every verb (and logs failures loudly), but does not count them —
@@ -507,6 +511,7 @@ func (p *Player) Status() PlayerStatus {
 		Paused:     paused,
 		Done:       p.done.Load(),
 		Dt:         p.spec.Params.Dt,
+		Hash:       p.spec.Hash,
 		CRCErrors:  p.crcErrs.Load(),
 		VerbErrors: p.verbErrs.Load(),
 	}

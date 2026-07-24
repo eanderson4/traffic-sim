@@ -1,15 +1,23 @@
 package main
 
-// geojson.go — per-demo network GeoJSON for the viz. Generated on first
-// request from the demo's scenario network file through the engine's OWN
+// geojson.go — per-entry network GeoJSON for the viz. Generated on first
+// request from the entry's scenario network file through the engine's OWN
 // exporter (engine.WriteGeoJSON — the exact code path of serve's -geojson
 // flag: local metric frame + the "frame" foreign member carrying
 // projection/netOffset from the network provenance, engine/geojson.go),
 // then cached under -netcache. The network path comes from the scenario
 // loader (traffic-sim/engine/scenario — its yaml.v3 dependency is the
 // ADR-0012 §2 approved exception, confined to that package), never from
-// YAML sniffing here. The cache is existence-based: delete a cache file to
-// regenerate after editing a network.
+// YAML sniffing here.
+//
+// The cache is keyed by CONTENT identity — {id}.{hash12}.geojson, hash12
+// from the scenario's ADR-0012 content hash — not by entry id alone: an
+// edit-then-revert of the scenario must not resurrect a stale edited
+// network from the cache (the recording hash check would pass against the
+// reverted scenario while the viz renders the edited one). Any content
+// change simply lands in a NEW cache file; orphans are harmless (a dev
+// cache). scenario.Load per request is trivially cheap — the same
+// no-memoization discipline as params.go.
 
 import (
 	"encoding/json"
@@ -27,9 +35,18 @@ type netCache struct {
 	mu  sync.Mutex // generation is rare and cheap; one at a time is plenty
 }
 
-// path returns the cached GeoJSON file for d, generating it on first use.
-func (c *netCache) path(d *Demo) (string, error) {
-	path := filepath.Join(c.dir, d.ID+".geojson")
+// path returns the cached GeoJSON file for a demo or recording id,
+// generating it on first use from the entry's scenario directory.
+func (c *netCache) path(id, scenarioDir string) (string, error) {
+	scen, err := scenario.Load(scenarioDir)
+	if err != nil {
+		return "", err
+	}
+	hash := scen.Hash()
+	if len(hash) > 12 {
+		hash = hash[:12]
+	}
+	path := filepath.Join(c.dir, id+"."+hash+".geojson")
 	if _, err := os.Stat(path); err == nil {
 		return path, nil
 	}
@@ -38,10 +55,6 @@ func (c *netCache) path(d *Demo) (string, error) {
 	// Another request may have generated it while we waited.
 	if _, err := os.Stat(path); err == nil {
 		return path, nil
-	}
-	scen, err := scenario.Load(d.ScenarioDir)
-	if err != nil {
-		return "", err
 	}
 	data, err := os.ReadFile(scen.NetPath)
 	if err != nil {

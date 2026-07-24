@@ -42,6 +42,14 @@
   replay decimates to ~10 Hz so this is moot until someone raises decimation.
 - **Chord-vs-path speed underestimate** grows with tick-skip on curved geometry (nit;
   speeds are a labelled client-side estimate).
+- **Replay-panel deferrals (Sol, C3 final round, 2026-07-23):** (a) trailer
+  articulation integrates `sample.tick` which is the newer snapshot's INTEGER tick —
+  sim time advances in one burst per snapshot, so trailers jerk instead of following
+  the lerp (cosmetic); (b) panel polls have no in-flight guard — a slow (3 s timeout)
+  poll can overlap the next and overwrite newer state; (c) demosrv registry accepts
+  `"kind"` as an input field and overwrites it — should be rejected by the strict
+  fence or moved to an output DTO; (d) the panel's divergence warning shows
+  crcErrors only — surface verbErrors too.
 
 
 ### WQ-1: Spurious/"extra" signal heads at junctions

@@ -1,11 +1,13 @@
 // demos.ts — controller for the demosrv menu page (demos.html): renders
-// the registry as a card grid, polls /api/status every 3 s for the running
-// badge, and turns a card click into POST /api/demo/{id}/start → the live
-// map. Single-active-run is demosrv's rule (starting a demo kills the
-// previous engine); this page only reflects it. Pure helpers live in
-// demos-core.ts so node --test can reach them.
+// the registry as a card grid (demos AND recordings — replay entries carry
+// a REPLAY chip and a dashed border), polls /api/status every 3 s for the
+// running badge, and turns a card click into a start POST (routed by kind:
+// /api/demo/{id}/start vs /api/replay/{id}/start — demos-core.ts
+// startPath) → the live map. Single-active-run is demosrv's rule (starting
+// an entry kills the previous engine); this page only reflects it. Pure
+// helpers live in demos-core.ts so node --test can reach them.
 
-import { buildAppURL, type DemoInfo, type RunStatus } from "./demos-core.ts";
+import { deepLinkURL, startPath, type DemoInfo, type MenuEntry, type RecordingInfo, type RunStatus } from "./demos-core.ts";
 
 function must(id: string): HTMLElement {
   const el = document.getElementById(id);
@@ -16,6 +18,7 @@ const grid = must("grid");
 const notice = must("notice");
 
 let demos: DemoInfo[] = [];
+let recordings: RecordingInfo[] = [];
 let status: RunStatus = { active: null, pid: 0 };
 const starting = new Set<string>(); // start POST in flight — keep the spinner across re-renders
 
@@ -33,13 +36,14 @@ function showError(err: unknown): void {
   notice.style.display = "block";
 }
 
-function card(d: DemoInfo): HTMLElement {
+function card(d: MenuEntry): HTMLElement {
   const el = document.createElement("article");
   el.className = "card";
   const running = status.active === d.id;
   const isStarting = starting.has(d.id);
   if (running) el.classList.add("running");
   if (isStarting) el.classList.add("starting");
+  if (d.kind === "replay") el.classList.add("replay");
 
   const title = document.createElement("h2");
   title.textContent = d.title;
@@ -59,7 +63,15 @@ function card(d: DemoInfo): HTMLElement {
 
   const tags = document.createElement("div");
   tags.className = "tags";
-  for (const t of d.tags) {
+  // Kind chip first: a recording must read as a replay, not a live run.
+  if (d.kind === "replay") {
+    const chip = document.createElement("span");
+    chip.className = "chip replay";
+    chip.textContent = "REPLAY";
+    tags.append(chip);
+  }
+  // Recordings carry no tags (they replay their store as written).
+  for (const t of "tags" in d ? d.tags : []) {
     const chip = document.createElement("span");
     chip.className = "chip";
     chip.textContent = t;
@@ -83,23 +95,25 @@ function card(d: DemoInfo): HTMLElement {
 }
 
 function render(): void {
-  grid.replaceChildren(...demos.map(card));
+  grid.replaceChildren(...demos.map(card), ...recordings.map(card));
 }
 
-// activate starts the demo's engine (demosrv kills any previous run) and
-// navigates to the live map. The already-running card skips the start
-// round-trip via the pure buildAppURL — same URL shape as the start
-// response, pinned in test/demos.test.ts.
-async function activate(d: DemoInfo): Promise<void> {
+// activate starts the entry's engine (demosrv kills any previous run) and
+// navigates to the live map — the start POST is routed by kind (demos
+// spawn serve, recordings spawn the replay driver; same {url} response).
+// The already-running card skips the start round-trip via the pure
+// deepLinkURL — same URL shape as the start response, pinned in
+// test/demos.test.ts.
+async function activate(d: MenuEntry): Promise<void> {
   if (starting.has(d.id)) return;
   if (status.active === d.id) {
-    location.href = buildAppURL(d);
+    location.href = deepLinkURL(d);
     return;
   }
   starting.add(d.id);
   render();
   try {
-    const resp = await fetchJSON<{ url: string }>(`/api/demo/${d.id}/start`, { method: "POST" });
+    const resp = await fetchJSON<{ url: string }>(startPath(d), { method: "POST" });
     location.href = resp.url;
   } catch (err) {
     starting.delete(d.id);
@@ -127,8 +141,9 @@ async function refreshStatus(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const reg = await fetchJSON<{ demos: DemoInfo[] }>("/api/demos");
-  demos = reg.demos;
+  const reg = await fetchJSON<{ demos?: DemoInfo[]; recordings?: RecordingInfo[] }>("/api/demos");
+  demos = reg.demos ?? [];
+  recordings = reg.recordings ?? [];
   await refreshStatus(); // refreshStatus renders; covers the first paint too
   setInterval(() => void refreshStatus(), 3000);
 }

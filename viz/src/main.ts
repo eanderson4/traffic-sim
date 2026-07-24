@@ -31,7 +31,7 @@ import { decodeSignalFrame, type SigColor, type SignalTable } from "./tssg.ts";
 import { headStatesAtTick, signalHeads, type SignalHead } from "./signals.ts";
 import { SIGNAL_HEAD, SIGNAL_HEAD_IMAGE_ID, signalHeadImage } from "./signalhead.ts";
 import { makeProjector, type LocalFrame } from "./proj.ts";
-import { SnapshotBuffer } from "./snapshots.ts";
+import { SnapshotBuffer, SeekGate } from "./snapshots.ts";
 import {
   diffVehicles,
   diffTrailers,
@@ -46,6 +46,7 @@ import { Hud } from "./status.ts";
 import { Legend } from "./legend.ts";
 import { DemoSwitcher, demoIdFromNetUrl } from "./switcher.ts";
 import { ModelPanel } from "./modelpanel.ts";
+import { ReplayPanel } from "./replaypanel.ts";
 import { THEME, glyphByCls } from "./theme.ts";
 import { bodyImages, glyphImageId, TRACTOR_IMAGE_ID, TRAILER_IMAGE_ID, ICON_SIZE_STOPS } from "./glyphs.ts";
 import { Articulator } from "./artic.ts";
@@ -187,11 +188,18 @@ async function main(): Promise<void> {
   });
   map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-right");
 
-  const buffer = new SnapshotBuffer(cfg.bufferMs, cfg.dt);
+  // currentDt is THE sim timestep for every viz-side sim-math consumer
+  // (buffer speeds, seek-gate threshold, artic integration). It starts at
+  // the ?dt= URL hint and is REPLACED by the recorded run's authoritative
+  // dt on the replay panel's first status probe (the onStatus hook below)
+  // — a direct/stale deep link must not leave any consumer on the hint.
+  let currentDt = cfg.dt;
+  const buffer = new SnapshotBuffer(cfg.bufferMs, currentDt);
+  const seekGate = new SeekGate(currentDt);
   const applied = new Map<number, RenderedVehicle>();
   const appliedTrailers = new Map<number, RenderedTrailer>();
   const artic = new Articulator();
-  let prevFrameMs = 0;
+  let prevSampleTick: number | null = null; // last rendered sample's tick (sim clock)
   let mapReady = false;
 
   // Signal channel state: the latest TSSG table, the head set applied to
@@ -449,7 +457,17 @@ async function main(): Promise<void> {
     cfg.run,
     (data) => {
       try {
-        buffer.push(decodeFrame(data), performance.now());
+        const frame = decodeFrame(data);
+        // Replay seek (replaypanel.ts): the stream jumps — BACKWARD to a
+        // lower tick, or FORWARD past SeekGate's maxJump on a scrub-ahead.
+        // Everything the pre-seek stream painted belongs to states the
+        // seek abandoned; resetForSeek drops it (a lerp across the jump
+        // would smear vehicles and derive bogus speeds, lanes keep stale
+        // colors otherwise) and the new frame lands fresh. Duplicate ticks
+        // (paused republication) are not seeks; push's own drop handles
+        // them.
+        if (seekGate.observe(frame.tick)) resetForSeek();
+        buffer.push(frame, performance.now());
       } catch (err) {
         hud.setConnection(false, String(err));
       }
@@ -481,6 +499,30 @@ async function main(): Promise<void> {
   // updates are a per-snapshot cadence channel, not per render frame).
   let prevRatios = new Map<string, number>();
   let lastCongestionMs = 0;
+  // clearCongestion wipes every painted lane ratio (a replay seek abandons
+  // the states they describe): removeFeatureState with no key drops the
+  // feature's whole state, so lanes fall back to the no-data color until
+  // the post-seek stream repaints them.
+  function clearCongestion(): void {
+    if (mapReady) {
+      for (const laneId of prevRatios.keys()) {
+        map.removeFeatureState({ source: "network", id: laneId });
+      }
+    }
+    prevRatios = new Map();
+  }
+  // resetForSeek drops EVERYTHING the pre-seek stream painted: the
+  // interpolation buffer (a lerp across the jump would smear vehicles),
+  // the congestion overlay's tick-derived feature-state (lanes keep stale
+  // colors otherwise), and the inferred trailer poses (trucks keep their
+  // ids across a seek — artic.ts). Shared by the SeekGate backstop (above)
+  // and the panel's pre-seek hook (below).
+  function resetForSeek(): void {
+    buffer.reset();
+    clearCongestion();
+    artic.reset();
+    prevSampleTick = null; // the landing tick must not kick the trailer
+  }
   function updateCongestion(nowMs: number): void {
     if (!mapReady || nowMs - lastCongestionMs < 1000) return;
     lastCongestionMs = nowMs;
@@ -506,6 +548,42 @@ async function main(): Promise<void> {
     prevRatios = ratios;
   }
 
+  // Replay controls (replaypanel.ts); same probe discipline as the other
+  // panels — hides unless demosrv's replay proxy answers, so plain live
+  // demos never see it. Mounted HERE (not with the other panels) because
+  // its two hooks reach into the stream pipeline declared above:
+  //   onSeeking — the panel KNOWS when it seeks and fires BEFORE the POST
+  //     (the player publishes the landing frame before acking it, so a
+  //     post-ack reset could wipe that frame; a paused seek would show
+  //     stale vehicles until the ~1 Hz republication). Covers the forward
+  //     scrubs ≤ maxJump that SeekGate's heuristic misses; the gate stays
+  //     as backstop for non-panel seeks;
+  //   onStatus — the status dt is the RECORDED run's authoritative
+  //     timestep (the ?dt= URL hint comes from the mutable scenario, and
+  //     running-replay deep links carry no dt at all), so it wins on the
+  //     first probe: currentDt is re-targeted and EVERY sim-math consumer
+  //     follows (buffer speeds via setSimDt, the gate's forward-jump
+  //     window, artic integration — both read currentDt). If it differs,
+  //     speeds already rendered were off for one buffer-fill — acceptable;
+  //     warn and re-target.
+  void new ReplayPanel(document.getElementById("replay")!, {
+    // The panel only ever controls the replay THIS page displays — every
+    // probe/ctl binds cfg.run, so a stale deep link for another recording
+    // 409s into the mismatch hint instead of adopting the active replay.
+    expectedRun: cfg.run,
+    onSeeking: resetForSeek,
+    onStatus: (s) => {
+      if (s.dt <= 0 || s.dt === currentDt) return; // dt is constant per run
+      console.warn(
+        `replay status dt ${s.dt} ≠ config dt ${currentDt} — ` +
+          `adopting the recorded run's authoritative dt (speeds rendered so far were off)`,
+      );
+      currentDt = s.dt;
+      buffer.setSimDt(s.dt);
+      seekGate.setSimDt(s.dt);
+    },
+  }).init();
+
   // Render loop: interpolate behind the buffer, apply updateData diffs once
   // per rAF frame — never per incoming message.
   function frame(nowMs: number): void {
@@ -513,8 +591,17 @@ async function main(): Promise<void> {
       const sample = buffer.sample(nowMs);
       if (sample) {
         hideLoading(); // first renderable sample — the engine is streaming
-        const dtS = prevFrameMs === 0 ? 0 : (nowMs - prevFrameMs) / 1000;
-        prevFrameMs = nowMs;
+        // Trailer articulation integrates SIM time, not wall time: at 8×
+        // replay the tractor advances 8 sim-seconds per wall second. The
+        // sample's tick is the newer source snapshot's (snapshots.ts) —
+        // its progression × currentDt is the sim-elapsed for this render
+        // frame (0 while the buffer holds one tick; clamped ≥ 0;
+        // resetForSeek re-arms prevSampleTick so a seek never kicks the
+        // trailer). currentDt, not cfg.dt: the recorded run's dt may have
+        // replaced the URL hint (onStatus above).
+        const dtS =
+          prevSampleTick === null ? 0 : Math.max(0, sample.tick - prevSampleTick) * currentDt;
+        prevSampleTick = sample.tick;
         const next = new Map<number, RenderedVehicle>();
         const nextTrailers = new Map<number, RenderedTrailer>();
         for (const v of sample.vehicles) {

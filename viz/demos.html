@@ -36,6 +36,11 @@
       }
       .card:hover { border-color: #7e9dff; background: rgba(18, 40, 129, 0.75); transform: translateY(-1px); }
       .card.running { border-color: #1e9e6a; }
+      /* Recordings (kind "replay", demos-core.ts): dashed border + amber
+         REPLAY chip — a replayed run must read differently from a live
+         one at a glance. */
+      .card.replay { border-style: dashed; }
+      .chip.replay { color: #e8b43a; border-color: rgba(232, 180, 58, 0.55); }
       .card h2 { margin: 0; font-size: 15px; color: #eaf0ff; padding-right: 90px; }
       .card .blurb { margin: 8px 0 12px; color: #9fb2e8; font-size: 12px; }
       .tags { display: flex; flex-wrap: wrap; gap: 6px; }

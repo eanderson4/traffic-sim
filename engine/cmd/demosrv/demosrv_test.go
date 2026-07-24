@@ -8,7 +8,9 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -77,6 +79,10 @@ func TestLoadRegistryValidation(t *testing.T) {
 			{"id":"a","title":"t","scenarioDir":%q,"run":"r1"},
 			{"id":"a","title":"t","scenarioDir":%q,"run":"r2"}
 		]`, "duplicate id"},
+		{"duplicate run", `[
+			{"id":"a","title":"t","scenarioDir":%q,"run":"r1"},
+			{"id":"b","title":"t","scenarioDir":%q,"run":"r1"}
+		]`, "demo run ids must be unique"},
 		{"missing scenario dir", `[
 			{"id":"a","title":"t","scenarioDir":"/no/such/dir-anywhere","run":"r1"}
 		]`, "scenarioDir"},
@@ -92,13 +98,16 @@ func TestLoadRegistryValidation(t *testing.T) {
 		{"run with wildcard", `[
 			{"id":"a","title":"t","scenarioDir":%q,"run":"wild>*"}
 		]`, "must match [A-Za-z0-9_-]+"},
+		{"run with replay suffix", `[
+			{"id":"a","title":"t","scenarioDir":%q,"run":"foo-replay"}
+		]`, "reserved replay-plane suffix"},
 		{"bad id", `[
 			{"id":"a/b","title":"t","scenarioDir":%q,"run":"r1"}
 		]`, "id"},
 		{"missing title", `[
 			{"id":"a","scenarioDir":%q,"run":"r1"}
 		]`, "title"},
-		{"empty registry", `[]`, "no demos"},
+		{"empty registry", `[]`, "at least one demo"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -139,11 +148,11 @@ func TestLoadRegistryValidation(t *testing.T) {
 	}
 }
 
-// sleepSpawner returns a spawn stub: a plain `sleep 30` per demo, tracked
+// sleepSpawner returns a spawn stub: a plain `sleep 30` per target, tracked
 // so the test can assert on kills. The stub carries no scenario semantics —
 // it exists to be killed and reaped.
 func sleepSpawner(cmds *[]*exec.Cmd, mu *sync.Mutex) spawnFunc {
-	return func(d *Demo) (*exec.Cmd, error) {
+	return func(t spawnTarget) (*exec.Cmd, error) {
 		cmd := exec.Command("sleep", "30")
 		if err := cmd.Start(); err != nil {
 			return nil, err
@@ -175,10 +184,10 @@ func TestSupervisorLifecycle(t *testing.T) {
 	sup := newSupervisor(sleepSpawner(&cmds, &mu))
 	sup.ready = func() error { return nil } // sleep never opens a port
 
-	d1 := &Demo{ID: "demo-one", Run: "r1"}
-	d2 := &Demo{ID: "demo-two", Run: "r2"}
+	d1 := spawnTarget{Kind: "demo", Demo: &Demo{ID: "demo-one", Run: "r1"}}
+	d2 := spawnTarget{Kind: "demo", Demo: &Demo{ID: "demo-two", Run: "r2"}}
 
-	if err := sup.start(d1); err != nil {
+	if err := sup.start(d1, nil); err != nil {
 		t.Fatalf("start d1: %v", err)
 	}
 	id, pid, _, ok := sup.status()
@@ -190,7 +199,7 @@ func TestSupervisorLifecycle(t *testing.T) {
 	}
 
 	// Single active run: starting d2 must kill d1's process.
-	if err := sup.start(d2); err != nil {
+	if err := sup.start(d2, nil); err != nil {
 		t.Fatalf("start d2: %v", err)
 	}
 	waitDead(t, cmds[0], "d1 child after d2 start")
@@ -219,7 +228,7 @@ func TestSupervisorReadyTimeoutLeavesNoZombie(t *testing.T) {
 	sup.readyTimeout = 500 * time.Millisecond
 
 	start := time.Now()
-	err := sup.start(&Demo{ID: "never-ready", Run: "r1"})
+	err := sup.start(spawnTarget{Kind: "demo", Demo: &Demo{ID: "never-ready", Run: "r1"}}, nil)
 	if err == nil {
 		t.Fatal("start succeeded with no listener; want readiness error")
 	}
@@ -236,6 +245,99 @@ func TestSupervisorReadyTimeoutLeavesNoZombie(t *testing.T) {
 		t.Fatalf("%d spawns, want 1", len(cmds))
 	}
 	waitDead(t, cmds[0], "child after failed start")
+}
+
+// A failing post-ready verify hook fails the start and leaves NO process
+// behind — same discipline as a readiness failure, but for checks that
+// need the child UP (demosrv's recording hash check reads its /status).
+func TestSupervisorVerifyFailureKillsChild(t *testing.T) {
+	var mu sync.Mutex
+	var cmds []*exec.Cmd
+	sup := newSupervisor(sleepSpawner(&cmds, &mu))
+	sup.ready = func() error { return nil }
+	boom := errors.New("display binding failed")
+
+	err := sup.start(spawnTarget{Kind: "replay", Rec: &Recording{ID: "rec1", Run: "r1"}},
+		func() error { return boom })
+	if !errors.Is(err, boom) {
+		t.Fatalf("start error %v, want the verify error wrapped", err)
+	}
+	if _, _, _, ok := sup.status(); ok {
+		t.Fatal("status after failed verify = active, want idle")
+	}
+	mu.Lock()
+	n := len(cmds)
+	c0 := cmds[0]
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("%d spawns, want 1", n)
+	}
+	waitDead(t, c0, "child after failed verify")
+
+	// A passing verify is transparent.
+	if err := sup.start(spawnTarget{Kind: "replay", Rec: &Recording{ID: "rec1", Run: "r1"}},
+		func() error { return nil }); err != nil {
+		t.Fatalf("start with passing verify: %v", err)
+	}
+	sup.stop()
+}
+
+// Replay-kind spawns are ready only when BOTH the ws port and the HTTP
+// control port accept — replay's ws listener opens before its control
+// plane binds, and the start response sends the viz at the control plane.
+// Stub TCP listeners stand in for the child's two ports; the child itself
+// is the usual `sleep`.
+func TestSupervisorReplayWaitsForBothPorts(t *testing.T) {
+	var mu sync.Mutex
+	var cmds []*exec.Cmd
+	sup := newSupervisor(sleepSpawner(&cmds, &mu))
+	sup.readyTimeout = 500 * time.Millisecond
+	rec := spawnTarget{Kind: "replay", Rec: &Recording{ID: "rec1", Run: "r1"}}
+
+	wsLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wsLn.Close()
+	sup.wsAddr = wsLn.Addr().String()
+
+	// ws up, control port down: start must fail on the CONTROL port probe
+	// (and leave no process behind, like any readiness failure).
+	sup.ctlAddr = "127.0.0.1:1"
+	err = sup.start(rec, nil)
+	if err == nil {
+		t.Fatal("replay start succeeded with the control port down")
+	}
+	if !strings.Contains(err.Error(), "127.0.0.1:1") || !strings.Contains(err.Error(), "did not accept connections") {
+		t.Errorf("error %q, want the control-port probe failure", err)
+	}
+	if _, _, _, ok := sup.status(); ok {
+		t.Fatal("status after failed start = active, want idle")
+	}
+	mu.Lock()
+	n := len(cmds)
+	c0 := cmds[0]
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("%d spawns, want 1", n)
+	}
+	waitDead(t, c0, "replay child after failed start")
+
+	// Both ports up: start succeeds.
+	ctlLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctlLn.Close()
+	sup.ctlAddr = ctlLn.Addr().String()
+	if err := sup.start(rec, nil); err != nil {
+		t.Fatalf("replay start with both ports up: %v", err)
+	}
+	sup.stop()
+	mu.Lock()
+	c1 := cmds[1]
+	mu.Unlock()
+	waitDead(t, c1, "replay child after stop")
 }
 
 func TestHTTPEndpoints(t *testing.T) {

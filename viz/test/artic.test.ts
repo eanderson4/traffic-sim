@@ -1,7 +1,7 @@
 // artic.test.ts — the client-side single-track trailer model: spawn
 // alignment, straight tracking, steady-state articulation in a constant
 // turn (correct sign — the trailer cuts inside), hold-while-queued, ±π
-// wrap, and dt clamping.
+// wrap, sim-dt substep integration, and seek reset.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -100,13 +100,28 @@ test("±π wrap does not spin the trailer", () => {
   assert.ok(Math.abs(gap) < 0.05, `trailer spun: gap ${gap}, θtr ${pose.trailerAngle}`);
 });
 
-test("oversized frame dt is clamped (tab-switch gaps can't kick the trailer)", () => {
-  const run = (dt: number): number => {
-    const a = new Articulator();
-    a.update(1, 0, 0, 0, 10, DT);
-    return a.update(1, 1, 0, 0.3, 10, dt).trailerAngle;
-  };
-  assert.equal(run(10), run(0.05));
+test("large SIM dt integrates in substeps (fast replay), converging like small steps", () => {
+  // One 0.8 s sim delta (an 8× replay frame at dt 0.1) vs the equivalent
+  // 48 frames of 1/60 s: the trailer must land (nearly) the same — and
+  // far past the old 0.05 s wall-clamp.
+  const stepped = new Articulator();
+  stepped.update(1, 0, 0, 0, 10, DT);
+  let small = 0;
+  for (let i = 0; i < 48; i++) {
+    small = stepped.update(1, 10 * (i + 1) * DT, 0, 0.3, 10, DT).trailerAngle;
+  }
+  const big = new Articulator();
+  big.update(1, 0, 0, 0, 10, DT);
+  const bigAngle = big.update(1, 8, 0, 0.3, 10, 0.8).trailerAngle;
+  assert.ok(Math.abs(bigAngle - small) < 0.02, `big ${bigAngle} vs stepped ${small}`);
+  const oneStep = new Articulator();
+  oneStep.update(1, 0, 0, 0, 10, DT);
+  const clamped = oneStep.update(1, 8, 0, 0.3, 10, 0.05).trailerAngle;
+  assert.ok(bigAngle > clamped * 4, `substeps ${bigAngle} barely beat the old clamp ${clamped}`);
+  // A negative dt (a seek the caller didn't reset) integrates nothing.
+  const neg = new Articulator();
+  neg.update(1, 0, 0, 0, 10, DT);
+  assert.equal(neg.update(1, 1, 0, 0.3, 10, -1).trailerAngle, 0);
 });
 
 test("wrapPi folds to the shortest arc", () => {
@@ -115,4 +130,44 @@ test("wrapPi folds to the shortest arc", () => {
   assert.ok(Math.abs(Math.abs(wrapPi(3 * Math.PI)) - Math.PI) < 1e-12);
   assert.ok(Math.abs(Math.abs(wrapPi(-3 * Math.PI)) - Math.PI) < 1e-12);
   assert.ok(Math.abs(wrapPi(Math.PI + 0.2) - (-Math.PI + 0.2)) < 1e-12);
+});
+
+test("reset drops all trailer state — a seek re-spawns trailers aligned", () => {
+  const a = new Articulator();
+  // Articulate in a steady turn so the trailer angle diverges from the
+  // tractor's heading.
+  let theta = 0;
+  a.update(1, 0, 0, theta, 10, DT);
+  drive(a, 1, 300, (i) => {
+    theta += 0.2 * DT;
+    return { x: 10 * i * DT, y: 0, theta, v: 10 };
+  });
+  const turned = a.update(1, 60, 0, theta, 10, DT);
+  assert.ok(Math.abs(wrapPi(turned.trailerAngle - turned.tractorAngle)) > 0.01, "pre-reset: articulated");
+  // A replay seek teleports the truck (same id); the seek path calls
+  // reset — the next frame must re-spawn the trailer aligned, and it must
+  // hold even at speed 0 (a paused landing never reconverges otherwise).
+  a.reset();
+  const landed = a.update(1, 500, 500, -1.2, 0, DT);
+  assert.equal(landed.trailerAngle, -1.2);
+  assert.equal(landed.tractorAngle, -1.2);
+});
+
+test("a huge sim delta re-anchors instead of stepping (rAF suspension can't hang the viewer)", () => {
+  const a = new Articulator();
+  a.update(1, 0, 0, 0, 10, DT);
+  // Articulate so the trailer angle diverges from the tractor's heading.
+  drive(a, 1, 100, (i) => ({ x: 10 * i * DT, y: 0, theta: 0.3, v: 10 }));
+  const before = a.update(1, 20, 0, 0.3, 10, DT).trailerAngle;
+  assert.ok(Math.abs(wrapPi(before - 0.3)) > 0.01, "pre-jump: articulated");
+  // Backgrounded tab: 300 sim-seconds land in one update. No hang (the
+  // test returning at all proves it), and the trailer re-anchors aligned
+  // with the tractor, mini-seek style.
+  const landed = a.update(1, 3020, 0, 0.3, 10, 300).trailerAngle;
+  assert.equal(landed, 0.3);
+  // A delta at the clamp boundary still integrates normally.
+  const b = new Articulator();
+  b.update(1, 0, 0, 0, 10, DT);
+  const two = b.update(1, 20, 0, 0.3, 10, 2).trailerAngle;
+  assert.ok(two > 0.15 && two < 0.3, `2 s delta integrates (got ${two})`);
 });

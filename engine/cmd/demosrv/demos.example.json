@@ -1,5 +1,5 @@
 {
-  "_placeholder": "Template for data/scenarios/demos.json (JSON has no comments; remove this key before use — demosrv rejects unknown fields). scenarioDir is REPO-ROOT-relative (run demosrv from the repo root). run is a single NATS token matching [A-Za-z0-9_-]+ (it also rides the app URL raw). seed/ticks are OPTIONAL: they override the scenario manifest for this demo (serve's -seed/-ticks); omit them to run the manifest as authored. capacity is OPTIONAL: driver claim capacity (serve's -capacity, default 1000) — raise it for dense/overload demos, since ADR-0008's pause gate pauses the run when live unclaimed vehicles exceed spare capacity.",
+  "_placeholder": "Template for data/scenarios/demos.json (JSON has no comments; remove the _-prefixed keys (_placeholder, _recordings_note) before use — demosrv rejects unknown fields). scenarioDir and store are REPO-ROOT-relative (run demosrv from the repo root). run is a single NATS token matching [A-Za-z0-9_-]+ (it also rides the app URL raw) and must NOT end in \"-replay\" (ADR-0006 reserves that suffix for replay-plane ids). seed/ticks are OPTIONAL: they override the scenario manifest for this demo (serve's -seed/-ticks); omit them to run the manifest as authored. capacity is OPTIONAL: driver claim capacity (serve's -capacity, default 1000) — raise it for dense/overload demos, since ADR-0008's pause gate pauses the run when live unclaimed vehicles exceed spare capacity. recordings is OPTIONAL: VCR entries replayed by engine/cmd/replay — store is the durable JetStream store dir written by serve -store (the recording serve must have EXITED; demosrv's kill-before-spawn enforces store exclusivity), run is the recorded run id (the live plane is {run}-replay), scenarioDir is the scenario the recording was made from (network GeoJSON + dt hint). ids are unique ACROSS demos and recordings (they share /net/{id}); demo run ids must ALSO be unique (they share one NATS-subject namespace) — recording run ids need NOT be (recording a demo's run is the normal case; the planes are disjoint). At least one demo is required (recordings-only registries are not supported).",
   "demos": [
     {
       "id": "i280-baseline",
@@ -18,6 +18,17 @@
       "tags": ["tag-one", "tag-two"],
       "scenarioDir": "data/scenarios/my-scenario",
       "run": "my-run"
+    }
+  ],
+  "_recordings_note": "A recording's scenarioDir supplies the display network + dt at start time; do not edit the scenario after recording (the recorded run meta is authoritative for execution, the scenario for display).",
+  "recordings": [
+    {
+      "id": "my-recording",
+      "title": "My scenario — recorded run (VCR replay)",
+      "blurb": "Replays a run recorded earlier with serve -store. Pause/resume/speed/seek from the replay panel.",
+      "store": "data/recordings/my-run-store",
+      "run": "my-run",
+      "scenarioDir": "data/scenarios/my-scenario"
     }
   ]
 }
