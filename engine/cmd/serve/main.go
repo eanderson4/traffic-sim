@@ -54,10 +54,12 @@ func main() {
 	types := flag.String("types", "car", "comma-separated vehicle-type names for the scenario type list (car,truck); director spawn verbs resolve against this list")
 	geojson := flag.String("geojson", "", "also write the network as GeoJSON (local metric frame) to this path")
 	metricsOut := flag.String("metrics-out", "", "write M13 metric-kernel output (ADR-0014 §6) as JSON to this path at run end")
-	pace := flag.Float64("pace", 1, "wall-time pace multiplier: PaceFloor = dt/pace (1 = realtime, >1 = faster; 0 = unpaced batch mode, driverless runs only; >10 refused while driver/demand clients are attached)")
+	pace := flag.Float64("pace", 1, "wall-time pace multiplier: PaceFloor = dt/pace (1 = realtime, >1 = faster; 0 = unpaced batch mode — the attach barrier parks tick 0 until embedded clients are ready, so any pace is allowed with the driver/director attached)")
 	store := flag.String("store", "", "durable JetStream store directory (created if missing, kept on exit, refuses to append into an existing recording of the same run id); default is a temp dir deleted on exit")
 	withDriver := flag.Bool("driver", true, "run an in-process default driver replica")
 	capacity := flag.Int("capacity", 1000, "driver claim capacity")
+	exitRouting := flag.Bool("exit-routing", true, "driver assigns each claimed vehicle a seeded exit-lane destination (per-vehicle routing; without it vehicles take the kernel's leftmost-successor default)")
+	attachTimeout := flag.Duration("attach-timeout", 30*time.Second, "bound on the client-attach barrier: serve fails if an embedded client (driver, demand director) has not reported attached within this")
 	flag.Parse()
 
 	if *scenarioDir != "" && *netfile != "" {
@@ -161,27 +163,14 @@ func main() {
 
 	// Pacing (ADR-0005 §4 — pacing is a wrapper's business; the loop itself
 	// never blocks on input): default 1 keeps PaceFloor = one tick of wall
-	// time, today's behavior exactly.
+	// time, today's behavior exactly. Any non-negative pace is allowed with
+	// embedded clients attached: the client-attach barrier below parks the
+	// run loop at tick 0 until the driver/demand director report ready, so
+	// the early-tick loss that once motivated a pace cap cannot happen.
+	// Pace remains an UNRECORDED run condition — see the note at the
+	// barrier for exactly what is and isn't identical across paces.
 	paceFloorDur, err := paceFloor(spec.Params.Dt, *pace)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "serve:", err)
-		os.Exit(2)
-	}
-	if paceFloorDur == 0 {
-		// Unpaced mode outruns every asynchronous NATS client: the in-process
-		// driver replica AND the demand director both attach after the run
-		// loop starts, so an unpaced run can finish before either attaches —
-		// an empty or scheduler-dependent recording. Refuse the combination.
-		switch {
-		case *withDriver:
-			fmt.Fprintln(os.Stderr, "serve: -pace 0 (unpaced) outruns the in-process driver replica — rerun with -driver=false or a high finite -pace")
-			os.Exit(2)
-		case scen != nil && len(scen.Demands) > 0:
-			fmt.Fprintln(os.Stderr, "serve: -pace 0 (unpaced) outruns the demand director — use a high finite -pace for demand scenarios")
-			os.Exit(2)
-		}
-	}
-	if err := checkPaceClients(*pace, *withDriver, scen != nil && len(scen.Demands) > 0); err != nil {
 		fmt.Fprintln(os.Stderr, "serve:", err)
 		os.Exit(2)
 	}
@@ -282,11 +271,38 @@ func main() {
 		mobs = &metricObserver{cfg: cfg}
 	}
 
+	// Client-attach barrier: the run loop parks at tick 0 (contract plane
+	// served, sim time frozen — natsio.ContractConfig.StartGate) until
+	// every embedded client reports attached, so no early tick can outrun
+	// an attaching client at any pace. Readiness signals: driver.New
+	// returning (hello handshake answered, subscriptions flushed — the
+	// replica is ready to claim from tick 0's unclaimed pool) and demand
+	// Attach + Director.Ready (snapshot subscription live on the server).
+	//
+	// DETERMINISM NOTE — pace is an unrecorded run condition. What IS
+	// identical across paces for a given (content hash, seed): the
+	// director's verb DIRECTIVES — request ids, origins, vtypes, earliest
+	// ticks are a pure function of (demand, seed) — and, with the 30-tick
+	// lead, every steady-state verb is accepted before its earliest tick,
+	// so those vehicles inject at the identical tick at any pace. What is
+	// NOT identical: the acceptance tick recorded with each verb (its
+	// wall-clock landing, ~1 tick later unpaced), the effect tick of the
+	// program's head (verbs with earliest < the lead wait for the first
+	// snapshot, so they land at the acceptance boundary), and the tick
+	// individual claims/intents land on — client reaction latency is
+	// wall-clock, guaranteed only while clients keep up with the loop: at
+	// any finite pace the floor gives them dt/pace per tick (ample for
+	// in-process replicas); at -pace 0 the only margin is the record
+	// plane's per-tick puback, so an unpaced run's alignment is
+	// scheduler-dependent in principle. At every pace, whatever the live
+	// run applied is recorded verbatim and replays bit-identically (both
+	// directions pinned in natsio's startgate test).
+	startGate := make(chan struct{})
 	runErr := make(chan error, 1)
 	go func() {
 		// PaceFloor = one tick of wall time at -pace 1 (1× realtime); -pace N
 		// divides it by N, -pace 0 disables pacing entirely (batch mode).
-		cc := natsio.ContractConfig{PaceFloor: paceFloorDur}
+		cc := natsio.ContractConfig{PaceFloor: paceFloorDur, StartGate: startGate}
 		if mobs != nil {
 			cc.Observer = mobs
 		}
@@ -297,52 +313,34 @@ func main() {
 		runErr <- err
 	}()
 
+	barrier := make(chan attachOutcome, 2)
+	var expected []string
 	if *withDriver {
-		dnc, err := nats.Connect(nats.DefaultURL, nats.InProcessServer(ns), nats.Name("default-driver"))
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "serve: driver connect:", err)
-			os.Exit(1)
-		}
-		defer dnc.Close()
-		djs, err := dnc.JetStream()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "serve: driver JetStream:", err)
-			os.Exit(1)
-		}
-		d, err := driver.New(dnc, djs, driver.Config{Run: *run, Capacity: *capacity})
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "serve: driver:", err)
-			os.Exit(1)
-		}
-		defer d.Close()
-		fmt.Printf("serve: default driver attached as %s (capacity %d)\n", d.ID(), *capacity)
+		expected = append(expected, "default driver")
+		go func() {
+			barrier <- attachDriver(ns, *run, *capacity, *exitRouting, *attachTimeout)
+		}()
 	}
-
 	// Scenario demand parts run through the embedded reference demand
 	// director (engine/natsio/demand): sampled with the RUN seed, so the
 	// recorded (content-hash, seed) run key covers the demand realization
 	// and a same-seed rerun re-issues the identical verb program.
 	if scen != nil && len(scen.Demands) > 0 {
-		dnc, err := nats.Connect(nats.DefaultURL, nats.InProcessServer(ns), nats.Name("demand-director"))
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "serve: demand director connect:", err)
-			os.Exit(1)
-		}
-		defer dnc.Close()
-		djs, err := dnc.JetStream()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "serve: demand director JetStream:", err)
-			os.Exit(1)
-		}
-		lg := log.New(os.Stderr, "", 0)
-		dd, err := demand.Attach(dnc, djs, demand.Config{Run: *run, Seed: spec.Seed, Log: lg}, scen.Demands)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "serve: demand director:", err)
-			os.Exit(1)
-		}
-		defer dd.Close()
-		fmt.Printf("serve: demand director attached (%d demand file(s), run-seeded)\n", len(scen.Demands))
+		expected = append(expected, "demand director")
+		go func() {
+			barrier <- attachDirector(ns, *run, spec.Seed, scen.Demands)
+		}()
 	}
+	attached, err := waitBarrier(barrier, expected, runErr, *attachTimeout)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "serve:", err)
+		os.Exit(1)
+	}
+	for _, out := range attached {
+		defer out.cleanup()
+		fmt.Printf("serve: %s attached (%s)\n", out.client, out.desc)
+	}
+	close(startGate)
 
 	wsURL := fmt.Sprintf("ws://%s:%d", host, port)
 	if host == "" || host == "0.0.0.0" {
@@ -394,25 +392,116 @@ func paceFloor(dt, pace float64) (time.Duration, error) {
 	return time.Duration(v), nil
 }
 
-// maxClientPace bounds the pace multiplier while asynchronous NATS clients
-// (the in-process driver replica, the demand director) are attached. The run
-// loop starts before they finish attaching, and client reaction latency in
-// TICKS scales with pace: at 10× a ~100 ms attach costs ≤10 early ticks (the
-// network is still near-empty — harmless); beyond that the head of the
-// recording is increasingly under-controlled hold-last behavior. The cap
-// keeps "fast recording" honest; batch mode (-pace 0) remains available for
-// driverless runs only. NOTE: pace is an unrecorded run condition — the same
-// (scenario, seed) at different paces produces different traffic (client
-// latency scales in ticks), so cross-pace metric comparisons are invalid.
-const maxClientPace = 10
+// attachOutcome is one embedded client's report to the attach barrier.
+type attachOutcome struct {
+	client  string // barrier identity ("default driver", "demand director")
+	desc    string // success-line detail
+	cleanup func() // deferred Close calls; nil on failure
+	err     error
+}
 
-// checkPaceClients enforces maxClientPace when driver or demand clients are
-// attached (see the const's comment).
-func checkPaceClients(pace float64, driver, demand bool) error {
-	if pace > maxClientPace && (driver || demand) {
-		return fmt.Errorf("-pace %g exceeds %g, the safe bound with an attached driver/demand director (their attach and reaction latency scales in ticks) — use -driver=false and no demand parts for faster batch runs", pace, float64(maxClientPace))
+// attachDriver connects and attaches the in-process default driver replica.
+// driver.New returning IS the readiness signal: the hello handshake has
+// been answered and New's final Flush guarantees the server has processed
+// the observation/snapshot/unclaimed subscriptions, so tick 0's unclaimed
+// pool reaches this replica.
+func attachDriver(ns *server.Server, run string, capacity int, exitRouting bool, metaWait time.Duration) attachOutcome {
+	dnc, err := nats.Connect(nats.DefaultURL, nats.InProcessServer(ns), nats.Name("default-driver"))
+	if err != nil {
+		return attachOutcome{client: "default driver", err: err}
 	}
-	return nil
+	djs, err := dnc.JetStream()
+	if err != nil {
+		dnc.Close()
+		return attachOutcome{client: "default driver", err: err}
+	}
+	d, err := driver.New(dnc, djs, driver.Config{Run: run, Capacity: capacity, ExitRouting: exitRouting, MetaWait: metaWait})
+	if err != nil {
+		dnc.Close()
+		return attachOutcome{client: "default driver", err: err}
+	}
+	return attachOutcome{
+		client:  "default driver",
+		desc:    fmt.Sprintf("id %s, capacity %d", d.ID(), capacity),
+		cleanup: func() { d.Close(); dnc.Close() },
+	}
+}
+
+// attachDirector connects and attaches the embedded demand director, then
+// waits for its snapshot subscription to be live on the server
+// (Director.Ready) so no early snapshot — tick 0's included — slips past
+// the verb loop.
+func attachDirector(ns *server.Server, run string, seed uint64, dfs []*scenario.DemandFile) attachOutcome {
+	dnc, err := nats.Connect(nats.DefaultURL, nats.InProcessServer(ns), nats.Name("demand-director"))
+	if err != nil {
+		return attachOutcome{client: "demand director", err: err}
+	}
+	djs, err := dnc.JetStream()
+	if err != nil {
+		dnc.Close()
+		return attachOutcome{client: "demand director", err: err}
+	}
+	lg := log.New(os.Stderr, "", 0)
+	dd, err := demand.Attach(dnc, djs, demand.Config{Run: run, Seed: seed, Log: lg}, dfs)
+	if err != nil {
+		dnc.Close()
+		return attachOutcome{client: "demand director", err: err}
+	}
+	if err := dd.Ready(); err != nil {
+		dd.Close()
+		dnc.Close()
+		return attachOutcome{client: "demand director", err: err}
+	}
+	return attachOutcome{
+		client:  "demand director",
+		desc:    fmt.Sprintf("%d demand file(s), run-seeded", len(dfs)),
+		cleanup: func() { dd.Close(); dnc.Close() },
+	}
+}
+
+// waitBarrier collects one attach report per expected client until all have
+// reported, the run dies, or the timeout fires. Failures are fatal before
+// tick 0 (never a degraded run), and the error names the client that failed
+// — or those still pending at timeout / run death. A failed wait leaks the
+// still-attaching goroutines and the parked run loop on purpose: serve
+// exits right after, and abandoning mid-attach clients beats second-guessing
+// their connection state.
+func waitBarrier(barrier <-chan attachOutcome, expected []string, runErr <-chan error, timeout time.Duration) ([]attachOutcome, error) {
+	pending := append([]string(nil), expected...)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	var attached []attachOutcome
+	for len(pending) > 0 {
+		select {
+		case out := <-barrier:
+			if out.err != nil {
+				return nil, fmt.Errorf("%s failed to attach: %w", out.client, out.err)
+			}
+			found := false
+			for i, p := range pending {
+				if p == out.client {
+					pending = append(pending[:i], pending[i+1:]...)
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil, fmt.Errorf("unexpected attach report from %q", out.client)
+			}
+			attached = append(attached, out)
+		case err := <-runErr:
+			if err == nil {
+				return nil, fmt.Errorf("run finished before the embedded clients attached; still waiting for: %s",
+					strings.Join(pending, ", "))
+			}
+			return nil, fmt.Errorf("run aborted before the embedded clients attached (%v); still waiting for: %s",
+				err, strings.Join(pending, ", "))
+		case <-timer.C:
+			return nil, fmt.Errorf("attach timeout (%s) — still waiting for: %s",
+				timeout, strings.Join(pending, ", "))
+		}
+	}
+	return attached, nil
 }
 
 // checkFreshRecording refuses to start a run whose recording stream already

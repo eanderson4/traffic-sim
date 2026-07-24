@@ -63,6 +63,16 @@ type ContractConfig struct {
 	// knobs ride this config (PaceFloor precedent); the observer is not
 	// part of the controller contract.
 	Observer RunObserver
+	// StartGate, when non-nil, parks the tick loop at tick 0 — serving the
+	// contract plane (hello/claim/release/heartbeat/verb) but never
+	// Stepping — until the channel is closed. This is the embedded-client
+	// attach barrier (serve): the run starts only after the in-process
+	// driver/demand director have completed their attach handshakes and
+	// their subscriptions are live, so tick 0's snapshot and unclaimed
+	// pool reach every client and no early ticks are lost to attach
+	// latency. Dead wall-clock time like the pause gate: sim time stays
+	// frozen, invisible to tick determinism.
+	StartGate <-chan struct{}
 }
 
 func (c ContractConfig) withDefaults() ContractConfig {
@@ -329,8 +339,13 @@ func (c *Contract) ProcessControl(e *engine.Engine) error {
 
 	// Liveness sweep: silence past the budget detaches the controller and
 	// releases its claims (the v1 disconnect signal — core NATS has no
-	// presence primitive).
-	if len(c.ctrls) > 0 {
+	// presence primitive). Skipped in batch mode (PaceFloor == 0): unpaced,
+	// tick time outruns any client's wall-clock reaction, so the tick-space
+	// silence budget would detach healthy clients — and with no drive
+	// controller left to restore capacity, the pause gate then wedges the
+	// run for good. Batch mode is for offline runs with embedded clients;
+	// wire liveness assumes pacing keeps tick time near wall time.
+	if len(c.ctrls) > 0 && c.cfg.PaceFloor > 0 {
 		ids := make([]string, 0, len(c.ctrls))
 		for id := range c.ctrls {
 			ids = append(ids, id)

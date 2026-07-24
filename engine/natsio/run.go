@@ -25,7 +25,10 @@ import (
 // business. The tick NEVER blocks on subscribers — only on the record
 // plane's per-batch puback, which is the durability contract. While paused
 // (ADR-0008 §6) the loop keeps serving the contract plane so a restarting
-// driver can attach and resume the run.
+// driver can attach and resume the run. An optional start gate
+// (ContractConfig.StartGate) extends the same idea to BEFORE tick 0: the
+// loop parks — contract plane served, sim time frozen — until embedded
+// clients have attached, so no early tick outruns an attaching client.
 
 // pausePoll is the wall-clock sleep between contract rounds while the tick
 // loop is gated. Sim time is frozen; this is pure scheduling hygiene.
@@ -131,6 +134,22 @@ func RunLive(nc *nats.Conn, js nats.JetStreamContext, run string, spec engine.Ru
 	// Publish the signal-program table at run start (ADR-0006 M9 addendum);
 	// the loop republishes it at the keyframe cadence for late joiners.
 	bus.PublishSignals(e)
+
+	// Client-attach barrier: with a start gate configured, hold tick 0
+	// until it opens (serve closes it once the embedded driver/demand
+	// director report attached and ready). The contract plane keeps being
+	// served so the attach handshakes the barrier waits on can complete;
+	// sim time is frozen — dead wall-clock time, like the pause gate.
+	for gate := contractCfg.StartGate; gate != nil; {
+		if err := contract.ProcessControl(e); err != nil {
+			return finish(err)
+		}
+		select {
+		case <-gate:
+			gate = nil
+		case <-time.After(pausePoll):
+		}
+	}
 
 	for e.Tick < spec.Ticks {
 		tickStart := time.Now()

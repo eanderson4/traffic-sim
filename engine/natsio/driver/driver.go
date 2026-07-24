@@ -4,7 +4,8 @@
 // unclaimed vehicles up to its capacity, and drives them each tick — IDM
 // longitudinal + MOBIL lateral computed CLIENT-SIDE from observations,
 // reusing the kernel's shared policy functions (engine.PolicyCtx), plus a
-// Dijkstra router over the lane graph for destination params. Policy RNG
+// Dijkstra router over the lane graph for destination params (a configured
+// override, or per-vehicle drawn exit lanes — destinations.go). Policy RNG
 // streams are seeded per vehicle, keyed by vehicle ID (ADR-0007) — never
 // per process — so fleet failover and orphan re-claim are behaviorally
 // invisible, and which replica drives a vehicle does not matter.
@@ -42,8 +43,14 @@ type Config struct {
 	// (default 1000). Fleets size replicas to absorb one full peer loss.
 	Capacity int
 	// Destination is a lane ID routed toward for every claimed vehicle
-	// (the routing axis' destination parameter; "" = none).
+	// (the routing axis' destination parameter; "" = none). The explicit
+	// override: it wins over ExitRouting when set.
 	Destination string
+	// ExitRouting assigns each claimed vehicle its own destination among
+	// the network's exit lanes (speed-limit weighted, lanes under 30 m
+	// excluded), deterministic from the run seed and vehicle ID
+	// (ADR-0007) — see destinations.go. Ignored when Destination is set.
+	ExitRouting bool
 	// Type is the controller_type declared at attach (default
 	// "default-driver").
 	Type string
@@ -138,9 +145,21 @@ func New(nc *nats.Conn, js nats.JetStreamContext, cfg Config) (*Driver, error) {
 		},
 	}
 	payload, _ := json.Marshal(hello)
-	resp, err := nc.Request(natsio.SubjectCtlHello(cfg.Run), payload, 2*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("driver: hello: %w", err)
+	// Retry while the engine's contract plane is still coming up — on large
+	// networks RunLive needs seconds before it answers hello, and a bare
+	// request fails instantly with "no responders". Bounded by MetaWait so a
+	// genuinely absent engine still fails fast.
+	var resp *nats.Msg
+	deadline := time.Now().Add(cfg.MetaWait)
+	for {
+		resp, err = nc.Request(natsio.SubjectCtlHello(cfg.Run), payload, 2*time.Second)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("driver: hello: %w", err)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 	var reply natsio.HelloReply
 	if err := json.Unmarshal(resp.Data, &reply); err != nil {
@@ -284,17 +303,27 @@ func (d *Driver) onObs(msg *nats.Msg) {
 		}
 		// Routing axis: the destination parameter is persistent — send once
 		// per vehicle (plus the junction turn choice when the graph offers
-		// one; M1 networks are single-successor, so usually a no-op).
+		// one; M1 networks are single-successor, so usually a no-op). The
+		// destination is the configured override, or — with ExitRouting —
+		// the vehicle's per-ID drawn exit lane (tried once either way:
+		// the pick is deterministic, retrying would not change it).
 		d.mu.Lock()
-		if d.cfg.Destination != "" && !d.routed[ego.ID] {
-			if _, ok := Route(d.net, ego.LaneIdx, d.cfg.Destination); ok {
-				in.RouteSet = true
-				in.Route = d.cfg.Destination
-				if turn := d.turnChoice(ego.LaneIdx); turn != 0 {
-					in.TurnSet = true
-					in.Turn = turn
-				}
+		if !d.routed[ego.ID] {
+			dest := d.cfg.Destination
+			if dest == "" && d.cfg.ExitRouting {
+				dest, _ = pickExit(d.net, d.spec.Seed, ego.ID, ego.LaneIdx)
 				d.routed[ego.ID] = true
+			}
+			if dest != "" {
+				if _, ok := Route(d.net, ego.LaneIdx, dest); ok {
+					in.RouteSet = true
+					in.Route = dest
+					if turn := d.turnChoice(ego.LaneIdx, dest); turn != 0 {
+						in.TurnSet = true
+						in.Turn = turn
+					}
+					d.routed[ego.ID] = true
+				}
 			}
 		}
 		d.mu.Unlock()
@@ -335,8 +364,8 @@ func signalFor(laneDelta int) int {
 // turnChoice maps the router's next hop onto the junction turn axis:
 // successors are ordered left-to-right by convention (+1 first/leftmost,
 // −1 last/rightmost). No choice on single-successor lanes.
-func (d *Driver) turnChoice(laneIdx int) int {
-	path, ok := Route(d.net, laneIdx, d.cfg.Destination)
+func (d *Driver) turnChoice(laneIdx int, dest string) int {
+	path, ok := Route(d.net, laneIdx, dest)
 	if !ok || len(path) < 2 {
 		return 0
 	}
