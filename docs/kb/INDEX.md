@@ -50,7 +50,7 @@ back to it.
 - [Chicago Metro](articles/chicago-metro.md) — zoned Geofabrik→netconvert pipeline, portal-weighted napkin demand, driver exit-routing + serve attach barrier it required
 
 ### Decisions
-- [ADR Index](articles/decisions/adrs.md) — ADR-0001..0014 table with rationales, research basis, and pending-ADR queue
+- [ADR Index](articles/decisions/adrs.md) — ADR-0001..0015 table with rationales, research basis, and pending-ADR queue
 
 ## Raw Research
 
@@ -97,10 +97,12 @@ links its source synthesis for traceability.
 - [x] [ADR-0012](decisions/ADR-0012-scenario-format.md) — scenario format: manifest-of-parts directory in strict YAML, runtime director demand sampling (M10 contract), kustomize-style overlay variants, (content-hash, seed) run identity, format_version migrations
 - [x] [ADR-0013](decisions/ADR-0013-external-review-gate.md) — external multi-model review (Claude Fable + GPT-5.6-sol) as a pre-commit gate: tree-hash stamp proves review happened, triage stays the committer's job, fail-closed with a loud skip hatch
 - [x] [ADR-0014](decisions/ADR-0014-observability-metrics.md) — observability: trajectory-first metric kernel (trip records incl. horizon partials, lane-interval Edie q/k/u), contract-pinned definitions, dedicated metrics JetStream stream + simrun file sink, scenario metrics bindings, paired-seed sweep protocol, LOS as presentation skin
+- [x] [ADR-0015](decisions/ADR-0015-keyframe-chunking.md) — record-plane keyframes larger than 768 KiB are chunked into consecutive log messages (`kf_chunk: "i/n"` header); seek anchors on the last chunk; schema stays v2, old recordings read unchanged — unblocks city-scale past the 1 MiB max_payload wall hit at ~10.9k vehicles
 
 ---
 *Last distilled: 2026-07-17 | 18 articles from 56 raw research files*
 *ADR-0012 ratified 2026-07-21 (design; M11 implementation + review round landed same day)*
 *ADR-0013 ratified 2026-07-21 (external-review workflow, following the M11 round)*
 *ADR-0014 ratified 2026-07-21 (observability design; Fable+Sol review round, M13 implementation next)*
+*ADR-0015 ratified 2026-07-24 (keyframe chunking, after the WQ-4 stress test hit the max_payload wall)*
 *Run `/update-kb` to check freshness*

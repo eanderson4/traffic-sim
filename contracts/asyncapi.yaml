@@ -326,7 +326,12 @@ channels:
     description: |
       Full-state keyframes at a configurable cadence (default every 100
       ticks, plus tick 0). Seek anchor for replay: nearest keyframe ≤
-      target tick, then re-simulate with the intent log.
+      target tick, then re-simulate with the intent log. A keyframe
+      larger than the recorder's KeyframeChunkMax (default 768 KiB) is
+      split into consecutive chunk messages carrying a `kf_chunk: "i/n"`
+      header (1-based; ADR-0015); a message without the header is the
+      whole keyframe. The seek anchor sequence is the keyframe's LAST
+      message.
     parameters:
       run: { $ref: '#/components/parameters/runId' }
     messages:
@@ -352,7 +357,11 @@ channels:
       Control-plane events on the record plane (ADR-0008 §6): pause and
       resume, as JSON. Pause gates the tick loop when available claim
       capacity < demand (unclaimed vehicles) for T consecutive ticks
-      (default 5); resume fires on capacity recovery. These are dead-time
+      (default 5); resume fires on capacity recovery — or on the
+      pause-gate escape (ADR-0008 §6, 2026-07-24 clarification): after
+      PauseEscapeAfter of persistent deficit the engine resumes anyway on
+      hold-last, so an escape resume is identifiable by demand >
+      available. These are dead-time
       metadata: they carry no world state, the replayer ignores them, and
       tick determinism is unaffected — the CRC chain is contiguous across
       a pause.
@@ -660,11 +669,11 @@ components:
         v2 adds the controller axes, v3 — written ONLY while the director
         injection queue is non-empty — appends the pending directives so a
         seek resumes them bit-exactly; an empty queue marshals
-        byte-identical v2, and readers accept v2|v3). Payloads stay under
-        the 1 MB discipline (ADR-0002 clarification); the
-        vehicle-count/byte curve feeding the chunking decision is in
-        engine/BENCHMARKS.md.
-      headers: { $ref: '#/components/schemas/LogHeaders' }
+        byte-identical v2, and readers accept v2|v3). A keyframe larger
+        than the recorder's KeyframeChunkMax (default 768 KiB) is split
+        into consecutive chunk messages (ADR-0015); reassembled bytes are
+        exactly this payload.
+      headers: { $ref: '#/components/schemas/KeyframeHeaders' }
       payload:
         schemaFormat: application/octet-stream
         $ref: '#/components/schemas/KeyframeFrame'
@@ -738,6 +747,16 @@ components:
           type: integer
           minimum: 0
           description: 'Stream-level OCC — the broker-enforced single-writer assertion. 0 on the first write.'
+
+    KeyframeHeaders:
+      allOf:
+        - $ref: '#/components/schemas/LogHeaders'
+        - type: object
+          properties:
+            kf_chunk:
+              type: string
+              pattern: '^\d+/\d+$'
+              description: 'Chunk i of n of one keyframe (1-based; ADR-0015). Absent: the message IS the whole keyframe. Chunks of one keyframe share its tick and are consecutive in stream order; the seek anchor is the LAST chunk’s sequence.'
 
     SnapshotFrame:
       type: string

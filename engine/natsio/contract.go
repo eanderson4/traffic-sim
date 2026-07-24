@@ -3,7 +3,9 @@ package natsio
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -41,7 +43,13 @@ import (
 //     available claim capacity < demand (unclaimed vehicles) for
 //     PauseAfterTicks consecutive ticks, the run pauses (dead wall-clock
 //     time between ticks — invisible to tick determinism) and a pause event
-//     lands on the record plane; resume on capacity recovery.
+//     lands on the record plane; resume on capacity recovery. A jammed run
+//     never meets that resume condition (its active count does not drop),
+//     so the gate is not silent: it logs a heartbeat every PauseLogEvery
+//     while engaged, and after PauseEscapeAfter of persistent deficit it
+//     resumes anyway with a loud log — an escape resume is distinguishable
+//     on the record plane by demand > available. The gate re-arms once
+//     capacity has actually recovered.
 
 // ContractConfig tunes the contract layer; zero values take the defaults.
 type ContractConfig struct {
@@ -61,6 +69,21 @@ type ContractConfig struct {
 	// clients. Without it an unpaced loop spins at ~10⁴ ticks/s and even
 	// in-process controllers lag dozens of ticks.
 	PaceFloor time.Duration
+	// PauseLogEvery is the heartbeat cadence while the pause gate is
+	// engaged (default 10 s): each beat names demand, spare capacity, and
+	// active vehicles. A gated run burns no CPU and publishes nothing —
+	// without this a wedged run is indistinguishable from a hung process.
+	PauseLogEvery time.Duration
+	// PauseEscapeAfter is the maximum dwell before the gate escapes
+	// (default 60 s): if demand still exceeds spare capacity, the run
+	// resumes anyway with a loud log rather than wedge forever — a jam's
+	// active count never drops, so the resume condition can be
+	// unreachable. Unclaimed vehicles bridge on hold-last (ADR-0008 §6);
+	// the gate re-arms once capacity has actually recovered.
+	PauseEscapeAfter time.Duration
+	// Log receives the pause-gate heartbeat and escape lines (nil →
+	// stderr, matching the replay player).
+	Log *log.Logger
 	// Observer is an optional read-only per-tick observer on the run loop
 	// (RunObserver — the M13 metric kernel). Nil = none. Loop-behavior
 	// knobs ride this config (PaceFloor precedent); the observer is not
@@ -87,6 +110,15 @@ func (c ContractConfig) withDefaults() ContractConfig {
 	}
 	if c.HoldLastTicks == 0 {
 		c.HoldLastTicks = 2
+	}
+	if c.PauseLogEvery == 0 {
+		c.PauseLogEvery = 10 * time.Second
+	}
+	if c.PauseEscapeAfter == 0 {
+		c.PauseEscapeAfter = 60 * time.Second
+	}
+	if c.Log == nil {
+		c.Log = log.New(os.Stderr, "", 0)
 	}
 	return c
 }
@@ -229,6 +261,9 @@ type Contract struct {
 	driveSeen  bool // pause gating arms once a drive controller has attached
 	deficit    uint64
 	paused     bool
+	pausedAt   time.Time // gate engagement (heartbeat/escape dwell clock)
+	pauseLogAt time.Time // last heartbeat
+	escaped    bool      // gate escaped; re-arms when capacity recovers
 
 	subs []*nats.Subscription
 
@@ -362,13 +397,32 @@ func (c *Contract) ProcessControl(e *engine.Engine) error {
 		}
 	}
 
-	// Resume check: capacity recovered while gated?
+	// Resume check: capacity recovered while gated? Otherwise heartbeat,
+	// and escape the gate once the deficit has persisted past the dwell —
+	// a jam's active count never drops, so capacity recovery can be
+	// unreachable and the run would wedge silently.
 	if c.paused {
 		demand, avail := c.capacity(e)
 		if demand <= avail {
 			c.paused = false
 			if err := c.emitPause(e, EventResume, demand, avail); err != nil {
 				return err
+			}
+		} else {
+			now := time.Now()
+			if now.Sub(c.pauseLogAt) >= c.cfg.PauseLogEvery {
+				c.pauseLogAt = now
+				c.cfg.Log.Printf("pause gate: run %q gated at tick %d: demand=%d unclaimed, spare capacity=%d, active vehicles=%d — waiting for drive capacity",
+					c.run, e.Tick, demand, avail, len(e.Vehicles()))
+			}
+			if now.Sub(c.pausedAt) >= c.cfg.PauseEscapeAfter {
+				c.paused = false
+				c.escaped = true
+				c.cfg.Log.Printf("pause gate: run %q escape after %s at tick %d: demand=%d > spare=%d persistently — resuming anyway, unclaimed vehicles bridge on hold-last (ADR-0008 §6)",
+					c.run, now.Sub(c.pausedAt).Round(time.Millisecond), e.Tick, demand, avail)
+				if err := c.emitPause(e, EventResume, demand, avail); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -808,16 +862,22 @@ func (c *Contract) AfterStep(e *engine.Engine) error {
 
 	// Pause gate: available claim capacity < demand for PauseAfterTicks
 	// consecutive ticks gates the loop; hold-last bridges the grace window.
+	// After an escape the gate stays open until capacity has recovered at
+	// least once — re-engaging on an unchanged deficit would just dwell
+	// and escape again.
 	if c.driveSeen && !c.paused {
 		demand, avail := c.capacity(e)
 		if demand > avail {
 			c.deficit++
 		} else {
 			c.deficit = 0
+			c.escaped = false
 		}
-		if c.deficit >= c.cfg.PauseAfterTicks {
+		if !c.escaped && c.deficit >= c.cfg.PauseAfterTicks {
 			c.paused = true
 			c.deficit = 0
+			c.pausedAt = time.Now()
+			c.pauseLogAt = c.pausedAt
 			if err := c.emitPause(e, EventPause, demand, avail); err != nil {
 				return err
 			}

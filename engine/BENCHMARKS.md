@@ -53,11 +53,16 @@ multi-node or WAN deployments.
 B/veh flat). Against ADR-0002's 1 MB `max_payload` discipline: snapshots
 fit to ≈ 43k vehicles; **keyframes hit the wall at ≈ 13.6k vehicles** —
 the keyframe-chunking (or Object Store) decision must land before
-city-scale networks, as the synthesis predicted. Encode cost is linear and
-negligible (63 µs at 10k = 0.06 % of the tick); snapshot size is a broker
-bandwidth question, not a tick-budget question. Live frames at the
-validated scenario scale (I-80 ≈ 300 vehicles → ≈ 7 kB/tick) are far under
-any concern.
+city-scale networks, as the synthesis predicted. **Resolved 2026-07-24
+(ADR-0015):** the WQ-4 stress test hit the wall in production conditions
+at ~10.9k vehicles (real keyframe ≥92 B/veh, not the 77 B/veh above —
+per-vehicle controller state varies), and keyframes larger than 768 KiB
+are now chunked into consecutive log messages (`kf_chunk` header), so
+keyframe size is bounded by disk/memory, not `max_payload`. Encode cost
+is linear and negligible (63 µs at 10k = 0.06 % of the tick); snapshot
+size is a broker bandwidth question, not a tick-budget question. Live
+frames at the validated scenario scale (I-80 ≈ 300 vehicles → ≈ 7 kB/tick)
+are far under any concern.
 
 ## (c) Live-plane fan-out
 

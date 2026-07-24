@@ -32,9 +32,10 @@ import (
 //	  nDirectives u32 | per directive: tick u64 | laneIdx u32 | typeIdx u32 |
 //	  earliestTick u64 | reqIDLen u16 | reqID bytes
 //
-// Payloads stay far under the 1 MB max_payload discipline (ADR-0002) at
-// current network sizes (~70 B/vehicle); the measured byte curve and the
-// chunking decision past it are tracked in engine/BENCHMARKS.md.
+// Payloads run ≥92 B/vehicle measured (engine/BENCHMARKS.md); past the
+// broker's 1 MiB max_payload (~10.9k vehicles) the record plane chunks the
+// keyframe into consecutive log messages (ADR-0015) — this codec is
+// unchanged: chunks reassemble to exactly these bytes.
 
 const (
 	// keyframeMagic spells "TSKF" in the byte stream (little-endian u32).

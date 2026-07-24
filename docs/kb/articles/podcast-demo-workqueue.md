@@ -151,12 +151,16 @@ measured numbers (report §Follow-ups item 5). Run artifacts:
 `data/scenarios/stress-dtla-high/`, `data/recordings/wq4-stress{,2}/` +
 `wq4-stress2.metrics.json` (19.5 MB).
 
-### WQ-11: Keyframe chunking / Object Store (run-killer at ~10.9k vehicles)
-Demonstrated by WQ-4 Run A: at 10,862 vehicles the tick-6300 keyframe write
-failed `nats: maximum payload exceeded` and the recorder's fail-loud contract
-aborted the run. Any city-scale recording needs this first. Workaround for
-now: raise `-keyframe-every` so only the tick-0 keyframe exists (replay scans
-from tick 0). See the WQ-4 report §Scale ceilings.
+### WQ-11: Keyframe chunking — DONE (2026-07-24, ADR-0015)
+Keyframes > `KeyframeChunkMax` (default 768 KiB) are split into consecutive
+`ts.{run}.log.keyframe` messages with a `kf_chunk: "i/n"` header; no header =
+whole keyframe (old recordings unchanged); the seek anchor is the keyframe's
+LAST message so re-sim resumes at seq+1. `findKeyframe` reassembles + fails
+loud on malformed groups; `indexLogMsgs` counts one entry per keyframe.
+SchemaVersion stays 2. Tests: `engine/natsio/keyframe_chunk_test.go`
+(round-trip CRC-verified replay through chunked keyframes; malformed group
+errors). Remaining validation: re-run the WQ-4 stress scenario past 10.9k
+vehicles.
 
 ### WQ-12: Replay materialization footprint vs demosrv readiness timeout
 Found wiring the podcast recordings: the replay child materializes a
@@ -168,12 +172,17 @@ cards therefore point at 15-minute recordings. Real fixes: stream the
 materialization, or make readyTimeout generous/configurable (supervisor.go
 was mid-refactor by the theme session when found).
 
-### WQ-13: Pause-gate deadlock escape hatch (carried from WQ-4)
-ADR-0008 §6: resume requires demand ≤ spare capacity, but a jammed run's
-active count never drops — wedge with zero CPU/log. WQ-4 could not
-reproduce it only because capacity was raised 50×. Needs the escape hatch
-or at least the loud log/metric (the WQ-4 scratch harness's pause
-engage/release + 10 s heartbeat logger is a candidate shape).
+### WQ-13: Pause-gate deadlock escape hatch — DONE (2026-07-24)
+`engine/natsio/contract.go`: while the gate is engaged the engine logs a
+heartbeat every `PauseLogEvery` (default 10 s — demand / spare capacity /
+active vehicles), and after `PauseEscapeAfter` (default 60 s) of persistent
+deficit it resumes anyway on hold-last (ADR-0008 §6 already sanctions
+hold-last bridging) with a loud log; the escape resume is identifiable on
+the record plane by `demand > available`, no schema change. One-way latch
+prevents pause-livelock; the gate re-arms only after capacity recovers.
+Test: `TestPauseGateEscape` (`engine/natsio/pauseescape_test.go`) — wedged
+gate, heartbeats, escape, run completes, replay CRC matches. ADR-0008 §6
+clarification block added.
 
 ### WQ-5: Driver-lag divergence (skip-guarded test)
 `TestDifferentialLanedrop` wave-envelope assertion skip-guarded on a documented
@@ -188,11 +197,18 @@ Deferred until recordings exist. Not podcast-blocking.
 
 ## Program items (bigger, parallelizable, post-podcast unless cheap)
 
-### WQ-8: GIS network analysis (LA vs NY)
-Compare imported networks (lane miles, junction density, signal density, fragment
-rates, origin/exit counts) to see if GIS-type analysis yields anything useful for
-the episode. `engine/netimport` + `data/networks/`; metrics kernel (M13) can emit
-per-lane intervals. Research-flavored; agent-friendly.
+### WQ-8: GIS network analysis (LA vs NY) — DONE (2026-07-24)
+Report: `analysis/networks/README.md` (+ `netstats/` stdlib Go tool, 13
+compiled networks). Headlines: (1) control regime is the story — NY's
+conflicts are metered (65% signalized) vs LA's gap-acceptance fights (13%
+signalized, 3.4 yield approaches/junction): "New York waits in line, LA
+fights for gaps"; (2) Manhattan's short blocks + high portal density make it
+a spillback amplifier — box-blocking/gridlock is the predicted failure mode,
+a falsifiable sim prediction; (3) surprise: DTLA is MORE road-dense than
+Manhattan (31.7 vs 19.3 lane-km/km²) thanks to the freeway stack. Caveats:
+flat 600 veh/h/lane demand injects ~14× more vehicles/km² into Manhattan;
+27–59% of edges are netconvert micro-fragments; zero stop-sign approaches
+compile through (all minor control is yield).
 
 ### WQ-9: Intersection visualization + explanation layers
 What an intersection IS in the sim (stop lines, conflict points, signal programs)

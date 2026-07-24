@@ -30,12 +30,20 @@ type RecorderConfig struct {
 	AckWait time.Duration
 	// MaxAge bounds stream retention; 0 keeps everything (tests, local runs).
 	MaxAge time.Duration
+	// KeyframeChunkMax bounds one keyframe log message's payload in bytes
+	// (default 768 KiB — safely under the broker's 1 MiB max_payload with
+	// headers). A larger keyframe is split into chunk messages reassembled
+	// by the reader (ADR-0015).
+	KeyframeChunkMax int
 }
 
 func (c *RecorderConfig) withDefaults() RecorderConfig {
 	out := *c
 	if out.KeyframeEvery == 0 {
 		out.KeyframeEvery = 100
+	}
+	if out.KeyframeChunkMax == 0 {
+		out.KeyframeChunkMax = 768 * 1024
 	}
 	if out.CRCEvery == 0 {
 		out.CRCEvery = 1
@@ -71,12 +79,20 @@ const (
 	logFlagSuperseded = 1 << 6 // lost the same-tick tie-break: recorded, not applied
 )
 
+// headerKeyframeChunk marks a keyframe log message as fragment i of n of one
+// keyframe (value "i/n", 1-based — ADR-0015). Absent: the message IS the
+// whole keyframe (the pre-chunking format, and any keyframe that fits).
+const headerKeyframeChunk = "kf_chunk"
+
 // NewRecorder creates (or adopts) the per-run stream.
 func NewRecorder(js nats.JetStreamContext, run string, cfg RecorderConfig) (*Recorder, error) {
 	if err := validRunID(run); err != nil {
 		return nil, err
 	}
 	r := &Recorder{js: js, run: run, cfg: cfg.withDefaults(), stream: StreamName(run)}
+	if r.cfg.KeyframeChunkMax < 1 {
+		return nil, fmt.Errorf("KeyframeChunkMax must be ≥ 1, got %d", r.cfg.KeyframeChunkMax)
+	}
 	_, err := js.AddStream(&nats.StreamConfig{
 		Name:      r.stream,
 		Subjects:  []string{SubjectLogAll(run)},
@@ -141,7 +157,7 @@ func (r *Recorder) LogTick(e *engine.Engine) error {
 // between ticks (at a frozen tick) — the dedup id stays unique because it
 // embeds the predicted stream sequence, not a per-tick counter.
 func (r *Recorder) LogEvent(tick uint64, payload []byte) error {
-	if err := r.publish(SubjectLogEvent(r.run), tick, payload); err != nil {
+	if err := r.publish(SubjectLogEvent(r.run), tick, payload, 0, 0); err != nil {
 		return err
 	}
 	r.EventsWritten++
@@ -157,13 +173,17 @@ func (r *Recorder) LogEvent(tick uint64, payload []byte) error {
 // batches are awaited before the next tick, so the prediction is exact
 // unless a competing writer intervenes — which is precisely what the
 // assertion exists to catch. Publishes from one connection apply in order,
-// so intra-batch order holds too.
-func (r *Recorder) publish(subject string, tick uint64, data []byte) error {
+// so intra-batch order holds too. chunkN > 0 marks the message as fragment
+// chunkI of chunkN of a chunked keyframe (ADR-0015).
+func (r *Recorder) publish(subject string, tick uint64, data []byte, chunkI, chunkN int) error {
 	expected := r.lastSeq + uint64(len(r.batch)) + 1
 	msg := nats.NewMsg(subject)
 	msg.Data = data
 	msg.Header.Set(headerTick, strconv.FormatUint(tick, 10))
 	msg.Header.Set(headerSchemaVersion, strconv.Itoa(SchemaVersion))
+	if chunkN > 0 {
+		msg.Header.Set(headerKeyframeChunk, fmt.Sprintf("%d/%d", chunkI, chunkN))
+	}
 	msg.Header.Set(nats.MsgIdHdr, fmt.Sprintf("%s:%d:%d", r.run, tick, expected))
 	msg.Header.Set(nats.ExpectedLastSeqHdr, strconv.FormatUint(expected-1, 10))
 	f, err := r.js.PublishMsgAsync(msg)
@@ -262,7 +282,7 @@ func (r *Recorder) logIntent(t engine.TickedIntent) error {
 	data = append(data, k.Grant)
 	data = binary.LittleEndian.AppendUint16(data, uint16(len(route)))
 	data = append(data, route...)
-	if err := r.publish(SubjectLogIntent(r.run), tick, data); err != nil {
+	if err := r.publish(SubjectLogIntent(r.run), tick, data, 0, 0); err != nil {
 		return err
 	}
 	r.IntentsWritten++
@@ -279,7 +299,7 @@ func (r *Recorder) logVerb(s engine.TickedSpawn) error {
 	if err != nil {
 		return err
 	}
-	if err := r.publish(SubjectLogVerb(r.run), s.Tick, data); err != nil {
+	if err := r.publish(SubjectLogVerb(r.run), s.Tick, data, 0, 0); err != nil {
 		return err
 	}
 	r.VerbsWritten++
@@ -291,8 +311,25 @@ func (r *Recorder) logKeyframe(e *engine.Engine) error {
 	if err != nil {
 		return fmt.Errorf("keyframe marshal at tick %d: %w", e.Tick, err)
 	}
-	if err := r.publish(SubjectLogKeyframe(r.run), e.Tick, data); err != nil {
-		return err
+	subj := SubjectLogKeyframe(r.run)
+	max := r.cfg.KeyframeChunkMax
+	if len(data) <= max {
+		if err := r.publish(subj, e.Tick, data, 0, 0); err != nil {
+			return err
+		}
+	} else {
+		// Larger than one message can carry: split into chunk messages,
+		// consecutive in stream order (ADR-0015).
+		n := (len(data) + max - 1) / max
+		for i := 0; i < n; i++ {
+			end := (i + 1) * max
+			if end > len(data) {
+				end = len(data)
+			}
+			if err := r.publish(subj, e.Tick, data[i*max:end], i+1, n); err != nil {
+				return err
+			}
+		}
 	}
 	r.KeyframesWritten++
 	return nil
@@ -304,7 +341,7 @@ func (r *Recorder) logCRC(e *engine.Engine) error {
 	data := make([]byte, 0, 16)
 	data = binary.LittleEndian.AppendUint64(data, e.Tick)
 	data = binary.LittleEndian.AppendUint64(data, e.CRC())
-	if err := r.publish(SubjectLogCRC(r.run), e.Tick, data); err != nil {
+	if err := r.publish(SubjectLogCRC(r.run), e.Tick, data, 0, 0); err != nil {
 		return err
 	}
 	r.CRCsWritten++

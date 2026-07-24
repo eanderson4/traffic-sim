@@ -75,6 +75,14 @@ precedent for engine-enforced safety clamps.
    election), sized to absorb one full peer loss. The engine **pauses the
    run** when available claim capacity < demand for T ticks; pause/resume are
    recorded on the record plane and are invisible to tick determinism.
+   (2026-07-24 pause-gate escape: a jammed run's active count never drops,
+   so the capacity-recovery resume condition can be unreachable — the gate
+   wedged silently. The gate now logs a heartbeat every `PauseLogEvery`
+   (default 10 s) while engaged, and after `PauseEscapeAfter` (default 60 s)
+   of persistent deficit it resumes anyway on the hold-last bridging this
+   section already sanctions, loudly logged; the escape resume is
+   identifiable on the record plane by `demand > available`. The latch is
+   one-way: the gate re-arms only after capacity has actually recovered.)
    (2026-07-24 scope note: the detach timeout
    behind this section is a PACED-run regime — the sweep is skipped at
    `PaceFloor == 0`, where tick time outruns any client's wall-clock
