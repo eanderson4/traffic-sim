@@ -1,0 +1,19 @@
+ analysis/networks/README.md                       | 136 +++++++
+ analysis/networks/netstats/go.mod                 |   3 +
+ analysis/networks/netstats/main.go                | 255 +++++++++++++
+ analysis/networks/netstats/stats.json             | 442 ++++++++++++++++++++++
+ analysis/networks/netstats/table.md               |  29 ++
+ contracts/asyncapi.yaml                           |  33 +-
+ docs/kb/INDEX.md                                  |   4 +-
+ docs/kb/articles/decisions/adrs.md                |   1 +
+ docs/kb/articles/podcast-demo-workqueue.md        |  50 ++-
+ docs/kb/decisions/ADR-0008-controller-contract.md |   8 +
+ docs/kb/decisions/ADR-0015-keyframe-chunking.md   |  74 ++++
+ engine/BENCHMARKS.md                              |  15 +-
+ engine/keyframe.go                                |   7 +-
+ engine/natsio/contract.go                         |  66 +++-
+ engine/natsio/keyframe_chunk_test.go              | 138 +++++++
+ engine/natsio/pauseescape_test.go                 | 135 +++++++
+ engine/natsio/recorder.go                         |  53 ++-
+ engine/natsio/replay.go                           |  83 +++-
+ 18 files changed, 1483 insertions(+), 49 deletions(-)

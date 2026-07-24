@@ -44,8 +44,9 @@ Options considered:
 2. **A message without `kf_chunk` is a whole keyframe** — the
    pre-ADR-0015 format and the steady state for any keyframe that fits.
    Existing recordings remain readable unchanged. Old readers
-   encountering a chunked keyframe fail loud (chunk 1 does not parse as
-   a TSKF payload); no silent misread is possible.
+   encountering a chunked keyframe fail loud (chunk 1 parses as a
+   truncated TSKF payload — the codec's short-read error sticks; see
+   Consequences); no silent misread is possible.
 3. **The seek anchor sequence is the keyframe's LAST message** (final
    chunk, or the whole message when unchunked): re-simulation resumes
    at seq+1, after the complete keyframe. `findKeyframe` reassembles
@@ -67,6 +68,19 @@ Options considered:
 - `MarshalState` still builds the full keyframe in memory; at plausible
   fleet sizes (≤100k vehicles ≈ ≤10 MB) this is fine. Streaming marshal
   is unnecessary today.
+- **Retention hazard (deferred, 2026-07-24 review):** with
+  `RecorderConfig.MaxAge > 0`, JetStream expires messages individually,
+  so a chunk group straddling the expiry frontier leaves an orphan tail
+  (chunk 1 gone, 2..n present) that `findKeyframe` treats as a malformed
+  group — failing ALL seeks, including to intact later keyframes.
+  Accepted today: MaxAge is 0 for tests and local runs (recordings are
+  bounded by disk, not retention). If MaxAge is ever set, either ignore
+  a retention-truncated prefix at the stream head or make chunk-group
+  retention atomic.
+- Old readers encountering a chunked keyframe fail loud via the TSKF
+  codec's sticky short-read error (chunk 1 parses as a truncated
+  keyframe) and the player's duplicate-tick index check — not via the
+  magic bytes, which chunk 1 does carry.
 - Chunking only affects the record plane; replay determinism is
   unchanged (the reassembled bytes are the same TSKF payload the CRC
   chain pins).

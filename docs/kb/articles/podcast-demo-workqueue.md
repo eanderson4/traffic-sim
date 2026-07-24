@@ -79,6 +79,18 @@
   path; (f) legend still says "one per movement" — update to "one per
   approach + stop bar" (legend.ts was mid-refactor by the theme session).
 
+- **Keyframe-chunking round deferrals (Fable r3 + Sol r2/r3, commit 8fbb5a1):**
+  (a) MaxAge retention expires messages individually — a chunk group
+  straddling the frontier leaves an orphan tail that fails ALL seeks, and
+  `indexLogMsgs` counts `i==n` without group validation (recorded in
+  ADR-0015 consequences; MaxAge is 0 today); (b) asyncapi `kf_chunk`
+  pattern admits `0/3` (the parser enforces 1≤i≤n); (c) the header
+  canonicalizes to `Kf_chunk` on the wire (pre-existing pattern, matters
+  only to case-sensitive non-Go consumers); (d) netstats: last-lane-wins
+  edge length, SignalShare numerator/denominator sets differ, unstable
+  table sort (analysis-tool-grade); (e) the chunk test's seek-anchor
+  assertion is vacuous when the keyframe group is the stream tail
+  (harmless: CRC/verb messages always follow in the test).
 
 ### WQ-1: Spurious/"extra" signal heads at junctions — FIXED (2026-07-23, 62b6237 + 7aad2a3)
 Root cause was per-link duplication, not fragment artifacts: the wire's link
@@ -187,6 +199,17 @@ clarification block added.
 ### WQ-5: Driver-lag divergence (skip-guarded test)
 `TestDifferentialLanedrop` wave-envelope assertion skip-guarded on a documented
 signature; needs a driver-model fix. Details in the fixture test file.
+
+### WQ-14: Pause-gate escape semantics (Sol r3 blocker, deferred from 8fbb5a1)
+The WQ-13 escape latch disables the capacity gate until capacity recovers
+at least once; in a never-recovering jam the run free-runs on hold-last
+indefinitely (new unclaimed vehicles coast; finite HoldLastTicks exhausts).
+Alternatives on the table: (a) current one-way latch; (b) re-arm per
+escape — the gate dwells 60 s, grants ~PauseAfterTicks of progress, dwells
+again (honest backpressure, crawl instead of wedge); (c) abort the run
+loudly after the dwell. Belongs with the WQ-5 driver-model ADR-level pass.
+Context: the gate arming at all is an operator sizing error (WQ-4 ran
+-capacity 50000 so it never arms); the escape exists for demo-liveness.
 
 ### WQ-6: Roundabout circulation
 Directive expiry + yield conservatism; ADR-level. Fixture: `engine/fixture_roundabout_test.go`
