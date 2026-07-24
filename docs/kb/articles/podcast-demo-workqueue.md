@@ -63,23 +63,39 @@
   running-centroid clustering can drift (early member ends >75 m from the
   final centroid; Y-arms within 90° merge) — deterministic, cosmetic,
   revisit only if a real net shows the artifact.
+- **Signal-bar round deferrals (2026-07-23, commit 7aad2a3):** (a) the 45°
+  cone is a per-join gate against the running mean — a 0°/40°/60° bearing
+  bridge can still merge distinct arms (Sol) — compare against all members
+  or a fixed representative if a real net shows it; (b) bars draw through
+  the centroid, so entries staggered along the travel axis get a
+  misaligned bar (cosmetic); (c) off-state bars share the `noData` lane
+  tone and can vanish over no-data lanes (Fable question — accepted);
+  (d) coarse left-turn chord bearings can split one true approach into
+  two heads (Fable, cosmetic); (e) bar state-coloring is screenshot-
+  verified only — no headless assertion on the shared-id feature-state
+  path; (f) legend still says "one per movement" — update to "one per
+  approach + stop bar" (legend.ts was mid-refactor by the theme session).
 
 
-### WQ-1: Spurious/"extra" signal heads at junctions — FIXED (2026-07-23)
+### WQ-1: Spurious/"extra" signal heads at junctions — FIXED (2026-07-23, 62b6237 + 7aad2a3)
 Root cause was per-link duplication, not fragment artifacts: the wire's link
 index is one per SUMO connection (from-lane→to-lane), so wide multi-lane
 approaches rendered a head per lane-movement (~25 heads at one junction).
 Fix in `viz/src/signals.ts`: cluster bound links by (identical state column
 across all phases) AND approach geometry (≤75 m to the running centroid,
-entry bearing within 90° — opposing approaches at symmetric junctions must
-never merge), one head per cluster, set back 3.5 m along the approach
-bearing. Wilshire 3038 → 1404 heads, Manhattan 3256 → ~1.4k. Registration
-delay fixed engine-side: TSSG catch-up republish moved from the keyframe
-cadence (100 ticks = 10 s at 1×) to `signalCatchUpEvery` = 20 ticks
-(`engine/natsio/run.go`; contract + ADR-0006 addendum updated). Residual,
-deferred: mid-zoom (13–15) declutter at dense junction clusters (e.g. the
-San Vicente diagonal) — consider count-badged single heads; greedy-mean
-bearing drift noted by Fable (cosmetic, deterministic).
+entry bearing within ~45° of the running mean — tightened from 90° after
+skewed Wilshire X-junctions under-merged: 610/824 column-groups mixed
+bearing sectors). One head per cluster, set back 3.5 m along the approach
+bearing, plus a colored STOP BAR across the cluster's lanes (same feature
+id → same state color) as the "which approach" cue. Measured heads
+(per-link → column-only → approach split): Manhattan 3256 → 1100 → 1180,
+Wilshire 3038 → 824 → 1407, Boston 1085 → 438 → 536, stress-DTLA
+6025 → 1625 → 2514. Registration delay fixed engine-side: TSSG catch-up
+republish moved from the keyframe cadence (100 ticks = 10 s at 1×) to
+`signalCatchUpEvery` = 20 ticks (`engine/natsio/run.go`; contract +
+ADR-0006 addendum updated). Residual, deferred: mid-zoom (13–15) declutter
+at dense junction clusters (e.g. the San Vicente diagonal) — consider
+count-badged single heads.
 
 ### WQ-2: Trailer jackknife physics
 `viz/src/artic.ts` — trailers render perpendicular/detached. Root cause understood
