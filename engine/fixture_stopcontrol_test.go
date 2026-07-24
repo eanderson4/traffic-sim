@@ -263,7 +263,7 @@ func TestFixtureStopControlCrossTraffic(t *testing.T) {
 		if v.V > 0 || len(v.Lane.Successors) == 0 {
 			continue
 		}
-		next := pickSuccessor(v.Lane, v.HeldTurn)
+		next := e.pickSuccessor(v.Lane, v)
 		t.Logf("probe #%d on %s s=%.1f/%.1f next=%s row=%v boxBlocked=%v conflict=%v stopDone=%v",
 			v.ID, v.Lane.ID, v.S, v.Lane.Length, next.ID, next.Row,
 			e.boxBlocked(v, next), e.rowConflict(v, next), v.stopDone)

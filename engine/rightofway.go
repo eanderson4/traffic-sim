@@ -143,11 +143,15 @@ func (e *Engine) rowGate(v *Vehicle) (float64, bool) {
 func (e *Engine) gateTarget(v *Vehicle) (*Lane, float64) {
 	cur := v.Lane
 	dist := cur.Length - v.S
+	// Virtual walk: the held turn is consumed at the first crossing, as in
+	// boundaries() — later hops follow the route/default only.
+	probe := *v
 	for hops := 0; hops < maxLaneHops; hops++ {
 		if len(cur.Successors) == 0 {
 			return nil, 0
 		}
-		next := pickSuccessor(cur, v.HeldTurn)
+		next := e.pickSuccessor(cur, &probe)
+		probe.HeldTurn = 0
 		if next.Internal && e.controlled(next) {
 			if dist > maxSightM {
 				return nil, 0
@@ -248,11 +252,16 @@ func (e *Engine) exitBlocked(v *Vehicle, next *Lane, inBox bool) bool {
 	// there, so next.Length is correct). In the entry case it is unused.
 	dist := next.Length - v.S
 	cur := next
+	// Virtual walk: reaching `next` already consumed the held turn (the
+	// crossing into it spends it, boundaries()) — every hop here follows
+	// the route/default only.
+	probe := *v
+	probe.HeldTurn = 0
 	for hops := 0; hops < maxLaneHops; hops++ {
 		if len(cur.Successors) == 0 {
 			break
 		}
-		exit := pickSuccessor(cur, v.HeldTurn) // v's actual route, not the default
+		exit := e.pickSuccessor(cur, &probe) // v's actual route, not the default
 		// A shared funnel (several lanes feeding one) arbitrates
 		// simultaneous arrivals itself: no foe set covers cross-junction
 		// merges (netimport compiles foes WITHIN a junction only), so a

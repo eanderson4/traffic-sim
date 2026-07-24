@@ -3,9 +3,11 @@
 // process on the NATS contract. It attaches with the drive grant, claims
 // unclaimed vehicles up to its capacity, and drives them each tick — IDM
 // longitudinal + MOBIL lateral computed CLIENT-SIDE from observations,
-// reusing the kernel's shared policy functions (engine.PolicyCtx), plus a
-// Dijkstra router over the lane graph for destination params (a configured
-// override, or per-vehicle drawn exit lanes — destinations.go). Policy RNG
+// reusing the kernel's shared policy functions (engine.PolicyCtx), plus
+// destination params for the persistent routing axis (a configured
+// override, or per-vehicle drawn exit lanes — destinations.go); the kernel
+// follows a set destination at every multi-successor lane
+// (engine/routing.go), so no per-junction turn traffic is needed. Policy RNG
 // streams are seeded per vehicle, keyed by vehicle ID (ADR-0007) — never
 // per process — so fleet failover and orphan re-claim are behaviorally
 // invisible, and which replica drives a vehicle does not matter.
@@ -85,8 +87,11 @@ type Driver struct {
 	mu      sync.Mutex
 	fleet   map[uint64]bool // claimed vehicles (reconciled against observations)
 	pending map[uint64]bool // claims in flight
-	routed  map[uint64]bool // route intent already sent (persistent axis)
+	routed  map[uint64]bool // route intent confirmed by the obs echo (persistent axis)
 	streams map[uint64]*engine.Stream
+	exits   *exitCache // memoized pickExit inputs (candidates, reachability)
+
+	wantRoute map[uint64]string // destination chosen, re-sent until the obs echo confirms
 
 	subs []*nats.Subscription
 	done chan struct{}
@@ -121,7 +126,9 @@ func New(nc *nats.Conn, js nats.JetStreamContext, cfg Config) (*Driver, error) {
 		pending: map[uint64]bool{},
 		routed:  map[uint64]bool{},
 		streams: map[uint64]*engine.Stream{},
-		done:    make(chan struct{}),
+
+		wantRoute: map[uint64]string{},
+		done:      make(chan struct{}),
 	}
 	if len(d.types) == 0 {
 		d.types = []*engine.VehicleType{&engine.Car} // the kernel's own default
@@ -302,28 +309,40 @@ func (d *Driver) onObs(msg *nats.Msg) {
 			in.Signals = signalFor(lane)
 		}
 		// Routing axis: the destination parameter is persistent — send once
-		// per vehicle (plus the junction turn choice when the graph offers
-		// one; M1 networks are single-successor, so usually a no-op). The
-		// destination is the configured override, or — with ExitRouting —
-		// the vehicle's per-ID drawn exit lane (tried once either way:
-		// the pick is deterministic, retrying would not change it).
+		// per vehicle; the kernel follows it at every multi-successor lane
+		// (engine/routing.go), degrading to the successor default when the
+		// destination is unknown or unreachable. The destination is the
+		// configured override, or — with ExitRouting — the vehicle's per-ID
+		// drawn exit lane (tried once either way: the pick is
+		// deterministic, retrying would not change it).
 		d.mu.Lock()
 		if !d.routed[ego.ID] {
-			dest := d.cfg.Destination
-			if dest == "" && d.cfg.ExitRouting {
-				dest, _ = pickExit(d.net, d.spec.Seed, ego.ID, ego.LaneIdx)
-				d.routed[ego.ID] = true
-			}
-			if dest != "" {
-				if _, ok := Route(d.net, ego.LaneIdx, dest); ok {
-					in.RouteSet = true
-					in.Route = dest
-					if turn := d.turnChoice(ego.LaneIdx, dest); turn != 0 {
-						in.TurnSet = true
-						in.Turn = turn
-					}
-					d.routed[ego.ID] = true
+			// Failover adoption: a re-claimed vehicle may already carry the
+			// persistent route its previous controller assigned (the obs
+			// frame round-trips it) — keep it. Re-deriving from the
+			// current lane would change the destination mid-trip
+			// (ADR-0008 §6: failover is behaviorally invisible).
+			want, ok := d.wantRoute[ego.ID]
+			if !ok {
+				want = d.cfg.Destination
+				if want == "" {
+					want = ego.Route
 				}
+				if want == "" && d.cfg.ExitRouting {
+					want, _ = pickExit(d.net, d.exitCache(), d.spec.Seed, ego.ID, ego.LaneIdx)
+				}
+				d.wantRoute[ego.ID] = want
+			}
+			// Core NATS publish has no ack: re-send until the obs frame
+			// echoes the destination — a dropped one-shot Route intent
+			// would leave the vehicle on default routing for life. Mark
+			// routed only when the engine confirms (or nothing is wanted).
+			if want == "" || ego.Route == want {
+				d.routed[ego.ID] = true
+				delete(d.wantRoute, ego.ID)
+			} else {
+				in.RouteSet = true
+				in.Route = want
 			}
 		}
 		d.mu.Unlock()
@@ -338,6 +357,7 @@ func (d *Driver) onObs(msg *nats.Msg) {
 		if !present[vid] {
 			delete(d.fleet, vid)
 			delete(d.routed, vid)
+			delete(d.wantRoute, vid)
 		}
 	}
 	idle := len(d.fleet) == 0
@@ -361,26 +381,15 @@ func signalFor(laneDelta int) int {
 	}
 }
 
-// turnChoice maps the router's next hop onto the junction turn axis:
-// successors are ordered left-to-right by convention (+1 first/leftmost,
-// −1 last/rightmost). No choice on single-successor lanes.
-func (d *Driver) turnChoice(laneIdx int, dest string) int {
-	path, ok := Route(d.net, laneIdx, dest)
-	if !ok || len(path) < 2 {
-		return 0
+// exitCache lazily memoizes pickExit's O(network) inputs — the candidate
+// list and per-lane reachability — under d.mu. The network is immutable
+// for the run, and vehicles are first observed on a small set of origin
+// lanes, so the memo hit rate is near-total.
+func (d *Driver) exitCache() *exitCache {
+	if d.exits == nil {
+		d.exits = newExitCache()
 	}
-	lane := d.net.Lanes[laneIdx]
-	if len(lane.Successors) < 2 {
-		return 0
-	}
-	next := path[1]
-	if next == lane.Successors[0].Index {
-		return 1
-	}
-	if next == lane.Successors[len(lane.Successors)-1].Index {
-		return -1
-	}
-	return 0
+	return d.exits
 }
 
 // onSnap discovers claimable vehicles: the snapshot is the complete id list

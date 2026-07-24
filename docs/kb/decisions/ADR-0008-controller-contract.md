@@ -75,6 +75,11 @@ precedent for engine-enforced safety clamps.
    election), sized to absorb one full peer loss. The engine **pauses the
    run** when available claim capacity < demand for T ticks; pause/resume are
    recorded on the record plane and are invisible to tick determinism.
+   (2026-07-24 scope note: the detach timeout
+   behind this section is a PACED-run regime — the sweep is skipped at
+   `PaceFloor == 0`, where tick time outruns any client's wall-clock
+   reaction; batch mode is for offline runs with embedded clients. See the
+   ADR-0006 2026-07-24 addendum and `ctlHeartbeat` in asyncapi.)
 
 ## Consequences
 

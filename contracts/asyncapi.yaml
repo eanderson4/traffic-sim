@@ -205,7 +205,14 @@ channels:
       claims release and unclaimed-vehicle events fire (reason
       "disconnect"). Core NATS has no presence primitive; the tick-space
       timeout is the v1 disconnect signal. Idle standby replicas heartbeat
-      once per tick.
+      once per tick. BATCH-MODE EXCEPTION (2026-07-24): the sweep runs
+      only when the run is paced (PaceFloor > 0). At PaceFloor == 0 tick
+      time outruns any client's wall-clock reaction, so the tick-space
+      budget would detach healthy clients (and the pause gate would then
+      wedge the run); batch runs are offline runs with embedded clients —
+      an external controller attaching to one keeps its claims even if it
+      dies. Pace is an unrecorded run condition today: a client cannot
+      discover which regime it is under.
     parameters:
       run: { $ref: '#/components/parameters/runId' }
       controller_id: { $ref: '#/components/parameters/controllerId' }
@@ -848,7 +855,7 @@ components:
         speed_setpoint: { type: number, description: 'm/s; persistent cruise until replaced; negative clears; clamped to v0eff' }
         lane_delta: { type: integer, enum: [-1, 0, 1], description: '+1 left, −1 right; one-shot, expires if infeasible' }
         turn: { type: integer, enum: [-1, 0, 1], description: 'junction choice; held until consumed at the next lane crossing; 0 clears' }
-        route: { type: string, maxLength: 48, description: 'destination lane id; persistent' }
+        route: { type: string, maxLength: 48, description: 'destination lane id; persistent. The engine follows it at every multi-successor lane (shortest path by lane length); an explicit held turn wins the crossing; unknown/unreachable destinations degrade to the successor default' }
         signals: { type: integer, enum: [0, 1, 2, 3], description: '0 off, 1 left, 2 right, 3 hazard; persistent, informational in v1' }
 
     AckView:

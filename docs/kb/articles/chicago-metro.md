@@ -32,6 +32,13 @@ Source of truth: `scripts/chicago/zones.geojson` — display polygons
    total; fragments + minor classes skipped.
 7. Scenario dir per zone under `data/scenarios/chi-*/` (vendored network
    copy, scenario.yaml, demand/, README with the napkin derivation).
+8. Overlays for demosrv: copy the zone source of truth
+   (`scripts/chicago/zones.geojson`) plus the generated
+   `boundaries.geojson` / `water.geojson` into the demosrv `-overlaydir`
+   (this repo uses `data/networks/chicago/`). The viz fetches
+   `/overlay/{zones,boundaries,water}.geojson`; a 404 just means "no
+   overlay". Overlay artifacts are gitignored data — a fresh checkout
+   regenerates or copies them before they render.
 
 ## Zones (starter set)
 
@@ -56,10 +63,18 @@ the first real calibration target).
 ## Engine changes enabling this
 
 - Driver per-vehicle exit routing (`driver.Config.ExitRouting`, serve flag
-  `-exit-routing`, default on): seeded per-vehicle destination among
-  reachable exit lanes, speed-limit weighted, fragments excluded. Without
-  it grid zones take the kernel leftmost-successor default and circulation
-  is garbage. Deterministic from (run seed, vehicle ID) — failover-safe.
+  `-exit-routing`, default on): the driver assigns each claimed vehicle a
+  seeded destination among reachable exit lanes (speed-limit weighted,
+  fragments excluded, drawn from the domain-separated
+  `traffic-sim/driver/exit-destination` stream — failover-safe), sent once
+  as the persistent Route intent; the KERNEL follows it at every
+  multi-successor lane via memoized reverse-Dijkstra next-hop tables
+  (`engine/routing.go`). Without it grid zones take the kernel
+  leftmost-successor default and circulation is garbage. (2026-07-24
+  review fix: the first cut sent a one-shot turn intent that steered only
+  the first fork — middle successors of 3+-way forks were inexpressible
+  through the ±1 turn axis — and ran an O(V²) Dijkstra twice per
+  assignment; both removed in favor of engine-side resolution.)
 - serve client-attach barrier (`-attach-timeout`, StartGate in natsio):
   run loop parks at tick 0 until embedded driver/director report ready;
   any pace (incl. `-pace 0`) now legal with clients attached. Fast-
@@ -101,7 +116,12 @@ the first real calibration target).
   ~40% of spawns were claimed by end of a 10-min window (unclaimed
   vehicles ride the kernel defaults). For scorecard-grade runs where
   full driver control matters, use a finite pace the driver can keep up
-  with; unpaced is for throughput, not fidelity.
+  with; unpaced is for throughput, not fidelity. (2026-07-24 review:
+  the driver's per-claim routing costs — an O(V²) Dijkstra run twice
+  per assignment plus O(network) candidate/reachability rebuilds per
+  pick — were likely a major contributor and are now removed/memoized;
+  re-measure before assuming the finite-pace workaround is still
+  needed.)
 
 ## Scorecard (B4 results)
 

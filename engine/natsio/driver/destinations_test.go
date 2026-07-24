@@ -58,8 +58,8 @@ func TestPickExitDeterministic(t *testing.T) {
 	const seed = 42
 	from := net.Origins[0].Index
 	for vid := uint64(1); vid <= 50; vid++ {
-		a, okA := pickExit(net, seed, vid, from)
-		b, okB := pickExit(net, seed, vid, from)
+		a, okA := pickExit(net, newExitCache(), seed, vid, from)
+		b, okB := pickExit(net, newExitCache(), seed, vid, from)
 		if okA != okB || a != b {
 			t.Fatalf("vehicle %d: pick %q (ok %v) != re-pick %q (ok %v)", vid, a, okA, b, okB)
 		}
@@ -72,7 +72,7 @@ func TestPickExitDeterministic(t *testing.T) {
 	}
 	distinct := map[string]int{}
 	for vid := uint64(1); vid <= 200; vid++ {
-		dest, ok := pickExit(net, seed, vid, from)
+		dest, ok := pickExit(net, newExitCache(), seed, vid, from)
 		if !ok {
 			t.Fatalf("vehicle %d: no destination from origin %s", vid, net.Lanes[from].ID)
 		}
@@ -106,11 +106,11 @@ func TestPickExitRouteFound(t *testing.T) {
 		reachable := 0
 		for vid := uint64(1); vid <= 40; vid++ {
 			total++
-			dest, ok := pickExit(net, seed, vid, origin.Index)
+			dest, ok := pickExit(net, newExitCache(), seed, vid, origin.Index)
 			if !ok {
 				continue
 			}
-			if _, ok := Route(net, origin.Index, dest); !ok {
+			if !reachableLanes(net, origin.Index)[net.LaneByID(dest).Index] {
 				t.Fatalf("origin %s vehicle %d: assigned unreachable exit %s",
 					origin.ID, vid, dest)
 			}
@@ -145,7 +145,7 @@ func TestPickExitRerollConditions(t *testing.T) {
 	// reroll away from self (or report no pick).
 	for _, l := range exitCandidates(net) {
 		for vid := uint64(1); vid <= 20; vid++ {
-			if dest, ok := pickExit(net, seed, vid, l.Index); ok && dest == l.ID {
+			if dest, ok := pickExit(net, newExitCache(), seed, vid, l.Index); ok && dest == l.ID {
 				t.Fatalf("vehicle %d on %s drew its own lane", vid, l.ID)
 			}
 		}
@@ -154,8 +154,46 @@ func TestPickExitRerollConditions(t *testing.T) {
 	// exits (some of which out-rank real exits on speed limit) never win.
 	for _, origin := range net.Origins {
 		for vid := uint64(1); vid <= 40; vid++ {
-			if dest, ok := pickExit(net, seed, vid, origin.Index); ok && !eligible[dest] {
+			if dest, ok := pickExit(net, newExitCache(), seed, vid, origin.Index); ok && !eligible[dest] {
 				t.Fatalf("origin %s vehicle %d: %q is not an eligible exit", origin.ID, vid, dest)
+			}
+		}
+	}
+}
+
+// The destination draw must be independent of the vehicle's main stream
+// (the one the live policy stream consumes): a fresh stream under the MAIN
+// domain replays the policy sequence exactly, which coupled route choice
+// to lane-change draws fleet-wide (chicago-metro review, 2026-07-24).
+func TestPickExitStreamDomainSeparated(t *testing.T) {
+	const seed, vid = 42, 7
+	main := engine.DeriveStream(seed, vid)
+	dest := engine.DeriveStreamDomain(exitDomain, seed, vid)
+	again := engine.DeriveStreamDomain(exitDomain, seed, vid)
+	for i := 0; i < 8; i++ {
+		m, a, b := main.Float64(), dest.Float64(), again.Float64()
+		if m == a {
+			t.Fatalf("draw %d identical across domains (%v) — streams not separated", i, m)
+		}
+		if a != b {
+			t.Fatalf("draw %d: same-domain re-derivation diverged: %v != %v", i, a, b)
+		}
+	}
+}
+
+// A shared cache must never change a pick: memoized candidates and
+// reachability are identical to freshly computed ones.
+func TestPickExitCacheTransparent(t *testing.T) {
+	net := loadStopControl(t)
+	const seed = 42
+	ec := newExitCache()
+	for _, origin := range net.Origins {
+		for vid := uint64(1); vid <= 20; vid++ {
+			a, okA := pickExit(net, ec, seed, vid, origin.Index)
+			b, okB := pickExit(net, newExitCache(), seed, vid, origin.Index)
+			if a != b || okA != okB {
+				t.Fatalf("origin %s vehicle %d: cached %q (%v) != fresh %q (%v)",
+					origin.ID, vid, a, okA, b, okB)
 			}
 		}
 	}

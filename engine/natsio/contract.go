@@ -33,7 +33,10 @@ import (
 //   - liveness: an attached controller silent for DetachAfterTicks ticks is
 //     detached; its claims release and unclaimed-vehicle events fire
 //     (reason "disconnect"). Core NATS has no presence primitive, so the
-//     timeout in tick space is the disconnect signal (v1).
+//     timeout in tick space is the disconnect signal (v1). Paced runs only:
+//     the sweep is skipped at PaceFloor == 0, where tick time outruns any
+//     client's wall-clock reaction (see the sweep below and the ADR-0006
+//     2026-07-24 addendum).
 //   - pause gating (ADR-0008 §6): once a drive controller has attached, if
 //     available claim capacity < demand (unclaimed vehicles) for
 //     PauseAfterTicks consecutive ticks, the run pauses (dead wall-clock

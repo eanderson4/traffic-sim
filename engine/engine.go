@@ -82,6 +82,11 @@ type Engine struct {
 	appliedSpawns []TickedSpawn // entered the queue during the last Step (reused)
 	SpawnLog      []TickedSpawn // every accepted directive, in application order
 
+	// Route-following caches (routing.go): derived from the immutable
+	// network, never serialized, never folded into the CRC.
+	routeTabs map[int][]int32 // dest lane index → next-hop table
+	preds     [][]int32       // predecessor adjacency, built once
+
 	Stats Stats
 }
 
@@ -425,7 +430,7 @@ func (e *Engine) boundaries() {
 				e.Stats.Despawned++
 			case len(lane.Successors) > 0:
 				v.S -= lane.Length
-				next := pickSuccessor(lane, v.HeldTurn)
+				next := e.pickSuccessor(lane, v)
 				v.Lane = next
 				v.HeldTurn = 0 // turn-at-junction is held until consumed
 				// Stop-line duty is per junction APPROACH (ADR-0010), and an
@@ -459,18 +464,25 @@ func (e *Engine) boundaries() {
 
 // pickSuccessor chooses the next lane at a junction. Successors are ordered
 // left-to-right by convention: a held turn of +1 (left) takes the first, −1
-// (right) the last; no held turn takes the default first. M1 networks have
-// at most one successor, so this is a no-op there.
-func pickSuccessor(lane *Lane, heldTurn int) *Lane {
+// (right) the last, and an explicit held turn always wins for that crossing.
+// With no held turn, a set Route (the persistent routing axis, intent.go)
+// takes the successor on the shortest path to the destination lane
+// (routing.go); with neither, the default first. M1 networks have at most
+// one successor, so this is a no-op there.
+func (e *Engine) pickSuccessor(lane *Lane, v *Vehicle) *Lane {
 	n := len(lane.Successors)
 	switch {
-	case heldTurn > 0:
+	case v.HeldTurn > 0:
 		return lane.Successors[0]
-	case heldTurn < 0:
+	case v.HeldTurn < 0:
 		return lane.Successors[n-1]
-	default:
-		return lane.Successors[0]
 	}
+	if n > 1 && v.Route != "" {
+		if next := e.routeNextHop(lane, v.Route); next != nil {
+			return next
+		}
+	}
+	return lane.Successors[0]
 }
 
 // collisionGap is the overlap threshold: gap below this counts as a
