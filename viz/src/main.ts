@@ -472,44 +472,81 @@ async function main(): Promise<void> {
     }
     map.addSource("network", { type: "geojson", data: networkFC, promoteId: "id" });
     map.addSource("vehicles", { type: "geojson", data: EMPTY_FC, promoteId: "id" });
+    // Lane paint shared by the external and internal layer pairs below so
+    // the two can't drift (WQ-3). Junction interiors (internal:true) are
+    // zoom-gated to >=13 like the signal heads: below that they're squiggle
+    // clutter at every junction. External lanes draw at all zooms.
+    const casingPaint: maplibregl.LineLayerSpecification["paint"] = {
+      "line-color": theme.casing,
+      // Casing on edge-group boundaries only (edgeB, edges.ts): the
+      // outer shell of each road. Interior lanes keep a faint trace so
+      // adjacent stripes stay separable. Lanes without an edge group
+      // (junction interiors — now the internal pair below — and stale
+      // caches) are all boundaries, so they degrade to full casing inside
+      // edgeBoundaries.
+      "line-opacity": ["case", ["boolean", ["get", "edgeB"], true], 0.9, 0.15],
+      // Zoomed-out legibility: a touch wider from z=11 (interpolating up
+      // to z=14) — the network must read under the vehicle stream before
+      // any detail matters.
+      "line-width": ["interpolate", ["linear"], ["zoom"], 11, 3.2, 14, 7, 17, 12],
+    };
+    const linePaint: maplibregl.LineLayerSpecification["paint"] = {
+      // feature-state "ratio" (client-derived mean speed / limit); -1 = no data.
+      "line-color": [
+        "interpolate",
+        ["linear"],
+        ["coalesce", ["feature-state", "ratio"], -1],
+        -1, theme.noData,
+        0, theme.stopped,
+        0.35, theme.mid,
+        0.7, theme.freeFlow,
+        1.5, theme.freeFlow,
+      ],
+      "line-width": ["interpolate", ["linear"], ["zoom"], 11, 1.8, 14, 4, 17, 8],
+    };
+    const laneLayout: maplibregl.LineLayerSpecification["layout"] = {
+      "line-cap": "round",
+      "line-join": "round",
+    };
+    const externalOnly: maplibregl.FilterSpecification = ["!=", ["get", "internal"], true];
+    const internalOnly: maplibregl.FilterSpecification = ["==", ["get", "internal"], true];
+    // Order matters: BOTH casings below BOTH congestion lines (review
+    // round 1) — an internal casing's round end-cap is wider than the
+    // line and would overpaint the external lane's congestion color at
+    // every junction mouth if it sat above network-line.
     map.addLayer({
       id: "network-casing",
       type: "line",
       source: "network",
-      layout: { "line-cap": "round", "line-join": "round" },
-      paint: {
-        "line-color": theme.casing,
-        // Casing on edge-group boundaries only (edgeB, edges.ts): the
-        // outer shell of each road. Interior lanes keep a faint trace so
-        // adjacent stripes stay separable. Lanes without an edge group
-        // (junction interiors, stale caches) are all boundaries, so they
-        // degrade to full casing inside edgeBoundaries.
-        "line-opacity": ["case", ["boolean", ["get", "edgeB"], true], 0.9, 0.15],
-        // Zoomed-out legibility: a touch wider from z=11 (interpolating up
-        // to z=14) — the network must read under the vehicle stream before
-        // any detail matters.
-        "line-width": ["interpolate", ["linear"], ["zoom"], 11, 3.2, 14, 7, 17, 12],
-      },
+      filter: externalOnly,
+      layout: laneLayout,
+      paint: casingPaint,
+    });
+    map.addLayer({
+      id: "network-internal-casing",
+      type: "line",
+      source: "network",
+      minzoom: 13,
+      filter: internalOnly,
+      layout: laneLayout,
+      paint: casingPaint,
     });
     map.addLayer({
       id: "network-line",
       type: "line",
       source: "network",
-      layout: { "line-cap": "round", "line-join": "round" },
-      paint: {
-        // feature-state "ratio" (client-derived mean speed / limit); -1 = no data.
-        "line-color": [
-          "interpolate",
-          ["linear"],
-          ["coalesce", ["feature-state", "ratio"], -1],
-          -1, theme.noData,
-          0, theme.stopped,
-          0.35, theme.mid,
-          0.7, theme.freeFlow,
-          1.5, theme.freeFlow,
-        ],
-        "line-width": ["interpolate", ["linear"], ["zoom"], 11, 1.8, 14, 4, 17, 8],
-      },
+      filter: externalOnly,
+      layout: laneLayout,
+      paint: linePaint,
+    });
+    map.addLayer({
+      id: "network-internal-line",
+      type: "line",
+      source: "network",
+      minzoom: 13,
+      filter: internalOnly,
+      layout: laneLayout,
+      paint: linePaint,
     });
     // Static overlays: ABOVE the road lines (added after them) but BELOW
     // vehicles/signal heads (added before them). Both sources are optional

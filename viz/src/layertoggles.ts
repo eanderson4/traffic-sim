@@ -35,8 +35,10 @@ export interface LayerOps {
 //   - the five signal layers move as a group: housing + stop bars + the
 //     three lit-lens circles (ids mirror main.ts's signals-lens-{color});
 //   - "stop-signs" is the static stop-sign layer (stopsign.ts);
-//   - "network-line" is the congestion overlay; "network-casing" (the road
-//     geometry itself) is NEVER toggled.
+//   - "network-line" + "network-internal-line" are the congestion overlay
+//     (external lanes / zoom-gated junction interiors, WQ-3);
+//     "network-casing" + "network-internal-casing" (the road geometry
+//     itself) are NEVER toggled.
 export function layerOpsFor(state: ToggleState): LayerOps {
   const cls: number[] = [];
   if (state.car) cls.push(0);
@@ -54,6 +56,7 @@ export function layerOpsFor(state: ToggleState): LayerOps {
       ["signals-lens-green", state.signals],
       ["stop-signs", state.stops],
       ["network-line", state.congestion],
+      ["network-internal-line", state.congestion],
     ],
   };
 }

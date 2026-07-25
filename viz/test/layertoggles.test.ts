@@ -61,10 +61,12 @@ test("stops off: the static stop-signs layer hides", () => {
   assert.equal(v.get("signals-housing"), true);
 });
 
-test("congestion off: network-line hides; the casing is never toggled", () => {
+test("congestion off: both congestion line layers hide; the casings are never toggled", () => {
   const v = vis(layerOpsFor({ ...DEFAULT_TOGGLES, congestion: false }));
   assert.equal(v.get("network-line"), false);
+  assert.equal(v.get("network-internal-line"), false);
   assert.ok(!v.has("network-casing"), "casing is road geometry, not the overlay");
+  assert.ok(!v.has("network-internal-casing"), "internal casing is road geometry too");
 });
 
 test("every toggle key off still names only real layers, exactly once", () => {
