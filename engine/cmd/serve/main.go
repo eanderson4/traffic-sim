@@ -215,6 +215,12 @@ func main() {
 		JetStream:  true,
 		StoreDir:   storeDir,
 		Websocket:  server.WebsocketOpts{Host: host, Port: port, NoTLS: true},
+		// 4 MB (ADR-0016): per-message discipline is ~768 KiB chunks —
+		// the TSSG signal table (measured: sf-lean 2.1 MB, la-lean 7.3 MB)
+		// is chunked on the wire, so this is headroom for big-fleet TSSF
+		// snapshots (~1.2 MB at 50k vehicles), NOT a design allowance. A
+		// pathological frame fails LOUD (the pubErrs logging).
+		MaxPayload: 4 << 20,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "serve: nats-server:", err)

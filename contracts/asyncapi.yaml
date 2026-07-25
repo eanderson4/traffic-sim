@@ -20,7 +20,7 @@ asyncapi: 3.0.0
 
 info:
   title: traffic-sim engine contract
-  version: 2.2.0
+  version: 2.3.0
   description: |
     The engine's NATS surface per ADR-0006 (planes, taxonomy, pipelines) and
     ADR-0008 (the engine↔controller contract — M4, schema_version 2):
@@ -79,6 +79,19 @@ info:
     (TSKF v3 appends it; readers accepting v2|v3 are unaffected — see the
     M10 addendum migration note).
 
+    **M11 changes (additive; info version 2.3.0):** city-scale signal
+    tables (ADR-0016). `ts.{run}.state.sig` frames may now be CHUNKED:
+    a `sig_chunk: "i/n"` (1-based) NATS header marks each chunk (payload
+    stays TSSG v1, program_count per chunk; absent header = whole table,
+    the v1 back-compat). New request/reply channel
+    `ts.{run}.state.sig.req`: an empty request is answered with the full
+    chunk set on the reply inbox — the pull-when-ready catch-up for
+    busy/late clients that complements the 20-tick broadcast cadence.
+    Server `max_payload` is 4 MiB headroom (per-message discipline stays
+    ~768 KiB chunks). Client note: a reader that ignores `sig_chunk`
+    would install each chunk as the whole table — chunk-aware decoding
+    is required once tables exceed the chunk threshold.
+
 servers:
   embedded:
     host: in-process
@@ -114,9 +127,10 @@ channels:
       snapshot's tick) lets a client derive any tick's per-link states by
       the kernel's own integer math (half-open phase windows on the tick
       grid, the cycle wraps, phase 0 begins at offset_ticks). Core NATS
-      has no retention; the 20-tick republication is the entire
-      late-joiner catch-up — convergence ≤ 20 ticks, never waiting for a
-      phase change. Self-sufficient like every
+      has no retention; the 20-tick republication plus the
+      state.sig.req pull (below) form the late-joiner catch-up —
+      convergence ≤ 20 ticks, or one round-trip on request, never
+      waiting for a phase change. Self-sufficient like every
       live-plane message: a drop only delays a table-less client's
       convergence, never corrupts state. An empty program_count means the
       run has no signalized junctions (explicit — distinguishable from
@@ -139,17 +153,29 @@ channels:
     address: ts.{run}.state.sig.req
     description: |
       Signal-table resync, request/reply (ADR-0016 §3): a request (EMPTY
-      payload) is answered by the run with the full CACHED TSSG chunk set
-      on the reply inbox — the pull-when-ready catch-up for a client that
-      dropped a chunk (slow-consumer) or attached mid-run and refuses to
-      wait out a 20-tick catch-up round. Queue-served by the run (the
-      replay player answers identically on the -replay namespace). Each
-      reply message is a stateSig frame with the same headers (tick,
-      schema_version, sig_chunk when the table is chunked).
+      payload — non-empty is rejected) is answered by the run with the
+      full CACHED TSSG chunk set on the request's dynamic reply inbox —
+      the pull-when-ready catch-up for a client that dropped a chunk
+      (slow-consumer) or attached mid-run and refuses to wait out a
+      20-tick catch-up round. Queue-served by the run (the replay player
+      answers identically on the -replay namespace).
+    x-permissions: 'observers MAY publish (ADR-0016 §7 amendment to ADR-0006 §9 read-only observers); replies ride the requester dynamic _INBOX'
     parameters:
       run: { $ref: '#/components/parameters/runId' }
     messages:
       signalTableRequest: { $ref: '#/components/messages/SignalTableRequest' }
+      signalTableReply: { $ref: '#/components/messages/SignalTable' }
+
+  sigReplyInbox:
+    address: _INBOX.>
+    description: |
+      Dynamic per-request reply inboxes (NATS request/reply). The signal
+      table resync answer (the full chunk set, each message a stateSig
+      frame with the same tick/schema_version/sig_chunk headers) is
+      published here, never on the request subject; the engine confines
+      replies to the DEFAULT _INBOX.* prefix (bus.go onSignalRequest —
+      clients with a custom inboxPrefix are logged and not answered).
+    messages:
       signalTableReply: { $ref: '#/components/messages/SignalTable' }
 
   ctlIntent:
@@ -444,9 +470,21 @@ operations:
     action: send
     channel: { $ref: '#/channels/stateSnap' }
   publishSignalTable:
-    title: Engine → signal-program table at run start + keyframe cadence
+    title: Engine → signal-program table at run start + 20-tick catch-up cadence (chunked per sig_chunk header, ADR-0016)
     action: send
     channel: { $ref: '#/channels/stateSig' }
+  receiveSignalTableRequest:
+    title: Engine ← signal-table resync request (empty body; ADR-0016 §3)
+    action: receive
+    channel: { $ref: '#/channels/stateSigReq' }
+    messages:
+      - { $ref: '#/components/messages/SignalTableRequest' }
+  sendSignalTableReply:
+    title: Engine → full signal-table chunk set on the request's dynamic reply inbox (pull-when-ready catch-up)
+    action: send
+    channel: { $ref: '#/channels/sigReplyInbox' }
+    messages:
+      - { $ref: '#/components/messages/SignalTable' }
   receiveIntents:
     title: Engine ← raw controller intents
     action: receive
@@ -559,7 +597,10 @@ components:
       summary: |
         The request itself is the signal — an empty payload on
         ts.{run}.state.sig.req; the run answers with the full cached
-        chunk set on the reply inbox (each a SignalTable message).
+        chunk set on the request's dynamic reply inbox (each reply
+        message is a SignalTable chunk; the body is otherwise ignored).
+      payload: { $ref: '#/components/schemas/EmptyPayload' }
+      x-reply: { address: 'dynamic reply inbox (NATS request/reply)', message: '#/components/messages/SignalTable' }
 
     ControlIntent:
       name: controlIntent
@@ -760,7 +801,7 @@ components:
           properties:
             sig_chunk:
               type: string
-              pattern: '^\d+/\d+$'
+              pattern: '^[1-9][0-9]*/[1-9][0-9]*$'
               description: 'Chunk i of n of one signal table (1-based; ADR-0016). Absent: the message IS the whole table. Chunks of one publish round are consecutive on the subject; each chunk is a complete v1 TSSG frame (program_count = programs in THIS chunk).'
 
     SchemaHeaders:
@@ -799,7 +840,7 @@ components:
           properties:
             kf_chunk:
               type: string
-              pattern: '^\d+/\d+$'
+              pattern: '^[1-9][0-9]*/[1-9][0-9]*$'
               description: 'Chunk i of n of one keyframe (1-based; ADR-0015). Absent: the message IS the whole keyframe. Chunks of one keyframe share its tick and are consecutive in stream order; the seek anchor is the LAST chunk’s sequence.'
 
     SnapshotFrame:

@@ -14,8 +14,8 @@ mid-parse drains too slowly, the server's slow-consumer policy drops the
 (the failure that motivated this ADR — diagnosed as zero snapshots, then
 as the dropped table).
 
-The first fix shipped was raising `MaxPayload` to 64 MB in serve and
-replay. That was the wrong shape: it moves the wall (TSSF snapshots grow
+The first fix attempted was raising `MaxPayload` (64 MB in the working
+tree, never shipped). That was the wrong shape: it moves the wall (TSSF snapshots grow
 with fleet size and will meet any cap), it inflates per-message buffers
 broker-wide, and it does nothing for the slow-consumer drop, which is a
 drain-rate problem, not a cap problem. ADR-0002's discipline — bulk
@@ -46,7 +46,14 @@ Options considered:
    standalone with the unmodified v1 decoder) carrying a
    `sig_chunk: "i/n"` header (1-based, mirroring `kf_chunk`). A frame
    with NO `sig_chunk` header is the whole table — v1 back-compat for
-   free; `schema_version` stays 1. Programs greedy-pack in file order
+   free. The TSSG PAYLOAD layout stays schema v1 (the envelope's
+   `schema_version` header is the shared frame-schema version, currently
+   2, and is unaffected). Consumer note: the in-repo viz is the only
+   TSSG reader and migrates in the same change (ADR-0006's
+   engine↔viz-artifact rule); a LEGACY reader that ignored `sig_chunk`
+   would install each chunk as the whole table and end with only the
+   last one — acceptable today, but any third-party TSSG consumer moves
+   this to a versioned subject. Programs greedy-pack in file order
    (a pure function); a single program larger than the target rides its
    own oversized chunk and is logged.
 2. **Encode once, publish from cache.** The chunk set is split and
@@ -69,7 +76,12 @@ Options considered:
    accumulation and triggers a resync request. A generation is installed
    only when COMPLETE (the old table survives an incomplete new one).
    The tick is never a generation identity (a paused replay republishes
-   the same tick).
+   the same tick). LIMITATION: order alone cannot distinguish two
+   interleaved rounds that each lose complementary chunks (round A's
+   head merged with round B's tail) — harmless while tables are static
+   (identical content either way), but a generation identifier (the
+   deferred `sig_gen` content hash) is REQUIRED before tables may
+   change mid-run.
 5. **Paused replay stops re-broadcasting the table.** The ~1 Hz paused
    republication keeps the small snapshot only; a full city table every
    second is a firehose aimed at exactly the busy tabs it targets. Paused
@@ -78,13 +90,20 @@ Options considered:
    stderr logging the signal table already had (first 3 per run), plus a
    one-time log when any frame crosses 1 MiB, naming the size — the
    silent-`pubErrs` bug class must not regrow.
-7. **`MaxPayload` 64 MB → 4 MB** in serve and replay. This ADR explicitly
+7. **Observer auth amendment.** ADR-0006 §9's "observers read-only
+   `ts.>`" is amended: a browser client may PUBLISH to
+   `ts.{run}.state.sig.req` (and subscribe its own `_INBOX.>` reply
+   inbox) — the pull path is useless under a strictly read-only
+   observer. The permission is scoped to that one subject; all other
+   observer publish rights stay denied. AsyncAPI 2.3.0's stateSigReq
+   channel documents it.
+8. **`MaxPayload` 1 MiB (NATS default) → 4 MB** in serve and replay. This ADR explicitly
    AMENDS ADR-0002/ADR-0006's "never raise the server limit": the
    per-message discipline is 1 MiB via chunking everywhere (TSSG chunks,
    ADR-0015 keyframes, the GeoJSON HTTP manifest); the 4 MiB broker cap
    is HEADROOM for big-fleet TSSF snapshots (~1.2 MB at 50k vehicles),
    not a design allowance.
-8. **The TSSF wall is documented, not solved.** Snapshots grow
+9. **The TSSF wall is documented, not solved.** Snapshots grow
    ~24 B/vehicle at 10 Hz — past ~40k vehicles a browser cannot drink
    the stream at any cap. Interest windows (per-controller areas of
    interest, ADR-0006 §7 doctrine) or size-adaptive decimation are the
@@ -96,9 +115,13 @@ Options considered:
   more than ~768 KiB per message, a slow-consumer drop costs one chunk
   and one resync request, and the req/reply path converges late joiners
   in one round-trip regardless of tick rate.
-- Old clients decode new streams unchanged (no-header = whole table; old
-  binaries simply never subscribe `state.sig.req`). Old PUBLISHERS are
-  the only v1-only producers left — recordings contain no TSSG (the
+- Old clients that honor `sig_chunk` decode new streams unchanged
+  (no-header = whole table; old binaries simply never subscribe
+  `state.sig.req`). A legacy client that IGNORES the header would
+  install each chunk as the whole table and retain only the last one —
+  hence the coordinated-migration note in the decision: the in-repo viz
+  is the only TSSG reader and moved in the same change. Old PUBLISHERS
+  are the only v1-only producers left — recordings contain no TSSG (the
   player re-derives the table, so old recordings replay chunked under a
   new binary).
 - Republication cost at city scale drops from re-encoding megabytes

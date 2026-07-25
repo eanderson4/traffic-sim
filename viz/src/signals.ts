@@ -72,8 +72,9 @@ function columnKey(p: SigProgram, linkIdx: number): string {
 // entryBearing is the unit vector the internal lane leaves its stop line
 // on (first nonzero segment); null when the shape is too degenerate to
 // tell — the lane then joins on distance alone rather than guessing a
-// direction.
-function entryBearing(shape: ReadonlyArray<readonly number[]>): [number, number] | null {
+// direction. Exported for stopsign.ts, which clusters stop-controlled
+// approaches by the same geometry.
+export function entryBearing(shape: ReadonlyArray<readonly number[]>): [number, number] | null {
   const first = shape[0];
   if (first === undefined) return null;
   for (let i = 1; i < shape.length; i++) {

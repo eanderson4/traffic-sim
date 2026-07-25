@@ -188,10 +188,10 @@ func TestSupervisorLifecycle(t *testing.T) {
 	d1 := spawnTarget{Kind: "demo", Demo: &Demo{ID: "demo-one", Run: "r1"}}
 	d2 := spawnTarget{Kind: "demo", Demo: &Demo{ID: "demo-two", Run: "r2"}}
 
-	if err := sup.start(d1, nil); err != nil {
+	if _, err := sup.start(d1, nil); err != nil {
 		t.Fatalf("start d1: %v", err)
 	}
-	id, pid, _, ok := sup.status()
+	id, _, pid, _, ok := sup.status()
 	if !ok || id != "demo-one" {
 		t.Fatalf("status after start d1 = (%q, %v), want (demo-one, true)", id, ok)
 	}
@@ -200,18 +200,18 @@ func TestSupervisorLifecycle(t *testing.T) {
 	}
 
 	// Single active run: starting d2 must kill d1's process.
-	if err := sup.start(d2, nil); err != nil {
+	if _, err := sup.start(d2, nil); err != nil {
 		t.Fatalf("start d2: %v", err)
 	}
 	waitDead(t, cmds[0], "d1 child after d2 start")
-	id, _, _, ok = sup.status()
+	id, _, _, _, ok = sup.status()
 	if !ok || id != "demo-two" {
 		t.Fatalf("status after start d2 = (%q, %v), want (demo-two, true)", id, ok)
 	}
 
 	sup.stop()
 	waitDead(t, cmds[1], "d2 child after stop")
-	if _, _, _, ok := sup.status(); ok {
+	if _, _, _, _, ok := sup.status(); ok {
 		t.Fatal("status after stop = active, want idle")
 	}
 	sup.stop() // idempotent
@@ -229,7 +229,7 @@ func TestSupervisorReadyTimeoutLeavesNoZombie(t *testing.T) {
 	sup.readyTimeout = 500 * time.Millisecond
 
 	start := time.Now()
-	err := sup.start(spawnTarget{Kind: "demo", Demo: &Demo{ID: "never-ready", Run: "r1"}}, nil)
+	_, err := sup.start(spawnTarget{Kind: "demo", Demo: &Demo{ID: "never-ready", Run: "r1"}}, nil)
 	if err == nil {
 		t.Fatal("start succeeded with no listener; want readiness error")
 	}
@@ -239,7 +239,7 @@ func TestSupervisorReadyTimeoutLeavesNoZombie(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Errorf("start blocked %s, want ~readyTimeout", elapsed)
 	}
-	if _, _, _, ok := sup.status(); ok {
+	if _, _, _, _, ok := sup.status(); ok {
 		t.Fatal("status after failed start = active, want idle")
 	}
 	if len(cmds) != 1 {
@@ -258,12 +258,12 @@ func TestSupervisorVerifyFailureKillsChild(t *testing.T) {
 	sup.ready = func() error { return nil }
 	boom := errors.New("display binding failed")
 
-	err := sup.start(spawnTarget{Kind: "replay", Rec: &Recording{ID: "rec1", Run: "r1"}},
+	_, err := sup.start(spawnTarget{Kind: "replay", Rec: &Recording{ID: "rec1", Run: "r1"}},
 		func() error { return boom })
 	if !errors.Is(err, boom) {
 		t.Fatalf("start error %v, want the verify error wrapped", err)
 	}
-	if _, _, _, ok := sup.status(); ok {
+	if _, _, _, _, ok := sup.status(); ok {
 		t.Fatal("status after failed verify = active, want idle")
 	}
 	mu.Lock()
@@ -276,7 +276,7 @@ func TestSupervisorVerifyFailureKillsChild(t *testing.T) {
 	waitDead(t, c0, "child after failed verify")
 
 	// A passing verify is transparent.
-	if err := sup.start(spawnTarget{Kind: "replay", Rec: &Recording{ID: "rec1", Run: "r1"}},
+	if _, err := sup.start(spawnTarget{Kind: "replay", Rec: &Recording{ID: "rec1", Run: "r1"}},
 		func() error { return nil }); err != nil {
 		t.Fatalf("start with passing verify: %v", err)
 	}
@@ -305,14 +305,14 @@ func TestSupervisorReplayWaitsForBothPorts(t *testing.T) {
 	// ws up, control port down: start must fail on the CONTROL port probe
 	// (and leave no process behind, like any readiness failure).
 	sup.ctlAddr = "127.0.0.1:1"
-	err = sup.start(rec, nil)
+	_, err = sup.start(rec, nil)
 	if err == nil {
 		t.Fatal("replay start succeeded with the control port down")
 	}
 	if !strings.Contains(err.Error(), "127.0.0.1:1") || !strings.Contains(err.Error(), "did not accept connections") {
 		t.Errorf("error %q, want the control-port probe failure", err)
 	}
-	if _, _, _, ok := sup.status(); ok {
+	if _, _, _, _, ok := sup.status(); ok {
 		t.Fatal("status after failed start = active, want idle")
 	}
 	mu.Lock()
@@ -331,7 +331,7 @@ func TestSupervisorReplayWaitsForBothPorts(t *testing.T) {
 	}
 	defer ctlLn.Close()
 	sup.ctlAddr = ctlLn.Addr().String()
-	if err := sup.start(rec, nil); err != nil {
+	if _, err := sup.start(rec, nil); err != nil {
 		t.Fatalf("replay start with both ports up: %v", err)
 	}
 	sup.stop()
@@ -394,17 +394,24 @@ func TestHTTPEndpoints(t *testing.T) {
 		t.Fatalf("idle status = %v, want active null", body)
 	}
 
+	old := runNonce
+	runNonce = func() (string, error) { return "t9", nil }
+	defer func() { runNonce = old }()
 	code, body = post("/api/demo/d1/start")
 	if code != 200 {
 		t.Fatalf("start = %d (%v)", code, body)
 	}
-	if want := "/app/?run=r1&net=/net/d1.geojson"; body["url"] != want {
+	// Live demos get a per-spawn unique run id (foreign-broker proof).
+	if want := "/app/?run=r1-t9&net=/net/d1.geojson&ws=ws%3A%2F%2F127.0.0.1%3A8443"; body["url"] != want {
 		t.Errorf("start url = %v, want %s", body["url"], want)
 	}
 
 	_, body = get("/api/status")
 	if body["active"] != "d1" {
 		t.Fatalf("active status = %v, want d1", body)
+	}
+	if body["run"] != "r1-t9" {
+		t.Fatalf("status run = %v, want r1-t9 (the spawned unique id)", body["run"])
 	}
 
 	code, _ = post("/api/demo/nope/start")

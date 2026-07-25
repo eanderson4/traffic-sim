@@ -10,6 +10,8 @@
 //
 // Lens order mirrors a real head: red top, amber middle, green bottom.
 
+import { THEMES, type ThemeSpec } from "./theme.ts";
+
 // Image geometry (pixels at icon-size 1).
 export const SIGNAL_HEAD_IMAGE_ID = "signal-head";
 const W = 14; // housing width
@@ -30,10 +32,14 @@ export const SIGNAL_HEAD = {
 } as const;
 
 // signalHeadImage draws the unlit head: dark rounded housing with a light
-// rim (it must read against the navy canvas) and three dim lenses. Drawn
-// at devicePixelRatio so the housing stays as crisp as the lens circles on
-// hiDPI screens (map.addImage defaults pixelRatio 1 otherwise).
-export function signalHeadImage(): { image: ImageData; pixelRatio: number } {
+// rim (it must read against the canvas) and three dim lenses. Housing,
+// rim, and dim-lens colors come from the active theme (navy default keeps
+// the original look). Drawn at devicePixelRatio so the housing stays as
+// crisp as the lens circles on hiDPI screens (map.addImage defaults
+// pixelRatio 1 otherwise).
+export function signalHeadImage(
+  theme: ThemeSpec = THEMES.navy,
+): { image: ImageData; pixelRatio: number } {
   const dpr = Math.max(1, Math.min(3, Math.floor(globalThis.devicePixelRatio || 1)));
   const w = (W + 2 * PAD) * dpr;
   const h = (H + 2 * PAD) * dpr;
@@ -47,16 +53,16 @@ export function signalHeadImage(): { image: ImageData; pixelRatio: number } {
   const r = 4;
   ctx.beginPath();
   ctx.roundRect(PAD, PAD, W, H, r);
-  ctx.fillStyle = "#0a1230";
+  ctx.fillStyle = theme.sigHousing;
   ctx.fill();
-  ctx.strokeStyle = "rgba(214, 225, 255, 0.55)";
+  ctx.strokeStyle = theme.sigStroke;
   ctx.lineWidth = 1;
   ctx.stroke();
 
   for (const cy of LENS_CY) {
     ctx.beginPath();
     ctx.arc(PAD + W / 2, PAD + cy, LENS_R, 0, 2 * Math.PI);
-    ctx.fillStyle = "#1d2950";
+    ctx.fillStyle = theme.sigDim;
     ctx.fill();
   }
   return { image: ctx.getImageData(0, 0, w, h), pixelRatio: dpr };

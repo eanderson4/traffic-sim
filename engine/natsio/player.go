@@ -262,6 +262,10 @@ func (p *Player) Stop() { p.stopping.Store(true) }
 // is called; the end of the recording is a hold, not an exit.
 func (p *Player) Run() error {
 	defer close(p.runDone)
+	// Unsubscribe the sig.req responder (and anything else the bus holds)
+	// on exit: a stopped player must not keep answering — or sharing —
+	// signal-table requests against a replacement.
+	defer p.bus.Close()
 	// Opening frames: the signal table once (republished at the
 	// signalCatchUpEvery cadence from here on, mirroring run.go) and the
 	// tick-0 snapshot so a browser attaching before the first tick already
@@ -396,13 +400,15 @@ func (p *Player) handleCtrl(req ctrlRequest) {
 	}
 }
 
-// republishPaused resends the current snapshot and signal table at ~1 Hz
-// while the playhead is held, so a browser attaching mid-pause renders
-// immediately. Run-goroutine only.
+// republishPaused resends the current snapshot at ~1 Hz while the
+// playhead is held, so a browser attaching mid-pause renders immediately.
+// The signal TABLE does not ride this cadence (ADR-0016 §5): at city
+// scale the full chunk set every second is a firehose aimed at exactly
+// the busy tabs it targets — paused attaches resync via the request/reply
+// path (ts.{run}.state.sig.req) instead. Run-goroutine only.
 func (p *Player) republishPaused() {
 	if time.Since(p.lastRepublish) >= pausedRepublishInterval {
 		p.bus.PublishSnapshot(p.e)
-		p.bus.PublishSignals(p.e)
 		p.lastRepublish = time.Now()
 	}
 }

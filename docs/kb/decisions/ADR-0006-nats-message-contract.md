@@ -292,8 +292,10 @@ recorded here per rule 5:
   (process babysitting/operator console, documented at its introduction):
   ADR-0002 governs the sim service planes — world state, controller
   intents, demand, metrics — which remain NATS-only. The player is
-  publish-only; it consumes no intents and holds no authority over any
-  live run's state, so engine authority is untouched. If replay control
+  publish-only with respect to intents and control (it consumes no
+  intents and holds no authority over any live run's state — its one
+  subscription is the read-only `state.sig.req` table-resync responder,
+  ADR-0016), so engine authority is untouched. If replay control
   ever needs to cross a trust or machine boundary, it moves to
   `ts.{run}-replay.ctl.*` subjects; loopback demo tooling does not.
 - **Playback horizon:** a record marked `done` in the run registry ran to

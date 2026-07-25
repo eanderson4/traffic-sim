@@ -28,6 +28,7 @@ func TestWriteGeoJSON(t *testing.T) {
 			},
 			{
 				ID: "j:i_0", Length: 5, SpeedLimit: 11.18, Internal: true, // width 0 → default 3.5
+				Junction: "i", Row: "stop", // ADR-0010 right-of-way annotation
 				Shape: [][2]float64{{10, 0}, {15, 3}},
 			},
 		},
@@ -53,6 +54,8 @@ func TestWriteGeoJSON(t *testing.T) {
 				Internal   bool    `json:"internal"`
 				Edge       string  `json:"edge"`
 				EdgeIndex  int     `json:"edgeIndex"`
+				Junction   string  `json:"junction"`
+				Row        string  `json:"row"`
 			} `json:"properties"`
 			Geometry struct {
 				Type        string       `json:"type"`
@@ -90,6 +93,12 @@ func TestWriteGeoJSON(t *testing.T) {
 	}
 	if f1.Properties.Edge != "" {
 		t.Fatalf("feature 1 (internal) must carry no edge group: %+v", f1.Properties)
+	}
+	if f1.Properties.Junction != "i" || f1.Properties.Row != "stop" {
+		t.Fatalf("feature 1 junction/row: %+v", f1.Properties)
+	}
+	if f0.Properties.Junction != "" || f0.Properties.Row != "" {
+		t.Fatalf("feature 0 (external) must carry no junction/row: %+v", f0.Properties)
 	}
 }
 
@@ -146,5 +155,55 @@ func TestWriteGeoJSONReferenceNet(t *testing.T) {
 		if f.Properties.SpeedLimit <= 0 {
 			t.Fatalf("feature %q speedLimit %v", f.ID, f.Properties.SpeedLimit)
 		}
+	}
+}
+
+// WriteGeoJSONRange shares WriteGeoJSON's marshaling exactly: the full
+// range is byte-identical to the single document, and a sub-range is a
+// valid standalone collection carrying the frame and the lane slice.
+func TestWriteGeoJSONRange(t *testing.T) {
+	nf := &NetFile{
+		Version: 1,
+		Name:    "toy",
+		Provenance: &NetProvenance{
+			Projection: "+proj=utm +zone=10 +ellps=WGS84 +datum=WGS84 +units=m +no_defs",
+			NetOffset:  [2]float64{-1, -2},
+		},
+		Lanes: []NetLane{
+			{ID: "a", Section: "a", Length: 10, SpeedLimit: 10, Width: 3.2, Shape: [][2]float64{{0, 0}, {10, 0}}, Successors: []string{"b"}},
+			{ID: "b", Section: "b", Length: 10, SpeedLimit: 10, Width: 3.2, Shape: [][2]float64{{10, 0}, {20, 0}}, Successors: []string{"c"}},
+			{ID: "c", Section: "c", Length: 10, SpeedLimit: 10, Width: 3.2, Shape: [][2]float64{{20, 0}, {30, 0}}, Exit: true},
+		},
+	}
+	var full, ranged bytes.Buffer
+	if err := WriteGeoJSON(nf, &full); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteGeoJSONRange(nf, &ranged, 0, len(nf.Lanes)); err != nil {
+		t.Fatal(err)
+	}
+	if full.String() != ranged.String() {
+		t.Fatal("full range must be byte-identical to WriteGeoJSON")
+	}
+
+	var part bytes.Buffer
+	if err := WriteGeoJSONRange(nf, &part, 1, 3); err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Type     string        `json:"type"`
+		Frame    *GeoJSONFrame `json:"frame"`
+		Features []struct {
+			ID string `json:"id"`
+		} `json:"features"`
+	}
+	if err := json.Unmarshal(part.Bytes(), &got); err != nil {
+		t.Fatalf("part does not parse: %v", err)
+	}
+	if got.Type != "FeatureCollection" || got.Frame == nil || got.Frame.Projection != nf.Provenance.Projection {
+		t.Fatalf("part header: %+v", got)
+	}
+	if len(got.Features) != 2 || got.Features[0].ID != "b" || got.Features[1].ID != "c" {
+		t.Fatalf("part features: %+v", got.Features)
 	}
 }

@@ -25,13 +25,14 @@ import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import type { Feature, FeatureCollection, LineString, Point } from "geojson";
 
-import { loadConfig } from "./config.ts";
+import { loadConfig, THEME_STORAGE_KEY } from "./config.ts";
 import { parseOverlay, prepareZones } from "./overlays.ts";
 import { decodeFrame } from "./tssf.ts";
-import { decodeSignalFrame, type SigColor, type SignalTable } from "./tssg.ts";
+import { decodeSignalFrame, parseSigChunkHeader, SignalTableAccumulator, type SigColor, type SignalTable } from "./tssg.ts";
 import { headStatesAtTick, signalHeads, type SignalHead } from "./signals.ts";
 import { SIGNAL_HEAD, SIGNAL_HEAD_IMAGE_ID, signalHeadImage } from "./signalhead.ts";
-import { makeProjector, type LocalFrame } from "./proj.ts";
+import { STOP_SIGN_IMAGE_ID, stopSignImage, stopSigns } from "./stopsign.ts";
+import { makeProjector } from "./proj.ts";
 import { SnapshotBuffer, SeekGate } from "./snapshots.ts";
 import {
   diffVehicles,
@@ -42,34 +43,20 @@ import {
 } from "./vehicles.ts";
 import { LaneIndex, laneSpeedRatios } from "./congestion.ts";
 import { edgeBoundaries } from "./edges.ts";
-import { subscribeSnapshots } from "./nats-client.ts";
+import { subscribeSnapshots, requestSignalTable } from "./nats-client.ts";
+import type { MsgHdrs, NatsConnection } from "nats.ws";
 import { Hud } from "./status.ts";
 import { Legend } from "./legend.ts";
+import { DEFAULT_TOGGLES, layerOpsFor, type ToggleState } from "./layertoggles.ts";
 import { DemoSwitcher, demoIdFromNetUrl } from "./switcher.ts";
 import { ModelPanel } from "./modelpanel.ts";
 import { ReplayPanel } from "./replaypanel.ts";
-import { THEME, glyphByCls } from "./theme.ts";
+import { THEMES, getTheme, glyphByCls } from "./theme.ts";
 import { bodyImages, glyphImageId, TRACTOR_IMAGE_ID, TRAILER_IMAGE_ID, ICON_SIZE_STOPS } from "./glyphs.ts";
 import { Articulator } from "./artic.ts";
-
-interface NetworkFile {
-  type: string;
-  frame?: LocalFrame;
-  features: Array<Feature<LineString>>;
-}
+import { fetchNetwork, type NetworkFile } from "./netload.ts";
 
 const EMPTY_FC: FeatureCollection = { type: "FeatureCollection", features: [] };
-
-// Blank dark style — local-first (ADR-0004): no tile-service dependency.
-// Navy canvas per the project design tokens (math-900, theme.ts).
-const DARK_STYLE: maplibregl.StyleSpecification = {
-  version: 8,
-  // Vendored SDF font (viz/public/fonts) — text symbol layers (overlay
-  // labels) need a glyphs URL, and local-first rules out a font service.
-  glyphs: "/fonts/{fontstack}/{range}.pbf",
-  sources: {},
-  layers: [{ id: "background", type: "background", paint: { "background-color": THEME.bg } }],
-};
 
 // Signal-head zoom curve: ONE size interpolation drives both the housing
 // sprite (icon-size) and the lit-lens circle layers (radius + translate),
@@ -88,17 +75,96 @@ function headSizeAt(z: number): number {
   return s1 + ((s2 - s1) * (z - z1)) / (z2 - z1);
 }
 
-// Lens order matches SIGNAL_HEAD.lensOffsetYPx: red top, amber, green.
-const SIG_LENSES: Array<{ color: SigColor; fill: string; offY: number }> = [
-  { color: "red", fill: THEME.signalRed, offY: SIGNAL_HEAD.lensOffsetYPx[0] },
-  { color: "amber", fill: THEME.signalAmber, offY: SIGNAL_HEAD.lensOffsetYPx[1] },
-  { color: "green", fill: THEME.signalGreen, offY: SIGNAL_HEAD.lensOffsetYPx[2] },
-];
-
 async function main(): Promise<void> {
   const cfg = loadConfig(location.search, location.hostname);
+  // Resolve the palette once (?theme=, navy default): every MapLibre paint
+  // prop, the legend, the signal-head sprite, and the HUD CSS variables
+  // below read from this one ThemeSpec.
+  const theme = getTheme(cfg.theme);
+
+  // Blank style — local-first (ADR-0004): no tile-service dependency.
+  // Canvas color per the active theme (theme.ts).
+  const blankStyle: maplibregl.StyleSpecification = {
+    version: 8,
+    // Vendored SDF font (viz/public/fonts) — text symbol layers (overlay
+    // labels) need a glyphs URL, and local-first rules out a font service.
+    glyphs: "/fonts/{fontstack}/{range}.pbf",
+    sources: {},
+    layers: [{ id: "background", type: "background", paint: { "background-color": theme.bg } }],
+  };
+
+  // Lens order matches SIGNAL_HEAD.lensOffsetYPx: red top, amber, green.
+  const SIG_LENSES: Array<{ color: SigColor; fill: string; offY: number }> = [
+    { color: "red", fill: theme.signalRed, offY: SIGNAL_HEAD.lensOffsetYPx[0] },
+    { color: "amber", fill: theme.signalAmber, offY: SIGNAL_HEAD.lensOffsetYPx[1] },
+    { color: "green", fill: theme.signalGreen, offY: SIGNAL_HEAD.lensOffsetYPx[2] },
+  ];
+
+  // HUD chrome (index.html) reads these CSS variables; their :root
+  // defaults are the navy values, so anything before this line (and pages
+  // without this script, e.g. demos.html) renders navy unchanged.
+  const themeCssVars: Record<string, string> = {
+    "--t-bg": theme.bg,
+    "--t-hud-bg": theme.hudBg,
+    "--t-hud-border": theme.hudBorder,
+    "--t-text": theme.hudText,
+    "--t-text-dim": theme.hudTextDim,
+    "--t-overlay": theme.overlayBg,
+    "--t-sig-bg": theme.sigHousing,
+    "--t-sig-stroke": theme.sigStroke,
+  };
+  for (const [k, v] of Object.entries(themeCssVars)) {
+    document.documentElement.style.setProperty(k, v);
+  }
+
+  // Theme toggle (HUD, top-right; index.html #theme-toggle): the label
+  // shows the ACTIVE theme, clicking flips to the other one. The choice
+  // persists to localStorage (config.ts THEME_STORAGE_KEY — the demos
+  // menu's toggle writes the same key) and is reflected into the URL
+  // (?theme=) before reloading. A reload, not a live re-paint: the
+  // signal-head housing is a baked sprite and the background layer color
+  // was fixed at style construction, so a live switch would need a second
+  // restyle path — reload reuses the single theme-application path above
+  // and the stream simply reconnects.
+  const activeThemeName = Object.hasOwn(THEMES, cfg.theme) ? cfg.theme : "navy";
+  const themeToggle = document.getElementById("theme-toggle");
+  if (themeToggle instanceof HTMLButtonElement) {
+    themeToggle.textContent = activeThemeName.toUpperCase();
+    themeToggle.addEventListener("click", () => {
+      const next = activeThemeName === "navy" ? "paper" : "navy";
+      try {
+        localStorage.setItem(THEME_STORAGE_KEY, next);
+      } catch {
+        // Storage denied (private mode) — the URL param still carries it.
+      }
+      const url = new URL(location.href);
+      url.searchParams.set("theme", next);
+      history.replaceState(null, "", url);
+      location.reload();
+    });
+  }
+
   const hud = new Hud("status", "inspect");
-  const legend = new Legend("legend");
+  // Legend row clicks → map layers. The pure toggle→ops mapping lives in
+  // layertoggles.ts (the legend itself stays MapLibre-free); state is
+  // in-memory only (no persistence), default all-on. A click before the
+  // style loads just updates the state — the load handler re-applies it.
+  const toggles: ToggleState = { ...DEFAULT_TOGGLES };
+  // Hoisted above applyLayerToggles (TDZ): a legend click before the style
+  // loads must read false, never throw.
+  let mapReady = false;
+  function applyLayerToggles(): void {
+    if (!mapReady) return;
+    const ops = layerOpsFor(toggles);
+    map.setFilter("vehicles", ops.vehiclesFilter as maplibregl.FilterSpecification | null);
+    for (const [id, on] of ops.visibility) {
+      map.setLayoutProperty(id, "visibility", on ? "visible" : "none");
+    }
+  }
+  const legend = new Legend("legend", theme, (key, on) => {
+    toggles[key] = on;
+    applyLayerToggles();
+  }, cfg.dt);
   // In-map demo swap; hides itself when no demosrv answers (detached —
   // the map must not wait on the probe). The model panel (same probe
   // discipline) shows the resolved controllers + sim parameters.
@@ -122,9 +188,13 @@ async function main(): Promise<void> {
   };
   loadingMsg.textContent = `loading network ${cfg.networkUrl} …`;
 
-  const res = await fetch(cfg.networkUrl);
-  if (!res.ok) throw new Error(`fetch ${cfg.networkUrl}: ${res.status} ${res.statusText}`);
-  const net = (await res.json()) as NetworkFile;
+  // ?bare=1: clean-canvas mode for screenshots — CSS hides the HUD chrome
+  // and the loading overlay (which otherwise waits on a live engine).
+  if (cfg.bare) document.body.classList.add("bare");
+
+  // Network GeoJSON — chunked manifests (netload.ts) are reassembled
+  // here, so everything downstream sees one plain collection.
+  const net = await fetchNetwork(cfg.networkUrl);
   if (net.type !== "FeatureCollection" || !Array.isArray(net.features)) {
     throw new Error(`${cfg.networkUrl}: not a FeatureCollection`);
   }
@@ -202,10 +272,21 @@ async function main(): Promise<void> {
   for (const f of net.features) {
     shapeByLane.set(String(f.id ?? f.properties?.["id"]), f.geometry.coordinates as Array<[number, number]>);
   }
+  // Stop signs (stopsign.ts, ADR-0010 row/junction lane properties): one
+  // sign per stop-controlled approach cluster, resolved ONCE from the
+  // static geometry — no feature-state channel, no per-tick update.
+  const stopSignPts = stopSigns(
+    net.features.map((f) => ({
+      id: String(f.id ?? f.properties?.["id"]),
+      row: String(f.properties?.["row"] ?? ""),
+      junction: String(f.properties?.["junction"] ?? ""),
+      shape: f.geometry.coordinates as Array<[number, number]>,
+    })),
+  );
 
   const map = new maplibregl.Map({
     container: "map",
-    style: DARK_STYLE,
+    style: blankStyle,
     bounds,
     fitBoundsOptions: { padding: 40 },
     attributionControl: false,
@@ -224,7 +305,6 @@ async function main(): Promise<void> {
   const appliedTrailers = new Map<number, RenderedTrailer>();
   const artic = new Articulator();
   let prevSampleTick: number | null = null; // last rendered sample's tick (sim clock)
-  let mapReady = false;
 
   // Signal channel state: the latest TSSG table, the head set applied to
   // the "signals" source (keyed by binding signature so a republished
@@ -235,6 +315,88 @@ async function main(): Promise<void> {
   const prevSigStates = new Map<string, SigColor>();
   const sigPoints: Array<[number, number]> = []; // debug handle (headless proof)
   const sigDebug = { seen: 0, ok: 0, err: "", pts: -1 }; // debug handle: onSignals counters
+
+  // Chunked tables (ADR-0016): the accumulator reassembles sig_chunk
+  // generations; a complete one swaps in atomically. On a gap (a dropped
+  // chunk killed the round) or a stalled partial (15 s without the rest —
+  // the round simply never completed) the client PULLS the full set via
+  // the request/reply subject; one attach-time request covers the
+  // late-joiner case without waiting out a catch-up round.
+  const sigAccum = new SignalTableAccumulator();
+  let wasConnected: boolean | null = null;
+  let natsConn: NatsConnection | null = null;
+  let sigPartialTimer: number | null = null;
+  let sigReqInFlight = false;
+  const installSigTable = (table: SignalTable): void => {
+    sigTable = table;
+    sigDebug.ok++;
+    ensureSignalSource();
+    clearSigPartialTimer();
+  };
+  let sigReqRetries = 0;
+  const requestSig = (): void => {
+    // One request in flight: reply chunks interleave with broadcast rounds
+    // and each gap would otherwise fire another full-set request — exactly
+    // the busy-tab condition the pull path exists to fix (ADR-0016). Reply
+    // chunks feed a DEDICATED accumulator: interleaved broadcast rounds can
+    // no longer reset (or be reset by) the pull (sol review). A reply that
+    // itself arrives gapped/partial retries — bounded (3) so a chronically
+    // dropping path falls back to the broadcast cadence rather than
+    // hot-looping full-set requests.
+    if (natsConn === null || sigReqInFlight || sigReqRetries >= 3) return;
+    sigReqInFlight = true;
+    sigReqRetries++;
+    const replyAccum = new SignalTableAccumulator();
+    let retry = false;
+    void (async () => {
+      const completed = await requestSignalTable(natsConn!, cfg.run, (data, headers) => {
+        sigDebug.seen++;
+        try {
+          const chunk = parseSigChunkHeader(headers?.get("sig_chunk"));
+          const res = replyAccum.feed(decodeSignalFrame(data), chunk);
+          if (res.gap) retry = true;
+          if (res.table !== null) {
+            sigReqRetries = 0; // only a PULL success re-arms (a routine broadcast completing must not defeat the 3-request bound)
+            installSigTable(res.table);
+          }
+          return true;
+        } catch (err) {
+          sigDebug.err = String(err);
+          return false;
+        }
+      });
+      sigReqInFlight = false;
+      // Retry on gapped/partial sets AND on a wholesale-dropped reply
+      // (!completed) — bounded by sigReqRetries (3), else the broadcast
+      // cadence is the fallback.
+      if (!completed || retry || replyAccum.partial) requestSig();
+    })();
+  };
+  const clearSigPartialTimer = (): void => {
+    if (sigPartialTimer !== null) {
+      window.clearTimeout(sigPartialTimer);
+      sigPartialTimer = null;
+    }
+  };
+  function handleSigMessage(data: Uint8Array, headers: MsgHdrs | undefined): void {
+    sigDebug.seen++;
+    try {
+      const chunk = parseSigChunkHeader(headers?.get("sig_chunk"));
+      const res = sigAccum.feed(decodeSignalFrame(data), chunk);
+      if (res.gap) requestSig();
+      if (res.table !== null) {
+        installSigTable(res.table);
+      } else if (sigAccum.partial && sigPartialTimer === null) {
+        sigPartialTimer = window.setTimeout(() => {
+          sigPartialTimer = null;
+          if (sigAccum.partial) requestSig();
+        }, 15_000);
+      }
+    } catch (err) {
+      sigDebug.err = String(err);
+      hud.setConnection(false, String(err));
+    }
+  }
 
   // ensureSignalSource (re)builds the head point features when the table's
   // binding changes — the ONLY setData on this source; per-tick color
@@ -305,7 +467,7 @@ async function main(): Promise<void> {
         id: "water-fill",
         type: "fill",
         source: "water",
-        paint: { "fill-color": THEME.water },
+        paint: { "fill-color": theme.water },
       });
     }
     map.addSource("network", { type: "geojson", data: networkFC, promoteId: "id" });
@@ -316,7 +478,7 @@ async function main(): Promise<void> {
       source: "network",
       layout: { "line-cap": "round", "line-join": "round" },
       paint: {
-        "line-color": THEME.casing,
+        "line-color": theme.casing,
         // Casing on edge-group boundaries only (edgeB, edges.ts): the
         // outer shell of each road. Interior lanes keep a faint trace so
         // adjacent stripes stay separable. Lanes without an edge group
@@ -340,11 +502,11 @@ async function main(): Promise<void> {
           "interpolate",
           ["linear"],
           ["coalesce", ["feature-state", "ratio"], -1],
-          -1, THEME.noData,
-          0, THEME.stopped,
-          0.35, THEME.mid,
-          0.7, THEME.freeFlow,
-          1.5, THEME.freeFlow,
+          -1, theme.noData,
+          0, theme.stopped,
+          0.35, theme.mid,
+          0.7, theme.freeFlow,
+          1.5, theme.freeFlow,
         ],
         "line-width": ["interpolate", ["linear"], ["zoom"], 11, 1.8, 14, 4, 17, 8],
       },
@@ -362,7 +524,7 @@ async function main(): Promise<void> {
         type: "line",
         source: "boundaries",
         paint: {
-          "line-color": THEME.boundary,
+          "line-color": theme.boundary,
           "line-opacity": 0.55,
           // Higher admin levels (county 6, township 7) read a touch heavier
           // than municipal (8).
@@ -383,8 +545,8 @@ async function main(): Promise<void> {
           "text-size": 11,
         },
         paint: {
-          "text-color": THEME.boundary,
-          "text-halo-color": THEME.bg,
+          "text-color": theme.boundary,
+          "text-halo-color": theme.bg,
           "text-halo-width": 1,
         },
       });
@@ -396,7 +558,7 @@ async function main(): Promise<void> {
         type: "fill",
         source: "zones",
         filter: ["==", ["get", "zkind"], "district"],
-        paint: { "fill-color": THEME.district, "fill-opacity": 0.05 },
+        paint: { "fill-color": theme.district, "fill-opacity": 0.05 },
       });
       // Runnable zones are solid and prominent; import-pending drops to a
       // muted trace (zrun, overlays.ts).
@@ -406,7 +568,7 @@ async function main(): Promise<void> {
         source: "zones",
         filter: ["==", ["get", "zkind"], "district"],
         paint: {
-          "line-color": THEME.district,
+          "line-color": theme.district,
           "line-opacity": ["case", ["==", ["get", "zrun"], 1], 0.85, 0.3],
           "line-width": ["interpolate", ["linear"], ["zoom"], 10, 1.4, 14, 2.2],
         },
@@ -417,7 +579,7 @@ async function main(): Promise<void> {
         source: "zones",
         filter: ["==", ["get", "zkind"], "corridor"],
         paint: {
-          "line-color": THEME.corridor,
+          "line-color": theme.corridor,
           "line-opacity": ["case", ["==", ["get", "zrun"], 1], 0.8, 0.3],
           "line-width": ["interpolate", ["linear"], ["zoom"], 10, 1.4, 14, 2.2],
           "line-dasharray": [2.5, 1.5],
@@ -438,10 +600,10 @@ async function main(): Promise<void> {
             "match",
             ["get", "zkind"],
             "corridor",
-            THEME.corridor,
-            THEME.district,
+            theme.corridor,
+            theme.district,
           ],
-          "text-halo-color": THEME.bg,
+          "text-halo-color": theme.bg,
           "text-halo-width": 1,
         },
       });
@@ -481,8 +643,8 @@ async function main(): Promise<void> {
         ],
       },
       paint: {
-        "icon-color": glyphByCls(1).color,
-        "icon-halo-color": THEME.bg,
+        "icon-color": glyphByCls(1, theme).color,
+        "icon-halo-color": theme.glyphHalo,
         "icon-halo-width": 1,
       },
     });
@@ -508,8 +670,8 @@ async function main(): Promise<void> {
         ],
       },
       paint: {
-        "icon-color": ["match", ["get", "cls"], 0, glyphByCls(0).color, glyphByCls(1).color],
-        "icon-halo-color": THEME.bg,
+        "icon-color": ["match", ["get", "cls"], 0, glyphByCls(0, theme).color, glyphByCls(1, theme).color],
+        "icon-halo-color": theme.glyphHalo,
         "icon-halo-width": 1,
       },
     });
@@ -522,11 +684,11 @@ async function main(): Promise<void> {
     // to ≥13: at city zooms the heads blob into clutter that hides the
     // network itself (zoomed-out detail is the congestion channel's job).
     map.addSource("signals", { type: "geojson", data: EMPTY_FC, promoteId: "id" });
-    const sigHeadImg = signalHeadImage();
+    const sigHeadImg = signalHeadImage(theme);
     map.addImage(SIGNAL_HEAD_IMAGE_ID, sigHeadImg.image, { pixelRatio: sigHeadImg.pixelRatio });
     // Stop bars: the "which approach" cue — one line across each head's
     // bound lanes, sharing the head's feature id, so the feature-state
-    // color always matches a lens. Off = the no-data lane tone: the bar
+    // color always matches a lens. Off = the dim-lens tone: the bar
     // still marks the signalized stop line when no lens is lit.
     map.addLayer({
       id: "signals-bars",
@@ -539,12 +701,12 @@ async function main(): Promise<void> {
           "match",
           ["coalesce", ["feature-state", "sig"], "off"],
           "green",
-          THEME.signalGreen,
+          theme.signalGreen,
           "amber",
-          THEME.signalAmber,
+          theme.signalAmber,
           "red",
-          THEME.signalRed,
-          THEME.noData,
+          theme.signalRed,
+          theme.sigDim,
         ],
         "line-width": ["interpolate", ["linear"], ["zoom"], 13, 2, 17, 5],
         "line-opacity": 0.9,
@@ -609,6 +771,43 @@ async function main(): Promise<void> {
         },
       });
     }
+    // Stop signs (stopsign.ts): STATIC — the source is fully built here
+    // (no setData/feature-state later). Same zoom gate and size curve as
+    // the signal heads: at city zooms signs would blob into the same
+    // clutter the heads are gated against.
+    map.addSource("stops", {
+      type: "geojson",
+      data: {
+        type: "FeatureCollection",
+        features: stopSignPts.map((s) => ({
+          type: "Feature",
+          id: s.id,
+          properties: { id: s.id },
+          geometry: { type: "Point", coordinates: project(s.x, s.y) },
+        })),
+      },
+    });
+    const stopSignImg = stopSignImage(theme);
+    map.addImage(STOP_SIGN_IMAGE_ID, stopSignImg.image, { pixelRatio: stopSignImg.pixelRatio });
+    map.addLayer({
+      id: "stop-signs",
+      type: "symbol",
+      source: "stops",
+      minzoom: 13,
+      layout: {
+        "icon-image": STOP_SIGN_IMAGE_ID,
+        "icon-allow-overlap": true,
+        "icon-ignore-placement": true,
+        "icon-size": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          HEAD_SIZE_STOPS[0]![0], HEAD_SIZE_STOPS[0]![1],
+          HEAD_SIZE_STOPS[1]![0], HEAD_SIZE_STOPS[1]![1],
+          HEAD_SIZE_STOPS[2]![0], HEAD_SIZE_STOPS[2]![1],
+        ],
+      },
+    });
     map.on("click", (e) => {
       const feats = map.queryRenderedFeatures(e.point, { layers: ["vehicles"] });
       const f = feats[0];
@@ -628,11 +827,12 @@ async function main(): Promise<void> {
     });
     mapReady = true;
     ensureSignalSource(); // a table may have arrived before the style
+    applyLayerToggles(); // a legend click may have beaten the style load
   });
 
   hud.setConnection(false, `connecting to ${cfg.ws} …`);
   loadingMsg.textContent = `connecting to ${cfg.ws} …`;
-  await subscribeSnapshots(
+  const snapSub = await subscribeSnapshots(
     cfg.ws,
     cfg.run,
     (data) => {
@@ -652,17 +852,7 @@ async function main(): Promise<void> {
         hud.setConnection(false, String(err));
       }
     },
-    (data) => {
-      sigDebug.seen++;
-      try {
-        sigTable = decodeSignalFrame(data);
-        sigDebug.ok++;
-        ensureSignalSource();
-      } catch (err) {
-        sigDebug.err = String(err);
-        hud.setConnection(false, String(err));
-      }
-    },
+    handleSigMessage,
     (connected, detail) => {
       hud.setConnection(connected, `${detail}  ·  run ${cfg.run}`);
       // The overlay covers the HUD until the first sample — mirror the
@@ -672,8 +862,29 @@ async function main(): Promise<void> {
           ? "connected — waiting for the engine's first snapshot (world build) …"
           : `connection lost before the first snapshot — ${detail}`;
       }
+      if (connected && wasConnected === false) {
+        // Reconnect: the pull budget may have burned out while down, and
+        // paused replay never rebroadcasts — re-arm and pull (sol review).
+        sigReqRetries = 0;
+        requestSig();
+      }
+      wasConnected = connected;
     },
   );
+  natsConn = snapSub.nc;
+  requestSig(); // attach-time pull (ADR-0016 §3): don't wait out a catch-up round
+
+  // Startup watchdog: 20 s connected with no first sample usually means the
+  // broker on the ws port isn't streaming THIS run (foreign engine, dead
+  // child), not a slow world build — say so, but keep waiting and retrying
+  // (non-fatal; a genuinely big world build just needs longer). ?bare=1
+  // hides the overlay in CSS either way.
+  setTimeout(() => {
+    if (loadingHidden) return;
+    loadingMsg.textContent =
+      `still waiting — the engine for run ${cfg.run} isn't streaming yet; ` +
+      `check that it's running (demos menu) — retrying …`;
+  }, 20_000);
 
   // Congestion: recompute per-lane ratios at ~1 Hz (research: feature-state
   // updates are a per-snapshot cadence channel, not per render frame).
@@ -759,6 +970,7 @@ async function main(): Promise<void> {
           `adopting the recorded run's authoritative dt (speeds rendered so far were off)`,
       );
       currentDt = s.dt;
+      legend.setDt(s.dt);
       buffer.setSimDt(s.dt);
       seekGate.setSimDt(s.dt);
     },

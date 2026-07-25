@@ -5,15 +5,30 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>traffic-sim viz</title>
     <style>
-      /* M6 viz chrome — dark navy per the project design tokens (math-900). */
-      html, body, #map { margin: 0; height: 100%; background: #0e1d5c; }
+      /* M6 viz chrome — colors read from CSS variables; the :root defaults
+         are the navy palette (theme.ts THEMES.navy) and main.ts overrides
+         them on documentElement when ?theme= picks another palette. */
+      :root {
+        --t-bg: #0e1d5c;
+        --t-hud-bg: rgba(14, 29, 92, 0.82);
+        --t-hud-border: #2e5bff;
+        --t-text: #d6e1ff;
+        --t-text-dim: #9fb2e8;
+        --t-overlay: rgba(14, 29, 92, 0.94);
+        --t-sig-bg: #0a1230;
+        --t-sig-stroke: rgba(214, 225, 255, 0.55);
+      }
+      html, body, #map { margin: 0; height: 100%; background: var(--t-bg); }
+      /* ?bare=1 (main.ts adds body.bare): clean canvas for screenshots —
+         no HUD chrome, no loading overlay. */
+      .bare .hud, .bare #theme-toggle, .bare #loading, .bare .maplibregl-ctrl { display: none !important; }
       .hud {
         position: absolute;
         z-index: 1;
         font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
-        color: #d6e1ff;
-        background: rgba(14, 29, 92, 0.82);
-        border: 1px solid #2e5bff;
+        color: var(--t-text);
+        background: var(--t-hud-bg);
+        border: 1px solid var(--t-hud-border);
         border-radius: 4px;
         padding: 6px 10px;
         pointer-events: none;
@@ -23,20 +38,56 @@
       #inspect { bottom: 10px; left: 10px; display: none; }
       #status .ok { color: #1e9e6a; }
       #status .bad { color: #e5484d; }
+      /* Theme toggle — flips ?theme= + localStorage and reloads (main.ts).
+         Same HUD chrome as .hud but interactive (a real button); sits
+         top-right above the legend. */
+      #theme-toggle {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        z-index: 1;
+        font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        letter-spacing: 0.08em;
+        color: var(--t-text);
+        background: var(--t-hud-bg);
+        border: 1px solid var(--t-hud-border);
+        border-radius: 4px;
+        padding: 3px 10px;
+        cursor: pointer;
+      }
+      #theme-toggle:hover { border-color: var(--t-text-dim); }
       /* Legend key — same HUD tokens. Swatch/dot/ramp colors are injected
          from theme.ts (legend.ts); the muted label and separator tones
-         below are CSS-local literals, not data encodings. */
-      #legend { top: 10px; right: 10px; min-width: 150px; }
-      .legend-title { text-transform: uppercase; letter-spacing: 0.12em; font-size: 10px; color: #9fb2e8; }
+         below are CSS-local literals, not data encodings. Rows are
+         clickable layer toggles (legend.ts → main.ts), so the panel must
+         override .hud's pointer-events: none. */
+      #legend { top: 46px; right: 10px; min-width: 150px; pointer-events: auto; }
+      .legend-title { text-transform: uppercase; letter-spacing: 0.12em; font-size: 10px; color: var(--t-text-dim); }
       .legend-row { display: flex; align-items: center; gap: 8px; margin-top: 5px; }
       .legend-row span:last-child { margin-left: auto; }
       .legend-veh { display: inline-block; border-radius: 1px; flex: none; }
+      /* Stop-sign swatch — octagon clipped from the theme's stopFace
+         (background injected by legend.ts). */
+      .legend-stop {
+        display: inline-block; width: 10px; height: 10px; flex: none;
+        clip-path: polygon(29% 0%, 71% 0%, 100% 29%, 100% 71%, 71% 100%, 29% 100%, 0% 71%, 0% 29%);
+      }
       .legend-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex: none; }
       .legend-sep { border-top: 1px solid rgba(46, 91, 255, 0.4); margin: 7px 0 2px; }
       .legend-ramp { height: 8px; border-radius: 2px; margin-top: 5px; }
-      .legend-ramp-labels { display: flex; justify-content: space-between; font-size: 10px; color: #9fb2e8; }
-      .legend-caption { font-size: 10px; color: #9fb2e8; }
+      .legend-ramp-labels { display: flex; justify-content: space-between; font-size: 10px; color: var(--t-text-dim); }
+      .legend-caption { font-size: 10px; color: var(--t-text-dim); }
       .legend-clock { font-variant-numeric: tabular-nums; }
+      /* Layer toggles — click flips the matching map layers (off state:
+         dimmed + greyed swatch). Negative margin keeps the padded hover
+         outline from shifting the layout. */
+      .legend-toggle { cursor: pointer; user-select: none; border-radius: 3px; padding: 1px 3px; margin-left: -3px; margin-right: -3px; }
+      .legend-toggle:hover { outline: 1px solid var(--t-hud-border); }
+      .legend-toggle.legend-off { opacity: 0.45; }
+      .legend-toggle.legend-off .legend-veh,
+      .legend-toggle.legend-off .legend-sig,
+      .legend-toggle.legend-off .legend-stop,
+      .legend-toggle.legend-off .legend-ramp { filter: grayscale(1); }
       /* Demo switcher — in-map demosrv control (switcher.ts). Interactive
          (overrides .hud's pointer-events: none); hidden unless the
          demosrv API answers. */
@@ -45,7 +96,7 @@
       #switcher .sw-row { margin-top: 4px; padding: 3px 6px; border-radius: 3px; white-space: normal; }
       #switcher .sw-row:hover { background: rgba(46, 91, 255, 0.25); }
       #switcher .sw-current { color: #1e9e6a; }
-      #switcher .sw-menu { color: #9fb2e8; }
+      #switcher .sw-menu { color: var(--t-text-dim); }
       /* Loading overlay — narrates page load → network fetch → ws connect
          → first snapshot (engine world build can take seconds on big
          demos); main.ts lifts it on the first renderable sample. */
@@ -58,15 +109,15 @@
         align-items: center;
         justify-content: center;
         gap: 14px;
-        background: rgba(14, 29, 92, 0.94);
-        color: #d6e1ff;
+        background: var(--t-overlay);
+        color: var(--t-text);
         font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
       }
       #loading .spin {
         width: 26px;
         height: 26px;
         border: 3px solid rgba(46, 91, 255, 0.35);
-        border-top-color: #d6e1ff;
+        border-top-color: var(--t-text);
         border-radius: 50%;
         animation: spin 0.9s linear infinite;
       }
@@ -78,8 +129,8 @@
         flex-direction: column;
         gap: 1px;
         padding: 2px;
-        background: #0a1230;
-        border: 1px solid rgba(214, 225, 255, 0.55);
+        background: var(--t-sig-bg);
+        border: 1px solid var(--t-sig-stroke);
         border-radius: 3px;
         flex: none;
       }
@@ -89,9 +140,9 @@
          demosrv params API answers. */
       #model { bottom: 60px; right: 10px; pointer-events: auto; user-select: none; max-width: 360px; max-height: 62vh; overflow-y: auto; white-space: normal; }
       #model .mp-toggle { font-weight: 700; letter-spacing: 0.08em; cursor: pointer; }
-      #model .mp-sec { margin-top: 7px; text-transform: uppercase; letter-spacing: 0.12em; font-size: 10px; color: #9fb2e8; }
+      #model .mp-sec { margin-top: 7px; text-transform: uppercase; letter-spacing: 0.12em; font-size: 10px; color: var(--t-text-dim); }
       #model .mp-row { display: flex; gap: 10px; margin-top: 2px; font-size: 11px; }
-      #model .mp-row span:first-child { color: #9fb2e8; flex: none; }
+      #model .mp-row span:first-child { color: var(--t-text-dim); flex: none; }
       #model .mp-row span:last-child { margin-left: auto; text-align: right; }
       /* Replay controls — replay-driver control plane (replaypanel.ts).
          Interactive; bottom-center; hides unless demosrv's replay proxy
@@ -100,7 +151,7 @@
          convention as #status .ok/.bad and .sw-current). */
       #replay { bottom: 10px; left: 50%; transform: translateX(-50%); pointer-events: auto; user-select: none; min-width: 300px; white-space: normal; }
       #replay .rp-head { display: flex; align-items: baseline; gap: 8px; font-weight: 700; letter-spacing: 0.08em; }
-      #replay .rp-run { margin-left: auto; color: #9fb2e8; font-weight: 400; letter-spacing: 0; }
+      #replay .rp-run { margin-left: auto; color: var(--t-text-dim); font-weight: 400; letter-spacing: 0; }
       #replay .rp-controls { display: flex; gap: 6px; margin-top: 5px; }
       #replay .rp-btn { padding: 1px 8px; border: 1px solid rgba(46, 91, 255, 0.55); border-radius: 3px; cursor: pointer; }
       #replay .rp-btn:hover { background: rgba(46, 91, 255, 0.25); }
@@ -113,6 +164,7 @@
   </head>
   <body>
     <div id="map"></div>
+    <button id="theme-toggle" type="button" title="theme — click to switch">NAVY</button>
     <div id="status" class="hud">connecting…</div>
     <div id="inspect" class="hud"></div>
     <div id="legend" class="hud"></div>

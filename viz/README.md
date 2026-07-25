@@ -43,6 +43,8 @@ URL parameters (all optional):
 | `ws` | `ws://<host>:8443` | engine WebSocket listener |
 | `net` | `/network.geojson` | static network GeoJSON URL |
 | `buffer` | `250` | interpolation buffer (ms) |
+| `theme` | `navy` | palette from `src/theme.ts` THEMES (`navy` \| `paper`); the HUD/menu toggle writes `localStorage["viz-theme"]`, which wins when no param is given |
+| `bare` | off | `?bare=1` hides all HUD chrome + the loading overlay (clean-canvas screenshots) |
 
 `serve` flags: `-ticks` (default 36000 = 1 h at the 100 ms tick), `-seed`,
 `-rate` (veh/h per origin lane), `-density`, `-driver` (in-process default

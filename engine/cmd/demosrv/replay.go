@@ -16,6 +16,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"time"
 
 	"traffic-sim/engine/scenario"
@@ -119,7 +120,7 @@ func (s *server) handleReplayStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	verify := func() error { return checkRecordingHash(s.replayCtl, scenHash) }
-	if err := s.sup.start(spawnTarget{Kind: "replay", Rec: rec}, verify); err != nil {
+	if _, err := s.sup.start(spawnTarget{Kind: "replay", Rec: rec}, verify); err != nil {
 		// A verification failure has already killed the child (inside
 		// start): 409 for a binding problem with the recording itself,
 		// 502 for spawn/readiness/transport failures.
@@ -131,7 +132,7 @@ func (s *server) handleReplayStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{
-		"url": fmt.Sprintf("/app/?run=%s-replay&net=/net/%s.geojson&dt=%g", rec.Run, rec.ID, dt),
+		"url": fmt.Sprintf("/app/?run=%s-replay&net=/net/%s.geojson&dt=%g&ws=%s", rec.Run, rec.ID, dt, url.QueryEscape(advertisedWsURL(r))),
 	})
 }
 

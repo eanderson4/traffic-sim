@@ -72,31 +72,105 @@ type SigFrame struct {
 // SignalFrame encodes the network's fixed-time programs (ADR-0011) as a
 // self-sufficient TSSG frame at the engine's current tick. Networks without
 // signals encode an empty table (program_count 0) — explicit "no signals",
-// distinguishable from "table not yet received".
+// distinguishable from "table not yet received". This is the WHOLE-table
+// single-frame form; the publish path sends SignalChunks' output (one
+// frame — identical bytes — whenever the table fits in one chunk).
 func SignalFrame(e *engine.Engine) []byte {
+	return signalFrameFrom(e.Tick, signalProgramBodies(e))
+}
+
+// SigChunkMax is the target maximum size of one published TSSG chunk,
+// header included (768 KiB — ADR-0015's keyframe chunk size, ADR-0016:
+// comfortably under the broker's 4 MiB cap AND the 1 MiB per-message
+// discipline, so a busy browser's slow-consumer drop costs one small
+// chunk, not a multi-MB table). la-lean's 7.3 MB table → ~10 chunks,
+// sf-lean's 2.1 MB → ~3; smaller tables stay one message.
+const SigChunkMax = 768 << 10
+
+// SignalChunks encodes the table as a sequence of COMPLETE v1-layout
+// frames — program_count counts the programs in THIS chunk, so every
+// chunk parses standalone with the unmodified v1 decoder and no schema
+// bump (ADR-0016). Programs greedy-pack in file order until the next
+// would exceed SigChunkMax; a single program larger than the target gets
+// its own oversized chunk (the publisher logs it). The pack is a pure
+// function of the network. One chunk — the common case — is exactly
+// SignalFrame's bytes.
+func SignalChunks(e *engine.Engine) [][]byte {
+	return signalChunksMax(e, SigChunkMax)
+}
+
+// signalChunksMax is SignalChunks with a caller-chosen cap (the tests
+// exercise the pack boundaries without megabyte fixtures).
+func signalChunksMax(e *engine.Engine, max int) [][]byte {
+	bodies := signalProgramBodies(e)
+	var chunks [][]byte
+	var batch [][]byte
+	size := sigFrameHeader
+	flush := func() {
+		if len(batch) > 0 {
+			chunks = append(chunks, signalFrameFrom(e.Tick, batch))
+			batch = nil
+			size = sigFrameHeader
+		}
+	}
+	for _, b := range bodies {
+		if len(batch) > 0 && size+len(b) > max {
+			flush()
+		}
+		batch = append(batch, b)
+		size += len(b)
+	}
+	flush()
+	if len(chunks) == 0 {
+		// Empty table: one explicit empty frame (program_count 0).
+		chunks = append(chunks, signalFrameFrom(e.Tick, nil))
+	}
+	return chunks
+}
+
+// signalProgramBodies encodes each program body in file order — the chunk
+// packer's input. Concatenating every body reproduces SignalFrame's whole
+// -table layout exactly (the golden-bytes test pins this).
+func signalProgramBodies(e *engine.Engine) [][]byte {
 	progs := e.Net.Signals
+	bodies := make([][]byte, 0, len(progs))
+	for _, p := range progs {
+		bodies = append(bodies, encodeSignalProgram(e, p))
+	}
+	return bodies
+}
+
+// encodeSignalProgram encodes one program body (no frame header).
+func encodeSignalProgram(e *engine.Engine, p *engine.SignalProgram) []byte {
+	var buf []byte
+	phaseTicks, offsetTicks := p.CompiledTicks()
+	buf = appendStr(buf, p.ID)
+	buf = appendStr(buf, p.Junction)
+	buf = binary.LittleEndian.AppendUint64(buf, offsetTicks)
+	buf = binary.LittleEndian.AppendUint16(buf, uint16(len(phaseTicks)))
+	links := signalLinks(e.Net, p)
+	buf = binary.LittleEndian.AppendUint16(buf, uint16(len(links)))
+	for i, tk := range phaseTicks {
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(tk))
+		buf = appendStr(buf, p.Phases[i].State)
+	}
+	for _, l := range links {
+		buf = binary.LittleEndian.AppendUint16(buf, uint16(l.LinkIdx))
+		buf = appendStr(buf, l.LaneID)
+	}
+	return buf
+}
+
+// signalFrameFrom assembles a complete frame (header + bodies).
+func signalFrameFrom(tick uint64, bodies [][]byte) []byte {
 	buf := make([]byte, sigFrameHeader)
 	binary.LittleEndian.PutUint32(buf[0:], sigFrameMagic)
 	binary.LittleEndian.PutUint16(buf[4:], sigFrameVersion)
 	binary.LittleEndian.PutUint16(buf[6:], 0)
-	binary.LittleEndian.PutUint64(buf[8:], e.Tick)
-	binary.LittleEndian.PutUint32(buf[16:], uint32(len(progs)))
-	for _, p := range progs {
-		phaseTicks, offsetTicks := p.CompiledTicks()
-		buf = appendStr(buf, p.ID)
-		buf = appendStr(buf, p.Junction)
-		buf = binary.LittleEndian.AppendUint64(buf, offsetTicks)
-		buf = binary.LittleEndian.AppendUint16(buf, uint16(len(phaseTicks)))
-		links := signalLinks(e.Net, p)
-		buf = binary.LittleEndian.AppendUint16(buf, uint16(len(links)))
-		for i, tk := range phaseTicks {
-			buf = binary.LittleEndian.AppendUint32(buf, uint32(tk))
-			buf = appendStr(buf, p.Phases[i].State)
-		}
-		for _, l := range links {
-			buf = binary.LittleEndian.AppendUint16(buf, uint16(l.LinkIdx))
-			buf = appendStr(buf, l.LaneID)
-		}
+	binary.LittleEndian.PutUint64(buf[8:], tick)
+	binary.LittleEndian.PutUint32(buf[16:], uint32(len(bodies)))
+	for _, b := range bodies {
+		buf = append(buf, b...)
 	}
 	return buf
 }

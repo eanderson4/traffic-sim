@@ -47,6 +47,7 @@ export type MenuEntry = DemoInfo | RecordingInfo;
 // kinds), or null when no engine is up.
 export interface RunStatus {
   active: string | null;
+  run?: string; // live run id — unique per spawn for demos (demosrv)
   pid: number;
   startedAt?: string;
 }
@@ -56,9 +57,13 @@ export interface RunStatus {
 // they must agree; demos.test.ts pins the shape on this side). The menu
 // uses it for the already-running card, which navigates straight to the
 // map without a start round-trip. Registry-validated single tokens
-// ([A-Za-z0-9_-]+ ids, NATS-token runs) need no escaping.
-export function buildAppURL(demo: Pick<DemoInfo, "id" | "run">): string {
-  return `/app/?run=${demo.run}&net=/net/${demo.id}.geojson`;
+// ([A-Za-z0-9_-]+ ids, NATS-token runs) need no escaping. ws comes from
+// the /api/demos payload: it pins the engine port this demosrv spawns to
+// (non-default when another process holds 8443); absent, the viz default
+// in config.ts applies.
+export function buildAppURL(demo: Pick<DemoInfo, "id" | "run">, ws?: string): string {
+  const base = `/app/?run=${demo.run}&net=/net/${demo.id}.geojson`;
+  return ws ? `${base}&ws=${encodeURIComponent(ws)}` : base;
 }
 
 // buildReplayURL is the already-running RECORDING card's deep link — the
@@ -66,13 +71,18 @@ export function buildAppURL(demo: Pick<DemoInfo, "id" | "run">): string {
 // (the registry carries no dt; config.ts's 0.1 default applies). A
 // NON-running recording never takes this path: its activation POSTs
 // startPath and navigates on the response, which carries the dt.
-export function buildReplayURL(rec: Pick<RecordingInfo, "id" | "run">): string {
-  return `/app/?run=${rec.run}-replay&net=/net/${rec.id}.geojson`;
+export function buildReplayURL(rec: Pick<RecordingInfo, "id" | "run">, ws?: string): string {
+  const base = `/app/?run=${rec.run}-replay&net=/net/${rec.id}.geojson`;
+  return ws ? `${base}&ws=${encodeURIComponent(ws)}` : base;
 }
 
-// deepLinkURL picks the running-card navigation URL by kind.
-export function deepLinkURL(entry: Pick<MenuEntry, "id" | "run" | "kind">): string {
-  return entry.kind === "replay" ? buildReplayURL(entry) : buildAppURL(entry);
+// deepLinkURL picks the running-card navigation URL by kind. liveRun
+// overrides the registry run id: live demos spawn with a per-spawn unique
+// run id (demosrv), so the running card must use the id /api/status
+// reports, not the registry's.
+export function deepLinkURL(entry: Pick<MenuEntry, "id" | "run" | "kind">, ws?: string, liveRun?: string): string {
+  if (entry.kind === "replay") return buildReplayURL(entry, ws);
+  return buildAppURL({ id: entry.id, run: liveRun ?? entry.run }, ws);
 }
 
 // startPath routes an activation POST by kind: demos spawn serve,

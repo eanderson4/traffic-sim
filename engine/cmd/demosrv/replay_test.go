@@ -246,7 +246,7 @@ func TestReplayStartStopAndNet(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("replay start = %d (%v)", code, body)
 	}
-	if want := "/app/?run=recrun-replay&net=/net/rec1.geojson&dt=0.05"; body["url"] != want {
+	if want := "/app/?run=recrun-replay&net=/net/rec1.geojson&dt=0.05&ws=ws%3A%2F%2F127.0.0.1%3A8443"; body["url"] != want {
 		t.Errorf("replay start url = %v, want %s", body["url"], want)
 	}
 
@@ -377,7 +377,7 @@ func TestCheckRecordingHash(t *testing.T) {
 // the proxy's active-kind gate opens.
 func startSleepReplay(t *testing.T, srv *server) {
 	t.Helper()
-	if err := srv.sup.start(spawnTarget{Kind: "replay", Rec: &Recording{ID: "rec1", Run: "recrun"}}, nil); err != nil {
+	if _, err := srv.sup.start(spawnTarget{Kind: "replay", Rec: &Recording{ID: "rec1", Run: "recrun"}}, nil); err != nil {
 		t.Fatalf("start replay stub: %v", err)
 	}
 	t.Cleanup(srv.sup.stop)
@@ -400,7 +400,7 @@ func TestReplayProxy(t *testing.T) {
 	}
 
 	// Live demo active: still nothing to control.
-	if err := srv.sup.start(spawnTarget{Kind: "demo", Demo: &Demo{ID: "d1", Run: "r1"}}, nil); err != nil {
+	if _, err := srv.sup.start(spawnTarget{Kind: "demo", Demo: &Demo{ID: "d1", Run: "r1"}}, nil); err != nil {
 		t.Fatal(err)
 	}
 	resp, err = http.Get(ts.URL + "/api/replay/status")

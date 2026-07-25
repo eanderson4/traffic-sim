@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"sort"
 	"strconv"
@@ -48,7 +49,8 @@ const (
 	headerTick          = "tick"
 	headerSchemaVersion = "schema_version"
 	headerAppliedTick   = "applied_tick"
-	intentSubjectTokens = 5 // ts.{run}.ctl.intent.{controller_id}
+	headerSigChunk      = "sig_chunk" // "i/n" 1-based, ADR-0016 (absent = whole table)
+	intentSubjectTokens = 5           // ts.{run}.ctl.intent.{controller_id}
 )
 
 // EncodeIntent serializes one intent for ts.{run}.ctl.intent.{controller_id}.
@@ -150,12 +152,23 @@ type Bus struct {
 	sub   *nats.Subscription
 	geoms []LaneGeom
 
+	// Signal table (ADR-0016): chunks are split+encoded ONCE here and every
+	// publish (the 20-tick cadence AND the request/reply responder) sends
+	// the cached slices with only the tick patched — never a re-encode.
+	sigChunks   [][]byte
+	sigReq      *nats.Subscription
+	sigTick     atomic.Uint64 // last tick the table was published at
+	sigHiWater  atomic.Bool   // 1 MiB watermark logged (signal chunk)
+	snapHiWater atomic.Bool   // 1 MiB watermark logged (snapshot)
+
 	mu       sync.Mutex
 	buf      []ArrivedIntent // arrival order
 	lastAppl map[string]uint64
 
 	dropped  atomic.Uint64 // malformed/oversized intent messages dropped
 	pubErrs  atomic.Uint64 // core publish errors (counted, not fatal — best effort plane)
+	snapErrs atomic.Uint64 // snapshot publish failures (separate loud-budget from sigErrs, ADR-0016 §6)
+	sigErrs  atomic.Uint64 // signal table publish/reply failures
 	snapsOut atomic.Uint64
 }
 
@@ -169,26 +182,56 @@ func NewBus(nc *nats.Conn, run string, e *engine.Engine) (*Bus, error) {
 	}
 	sub, err := nc.Subscribe(SubjectCtlIntentAll(run), b.onIntent)
 	if err != nil {
+		// Don't leak the sig.req responder NewPublishBus installed.
+		b.Close()
 		return nil, fmt.Errorf("subscribe intents: %w", err)
 	}
 	b.sub = sub
 	return b, nil
 }
 
-// NewPublishBus attaches a PUBLISH-only live plane for a run — no intent
+// NewPublishBus attaches a PUBLISH-side live plane for a run — no intent
 // subscription, for publishers with no contract plane (the replay Player).
 // It is the single Bus construction site (NewBus builds on it), so future
-// Bus fields initialize here, not at some hand-rolled literal.
+// Bus fields initialize here, not at some hand-rolled literal. The signal
+// table is split+encoded into cached chunks HERE (ADR-0016 §2), and the
+// request/reply catch-up responder (ts.{run}.state.sig.req) is queue
+// -subscribed here too: live runs (via NewBus) and replay get it alike.
 func NewPublishBus(nc *nats.Conn, run string, e *engine.Engine) (*Bus, error) {
 	if err := validToken("run id", run); err != nil {
 		return nil, err
 	}
-	return &Bus{
-		nc:       nc,
-		run:      run,
-		geoms:    LaneGeoms(e.Net),
-		lastAppl: map[string]uint64{},
-	}, nil
+	b := &Bus{
+		nc:        nc,
+		run:       run,
+		geoms:     LaneGeoms(e.Net),
+		sigChunks: SignalChunks(e),
+		lastAppl:  map[string]uint64{},
+	}
+	b.sigTick.Store(e.Tick)
+	for i, c := range b.sigChunks {
+		// The broker counts payload + serialized headers: reserve headroom
+		// for tick/schema/sig_chunk headers or a just-under chunk would
+		// pass validation and fail every publish (sol review).
+		if len(c)+256 > sigMaxPayload {
+			// A single program bigger than the broker cap can NEVER be
+			// delivered — every broadcast and resync of this table fails
+			// forever. Fail the run now, loudly, instead (ADR-0016 §1).
+			return nil, fmt.Errorf("signal chunk %d/%d is %d bytes (+headers), over the %d-byte server cap: one program cannot be delivered (split it at the source)", i+1, len(b.sigChunks), len(c), sigMaxPayload)
+		}
+		if len(c) > SigChunkMax {
+			// A single program exceeded the chunk target — it rides its own
+			// oversized chunk (still deliverable under the cap). Loud.
+			log.Printf("run %s: signal chunk %d/%d is %d bytes (> %d target): one program exceeds the chunk target (server cap 4 MiB)",
+				run, i+1, len(b.sigChunks), len(c), SigChunkMax)
+		}
+	}
+	sub, err := nc.QueueSubscribe(SubjectStateSigReq(run), "sig-table", b.onSignalRequest)
+	if err != nil {
+		return nil, fmt.Errorf("subscribe signal-table requests: %w", err)
+	}
+	b.sigReq = sub
+	return b, nil
 }
 
 // onIntent buffers a raw intent with its controller identity. Called on a
@@ -224,9 +267,15 @@ func (b *Bus) DrainIntents() []ArrivedIntent {
 	return out
 }
 
+// sigMaxPayload mirrors the embedded broker's MaxPayload (cmd/serve,
+// cmd/replay — 4 MiB): the ceiling a single message can ever cross.
+const sigMaxPayload = 4 << 20
+
 // PublishSnapshot sends the per-tick self-sufficient snapshot
 // fire-and-forget (ADR-0006 §6: the live plane never blocks the tick; a
-// slow subscriber is the server's problem, not the engine's).
+// slow subscriber is the server's problem, not the engine's). Publish
+// failures are LOUD (first 3 per run) — a silently dropped snapshot plane
+// is the failure mode this whole chunking episode came from.
 func (b *Bus) PublishSnapshot(e *engine.Engine) {
 	msg := nats.NewMsg(SubjectStateSnap(b.run))
 	msg.Data = SnapshotFrame(e, b.geoms)
@@ -234,24 +283,121 @@ func (b *Bus) PublishSnapshot(e *engine.Engine) {
 	msg.Header.Set(headerSchemaVersion, strconv.Itoa(SchemaVersion))
 	if err := b.nc.PublishMsg(msg); err != nil {
 		b.pubErrs.Add(1)
+		if n := b.snapErrs.Add(1); n <= 3 {
+			log.Printf("run %s: snapshot publish FAILED (tick %d, %d bytes): %v", b.run, e.Tick, len(msg.Data), err)
+		}
 		return
 	}
+	b.noteFrameSize("TSSF snapshot", len(msg.Data), &b.snapHiWater)
 	b.snapsOut.Add(1)
 }
 
-// PublishSignals sends the signal-program table (TSSG v1) on
-// ts.{run}.state.sig, fire-and-forget like the snapshot path. The table is
-// self-sufficient: with the tick (header + payload) a client derives every
-// light state by pure integer math (ADR-0011 §1), so republication at the
-// signalCatchUpEvery cadence is the whole late-joiner catch-up story.
-func (b *Bus) PublishSignals(e *engine.Engine) {
-	msg := nats.NewMsg(SubjectStateSig(b.run))
-	msg.Data = SignalFrame(e)
-	msg.Header.Set(headerTick, strconv.FormatUint(e.Tick, 10))
-	msg.Header.Set(headerSchemaVersion, strconv.Itoa(SchemaVersion))
-	if err := b.nc.PublishMsg(msg); err != nil {
-		b.pubErrs.Add(1)
+// noteFrameSize logs ONCE per frame type when a frame crosses the 1 MiB
+// per-message discipline (ADR-0016: the 4 MiB server cap is headroom, not
+// an allowance) — the first oversized frame names its size.
+func (b *Bus) noteFrameSize(kind string, size int, flag *atomic.Bool) {
+	if size > 1<<20 && flag.CompareAndSwap(false, true) {
+		log.Printf("run %s: %s is %d bytes (> 1 MiB per-message discipline; server cap 4 MiB is headroom, not allowance)", b.run, kind, size)
 	}
+}
+
+// PublishSignals sends the signal-program table on ts.{run}.state.sig,
+// fire-and-forget like the snapshot path: the CACHED chunk set (encoded
+// once at NewPublishBus, ADR-0016 §2) with the tick patched per publish
+// and a sig_chunk "i/n" header when the table is chunked (n > 1 — absent
+// means whole table, the v1 back-compat). The table is self-sufficient:
+// with the tick (header + payload) a client derives every light state by
+// pure integer math (ADR-0011 §1), so republication at the
+// signalCatchUpEvery cadence plus the request/reply catch-up
+// (onSignalRequest) is the whole late-joiner story. Publish failures are
+// LOUD (first 3 per run): the table is the only path to lit signal heads,
+// and a silently dropped city-scale table reads as "no signals in this
+// city".
+func (b *Bus) PublishSignals(e *engine.Engine) {
+	n := len(b.sigChunks)
+	for i, chunk := range b.sigChunks {
+		data := withSigTick(chunk, e.Tick)
+		msg := nats.NewMsg(SubjectStateSig(b.run))
+		msg.Data = data
+		msg.Header.Set(headerTick, strconv.FormatUint(e.Tick, 10))
+		msg.Header.Set(headerSchemaVersion, strconv.Itoa(SchemaVersion))
+		if n > 1 {
+			msg.Header.Set(headerSigChunk, fmt.Sprintf("%d/%d", i+1, n))
+		}
+		if err := b.nc.PublishMsg(msg); err != nil {
+			b.pubErrs.Add(1)
+			if k := b.sigErrs.Add(1); k <= 3 {
+				log.Printf("run %s: signal table publish FAILED (tick %d, chunk %d/%d, %d bytes): %v",
+					b.run, e.Tick, i+1, n, len(data), err)
+			}
+		}
+		b.noteFrameSize("TSSG signal chunk", len(data), &b.sigHiWater)
+	}
+	b.sigTick.Store(e.Tick)
+}
+
+// onSignalRequest answers a ts.{run}.state.sig.req request with the full
+// cached chunk set on the reply inbox (ADR-0016 §3: pull-when-ready — a
+// busy browser that dropped a chunk, or a late joiner, resyncs when IT is
+// ready instead of waiting out a catch-up round). Serves from the cached
+// slices; never re-encodes.
+func (b *Bus) onSignalRequest(msg *nats.Msg) {
+	if msg.Reply == "" {
+		return
+	}
+	// Reply-subject confinement: answers go to the requester's own inbox,
+	// never an arbitrary subject — without this, a request could make the
+	// engine dump the whole (multi-MB) table onto any address it names.
+	// Clients with a custom inboxPrefix aren't answered (logged) — the
+	// only consumer is our viz, which uses the default prefix.
+	if !strings.HasPrefix(msg.Reply, "_INBOX.") {
+		log.Printf("run %s: signal table request with non-inbox reply %q ignored", b.run, msg.Reply)
+		return
+	}
+	// The contract payload is EMPTY: a non-empty request is malformed and
+	// gets no answer (observers can publish here now — validate at the
+	// boundary, never reward a multi-MB malformed request with a multi-MB
+	// response set).
+	if len(msg.Data) != 0 {
+		log.Printf("run %s: signal table request with %d-byte payload ignored (contract: empty)", b.run, len(msg.Data))
+		return
+	}
+	tick := b.sigTick.Load()
+	n := len(b.sigChunks)
+	for i, chunk := range b.sigChunks {
+		m := nats.NewMsg(msg.Reply)
+		m.Data = withSigTick(chunk, tick)
+		m.Header.Set(headerTick, strconv.FormatUint(tick, 10))
+		m.Header.Set(headerSchemaVersion, strconv.Itoa(SchemaVersion))
+		if n > 1 {
+			m.Header.Set(headerSigChunk, fmt.Sprintf("%d/%d", i+1, n))
+		}
+		if err := b.nc.PublishMsg(m); err != nil {
+			b.pubErrs.Add(1)
+			if k := b.sigErrs.Add(1); k <= 3 {
+				log.Printf("run %s: signal table reply FAILED (chunk %d/%d): %v", b.run, i+1, n, err)
+			}
+		}
+	}
+	// PublishMsg only enqueues; the FLUSH is what proves the resync left
+	// the process — a failed flush must be loud too (ADR-0016 §6).
+	if err := b.nc.Flush(); err != nil {
+		b.pubErrs.Add(1)
+		if k := b.sigErrs.Add(1); k <= 3 {
+			log.Printf("run %s: signal table reply flush FAILED: %v", b.run, err)
+		}
+	}
+}
+
+// withSigTick returns chunk with the payload tick (header offset 8) set to
+// tick. A COPY — the cached chunks stay immutable (the request responder
+// reads them from a nats callback goroutine while the run loop publishes).
+// A ≤ 768 KiB memcpy per chunk is not a re-encode.
+func withSigTick(chunk []byte, tick uint64) []byte {
+	buf := make([]byte, len(chunk))
+	copy(buf, chunk)
+	binary.LittleEndian.PutUint64(buf[8:], tick)
+	return buf
 }
 
 // AckPayload is the JSON body of the applied_tick echo (small; the headers
@@ -305,5 +451,8 @@ func (b *Bus) Stats() (droppedIntents, pubErrs, snapshots uint64) {
 func (b *Bus) Close() {
 	if b.sub != nil {
 		_ = b.sub.Unsubscribe()
+	}
+	if b.sigReq != nil {
+		_ = b.sigReq.Unsubscribe()
 	}
 }

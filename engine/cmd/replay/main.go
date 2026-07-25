@@ -74,6 +74,10 @@ func main() {
 		JetStream:  true,
 		StoreDir:   *store,
 		Websocket:  server.WebsocketOpts{Host: host, Port: port, NoTLS: true},
+		// 4 MB, same as serve (ADR-0016): TSSG is chunked at ~768 KiB per
+		// message; this is headroom for big-fleet TSSF snapshots, not a
+		// design allowance.
+		MaxPayload: 4 << 20,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "replay: nats-server:", err)

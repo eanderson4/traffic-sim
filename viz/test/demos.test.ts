@@ -47,6 +47,15 @@ test("buildReplayURL deep-links the replay live plane ({run}-replay, no dt hint)
   );
 });
 
+test("deepLinkURL uses the live run id when /api/status carries one", () => {
+  // Live demos spawn with a per-spawn unique run id; the running card
+  // must navigate to THAT, not the registry's.
+  assert.equal(
+    deepLinkURL({ id: "sf", run: "sf", kind: "demo" }, undefined, "sf-t9"),
+    "/app/?run=sf-t9&net=/net/sf.geojson",
+  );
+});
+
 test("deepLinkURL picks the running-card URL by kind", () => {
   assert.equal(
     deepLinkURL({ id: "i280-baseline", run: "baseline", kind: "demo" }),
@@ -55,5 +64,17 @@ test("deepLinkURL picks the running-card URL by kind", () => {
   assert.equal(
     deepLinkURL({ id: "rec1", run: "baseline", kind: "replay" }),
     "/app/?run=baseline-replay&net=/net/rec1.geojson",
+  );
+});
+
+test("buildAppURL/buildReplayURL append &ws= when demosrv runs the engine off-port", () => {
+  const ws = "ws://127.0.0.1:9443";
+  assert.equal(
+    buildAppURL({ id: "la", run: "la" }, ws),
+    "/app/?run=la&net=/net/la.geojson&ws=ws%3A%2F%2F127.0.0.1%3A9443",
+  );
+  assert.equal(
+    deepLinkURL({ id: "rec1", run: "baseline", kind: "replay" }, ws),
+    "/app/?run=baseline-replay&net=/net/rec1.geojson&ws=ws%3A%2F%2F127.0.0.1%3A9443",
   );
 });

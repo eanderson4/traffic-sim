@@ -88,6 +88,12 @@ func SubjectStateSnap(run string) string { return Namespace + "." + run + ".stat
 // never on the wire — it derives from the tick (ADR-0011 §1).
 func SubjectStateSig(run string) string { return Namespace + "." + run + ".state.sig" }
 
+// SubjectStateSigReq is the signal-table request/reply subject:
+// ts.{run}.state.sig.req (ADR-0016). A request (empty payload) is answered
+// by the run with the full cached chunk set on the reply inbox — the
+// pull-when-ready catch-up for slow consumers and late joiners.
+func SubjectStateSigReq(run string) string { return Namespace + "." + run + ".state.sig.req" }
+
 // SubjectCtlIntent is one controller's intent subject: ts.{run}.ctl.intent.{controller_id}.
 func SubjectCtlIntent(run, ctl string) string {
 	return Namespace + "." + run + ".ctl.intent." + ctl

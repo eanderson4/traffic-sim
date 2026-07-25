@@ -22,6 +22,9 @@ import (
 // edge/edgeIndex are the lateral-chaining group (network-format v1): the
 // viz draws group-boundary casing from them so same-road lanes read as one
 // road; empty edge (junction interiors) = no lateral neighbors.
+// junction/row are the junction right-of-way annotation (ADR-0010,
+// internal lanes only): the viz clusters row="stop" lanes per junction
+// approach to place stop signs (stopsign.ts).
 type GeoJSONLaneProperties struct {
 	ID         string  `json:"id"`
 	SpeedLimit float64 `json:"speedLimit"` // m/s
@@ -29,6 +32,8 @@ type GeoJSONLaneProperties struct {
 	Internal   bool    `json:"internal"`
 	Edge       string  `json:"edge,omitempty"`
 	EdgeIndex  int     `json:"edgeIndex"`
+	Junction   string  `json:"junction,omitempty"` // junction this internal lane belongs to
+	Row        string  `json:"row,omitempty"`      // approach class: "major"|"minor"|"stop"
 }
 
 // GeoJSONFrame is the foreign member describing the local metric frame the
@@ -60,24 +65,43 @@ type geoJSONCollection struct {
 // WriteGeoJSON writes nf as a GeoJSON FeatureCollection (one LineString per
 // lane, local metric frame + "frame" descriptor). Lane order is preserved.
 func WriteGeoJSON(nf *NetFile, w io.Writer) error {
-	if nf.Version != 1 {
-		return fmt.Errorf("geojson: unsupported network version %d (want 1)", nf.Version)
+	return encodeGeoJSON(nf, w, geoJSONFeatures(nf, 0, len(nf.Lanes)))
+}
+
+// WriteGeoJSONRange writes lanes [start, end) as one standalone
+// FeatureCollection — the same "frame" descriptor and the same per-feature
+// encoding as WriteGeoJSON, so a range covering every lane is
+// byte-identical to the single-file output (pinned in geojson_test.go).
+// This is the PART-document encoding for demosrv's chunked network cache:
+// oversized networks are split at lane (feature) boundaries, never by
+// text-splitting JSON.
+func WriteGeoJSONRange(nf *NetFile, w io.Writer, start, end int) error {
+	if start < 0 {
+		start = 0
 	}
-	coll := geoJSONCollection{Type: "FeatureCollection"}
-	if p := nf.Provenance; p != nil {
-		coll.Frame = &GeoJSONFrame{
-			Projection: p.Projection,
-			NetOffset:  p.NetOffset,
-			OSMBbox:    p.OSMBbox,
-		}
+	if end < 0 {
+		end = 0 // a negative end is empty, never "to the last lane"
 	}
-	for i := range nf.Lanes {
+	if end > len(nf.Lanes) {
+		end = len(nf.Lanes)
+	}
+	if start > end {
+		start = end
+	}
+	return encodeGeoJSON(nf, w, geoJSONFeatures(nf, start, end))
+}
+
+// geoJSONFeatures builds the per-lane feature blocks for lanes [start, end)
+// — the single marshaling path shared by the full document and parts.
+func geoJSONFeatures(nf *NetFile, start, end int) []geoJSONFeature {
+	var features []geoJSONFeature
+	for i := start; i < end; i++ {
 		nl := &nf.Lanes[i]
 		width := nl.Width
 		if width == 0 {
 			width = 3.5 // the loader's default; keep the file and engine in agreement
 		}
-		coll.Features = append(coll.Features, geoJSONFeature{
+		features = append(features, geoJSONFeature{
 			Type: "Feature",
 			ID:   nl.ID,
 			Properties: GeoJSONLaneProperties{
@@ -87,9 +111,26 @@ func WriteGeoJSON(nf *NetFile, w io.Writer) error {
 				Internal:   nl.Internal,
 				Edge:       nl.Edge,
 				EdgeIndex:  nl.EdgeIndex,
+				Junction:   nl.Junction,
+				Row:        nl.Row,
 			},
 			Geometry: geoJSONGeometry{Type: "LineString", Coordinates: nl.Shape},
 		})
+	}
+	return features
+}
+
+func encodeGeoJSON(nf *NetFile, w io.Writer, features []geoJSONFeature) error {
+	if nf.Version != 1 {
+		return fmt.Errorf("geojson: unsupported network version %d (want 1)", nf.Version)
+	}
+	coll := geoJSONCollection{Type: "FeatureCollection", Features: features}
+	if p := nf.Provenance; p != nil {
+		coll.Frame = &GeoJSONFrame{
+			Projection: p.Projection,
+			NetOffset:  p.NetOffset,
+			OSMBbox:    p.OSMBbox,
+		}
 	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")

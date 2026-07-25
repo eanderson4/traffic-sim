@@ -5,19 +5,31 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>traffic-sim — demos</title>
     <style>
-      /* demosrv menu chrome — same design tokens as the map app (math-900
-         navy canvas, math-800 cards, math-300/500 accents; see
-         viz/src/theme.ts and index.html). */
-      html, body { margin: 0; min-height: 100%; background: #0e1d5c; }
+      /* demosrv menu chrome — same palette as the map app via CSS
+         variables (theme.ts THEMES.navy values as :root defaults; this
+         page follows the localStorage theme via the toggle). Semantic
+         status colors (running/starting/replay/error) stay literals. */
+      :root {
+        --t-bg: #0e1d5c;
+        --t-text: #d6e1ff;
+        --t-text-bright: #eaf0ff;
+        --t-text-dim: #9fb2e8;
+        --t-accent: #7e9dff;
+        --t-card-bg: rgba(18, 40, 129, 0.45);
+        --t-card-bg-hover: rgba(18, 40, 129, 0.75);
+        --t-card-border: #2e5bff;
+        --t-chip-border: rgba(126, 157, 255, 0.5);
+      }
+      html, body { margin: 0; min-height: 100%; background: var(--t-bg); }
       body {
         font: 14px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
-        color: #d6e1ff;
+        color: var(--t-text);
         padding: 48px 24px 64px;
       }
       header { max-width: 1080px; margin: 0 auto 32px; }
-      h1 { font-size: 22px; letter-spacing: 0.04em; margin: 0; color: #eaf0ff; }
-      h1 .accent { color: #7e9dff; }
-      header p { margin: 6px 0 0; color: #9fb2e8; font-size: 12px; }
+      h1 { font-size: 22px; letter-spacing: 0.04em; margin: 0; color: var(--t-text-bright); }
+      h1 .accent { color: var(--t-accent); }
+      header p { margin: 6px 0 0; color: var(--t-text-dim); font-size: 12px; }
       #notice {
         max-width: 1080px; margin: 0 auto 16px; display: none;
         border: 1px solid #e5484d; border-radius: 6px; padding: 8px 12px;
@@ -29,24 +41,24 @@
       }
       .card {
         position: relative; cursor: pointer;
-        background: rgba(18, 40, 129, 0.45);
-        border: 1px solid #2e5bff; border-radius: 8px;
+        background: var(--t-card-bg);
+        border: 1px solid var(--t-card-border); border-radius: 8px;
         padding: 16px 18px 14px;
         transition: border-color 0.15s, background 0.15s, transform 0.15s;
       }
-      .card:hover { border-color: #7e9dff; background: rgba(18, 40, 129, 0.75); transform: translateY(-1px); }
+      .card:hover { border-color: var(--t-accent); background: var(--t-card-bg-hover); transform: translateY(-1px); }
       .card.running { border-color: #1e9e6a; }
       /* Recordings (kind "replay", demos-core.ts): dashed border + amber
          REPLAY chip — a replayed run must read differently from a live
          one at a glance. */
       .card.replay { border-style: dashed; }
       .chip.replay { color: #e8b43a; border-color: rgba(232, 180, 58, 0.55); }
-      .card h2 { margin: 0; font-size: 15px; color: #eaf0ff; padding-right: 90px; }
-      .card .blurb { margin: 8px 0 12px; color: #9fb2e8; font-size: 12px; }
+      .card h2 { margin: 0; font-size: 15px; color: var(--t-text-bright); padding-right: 90px; }
+      .card .blurb { margin: 8px 0 12px; color: var(--t-text-dim); font-size: 12px; }
       .tags { display: flex; flex-wrap: wrap; gap: 6px; }
       .chip {
         font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
-        color: #7e9dff; border: 1px solid rgba(126, 157, 255, 0.5);
+        color: var(--t-accent); border: 1px solid var(--t-chip-border);
         border-radius: 999px; padding: 2px 9px;
       }
       .badge {
@@ -69,6 +81,19 @@
         padding: 3px 10px; cursor: pointer;
       }
       .stop:hover { background: rgba(229, 72, 77, 0.25); }
+      /* Theme toggle — flips the menu palette via the CSS vars and
+         persists to localStorage (inline script below); the map app reads
+         the same key, so demos opened from here inherit the choice. */
+      #theme-toggle {
+        position: fixed; top: 14px; right: 16px; z-index: 2;
+        font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        letter-spacing: 0.08em;
+        color: var(--t-text);
+        background: var(--t-card-bg);
+        border: 1px solid var(--t-card-border); border-radius: 4px;
+        padding: 4px 10px; cursor: pointer;
+      }
+      #theme-toggle:hover { border-color: var(--t-accent); }
     </style>
   </head>
   <body>
@@ -76,8 +101,59 @@
       <h1>traffic-sim <span class="accent">// demos</span></h1>
       <p>One click starts the engine for that scenario (the previous run stops) and drops you into the live map.</p>
     </header>
+    <button id="theme-toggle" type="button" title="theme — click to switch">NAVY</button>
     <div id="notice"></div>
     <main id="grid"></main>
+    <script>
+      // Theme toggle — two palettes for this page's CSS vars (navy values
+      // mirror the :root defaults, paper mirrors theme.ts THEMES.paper).
+      // The choice persists to localStorage "viz-theme", which the map
+      // app's config (src/config.ts resolveThemeName) reads when a demo
+      // link carries no ?theme= — so a demo opened from here inherits the
+      // selected theme without demos.ts rewriting its navigation URLs.
+      (function () {
+        var KEY = "viz-theme";
+        var PALETTES = {
+          navy: {
+            "--t-bg": "#0e1d5c",
+            "--t-text": "#d6e1ff",
+            "--t-text-bright": "#eaf0ff",
+            "--t-text-dim": "#9fb2e8",
+            "--t-accent": "#7e9dff",
+            "--t-card-bg": "rgba(18, 40, 129, 0.45)",
+            "--t-card-bg-hover": "rgba(18, 40, 129, 0.75)",
+            "--t-card-border": "#2e5bff",
+            "--t-chip-border": "rgba(126, 157, 255, 0.5)"
+          },
+          paper: {
+            "--t-bg": "#fafafa",
+            "--t-text": "#26262b",
+            "--t-text-bright": "#111113",
+            "--t-text-dim": "#6e6e76",
+            "--t-accent": "#2563eb",
+            "--t-card-bg": "#ffffff",
+            "--t-card-bg-hover": "#f0f0f2",
+            "--t-card-border": "#e5e5e8",
+            "--t-chip-border": "rgba(37, 99, 235, 0.5)"
+          }
+        };
+        var btn = document.getElementById("theme-toggle");
+        function apply(name) {
+          var palette = PALETTES[name] || PALETTES.navy;
+          for (var k in palette) document.documentElement.style.setProperty(k, palette[k]);
+          btn.textContent = name.toUpperCase();
+          btn.dataset.theme = name;
+        }
+        var stored = null;
+        try { stored = localStorage.getItem(KEY); } catch (e) { /* private mode */ }
+        apply(stored === "paper" ? "paper" : "navy");
+        btn.addEventListener("click", function () {
+          var next = btn.dataset.theme === "navy" ? "paper" : "navy";
+          try { localStorage.setItem(KEY, next); } catch (e) { /* private mode */ }
+          apply(next);
+        });
+      })();
+    </script>
     <script type="module" src="/src/demos.ts"></script>
   </body>
 </html>

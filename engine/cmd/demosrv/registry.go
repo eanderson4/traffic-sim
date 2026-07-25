@@ -63,6 +63,11 @@ type Recording struct {
 type Registry struct {
 	Demos      []*Demo      `json:"demos"`
 	Recordings []*Recording `json:"recordings,omitempty"`
+	// WS is OUTPUT-ONLY (a demos.json ws key would unmarshal but is
+	// unconditionally overwritten by main's flag value): the engine WebSocket
+	// URL clients should dial, set by main() from the -ws flag so the
+	// menu's deep links can carry ?ws= when it differs from the viz default.
+	WS string `json:"ws,omitempty"`
 }
 
 // byID looks a demo up for the /api/demo/{id}/ and /net/{id} routes.

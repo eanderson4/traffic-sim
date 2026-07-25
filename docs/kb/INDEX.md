@@ -50,7 +50,7 @@ back to it.
 - [Chicago Metro](articles/chicago-metro.md) — zoned Geofabrik→netconvert pipeline, portal-weighted napkin demand, driver exit-routing + serve attach barrier it required
 
 ### Decisions
-- [ADR Index](articles/decisions/adrs.md) — ADR-0001..0017 table with rationales, research basis, and pending-ADR queue
+- [ADR Index](articles/decisions/adrs.md) — ADR-0001..0018 table with rationales, research basis, and pending-ADR queue
 
 ## Raw Research
 
@@ -98,7 +98,9 @@ links its source synthesis for traceability.
 - [x] [ADR-0013](decisions/ADR-0013-external-review-gate.md) — external multi-model review (Claude Fable + GPT-5.6-sol) as a pre-commit gate: tree-hash stamp proves review happened, triage stays the committer's job, fail-closed with a loud skip hatch
 - [x] [ADR-0014](decisions/ADR-0014-observability-metrics.md) — observability: trajectory-first metric kernel (trip records incl. horizon partials, lane-interval Edie q/k/u), contract-pinned definitions, dedicated metrics JetStream stream + simrun file sink, scenario metrics bindings, paired-seed sweep protocol, LOS as presentation skin
 - [x] [ADR-0015](decisions/ADR-0015-keyframe-chunking.md) — record-plane keyframes larger than 768 KiB are chunked into consecutive log messages (`kf_chunk: "i/n"` header); seek anchors on the last chunk; schema stays v2, old recordings read unchanged — unblocks city-scale past the 1 MiB max_payload wall hit at ~10.9k vehicles
-- [ ] [ADR-0016](decisions/ADR-0016-tssg-chunking.md) — PROPOSED (implementation pending, theme session): live-plane signal tables (TSSG) chunked like ADR-0015 (`sig_chunk`/`sig_gen` headers, per-chunk-valid frames), publish-once + request-reply catch-up replacing the 20-tick rebroadcast, max_payload 64MB→4MB as documented headroom
+- [x] [ADR-0016](decisions/ADR-0016-tssg-chunking.md) — live-plane signal tables (TSSG) chunked like ADR-0015 (`sig_chunk: "i/n"` header, per-chunk-valid frames, no `sig_gen`), 20-tick rebroadcast + request-reply catch-up on `ts.{run}.state.sig.req`, max_payload 64MB→4MB as documented headroom
+- [x] [ADR-0017](decisions/ADR-0017-city-import-decisions.md) — city-scale OSM import decisions: no `--junctions.join` (stop override keys by OSM node id), `priority_stop` as whole-junction approximation, relations (turn restrictions) not imported, directionless stops infer from oneway else forward with a reported count
+- [x] [ADR-0018](decisions/ADR-0018-chunked-geojson.md) — city-scale network GeoJSON served chunked over HTTP: manifest (`frame` + empty features + `parts`), hash+schema-pinned part URLs that 404 a stale generation, sequential client fetch; small nets byte-identical
 
 ---
 *Last distilled: 2026-07-17 | 18 articles from 56 raw research files*
@@ -106,5 +108,7 @@ links its source synthesis for traceability.
 *ADR-0013 ratified 2026-07-21 (external-review workflow, following the M11 round)*
 *ADR-0014 ratified 2026-07-21 (observability design; Fable+Sol review round, M13 implementation next)*
 *ADR-0015 ratified 2026-07-24 (keyframe chunking, after the WQ-4 stress test hit the max_payload wall)*
-*ADR-0016 drafted 2026-07-24 (TSSG chunking + pull resync, after the LA busy-tab slow-consumer incident; Fable+Sol design round settled)*
+*ADR-0016 ratified 2026-07-24 (TSSG chunking + pull resync, after the LA busy-tab slow-consumer incident; Fable+Sol design round settled)*
+*ADR-0017 ratified 2026-07-24 (city import decisions, ep-03 six-metro imports)*
+*ADR-0018 ratified 2026-07-24 (chunked network GeoJSON, after la-lean hit the V8 string cap)*
 *Run `/update-kb` to check freshness*

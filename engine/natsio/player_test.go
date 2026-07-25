@@ -854,8 +854,11 @@ func TestPlayerEndHoldEngagesPromptly(t *testing.T) {
 }
 
 // TestPlayerPausedRepublication: a browser attaching mid-pause gets a
-// snapshot and the signal table within ~1 s — it must not stare at an empty
-// map until the next resume.
+// snapshot within ~1 s — it must not stare at an empty map until the next
+// resume. The signal TABLE deliberately does NOT ride the paused
+// republish (ADR-0016 §5: a full chunk set every second is a firehose
+// aimed at the busy tabs it targets); the paused attach resyncs via the
+// request/reply path instead.
 func TestPlayerPausedRepublication(t *testing.T) {
 	srv := NewTestServer(t)
 	nc, js := srv.JetStream(t)
@@ -911,14 +914,36 @@ func TestPlayerPausedRepublication(t *testing.T) {
 	defer func() { _ = sigSub.Unsubscribe() }()
 
 	deadline := time.Now().Add(3 * time.Second)
-	for gotSnap.Load() == 0 || gotSig.Load() == 0 {
+	for gotSnap.Load() == 0 {
 		if time.Now().After(deadline) {
-			t.Fatalf("late subscriber got %d snapshots and %d signal frames within 3 s of pause, want ≥ 1 of each",
-				gotSnap.Load(), gotSig.Load())
+			t.Fatalf("late subscriber got %d snapshots within 3 s of pause, want ≥ 1", gotSnap.Load())
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	if snapTick.Load() != p.Status().Tick {
 		t.Fatalf("republished snapshot tick %d != paused tick %d", snapTick.Load(), p.Status().Tick)
+	}
+	// Let the pause settle past a republish interval: no broadcast table
+	// may arrive while paused (the opening publish predates the pause).
+	time.Sleep(1500 * time.Millisecond)
+	if gotSig.Load() != 0 {
+		t.Fatalf("paused replay broadcast %d signal frames, want 0 (attach resync is request/reply now)", gotSig.Load())
+	}
+
+	// The pull path: one request gets the table even while paused.
+	inbox := nats.NewInbox()
+	replies, err := nc.SubscribeSync(inbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.PublishRequest(SubjectStateSigReq(replayRun), inbox, nil); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := replies.NextMsg(5 * time.Second)
+	if err != nil {
+		t.Fatalf("paused request/reply: no table: %v", err)
+	}
+	if _, err := ParseSignalFrame(msg.Data); err != nil {
+		t.Fatalf("paused request/reply table: %v", err)
 	}
 }

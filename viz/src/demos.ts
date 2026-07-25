@@ -20,6 +20,7 @@ const notice = must("notice");
 let demos: DemoInfo[] = [];
 let recordings: RecordingInfo[] = [];
 let status: RunStatus = { active: null, pid: 0 };
+let engineWs: string | undefined; // /api/demos "ws" — engine port this demosrv spawns to
 const starting = new Set<string>(); // start POST in flight — keep the spinner across re-renders
 
 async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
@@ -107,7 +108,7 @@ function render(): void {
 async function activate(d: MenuEntry): Promise<void> {
   if (starting.has(d.id)) return;
   if (status.active === d.id) {
-    location.href = deepLinkURL(d);
+    location.href = deepLinkURL(d, engineWs, status.run);
     return;
   }
   starting.add(d.id);
@@ -141,9 +142,10 @@ async function refreshStatus(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const reg = await fetchJSON<{ demos?: DemoInfo[]; recordings?: RecordingInfo[] }>("/api/demos");
+  const reg = await fetchJSON<{ demos?: DemoInfo[]; recordings?: RecordingInfo[]; ws?: string }>("/api/demos");
   demos = reg.demos ?? [];
   recordings = reg.recordings ?? [];
+  engineWs = reg.ws; // engine port this demosrv spawns to (config.ts default when absent)
   await refreshStatus(); // refreshStatus renders; covers the first paint too
   setInterval(() => void refreshStatus(), 3000);
 }
