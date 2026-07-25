@@ -134,6 +134,17 @@
   signal), stale schema-pointer comments, single-seed caution line on the
   comparison page.
 
+- **WQ-3 zoom-gate round deferrals (Fable + Sol, commit f6b9d56):** (a) the
+  layertoggles "names only real layers" test checks id uniqueness, not that
+  the ids exist in main.ts — a typo'd id silently no-ops the toggle
+  (pre-existing weakness; Fable r2 nit); (b) casing comment still explains
+  the edgeB fallback in terms of junction interiors when only stale caches
+  hit it now (Fable r2 nit, wording). Round-1 finding FIXED before commit:
+  internal casing stacked above the external congestion line (both
+  reviewers) — order is now both casings below both lines. Fable r2
+  question (z11–12 junction mouths) answered by the live zoom-out
+  screenshot: crossings read clean on external round caps alone.
+
 - **Keyframe-chunking round deferrals (Fable r3 + Sol r2/r3, commit 8fbb5a1):**
   (a) MaxAge retention expires messages individually — a chunk group
   straddling the frontier leaves an orphan tail that fails ALL seeks, and
@@ -190,9 +201,16 @@ least-bad rendering of impossible geometry (Fable r4 question);
 (Fable r4 question). The lumped-dtS jerk (WQ-0 replay (a)) is the real
 underlying fix for fast-replay articulation accuracy.
 
-### WQ-3: Junction-interior squiggles at city zoom
-`internal` lanes still draw when zoomed out (squiggle clutter at every junction).
-Candidate: zoom-gate internal lanes to ≥13 like the signal heads. Quick win.
+### WQ-3: Junction-interior squiggles at city zoom — FIXED (2026-07-25)
+Network lane layers split into external + internal pairs in `viz/src/main.ts`:
+external lanes draw at all zooms, `internal:true` lanes (junction interiors)
+are on `network-internal-{casing,line}` with minzoom 13, matching the signal
+heads. Shared paint/layout consts so the pairs can't drift; congestion toggle
+in `layertoggles.ts` hides both line layers, casings never toggle. Verified
+live on manhattan-grid (zoom-out: clean bands, no squiggles/heads; zoom-in:
+detail returns). Note: the theme session's viz rewrite had dropped the old
+`internal` reference entirely — junction interiors were drawing as FULL
+casing at every zoom (edgeBoundaries treats group-less lanes as boundaries).
 
 ## Engine trust / architecture
 
@@ -233,15 +251,19 @@ CRC-verified replay to tick 7200 through a chunked anchor. Store:
 `/tmp/wq4store3` (517 MB), metrics `/tmp/wq4-stress3.metrics.json` (both
 /tmp — regenerate with `-store` into data/recordings/ if worth keeping).
 
-### WQ-12: Replay materialization footprint vs demosrv readiness timeout
+### WQ-12: Replay materialization footprint vs demosrv readiness timeout — DE-RISKED (2026-07-25)
 Found wiring the podcast recordings: the replay child materializes a
 recording in memory before listening — a 36000-tick i280 recording (3.3 GB)
-took ~40 s and ~23 GB RSS, so demosrv's 10 s child-readiness timeout
-(`supervisor.go` readyTimeout) tears it down ("did not become ready"). A
-9000-tick recording (369 MB) starts in ~5 s at ~2.7 GB RSS — podcast demo
-cards therefore point at 15-minute recordings. Real fixes: stream the
-materialization, or make readyTimeout generous/configurable (supervisor.go
-was mid-refactor by the theme session when found).
+took ~40 s and ~23 GB RSS, so demosrv's old 10 s child-readiness timeout
+tore it down ("did not become ready"). The theme session's supervisor
+rework (47935dc) fixed the ordering: readyTimeout is now 60 s and the
+replay control listener binds only AFTER NewPlayer materializes
+(engine/cmd/replay/main.go:105→114), so demosrv's ctl-port probe covers
+materialization — the 40 s i280 hour fits with ~1.5× headroom. Podcast
+demo cards point at 15-minute recordings (369 MB, ~5 s, ~2.7 GB RSS).
+REMAINING (post-podcast): stream the materialization (NewPlayer holds
+~7× the store size in RSS) and bound the wait by recording size, not a
+flat 60 s — an LA-scale hour recording would blow both.
 
 ### WQ-13: Pause-gate deadlock escape hatch — DONE (2026-07-24)
 `engine/natsio/contract.go`: while the gate is engaged the engine logs a

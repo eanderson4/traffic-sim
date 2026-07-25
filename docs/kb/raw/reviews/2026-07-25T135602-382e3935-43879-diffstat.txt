@@ -1,0 +1,4 @@
+ viz/src/layertoggles.ts       |  7 +++-
+ viz/src/main.ts               | 90 +++++++++++++++++++++++++++++--------------
+ viz/test/layertoggles.test.ts |  4 +-
+ 3 files changed, 69 insertions(+), 32 deletions(-)

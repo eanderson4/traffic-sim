@@ -1,0 +1,153 @@
+diff --git a/viz/src/layertoggles.ts b/viz/src/layertoggles.ts
+index 7bb193813ce2d1808fb85e0eb7a6df3ddf3fea55..1c959385a33ffb2ee2df6bd9ec0e402014cb18c2 100644
+--- a/viz/src/layertoggles.ts
++++ b/viz/src/layertoggles.ts
+@@ -35,8 +35,10 @@ export interface LayerOps {
+ //   - the five signal layers move as a group: housing + stop bars + the
+ //     three lit-lens circles (ids mirror main.ts's signals-lens-{color});
+ //   - "stop-signs" is the static stop-sign layer (stopsign.ts);
+-//   - "network-line" is the congestion overlay; "network-casing" (the road
+-//     geometry itself) is NEVER toggled.
++//   - "network-line" + "network-internal-line" are the congestion overlay
++//     (external lanes / zoom-gated junction interiors, WQ-3);
++//     "network-casing" + "network-internal-casing" (the road geometry
++//     itself) are NEVER toggled.
+ export function layerOpsFor(state: ToggleState): LayerOps {
+   const cls: number[] = [];
+   if (state.car) cls.push(0);
+@@ -54,6 +56,7 @@ export function layerOpsFor(state: ToggleState): LayerOps {
+       ["signals-lens-green", state.signals],
+       ["stop-signs", state.stops],
+       ["network-line", state.congestion],
++      ["network-internal-line", state.congestion],
+     ],
+   };
+ }
+diff --git a/viz/src/main.ts b/viz/src/main.ts
+index eb7765ea681cfdf21d60063a7663fc30d47ad7e9..d29878070fe25af11c57b9a0511e95d7834eb3d5 100644
+--- a/viz/src/main.ts
++++ b/viz/src/main.ts
+@@ -472,44 +472,76 @@ async function main(): Promise<void> {
+     }
+     map.addSource("network", { type: "geojson", data: networkFC, promoteId: "id" });
+     map.addSource("vehicles", { type: "geojson", data: EMPTY_FC, promoteId: "id" });
++    // Lane paint shared by the external and internal layer pairs below so
++    // the two can't drift (WQ-3). Junction interiors (internal:true) are
++    // zoom-gated to >=13 like the signal heads: below that they're squiggle
++    // clutter at every junction. External lanes draw at all zooms.
++    const casingPaint: maplibregl.LineLayerSpecification["paint"] = {
++      "line-color": theme.casing,
++      // Casing on edge-group boundaries only (edgeB, edges.ts): the
++      // outer shell of each road. Interior lanes keep a faint trace so
++      // adjacent stripes stay separable. Lanes without an edge group
++      // (junction interiors, stale caches) are all boundaries, so they
++      // degrade to full casing inside edgeBoundaries.
++      "line-opacity": ["case", ["boolean", ["get", "edgeB"], true], 0.9, 0.15],
++      // Zoomed-out legibility: a touch wider from z=11 (interpolating up
++      // to z=14) — the network must read under the vehicle stream before
++      // any detail matters.
++      "line-width": ["interpolate", ["linear"], ["zoom"], 11, 3.2, 14, 7, 17, 12],
++    };
++    const linePaint: maplibregl.LineLayerSpecification["paint"] = {
++      // feature-state "ratio" (client-derived mean speed / limit); -1 = no data.
++      "line-color": [
++        "interpolate",
++        ["linear"],
++        ["coalesce", ["feature-state", "ratio"], -1],
++        -1, theme.noData,
++        0, theme.stopped,
++        0.35, theme.mid,
++        0.7, theme.freeFlow,
++        1.5, theme.freeFlow,
++      ],
++      "line-width": ["interpolate", ["linear"], ["zoom"], 11, 1.8, 14, 4, 17, 8],
++    };
++    const laneLayout: maplibregl.LineLayerSpecification["layout"] = {
++      "line-cap": "round",
++      "line-join": "round",
++    };
++    const externalOnly: maplibregl.FilterSpecification = ["!=", ["get", "internal"], true];
++    const internalOnly: maplibregl.FilterSpecification = ["==", ["get", "internal"], true];
+     map.addLayer({
+       id: "network-casing",
+       type: "line",
+       source: "network",
+-      layout: { "line-cap": "round", "line-join": "round" },
+-      paint: {
+-        "line-color": theme.casing,
+-        // Casing on edge-group boundaries only (edgeB, edges.ts): the
+-        // outer shell of each road. Interior lanes keep a faint trace so
+-        // adjacent stripes stay separable. Lanes without an edge group
+-        // (junction interiors, stale caches) are all boundaries, so they
+-        // degrade to full casing inside edgeBoundaries.
+-        "line-opacity": ["case", ["boolean", ["get", "edgeB"], true], 0.9, 0.15],
+-        // Zoomed-out legibility: a touch wider from z=11 (interpolating up
+-        // to z=14) — the network must read under the vehicle stream before
+-        // any detail matters.
+-        "line-width": ["interpolate", ["linear"], ["zoom"], 11, 3.2, 14, 7, 17, 12],
+-      },
++      filter: externalOnly,
++      layout: laneLayout,
++      paint: casingPaint,
+     });
+     map.addLayer({
+       id: "network-line",
+       type: "line",
+       source: "network",
+-      layout: { "line-cap": "round", "line-join": "round" },
+-      paint: {
+-        // feature-state "ratio" (client-derived mean speed / limit); -1 = no data.
+-        "line-color": [
+-          "interpolate",
+-          ["linear"],
+-          ["coalesce", ["feature-state", "ratio"], -1],
+-          -1, theme.noData,
+-          0, theme.stopped,
+-          0.35, theme.mid,
+-          0.7, theme.freeFlow,
+-          1.5, theme.freeFlow,
+-        ],
+-        "line-width": ["interpolate", ["linear"], ["zoom"], 11, 1.8, 14, 4, 17, 8],
+-      },
++      filter: externalOnly,
++      layout: laneLayout,
++      paint: linePaint,
++    });
++    map.addLayer({
++      id: "network-internal-casing",
++      type: "line",
++      source: "network",
++      minzoom: 13,
++      filter: internalOnly,
++      layout: laneLayout,
++      paint: casingPaint,
++    });
++    map.addLayer({
++      id: "network-internal-line",
++      type: "line",
++      source: "network",
++      minzoom: 13,
++      filter: internalOnly,
++      layout: laneLayout,
++      paint: linePaint,
+     });
+     // Static overlays: ABOVE the road lines (added after them) but BELOW
+     // vehicles/signal heads (added before them). Both sources are optional
+diff --git a/viz/test/layertoggles.test.ts b/viz/test/layertoggles.test.ts
+index 06504d188a4d72cca4458db3e07f4fe5a924e7b0..bd66bef4caf64783322957847de934fe4a0a1786 100644
+--- a/viz/test/layertoggles.test.ts
++++ b/viz/test/layertoggles.test.ts
+@@ -61,10 +61,12 @@ test("stops off: the static stop-signs layer hides", () => {
+   assert.equal(v.get("signals-housing"), true);
+ });
+ 
+-test("congestion off: network-line hides; the casing is never toggled", () => {
++test("congestion off: both congestion line layers hide; the casings are never toggled", () => {
+   const v = vis(layerOpsFor({ ...DEFAULT_TOGGLES, congestion: false }));
+   assert.equal(v.get("network-line"), false);
++  assert.equal(v.get("network-internal-line"), false);
+   assert.ok(!v.has("network-casing"), "casing is road geometry, not the overlay");
++  assert.ok(!v.has("network-internal-casing"), "internal casing is road geometry too");
+ });
+ 
+ test("every toggle key off still names only real layers, exactly once", () => {
