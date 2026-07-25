@@ -1,0 +1,612 @@
+diff --git a/docs/kb/INDEX.md b/docs/kb/INDEX.md
+index 164100660d8edd6d93715b19a89790ad57fc8523..5d271bc6830a0aa65a29292690a57d4f1679992c 100644
+--- a/docs/kb/INDEX.md
++++ b/docs/kb/INDEX.md
+@@ -50,7 +50,7 @@ back to it.
+ - [Chicago Metro](articles/chicago-metro.md) — zoned Geofabrik→netconvert pipeline, portal-weighted napkin demand, driver exit-routing + serve attach barrier it required
+ 
+ ### Decisions
+-- [ADR Index](articles/decisions/adrs.md) — ADR-0001..0018 table with rationales, research basis, and pending-ADR queue
++- [ADR Index](articles/decisions/adrs.md) — ADR-0001..0019 table with rationales, research basis, and pending-ADR queue
+ 
+ ## Raw Research
+ 
+diff --git a/docs/kb/articles/decisions/adrs.md b/docs/kb/articles/decisions/adrs.md
+index 926b476ee24f0a18f7bb41ff768199e90dfc0d82..dccd4ca7eafe1d9c6984b91f3a18f654460c497e 100644
+--- a/docs/kb/articles/decisions/adrs.md
++++ b/docs/kb/articles/decisions/adrs.md
+@@ -33,6 +33,7 @@ closed (2026-07-15..17).
+ | [ADR-0016](../../decisions/ADR-0016-tssg-chunking.md) | Live-plane signal tables are chunked like keyframes (`sig_chunk: "i/n"` header, 768 KiB target, no header = whole table) plus request-reply catch-up on `ts.{run}.state.sig.req` so a busy client pulls the table when ready; server `max_payload` amended to 4 MiB headroom, per-message discipline stays ~768 KiB chunks | City-scale tables (sf-lean 2.1 MB, la-lean 7.3 MB) blew the 1 MiB cap, and a browser parsing a 1.4M-lane network becomes a slow consumer whose deliveries are silently dropped — push-and-pray had to become pull-when-ready | Design round 2026-07-24 (Fable + Sol, [reviews](../../raw/reviews/)); ADR-0015 precedent |
+ | [ADR-0017](../../decisions/ADR-0017-city-import-decisions.md) | City-scale OSM imports: no `--junctions.join` (stop override keys by OSM node id), `priority_stop` accepted as a whole-junction approximation, OSM relations (turn restrictions) not imported, directionless stops infer from oneway else forward with a reported count | The stop-sign pipeline (netconvert ignores `highway=stop`, eclipse-sumo #5244) forced each trade-off; recording them keeps the deviations from reading as oversights | ep-03 city imports (six metros); external-review rounds 2026-07-24 ([reviews](../../raw/reviews/)) |
+ | [ADR-0018](../../decisions/ADR-0018-chunked-geojson.md) | City-scale network GeoJSON is served chunked over HTTP: manifest (`frame` + empty features + `parts`) at `/net/{id}.geojson`, hash-pinned part URLs that 404 a stale generation, sequential client fetch; small nets byte-identical | V8's ~537M-char string cap makes la-lean's ~860 MB single document unparseable; chunking keeps the existing endpoint and cache instead of a vector-tile migration | ADR-0015/0016 chunking precedent; la-lean browser verification 2026-07-24 |
++| [ADR-0019](../../decisions/ADR-0019-route-budget-determinism.md) | Route-budget determinism bound: per-replica admission timing (~0.3 sim-s worst case) and mid-queue failover lane re-freeze are accepted and bounded; strict fix is O(1) global exit-reachability, retiring the budget | City-scale cold-origin reachability scans stalled the obs path (measured sf-lean); the budget is the throttle, its edge cases are the recorded price | sf-lean stall diagnosis 2026-07-24; sol review rounds |
+ 
+ ## Research Complete, ADR Pending
+ 
+@@ -56,4 +57,4 @@ These areas have finished research (the gate) but no drafted ADR yet — see
+   [VISION.md](../../../VISION.md).
+ 
+ ---
+-*Derived from: [decisions/](../../decisions/) ADR-0001..0018 and the raw research syntheses linked above*
++*Derived from: [decisions/](../../decisions/) ADR-0001..0019 and the raw research syntheses linked above*
+diff --git a/docs/kb/decisions/ADR-0019-route-budget-determinism.md b/docs/kb/decisions/ADR-0019-route-budget-determinism.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..5b1ca1c88e9813946b23d57b41b51b8f9ea1bc2a
+--- /dev/null
++++ b/docs/kb/decisions/ADR-0019-route-budget-determinism.md
+@@ -0,0 +1,57 @@
++# ADR-0019: Route-budget determinism bound (driver exit routing)
++
++- **Status:** ACCEPTED
++- **Date:** 2026-07-24
++
++## Context
++
++The default driver's exit draw (`pickExit`) needs per-lane reachability,
++an O(network) scan per NEW origin lane (memoized in `exitCache`). On
++city-scale networks (la-lean: 1.38M lanes) an unbounded spawn burst of
++cold origins stalled the obs path — measured as minutes of 100% CPU with
++no snapshots (2026-07-24, sf-lean 303k lanes). `Config.RouteBudgetPerTick`
++(default 32) meters the draws: over-budget vehicles keep the kernel's
++default routing and retry on the next observation.
++
++External review (GPT-5.6-sol) flagged the budget's consequence for
++ADR-0008's behaviorally-invisible failover:
++
++1. **Admission timing is per-replica.** Each replica meters its own
++   claim set, so a deferred vehicle's route lands up to
++   ⌈unrouted/budget⌉ observations late (~0.3 sim-s at demo spawn rates).
++   A fork passed in that window is traversed on default routing.
++2. **Failover mid-queue loses the frozen lane.** `wantLane` (the
++   first-observation lane that keeps the draw a pure function of
++   (seed, id)) is process-local; a replacement driver re-freezes at ITS
++   first observation and can draw a different exit.
++
++## Decision
++
++The bound is accepted and recorded rather than engineered away today:
++
++- At demo scale the shard case is nominal: one driver at capacity
++  50 000 sees the entire fleet (no partitioning), so admission timing is
++  identical across replicas. The divergence requires BOTH
++  capacity-overflow sharding AND a fork within ~0.3 sim-s of spawn —
++  origins sit at the network edge, so the first junction is rarely
++  within that window.
++- Case 2 is a pre-existing limitation of ANY lane-input draw (failover
++  before the FIRST route assignment), not of the budget; the budget
++  only widens the window by ⌈unrouted/32⌉ observations. Once assigned,
++  routes are persistent and round-trip through the obs echo — failover
++  adoption is exact.
++- The strict fix is an O(1)-per-vehicle `pickExit` (one global
++  exit-reachability pass instead of per-origin BFS), which removes the
++  budget entirely. That is future work; when it lands, this ADR and
++  `RouteBudgetPerTick` retire.
++
++## Consequences
++
++- `RouteBudgetPerTick` and its timing note stay in the driver config
++  with a pointer here.
++- The hello retry loop retries only `nats.ErrNoResponders` (the
++  startup race it exists for): the attach hello is not idempotent —
++  retrying a timeout can register a ghost controller holding claim
++  capacity (review blocker, same round).
++- `engine/natsio/driver/router.go` (an O(V²)-era unused Dijkstra) was
++  deleted: routing lives engine-side in `engine/routing.go`.
+diff --git a/engine/natsio/driver/driver.go b/engine/natsio/driver/driver.go
+index 64e08bd5b1b60e6f1a62ec9300a19633fb9d66da..10f7c50964b50c06776c56c60d3d1013f35be88e 100644
+--- a/engine/natsio/driver/driver.go
++++ b/engine/natsio/driver/driver.go
+@@ -27,6 +27,7 @@ package driver
+ 
+ import (
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"sync"
+ 	"sync/atomic"
+@@ -53,6 +54,22 @@ type Config struct {
+ 	// excluded), deterministic from the run seed and vehicle ID
+ 	// (ADR-0007) — see destinations.go. Ignored when Destination is set.
+ 	ExitRouting bool
++	// RouteBudgetPerTick caps how many vehicles per observation get their
++	// routing destination RESOLVED (default 32): the exit draw's
++	// first-touch reachability scan is O(network) per NEW origin lane
++	// (warm picks are cheap and still pass through the counter), so an
++	// unbounded claim burst on a big network stalls the tick loop
++	// (measured: the Observe path was synchronous in the tick loop,
++	// run.go). Vehicles past the budget keep the kernel's default routing
++	// and retry on the next observation. TIMING NOTE (ADR-0008
++	// invisibility bound): admission order is per-replica, so a deferred
++	// vehicle's route lands up to ceil(unrouted/budget) observations
++	// later than an unbudgeted one — ~0.3 sim-s at demo spawn rates. A
++	// fork passed in that window means default routing for that leg; the
++	// draw itself stays seed-pure (frozen first-observation lane).
++	// Strict timing-invariance needs an O(1) pickExit (global
++	// exit-reachability), future work.
++	RouteBudgetPerTick int
+ 	// Type is the controller_type declared at attach (default
+ 	// "default-driver").
+ 	Type string
+@@ -71,6 +88,9 @@ func (c Config) withDefaults() Config {
+ 	if c.MetaWait <= 0 {
+ 		c.MetaWait = 10 * time.Second
+ 	}
++	if c.RouteBudgetPerTick <= 0 {
++		c.RouteBudgetPerTick = 32
++	}
+ 	return c
+ }
+ 
+@@ -92,6 +112,7 @@ type Driver struct {
+ 	exits   *exitCache // memoized pickExit inputs (candidates, reachability)
+ 
+ 	wantRoute map[uint64]string // destination chosen, re-sent until the obs echo confirms
++	wantLane  map[uint64]int    // lane at FIRST unrouted observation — the pickExit input (budget-deferred draws stay seed-deterministic)
+ 
+ 	subs []*nats.Subscription
+ 	done chan struct{}
+@@ -128,6 +149,7 @@ func New(nc *nats.Conn, js nats.JetStreamContext, cfg Config) (*Driver, error) {
+ 		streams: map[uint64]*engine.Stream{},
+ 
+ 		wantRoute: map[uint64]string{},
++		wantLane:  map[uint64]int{},
+ 		done:      make(chan struct{}),
+ 	}
+ 	if len(d.types) == 0 {
+@@ -152,21 +174,34 @@ func New(nc *nats.Conn, js nats.JetStreamContext, cfg Config) (*Driver, error) {
+ 		},
+ 	}
+ 	payload, _ := json.Marshal(hello)
+-	// Retry while the engine's contract plane is still coming up — on large
+-	// networks RunLive needs seconds before it answers hello, and a bare
+-	// request fails instantly with "no responders". Bounded by MetaWait so a
+-	// genuinely absent engine still fails fast.
++	// Like awaitMeta, the hello must tolerate an engine that is still coming
++	// up: RunLive subscribes the contract plane only AFTER the world build,
++	// the recorder, and the bus — on big networks the driver can finish its
++	// own BuildNet first and hit an unsubscribed hello subject (fast-fail
++	// "no responders"). Retry ONLY that error: the hello is not idempotent
++	// (the engine creates a controller on receipt), so retrying a TIMEOUT
++	// risks a ghost controller holding claim capacity (sol review); any
++	// other failure surfaces immediately.
++	helloDeadline := time.Now().Add(cfg.MetaWait)
+ 	var resp *nats.Msg
+-	deadline := time.Now().Add(cfg.MetaWait)
++	var helloErr error
+ 	for {
+-		resp, err = nc.Request(natsio.SubjectCtlHello(cfg.Run), payload, 2*time.Second)
+-		if err == nil {
++		// The request timeout is the REMAINING budget (capped at 2 s), and
++		// the retry sleep never overshoots the deadline — MetaWait must
++		// actually bound the wait (sol review).
++		remaining := time.Until(helloDeadline)
++		if remaining <= 0 {
++			return nil, fmt.Errorf("driver: hello: deadline exhausted (%s): %w", cfg.MetaWait, helloErr)
++		}
++		resp, helloErr = nc.Request(natsio.SubjectCtlHello(cfg.Run), payload, min(2*time.Second, remaining))
++		if helloErr == nil {
+ 			break
+ 		}
+-		if time.Now().After(deadline) {
+-			return nil, fmt.Errorf("driver: hello: %w", err)
++		if !errors.Is(helloErr, nats.ErrNoResponders) {
++			return nil, fmt.Errorf("driver: hello: %w", helloErr)
+ 		}
+-		time.Sleep(200 * time.Millisecond)
++		// Always sleep, never hot-spin — capped so the deadline holds.
++		time.Sleep(min(250*time.Millisecond, time.Until(helloDeadline)))
+ 	}
+ 	var reply natsio.HelloReply
+ 	if err := json.Unmarshal(resp.Data, &reply); err != nil {
+@@ -293,6 +328,7 @@ func (d *Driver) onObs(msg *nats.Msg) {
+ 	d.lastObsTick.Store(obs.Tick)
+ 	params := d.spec.Params
+ 	present := map[uint64]bool{}
++	routeBudget := d.cfg.RouteBudgetPerTick
+ 	for i := range obs.Egos {
+ 		ego := &obs.Egos[i]
+ 		present[ego.ID] = true
+@@ -308,43 +344,8 @@ func (d *Driver) onObs(msg *nats.Msg) {
+ 			in.SignalSet = true
+ 			in.Signals = signalFor(lane)
+ 		}
+-		// Routing axis: the destination parameter is persistent — send once
+-		// per vehicle; the kernel follows it at every multi-successor lane
+-		// (engine/routing.go), degrading to the successor default when the
+-		// destination is unknown or unreachable. The destination is the
+-		// configured override, or — with ExitRouting — the vehicle's per-ID
+-		// drawn exit lane (tried once either way: the pick is
+-		// deterministic, retrying would not change it).
+ 		d.mu.Lock()
+-		if !d.routed[ego.ID] {
+-			// Failover adoption: a re-claimed vehicle may already carry the
+-			// persistent route its previous controller assigned (the obs
+-			// frame round-trips it) — keep it. Re-deriving from the
+-			// current lane would change the destination mid-trip
+-			// (ADR-0008 §6: failover is behaviorally invisible).
+-			want, ok := d.wantRoute[ego.ID]
+-			if !ok {
+-				want = d.cfg.Destination
+-				if want == "" {
+-					want = ego.Route
+-				}
+-				if want == "" && d.cfg.ExitRouting {
+-					want, _ = pickExit(d.net, d.exitCache(), d.spec.Seed, ego.ID, ego.LaneIdx)
+-				}
+-				d.wantRoute[ego.ID] = want
+-			}
+-			// Core NATS publish has no ack: re-send until the obs frame
+-			// echoes the destination — a dropped one-shot Route intent
+-			// would leave the vehicle on default routing for life. Mark
+-			// routed only when the engine confirms (or nothing is wanted).
+-			if want == "" || ego.Route == want {
+-				d.routed[ego.ID] = true
+-				delete(d.wantRoute, ego.ID)
+-			} else {
+-				in.RouteSet = true
+-				in.Route = want
+-			}
+-		}
++		d.routeStep(&in, ego, &routeBudget)
+ 		d.mu.Unlock()
+ 		if err := d.nc.Publish(natsio.SubjectCtlIntent(d.cfg.Run, d.id), natsio.EncodeIntent(in)); err == nil {
+ 			d.sentIntents.Add(1)
+@@ -358,6 +359,7 @@ func (d *Driver) onObs(msg *nats.Msg) {
+ 			delete(d.fleet, vid)
+ 			delete(d.routed, vid)
+ 			delete(d.wantRoute, vid)
++			delete(d.wantLane, vid)
+ 		}
+ 	}
+ 	idle := len(d.fleet) == 0
+@@ -369,6 +371,80 @@ func (d *Driver) onObs(msg *nats.Msg) {
+ 	}
+ }
+ 
++// routeStep advances ONE ego's routing axis under the per-tick budget
++// (Config.RouteBudgetPerTick). The routing axis' destination parameter is
++// persistent — sent once per vehicle; the kernel follows it at every
++// multi-successor lane (engine/routing.go), degrading to the successor
++// default when the destination is unknown or unreachable. The destination
++// is the configured override, or — with ExitRouting — the vehicle's
++// per-ID drawn exit lane (tried once either way: the pick is
++// deterministic, retrying would not change it). Only the DRAW is metered:
++// its first-touch reachability scan is O(network) per origin lane
++// (destinations.go exitCache) — the cost that stalled big-city ticks when
++// routing ran synchronously in the tick loop, and still worth metering in
++// the callback path (a burst of first-touch scans delays every intent
++// behind it); the re-send of an unconfirmed destination is a string copy.
++// The budget freezes the draw's lane at first observation, so deferred
++// vehicles may draw an exit unreachable from a lane they reached since —
++// the kernel then degrades to default routing, exactly as for any
++// unreachable destination (deterministic either way). A controller that
++// fails BEFORE an unrouted vehicle's first draw lets the replacement draw
++// from a later lane — a pre-existing limitation of lane-input draws, not
++// of the budget; the route, once assigned, round-trips via the obs echo
++// and is adopted (ADR-0008 §6). Over budget the
++// ego is left unrouted and retried next observation (only the first-obs
++// lane is remembered for determinism — unrouted-due-to-budget must not
++// read as routed). Caller holds d.mu.
++func (d *Driver) routeStep(in *engine.Intent, ego *natsio.ObsEgo, budget *int) {
++	if d.routed[ego.ID] {
++		return
++	}
++	// Failover adoption: a re-claimed vehicle may already carry the
++	// persistent route its previous controller assigned (the obs frame
++	// round-trips it) — keep it. Re-deriving from the current lane would
++	// change the destination mid-trip (ADR-0008 §6: failover is
++	// behaviorally invisible).
++	want, ok := d.wantRoute[ego.ID]
++	if !ok {
++		want = d.cfg.Destination
++		if want == "" {
++			want = ego.Route
++		}
++		if want == "" && d.cfg.ExitRouting {
++			// The draw's lane input is captured at FIRST observation, not
++			// at budget admission: pickExit(seed, id, lane) must be a pure
++			// function of the run, never of controller lag (ADR-0007/0008
++			// failover replicas must draw the SAME exit — sol review).
++			lane, seen := d.wantLane[ego.ID]
++			if !seen {
++				if d.wantLane == nil {
++					d.wantLane = map[uint64]int{} // tests construct Driver directly
++				}
++				lane = ego.LaneIdx
++				d.wantLane[ego.ID] = lane
++			}
++			if *budget <= 0 {
++				return // past the per-tick routing budget — retry next obs
++			}
++			*budget--
++			want, _ = pickExit(d.net, d.exitCache(), d.spec.Seed, ego.ID, lane)
++		}
++		d.wantRoute[ego.ID] = want
++	}
++	// Core NATS publish has no ack: re-send until the obs frame echoes the
++	// destination — a dropped one-shot Route intent would leave the
++	// vehicle on default routing for life. Mark routed only when the
++	// engine confirms (or nothing is wanted).
++	if want == "" || ego.Route == want {
++		d.routed[ego.ID] = true
++		delete(d.wantRoute, ego.ID)
++		delete(d.wantLane, ego.ID)
++	} else {
++		in.RouteSet = true
++		in.Route = want
++	}
++}
++
+ // signalFor maps a lane decision to the informational signal axis.
+ func signalFor(laneDelta int) int {
+ 	switch {
+diff --git a/engine/natsio/driver/driver_test.go b/engine/natsio/driver/driver_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..7eba1bb1bce7fd2122de7a2d3767ea51f8afba05
+--- /dev/null
++++ b/engine/natsio/driver/driver_test.go
+@@ -0,0 +1,264 @@
++package driver
++
++import (
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/nats-io/nats-server/v2/server"
++	"github.com/nats-io/nats.go"
++	"traffic-sim/engine"
++	"traffic-sim/engine/natsio"
++)
++
++// driver_test.go — the per-tick routing budget (Config.RouteBudgetPerTick,
++// driver.go routeStep): an observation carrying more routable vehicles
++// than the budget resolves only N destinations; the rest stay COMPLETELY
++// untouched (no wantRoute entry, no routed mark) and are resolved by
++// subsequent observations. Runs against an in-process NATS server so the
++// real onObs (including intent publish) is exercised.
++
++func startTestBroker(t *testing.T) (*server.Server, *nats.Conn) {
++	t.Helper()
++	ns, err := server.NewServer(&server.Options{DontListen: true})
++	if err != nil {
++		t.Fatalf("nats-server NewServer: %v", err)
++	}
++	ns.Start()
++	if !ns.ReadyForConnections(10 * time.Second) {
++		t.Fatal("nats-server not ready")
++	}
++	nc, err := nats.Connect(nats.DefaultURL, nats.InProcessServer(ns))
++	if err != nil {
++		t.Fatalf("in-process connect: %v", err)
++	}
++	t.Cleanup(func() {
++		nc.Close()
++		ns.Shutdown()
++	})
++	return ns, nc
++}
++
++// intentCounter tallies RouteSet intents on the driver's intent subject.
++type intentCounter struct {
++	mu       sync.Mutex
++	routeSet int
++	total    int
++}
++
++func (c *intentCounter) subscribe(t *testing.T, nc *nats.Conn, run, id string) {
++	t.Helper()
++	_, err := nc.Subscribe(natsio.SubjectCtlIntent(run, id), func(m *nats.Msg) {
++		in, ok := natsio.DecodeIntent(m.Data)
++		c.mu.Lock()
++		defer c.mu.Unlock()
++		c.total++
++		if ok && in.RouteSet {
++			c.routeSet++
++		}
++	})
++	if err != nil {
++		t.Fatalf("subscribe intents: %v", err)
++	}
++}
++
++func (c *intentCounter) waitRouteSet(t *testing.T, want int) {
++	t.Helper()
++	deadline := time.Now().Add(5 * time.Second)
++	for time.Now().Before(deadline) {
++		c.mu.Lock()
++		got := c.routeSet
++		c.mu.Unlock()
++		if got == want {
++			return
++		}
++		time.Sleep(5 * time.Millisecond)
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	t.Fatalf("RouteSet intents = %d, want %d", c.routeSet, want)
++}
++
++// A vehicle that MOVES between first observation and budget admission
++// must draw from the FROZEN first-observation lane, not its current one
++// — that is what keeps the draw a pure function of (seed, id) rather
++// than controller timing (ADR-0007/0008 failover, sol review).
++func TestRouteBudgetFrozenLane(t *testing.T) {
++	_, nc := startTestBroker(t)
++	net := loadStopControl(t)
++
++	originIdx := -1
++	for _, o := range net.Origins {
++		if _, ok := pickExit(net, newExitCache(), 42, 7, o.Index); ok {
++			originIdx = o.Index
++			break
++		}
++	}
++	if originIdx < 0 {
++		t.Fatal("no fixture origin routes vehicle 7")
++	}
++
++	d := &Driver{
++		nc: nc,
++		cfg: Config{
++			Run:                "t",
++			ExitRouting:        true,
++			RouteBudgetPerTick: 1,
++		}.withDefaults(),
++		id:        "drv",
++		spec:      engine.RunSpec{Seed: 42},
++		types:     []*engine.VehicleType{&engine.Car},
++		net:       net,
++		fleet:     map[uint64]bool{},
++		pending:   map[uint64]bool{},
++		routed:    map[uint64]bool{},
++		streams:   map[uint64]*engine.Stream{},
++		wantRoute: map[uint64]string{},
++		wantLane:  map[uint64]int{},
++		done:      make(chan struct{}),
++	}
++
++	// Tick 1: two egos on the origin lane; budget 1 admits the first,
++	// vehicle 7 (lower ID wins the sorted walk... verify order) is second.
++	egos := []natsio.ObsEgo{{ID: 6, LaneIdx: originIdx}, {ID: 7, LaneIdx: originIdx}}
++	d.onObs(&nats.Msg{Data: natsio.EncodeObs(1, 0, egos, nil)})
++	if _, ok := d.wantRoute[7]; ok {
++		t.Fatal("vehicle 7 routed in tick 1 past the budget of 1")
++	}
++
++	// Tick 2: vehicle 7 has MOVED (different lane) — the draw must still
++	// use the tick-1 lane.
++	moved := (originIdx + 1) % len(net.Lanes)
++	egos = []natsio.ObsEgo{{ID: 6, LaneIdx: originIdx}, {ID: 7, LaneIdx: moved}}
++	d.onObs(&nats.Msg{Data: natsio.EncodeObs(2, 0, egos, nil)})
++	want, ok := pickExit(net, newExitCache(), 42, 7, originIdx)
++	if !ok {
++		t.Fatal("pickExit from the frozen lane fails")
++	}
++	if got := d.wantRoute[7]; got != want {
++		t.Fatalf("deferred draw = %q, want %q (frozen tick-1 lane, not the moved lane)", got, want)
++	}
++}
++
++func TestRouteBudgetPerTick(t *testing.T) {
++	_, nc := startTestBroker(t)
++	net := loadStopControl(t) // destinations_test.go fixture
++
++	// An origin where every test vehicle draws a reachable exit (per
++	// TestPickExitRouteFound, fixture origins are all-or-nothing).
++	originIdx := -1
++	for _, o := range net.Origins {
++		okAll := true
++		for vid := uint64(1); vid <= 5; vid++ {
++			if _, ok := pickExit(net, newExitCache(), 42, vid, o.Index); !ok {
++				okAll = false
++				break
++			}
++		}
++		if okAll {
++			originIdx = o.Index
++			break
++		}
++	}
++	if originIdx < 0 {
++		t.Fatal("no fixture origin routes all five test vehicles")
++	}
++
++	d := &Driver{
++		nc: nc,
++		cfg: Config{
++			Run:                "t",
++			ExitRouting:        true,
++			RouteBudgetPerTick: 2,
++		}.withDefaults(),
++		id:        "drv",
++		spec:      engine.RunSpec{Seed: 42},
++		types:     []*engine.VehicleType{&engine.Car},
++		net:       net,
++		fleet:     map[uint64]bool{},
++		pending:   map[uint64]bool{},
++		routed:    map[uint64]bool{},
++		streams:   map[uint64]*engine.Stream{},
++		wantRoute: map[uint64]string{},
++		done:      make(chan struct{}),
++	}
++	var counter intentCounter
++	counter.subscribe(t, nc, "t", "drv")
++
++	egos := make([]natsio.ObsEgo, 5)
++	for i := range egos {
++		egos[i] = natsio.ObsEgo{ID: uint64(i + 1), LaneIdx: originIdx}
++	}
++	obs := func(tick uint64) *nats.Msg {
++		return &nats.Msg{Data: natsio.EncodeObs(tick, 0, egos, nil)}
++	}
++
++	// Tick 1: budget 2 → exactly two destinations resolved and sent; the
++	// other three egos carry no route state (only their first-observation
++	// lane in wantLane — the frozen draw input). (RouteSet intent counts
++	// include the unconfirmed re-sends: an unresolved-but-sent destination
++	// is re-published every obs until the echo confirms — unmetered, cheap
++	// string copies — so cumulative counts below are 2, 2+2·2, 6+5.)
++	d.onObs(obs(1))
++	counter.waitRouteSet(t, 2)
++	if got := len(d.wantRoute); got != 2 {
++		t.Fatalf("after tick 1: %d wantRoute entries, want 2 (over-budget egos must stay untouched)", got)
++	}
++	if got := len(d.routed); got != 0 {
++		t.Fatalf("after tick 1: %d routed marks, want 0 (nothing echoed yet)", got)
++	}
++
++	// Tick 2: two more resolved (2 re-sends + 2 new = 4 this tick, 6
++	// total); tick 3: the last one (2+2 re-sends + 1 new = 5, 11 total).
++	d.onObs(obs(2))
++	counter.waitRouteSet(t, 6)
++	if got := len(d.wantRoute); got != 4 {
++		t.Fatalf("after tick 2: %d wantRoute entries, want 4", got)
++	}
++	d.onObs(obs(3))
++	counter.waitRouteSet(t, 11)
++	if got := len(d.wantRoute); got != 5 {
++		t.Fatalf("after tick 3: %d wantRoute entries, want 5", got)
++	}
++
++	// Tick 4: the obs echoes the assigned destinations (engine applied
++	// them) — every vehicle flips to routed and no new Route intent goes
++	// out.
++	for i := range egos {
++		egos[i].Route = d.wantRoute[egos[i].ID]
++	}
++	d.onObs(obs(4))
++	if got := len(d.routed); got != 5 {
++		t.Fatalf("after echo: %d routed, want 5", got)
++	}
++	if got := len(d.wantRoute); got != 0 {
++		t.Fatalf("after echo: %d wantRoute entries, want 0", got)
++	}
++	// The intent counter is written on a subscriber goroutine: the count
++	// must hold STEADY at 11 through a quiet interval before we declare
++	// no extra RouteSet was sent — a single lucky read false-passes (sol
++	// review).
++	stable := 0
++	final := -1
++	deadline := time.Now().Add(1 * time.Second)
++	for time.Now().Before(deadline) {
++		counter.mu.Lock()
++		final = counter.routeSet
++		counter.mu.Unlock()
++		if final > 11 {
++			t.Fatalf("echo tick sent %d extra RouteSet intents, want 0", final-11)
++		}
++		if final == 11 {
++			stable++
++			if stable >= 10 { // ~100 ms quiet
++				break
++			}
++		} else {
++			stable = 0
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	if final != 11 {
++		t.Fatalf("routeSet counter = %d, want 11 (initial sends lost?)", final)
++	}
++}

@@ -33,6 +33,7 @@ closed (2026-07-15..17).
 | [ADR-0016](../../decisions/ADR-0016-tssg-chunking.md) | Live-plane signal tables are chunked like keyframes (`sig_chunk: "i/n"` header, 768 KiB target, no header = whole table) plus request-reply catch-up on `ts.{run}.state.sig.req` so a busy client pulls the table when ready; server `max_payload` amended to 4 MiB headroom, per-message discipline stays ~768 KiB chunks | City-scale tables (sf-lean 2.1 MB, la-lean 7.3 MB) blew the 1 MiB cap, and a browser parsing a 1.4M-lane network becomes a slow consumer whose deliveries are silently dropped — push-and-pray had to become pull-when-ready | Design round 2026-07-24 (Fable + Sol, [reviews](../../raw/reviews/)); ADR-0015 precedent |
 | [ADR-0017](../../decisions/ADR-0017-city-import-decisions.md) | City-scale OSM imports: no `--junctions.join` (stop override keys by OSM node id), `priority_stop` accepted as a whole-junction approximation, OSM relations (turn restrictions) not imported, directionless stops infer from oneway else forward with a reported count | The stop-sign pipeline (netconvert ignores `highway=stop`, eclipse-sumo #5244) forced each trade-off; recording them keeps the deviations from reading as oversights | ep-03 city imports (six metros); external-review rounds 2026-07-24 ([reviews](../../raw/reviews/)) |
 | [ADR-0018](../../decisions/ADR-0018-chunked-geojson.md) | City-scale network GeoJSON is served chunked over HTTP: manifest (`frame` + empty features + `parts`) at `/net/{id}.geojson`, hash-pinned part URLs that 404 a stale generation, sequential client fetch; small nets byte-identical | V8's ~537M-char string cap makes la-lean's ~860 MB single document unparseable; chunking keeps the existing endpoint and cache instead of a vector-tile migration | ADR-0015/0016 chunking precedent; la-lean browser verification 2026-07-24 |
+| [ADR-0019](../../decisions/ADR-0019-route-budget-determinism.md) | Route-budget determinism bound: per-replica admission timing (~0.3 sim-s worst case) and mid-queue failover lane re-freeze are accepted and bounded; strict fix is O(1) global exit-reachability, retiring the budget | City-scale cold-origin reachability scans stalled the obs path (measured sf-lean); the budget is the throttle, its edge cases are the recorded price | sf-lean stall diagnosis 2026-07-24; sol review rounds |
 
 ## Research Complete, ADR Pending
 
@@ -56,4 +57,4 @@ These areas have finished research (the gate) but no drafted ADR yet — see
   [VISION.md](../../../VISION.md).
 
 ---
-*Derived from: [decisions/](../../decisions/) ADR-0001..0018 and the raw research syntheses linked above*
+*Derived from: [decisions/](../../decisions/) ADR-0001..0019 and the raw research syntheses linked above*

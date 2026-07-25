@@ -1,0 +1,1361 @@
+diff --git a/engine/cmd/demosrv/demosrv_test.go b/engine/cmd/demosrv/demosrv_test.go
+index a25261444437ef32a3b07075e141136b9c569140..fa405823a11c04c6cbbbd70d89ed74d72ae8bb42 100644
+--- a/engine/cmd/demosrv/demosrv_test.go
++++ b/engine/cmd/demosrv/demosrv_test.go
+@@ -398,7 +398,7 @@ func TestHTTPEndpoints(t *testing.T) {
+ 	if code != 200 {
+ 		t.Fatalf("start = %d (%v)", code, body)
+ 	}
+-	if want := "/app/?run=r1&net=/net/d1.geojson"; body["url"] != want {
++	if want := "/app/?run=r1&net=/net/d1.geojson&ws=ws://127.0.0.1:8443"; body["url"] != want {
+ 		t.Errorf("start url = %v, want %s", body["url"], want)
+ 	}
+ 
+diff --git a/engine/cmd/demosrv/geojson.go b/engine/cmd/demosrv/geojson.go
+index cc49e1a994df0018b0d7f8bb38a85f3112ca9fc9..0471ad608e715f598a15ee9ade77e4a0f2b372b3 100644
+--- a/engine/cmd/demosrv/geojson.go
++++ b/engine/cmd/demosrv/geojson.go
+@@ -10,16 +10,36 @@ package main
+ // ADR-0012 §2 approved exception, confined to that package), never from
+ // YAML sniffing here.
+ //
+-// The cache is keyed by CONTENT identity — {id}.{hash12}.geojson, hash12
+-// from the scenario's ADR-0012 content hash — not by entry id alone: an
+-// edit-then-revert of the scenario must not resurrect a stale edited
+-// network from the cache (the recording hash check would pass against the
+-// reverted scenario while the viz renders the edited one). Any content
+-// change simply lands in a NEW cache file; orphans are harmless (a dev
+-// cache). scenario.Load per request is trivially cheap — the same
+-// no-memoization discipline as params.go.
++// The cache is keyed by CONTENT identity — {id}.{schema}.{hash12}.geojson,
++// hash12 from the scenario's ADR-0012 content hash — not by entry id
++// alone: an edit-then-revert of the scenario must not resurrect a stale
++// edited network from the cache (the recording hash check would pass
++// against the reverted scenario while the viz renders the edited one).
++// Any content change simply lands in a NEW cache file; orphans are
++// harmless (a dev cache). scenario.Load per request is trivially cheap —
++// the same no-memoization discipline as params.go.
++//
++// CHUNKED SERVING (networks over geojsonChunkThreshold — V8's ~537M-char
++// string cap means the browser can never JSON.parse a bigger single
++// document): /net/{id}.geojson serves a small MANIFEST instead — a valid
++// FeatureCollection with the same "frame" member, an EMPTY features
++// array, and a "parts" foreign member listing part URLs in lane order:
++//
++//	{"type":"FeatureCollection","frame":{...},
++//	 "parts":["/net/{id}.geojson.part-000", ...], "features":[]}
++//
++// Each part ({id}.{schema}.{hash}.part-NNN.geojson in the cache) is a
++// standalone FeatureCollection under the threshold with a slice of the
++// lanes, split at feature boundaries by engine.WriteGeoJSONRange (never
++// text-split JSON). The viz fetches parts sequentially and concatenates
++// features (viz/src/netload.ts). Manifest mode depends on the same
++// geojsonSchemaVersion as single-file mode — parts carry the same
++// per-feature schema. Generation writes every part (temp+rename) and the
++// manifest LAST, so a killed generation can't serve a half-set: no
++// manifest → next request regenerates, orphaned parts are harmless.
+ 
+ import (
++	"bytes"
+ 	"encoding/json"
+ 	"fmt"
+ 	"os"
+@@ -30,13 +50,37 @@ import (
+ 	"traffic-sim/engine/scenario"
+ )
+ 
++// geojsonSchemaVersion versions the EXPORTER's output schema in the cache
++// filename: the scenario content hash covers the network file, NOT the
++// exporter, so a WriteGeoJSON change (new/changed properties or geometry)
++// would otherwise keep serving stale pre-change cache files. BUMP THIS
++// whenever engine.WriteGeoJSON's output schema changes. Superseded files
++// become harmless orphans.
++const geojsonSchemaVersion = "v2" // v2: + junction/row lane properties (ADR-0010)
++
++// geojsonChunkThreshold is the single-file size limit (256 MiB): past it
++// the cache generates part files + a manifest instead of one document.
++// Comfortably under V8's max string length (~537M chars), so the browser
++// can always parse a part. A var (not a const) so tests can lower it.
++var geojsonChunkThreshold = 256 << 20
++
++// geoJSONManifest is the chunked-serving contract (see the header comment).
++type geoJSONManifest struct {
++	Type     string               `json:"type"` // "FeatureCollection"
++	Frame    *engine.GeoJSONFrame `json:"frame,omitempty"`
++	Parts    []string             `json:"parts"`
++	Features []any                `json:"features"`
++}
++
+ type netCache struct {
+ 	dir string
+ 	mu  sync.Mutex // generation is rare and cheap; one at a time is plenty
+ }
+ 
+ // path returns the cached GeoJSON file for a demo or recording id,
+-// generating it on first use from the entry's scenario directory.
++// generating it on first use from the entry's scenario directory. Over the
++// chunk threshold the returned file is the MANIFEST (the part files sit
++// alongside it in the cache).
+ func (c *netCache) path(id, scenarioDir string) (string, error) {
+ 	scen, err := scenario.Load(scenarioDir)
+ 	if err != nil {
+@@ -46,7 +90,7 @@ func (c *netCache) path(id, scenarioDir string) (string, error) {
+ 	if len(hash) > 12 {
+ 		hash = hash[:12]
+ 	}
+-	path := filepath.Join(c.dir, id+"."+hash+".geojson")
++	path := filepath.Join(c.dir, id+"."+geojsonSchemaVersion+"."+hash+".geojson")
+ 	if _, err := os.Stat(path); err == nil {
+ 		return path, nil
+ 	}
+@@ -64,25 +108,116 @@ func (c *netCache) path(id, scenarioDir string) (string, error) {
+ 	if err := json.Unmarshal(data, &nf); err != nil {
+ 		return "", fmt.Errorf("netfile %s: %w", scen.NetPath, err)
+ 	}
+-	// Atomic write (temp + rename): a killed demosrv must not leave a
+-	// truncated file the next run would happily serve from the cache.
+-	tmp := path + ".tmp"
+-	f, err := os.Create(tmp)
++	// Generate the full document once to size it (a big-city one-off spike,
++	// ~1 GB for la-lean — acceptable, it's cached from then on).
++	var buf bytes.Buffer
++	if err := engine.WriteGeoJSON(&nf, &buf); err != nil {
++		return "", err
++	}
++	if buf.Len() <= geojsonChunkThreshold {
++		// Small net: single-file behavior, byte-for-byte as before.
++		if err := writeAtomic(path, buf.Bytes()); err != nil {
++			return "", err
++		}
++		return path, nil
++	}
++	// Chunked: part files first, manifest LAST (see the header comment).
++	nLanes := len(nf.Lanes)
++	nParts := buf.Len()/geojsonChunkThreshold + 1
++	per := (nLanes + nParts - 1) / nParts
++	var partURLs []string
++	partIdx := 0
++	var writePart func(start, end int) error
++	writePart = func(start, end int) error {
++		var pbuf bytes.Buffer
++		if err := engine.WriteGeoJSONRange(&nf, &pbuf, start, end); err != nil {
++			return err
++		}
++		if pbuf.Len() > geojsonChunkThreshold && end-start > 1 {
++			// A feature-heavy range (giant shapes): split finer. A single
++			// lane over the threshold is emitted as-is — the client
++			// contract is per-document parseability, and no real lane
++			// shape approaches 256 MiB.
++			mid := start + (end-start)/2
++			if err := writePart(start, mid); err != nil {
++				return err
++			}
++			return writePart(mid, end)
++		}
++		partPath := filepath.Join(c.dir, fmt.Sprintf("%s.%s.%s.part-%03d.geojson", id, geojsonSchemaVersion, hash, partIdx))
++		if err := writeAtomic(partPath, pbuf.Bytes()); err != nil {
++			return err
++		}
++		partURLs = append(partURLs, fmt.Sprintf("/net/%s.geojson.part-%03d", id, partIdx))
++		partIdx++
++		return nil
++	}
++	for start := 0; start < nLanes; start += per {
++		end := start + per
++		if end > nLanes {
++			end = nLanes
++		}
++		if err := writePart(start, end); err != nil {
++			return "", err
++		}
++	}
++	manifest, err := json.Marshal(geoJSONManifest{
++		Type:     "FeatureCollection",
++		Frame:    geoJSONFrameOf(&nf),
++		Parts:    partURLs,
++		Features: []any{},
++	})
+ 	if err != nil {
+ 		return "", err
+ 	}
+-	if err := engine.WriteGeoJSON(&nf, f); err != nil {
+-		f.Close()
+-		os.Remove(tmp)
++	if err := writeAtomic(path, manifest); err != nil {
+ 		return "", err
+ 	}
+-	if err := f.Close(); err != nil {
+-		os.Remove(tmp)
++	return path, nil
++}
++
++// part returns the cached part file for a chunked network, generating the
++// whole set first when the cache is cold (path writes parts + manifest as
++// one generation).
++func (c *netCache) part(id, scenarioDir string, idx int) (string, error) {
++	if _, err := c.path(id, scenarioDir); err != nil {
+ 		return "", err
+ 	}
++	scen, err := scenario.Load(scenarioDir)
++	if err != nil {
++		return "", err
++	}
++	hash := scen.Hash()
++	if len(hash) > 12 {
++		hash = hash[:12]
++	}
++	p := filepath.Join(c.dir, fmt.Sprintf("%s.%s.%s.part-%03d.geojson", id, geojsonSchemaVersion, hash, idx))
++	if _, err := os.Stat(p); err != nil {
++		return "", fmt.Errorf("no part %03d for %q", idx, id)
++	}
++	return p, nil
++}
++
++// geoJSONFrameOf mirrors the exporter's frame descriptor for the manifest
++// (engine/geojson.go GeoJSONFrame from the network provenance).
++func geoJSONFrameOf(nf *engine.NetFile) *engine.GeoJSONFrame {
++	p := nf.Provenance
++	if p == nil {
++		return nil
++	}
++	return &engine.GeoJSONFrame{Projection: p.Projection, NetOffset: p.NetOffset, OSMBbox: p.OSMBbox}
++}
++
++// writeAtomic writes a cache file temp+rename: a killed demosrv must not
++// leave a truncated file the next run would happily serve from the cache.
++func writeAtomic(path string, data []byte) error {
++	tmp := path + ".tmp"
++	if err := os.WriteFile(tmp, data, 0o644); err != nil {
++		return err
++	}
+ 	if err := os.Rename(tmp, path); err != nil {
+ 		os.Remove(tmp)
+-		return "", err
++		return err
+ 	}
+-	return path, nil
++	return nil
+ }
+diff --git a/engine/cmd/demosrv/geojson_test.go b/engine/cmd/demosrv/geojson_test.go
+index f12955ac731c4a75cffca007a47f6f37594b222b..cc76c6b182f11692ad1a6f18c13452f03f582b1b 100644
+--- a/engine/cmd/demosrv/geojson_test.go
++++ b/engine/cmd/demosrv/geojson_test.go
+@@ -5,9 +5,16 @@ package main
+ // and an edit-then-revert serves the ORIGINAL network, never a stale one.
+ 
+ import (
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
+ 	"os"
+ 	"path/filepath"
++	"strings"
+ 	"testing"
++
++	"traffic-sim/engine"
+ )
+ 
+ func TestNetCacheContentKeyed(t *testing.T) {
+@@ -56,3 +63,259 @@ func TestNetCacheContentKeyed(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// writeScenarioDirLanes builds an on-disk scenario with an n-lane chain
++// (plus network provenance, so the frame descriptor survives into the
++// manifest and every part) sized to trip a lowered chunk threshold.
++func writeScenarioDirLanes(t *testing.T, n int) string {
++	t.Helper()
++	dir := t.TempDir()
++	nf := engine.NetFile{
++		Version: 1,
++		Name:    "chunk-test",
++		Provenance: &engine.NetProvenance{
++			Projection: "+proj=utm +zone=10 +ellps=WGS84 +datum=WGS84 +units=m +no_defs",
++			NetOffset:  [2]float64{-1000, -2000},
++		},
++	}
++	for i := 0; i < n; i++ {
++		var succ []string
++		if i+1 < n {
++			succ = []string{fmt.Sprintf("a_%d", i+1)}
++		}
++		shape := make([][2]float64, 10)
++		for j := range shape {
++			shape[j] = [2]float64{float64(i*100 + j*10), float64(j)}
++		}
++		nf.Lanes = append(nf.Lanes, engine.NetLane{
++			ID: fmt.Sprintf("a_%d", i), Section: "a", Length: 90, SpeedLimit: 15,
++			Width: 3.2, Shape: shape, Successors: succ, Origin: i == 0, Exit: i == n-1,
++		})
++	}
++	data, err := json.Marshal(nf)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(dir, "network.json"), data, 0o644); err != nil {
++		t.Fatal(err)
++	}
++	manifest := `format_version: 1
++id: chunk-test
++seed: 7
++ticks: 300
++network: network.json
++types: [car]
++spawner:
++  rate_per_lane_h: 600
++`
++	if err := os.WriteFile(filepath.Join(dir, "scenario.yaml"), []byte(manifest), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	return dir
++}
++
++// withChunkThreshold lowers the split threshold for the test and restores
++// it after (the suite runs serially).
++func withChunkThreshold(t *testing.T, v int) {
++	t.Helper()
++	old := geojsonChunkThreshold
++	geojsonChunkThreshold = v
++	t.Cleanup(func() { geojsonChunkThreshold = old })
++}
++
++// readCollection parses a cached geojson file's shape relevant to the
++// chunked contract (foreign members ride the map).
++func readCollection(t *testing.T, path string) (features []any, frame map[string]any, raw map[string]any) {
++	t.Helper()
++	data, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := json.Unmarshal(data, &raw); err != nil {
++		t.Fatalf("%s: not valid JSON: %v", path, err)
++	}
++	if raw["type"] != "FeatureCollection" {
++		t.Fatalf("%s: type = %v", path, raw["type"])
++	}
++	feats, _ := raw["features"].([]any)
++	fr, _ := raw["frame"].(map[string]any)
++	return feats, fr, raw
++}
++
++// Small nets never chunk: the 2-lane fixture (~700 bytes) under a 6 KiB
++// threshold produces one plain collection — no manifest, no part files.
++func TestNetCacheSmallNetNoManifest(t *testing.T) {
++	withChunkThreshold(t, 6<<10)
++	scen := writeScenarioDir(t)
++	c := &netCache{dir: t.TempDir()}
++	p, err := c.path("d1", scen)
++	if err != nil {
++		t.Fatal(err)
++	}
++	feats, _, raw := readCollection(t, p)
++	if len(feats) != 2 {
++		t.Fatalf("features = %d, want 2 (single-file path)", len(feats))
++	}
++	if _, ok := raw["parts"]; ok {
++		t.Fatal("small net must not carry a parts manifest member")
++	}
++	entries, err := os.ReadDir(c.dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, e := range entries {
++		if strings.Contains(e.Name(), ".part-") {
++			t.Fatalf("small net produced a part file: %s", e.Name())
++		}
++	}
++}
++
++// Chunked contract: over the threshold the main cache file is a MANIFEST
++// (frame + empty features + ordered part URLs), every part is a valid
++// standalone FeatureCollection under the threshold carrying the frame,
++// and the parts reassemble to the full lane list in order.
++func TestNetCacheChunked(t *testing.T) {
++	withChunkThreshold(t, 6<<10)
++	const lanes = 40
++	scen := writeScenarioDirLanes(t, lanes)
++	c := &netCache{dir: t.TempDir()}
++
++	p, err := c.path("d1", scen)
++	if err != nil {
++		t.Fatal(err)
++	}
++	feats, frame, raw := readCollection(t, p)
++	if len(feats) != 0 {
++		t.Fatalf("manifest features = %d, want 0", len(feats))
++	}
++	if frame == nil || frame["projection"] == "" {
++		t.Fatalf("manifest lost the frame descriptor: %v", frame)
++	}
++	partURLs, ok := raw["parts"].([]any)
++	if !ok || len(partURLs) < 2 {
++		t.Fatalf("manifest parts = %v, want ≥ 2 URLs", raw["parts"])
++	}
++
++	seen := 0
++	for i, u := range partURLs {
++		// The manifest URL shape is /net/{id}.geojson.part-NNN.
++		want := fmt.Sprintf("/net/d1.geojson.part-%03d", i)
++		if u.(string) != want {
++			t.Fatalf("part %d URL = %v, want %s", i, u, want)
++		}
++		pp, err := c.part("d1", scen, i)
++		if err != nil {
++			t.Fatal(err)
++		}
++		info, err := os.Stat(pp)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if info.Size() > int64(geojsonChunkThreshold) {
++			t.Fatalf("part %d is %d bytes, over the %d threshold", i, info.Size(), geojsonChunkThreshold)
++		}
++		pfeats, pframe, _ := readCollection(t, pp)
++		if pframe == nil || pframe["projection"] != frame["projection"] {
++			t.Fatalf("part %d lost the frame descriptor", i)
++		}
++		for _, f := range pfeats {
++			id := f.(map[string]any)["id"].(string)
++			if want := fmt.Sprintf("a_%d", seen); id != want {
++				t.Fatalf("feature %d id = %s, want %s (order not preserved)", seen, id, want)
++			}
++			seen++
++		}
++	}
++	if seen != lanes {
++		t.Fatalf("reassembled %d features, want %d", seen, lanes)
++	}
++	if _, err := c.part("d1", scen, len(partURLs)); err == nil {
++		t.Fatal("out-of-range part index must fail")
++	}
++}
++
++// The manifest survives JSON re-encoding byte-for-byte (the contract the
++// viz parses): type, frame, parts, features — nothing else required.
++func TestManifestShape(t *testing.T) {
++	m := geoJSONManifest{
++		Type:     "FeatureCollection",
++		Frame:    &engine.GeoJSONFrame{Projection: "p", NetOffset: [2]float64{1, 2}},
++		Parts:    []string{"/net/d1.geojson.part-000"},
++		Features: []any{},
++	}
++	data, err := json.Marshal(m)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var raw map[string]any
++	if err := json.Unmarshal(data, &raw); err != nil {
++		t.Fatal(err)
++	}
++	for _, k := range []string{"type", "frame", "parts", "features"} {
++		if _, ok := raw[k]; !ok {
++			t.Fatalf("manifest missing %q: %s", k, data)
++		}
++	}
++	if feats := raw["features"].([]any); len(feats) != 0 {
++		t.Fatalf("features = %v, want []", feats)
++	}
++}
++
++// HTTP contract: /net/{id}.geojson serves the manifest for a chunked net,
++// /net/{id}.geojson.part-NNN serves the part, and a bad part index 404s.
++func TestHandleNetChunkedParts(t *testing.T) {
++	withChunkThreshold(t, 6<<10)
++	scen := writeScenarioDirLanes(t, 40)
++	srv, _, _ := newReplayTestServer(t, "http://127.0.0.1:1") // ctl plane unused by /net/
++	srv.reg = &Registry{
++		Demos: []*Demo{{ID: "d1", Title: "Demo", Run: "r1", ScenarioDir: scen, Kind: "demo"}},
++	}
++	ts := httptest.NewServer(srv.routes())
++	defer ts.Close()
++
++	get := func(path string) (*http.Response, map[string]any) {
++		t.Helper()
++		resp, err := http.Get(ts.URL + path)
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer resp.Body.Close()
++		var v map[string]any
++		_ = json.NewDecoder(resp.Body).Decode(&v)
++		return resp, v
++	}
++
++	resp, manifest := get("/net/d1.geojson")
++	if resp.StatusCode != 200 {
++		t.Fatalf("GET /net/d1.geojson = %d", resp.StatusCode)
++	}
++	parts, ok := manifest["parts"].([]any)
++	if !ok || len(parts) < 2 {
++		t.Fatalf("manifest = %v, want ≥ 2 parts", manifest)
++	}
++	if feats := manifest["features"].([]any); len(feats) != 0 {
++		t.Fatalf("manifest features = %v, want []", feats)
++	}
++
++	// Part URLs are served relative to the server root.
++	partPath := parts[0].(string)
++	resp, part := get(partPath)
++	if resp.StatusCode != 200 || !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/geo+json") {
++		t.Fatalf("GET %s = %d %q", partPath, resp.StatusCode, resp.Header.Get("Content-Type"))
++	}
++	if len(part["features"].([]any)) == 0 {
++		t.Fatalf("part %s has no features", partPath)
++	}
++	if part["frame"] == nil {
++		t.Fatalf("part %s lost the frame descriptor", partPath)
++	}
++
++	resp, _ = get("/net/d1.geojson.part-999")
++	if resp.StatusCode != 404 {
++		t.Fatalf("out-of-range part = %d, want 404", resp.StatusCode)
++	}
++	resp, _ = get("/net/d1.geojson.part-abc")
++	if resp.StatusCode != 404 {
++		t.Fatalf("non-numeric part index = %d, want 404", resp.StatusCode)
++	}
++}
+diff --git a/engine/cmd/demosrv/identity_test.go b/engine/cmd/demosrv/identity_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..88878b30228eebeebb64117a6b5c9c112e374554
+--- /dev/null
++++ b/engine/cmd/demosrv/identity_test.go
+@@ -0,0 +1,211 @@
++package main
++
++// identity_test.go — the demo-spawn identity phase (supervisor.waitIdentity)
++// against REAL embedded NATS servers with WebSocket listeners (serve's own
++// broker shape): the happy path (registry holds {run}/meta), the foreign
++// broker (a ws listener that answers the port probe but has no such run),
++// and the child that dies mid-probe (the foreign-port incident's failure
++// mode — bind failure must surface in seconds, with the child's stderr
++// tail, not after the full identity timeout).
++
++import (
++	"fmt"
++	"io"
++	"log"
++	"net"
++	"os/exec"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	natsserver "github.com/nats-io/nats-server/v2/server"
++	"github.com/nats-io/nats.go"
++
++	"traffic-sim/engine/natsio"
++)
++
++// wsNatsServer starts an embedded NATS server with a WebSocket listener on
++// a free loopback port (DontListen for the client port, like serve) and
++// returns its host:port. JetStream is on; whether the ts_runs bucket or the
++// {run}/meta key exist is the TEST's choice — that difference is exactly
++// the identity question.
++func wsNatsServer(t *testing.T) string {
++	t.Helper()
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	port := ln.Addr().(*net.TCPAddr).Port
++	ln.Close()
++	ns, err := natsserver.NewServer(&natsserver.Options{
++		DontListen: true,
++		JetStream:  true,
++		StoreDir:   t.TempDir(),
++		Websocket:  natsserver.WebsocketOpts{Host: "127.0.0.1", Port: port, NoTLS: true},
++	})
++	if err != nil {
++		t.Fatalf("nats-server NewServer: %v", err)
++	}
++	ns.Start()
++	if !ns.ReadyForConnections(10 * time.Second) {
++		t.Fatal("nats-server not ready")
++	}
++	t.Cleanup(ns.Shutdown)
++	return fmt.Sprintf("127.0.0.1:%d", port)
++}
++
++// putRunMeta creates the ts_runs bucket and writes {run}/meta — the
++// registry state reg.Start leaves behind inside RunLive.
++func putRunMeta(t *testing.T, addr, run string) {
++	t.Helper()
++	nc, err := nats.Connect("ws://" + addr)
++	if err != nil {
++		t.Fatalf("ws connect: %v", err)
++	}
++	defer nc.Close()
++	js, err := nc.JetStream()
++	if err != nil {
++		t.Fatalf("JetStream: %v", err)
++	}
++	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: natsio.RegistryBucket})
++	if err != nil {
++		t.Fatalf("create bucket: %v", err)
++	}
++	if _, err := kv.Put(run+"/meta", []byte(`{"run_id":"`+run+`"}`)); err != nil {
++		t.Fatalf("put meta: %v", err)
++	}
++}
++
++// Happy path: the broker on the ws port carries OUR run's registry entry —
++// port probe AND identity probe pass, start succeeds.
++func TestSupervisorDemoIdentityHappyPath(t *testing.T) {
++	addr := wsNatsServer(t)
++	putRunMeta(t, addr, "r1")
++
++	var mu sync.Mutex
++	var cmds []*exec.Cmd
++	sup := newSupervisor(sleepSpawner(&cmds, &mu))
++	sup.wsAddr = addr
++
++	if err := sup.start(spawnTarget{Kind: "demo", Demo: &Demo{ID: "d1", Run: "r1"}}, nil); err != nil {
++		t.Fatalf("start with our run registered: %v", err)
++	}
++	if id, _, _, ok := sup.status(); !ok || id != "d1" {
++		t.Fatalf("status after start = (%q, %v), want (d1, true)", id, ok)
++	}
++	sup.stop()
++	mu.Lock()
++	c0 := cmds[0]
++	mu.Unlock()
++	waitDead(t, c0, "demo child after stop")
++}
++
++// Foreign broker: a ws listener answers the port probe but its registry has
++// no {run}/meta (another session's engine — the incident shape). The child
++// stays alive, so the failure comes from the identity phase timeout, and
++// the error must name the run id so the user knows WHICH run never showed.
++func TestSupervisorDemoIdentityForeignBroker(t *testing.T) {
++	addr := wsNatsServer(t) // JetStream up, but no ts_runs bucket at all
++
++	var mu sync.Mutex
++	var cmds []*exec.Cmd
++	sup := newSupervisor(sleepSpawner(&cmds, &mu))
++	sup.wsAddr = addr
++	sup.identityTimeout = 1500 * time.Millisecond
++
++	start := time.Now()
++	err := sup.start(spawnTarget{Kind: "demo", Demo: &Demo{ID: "d1", Run: "r1"}}, nil)
++	if err == nil {
++		t.Fatal("start succeeded against a broker with no such run")
++	}
++	if !strings.Contains(err.Error(), `"r1"`) || !strings.Contains(err.Error(), natsio.RegistryBucket) {
++		t.Errorf("error %q, want it to name the run id and the registry bucket", err)
++	}
++	if elapsed := time.Since(start); elapsed < 1500*time.Millisecond || elapsed > 15*time.Second {
++		t.Errorf("start took %s, want ~identityTimeout", elapsed)
++	}
++	if _, _, _, ok := sup.status(); ok {
++		t.Fatal("status after failed start = active, want idle")
++	}
++	mu.Lock()
++	n := len(cmds)
++	c0 := cmds[0]
++	mu.Unlock()
++	if n != 1 {
++		t.Fatalf("%d spawns, want 1", n)
++	}
++	waitDead(t, c0, "child after failed identity probe")
++}
++
++// Child dies during the identity probe — the foreign-port case in reverse:
++// the port is held by a foreign listener, OUR child fails its bind and
++// exits, and start must fail in seconds (not after the 120 s identity
++// timeout) with the child's captured stderr tail in the error.
++func TestSupervisorDemoIdentityChildExits(t *testing.T) {
++	addr := wsNatsServer(t) // port answers; no such run
++
++	// Spawn stub shaped like childSpawner: a process that writes its
++	// failure to stderr and exits immediately, output teed through a
++	// prefixWriter so the supervisor can quote the tail.
++	spawner := func(tg spawnTarget) (*exec.Cmd, error) {
++		cmd := exec.Command("sh", "-c", "echo 'driver: hello: nats: no responders' >&2; exit 1")
++		w := &prefixWriter{lg: log.New(io.Discard, "", 0), prefix: "[" + tg.id() + "] "}
++		cmd.Stdout = w
++		cmd.Stderr = w
++		if err := cmd.Start(); err != nil {
++			return nil, err
++		}
++		return cmd, nil
++	}
++	sup := newSupervisor(spawner)
++	sup.wsAddr = addr
++	sup.identityTimeout = 60 * time.Second // would hang the test if done didn't abort
++
++	start := time.Now()
++	err := sup.start(spawnTarget{Kind: "demo", Demo: &Demo{ID: "d1", Run: "r1"}}, nil)
++	if err == nil {
++		t.Fatal("start succeeded with a dead child")
++	}
++	if !strings.Contains(err.Error(), "engine exited during startup") {
++		t.Errorf("error %q, want the child-exit report", err)
++	}
++	if !strings.Contains(err.Error(), "driver: hello: nats: no responders") {
++		t.Errorf("error %q, want the child's stderr tail", err)
++	}
++	if elapsed := time.Since(start); elapsed > 10*time.Second {
++		t.Errorf("start blocked %s with a dead child, want seconds", elapsed)
++	}
++	if _, _, _, ok := sup.status(); ok {
++		t.Fatal("status after failed start = active, want idle")
++	}
++}
++
++// prefixWriter's ring keeps only the last tailLines lines and joins them
++// oldest-first — the tail must carry the FAILURE line, not the child's
++// whole log.
++func TestPrefixWriterTailRing(t *testing.T) {
++	w := &prefixWriter{lg: log.New(io.Discard, "", 0), prefix: "[x] "}
++	var sb strings.Builder
++	for i := 0; i < tailLines+5; i++ {
++		fmt.Fprintf(&sb, "line-%d\n", i)
++	}
++	if _, err := w.Write([]byte(sb.String())); err != nil {
++		t.Fatal(err)
++	}
++	tail := w.tail()
++	lines := strings.Split(tail, "\n")
++	if len(lines) != tailLines {
++		t.Fatalf("tail has %d lines, want %d", len(lines), tailLines)
++	}
++	if lines[0] != "line-5" || lines[len(lines)-1] != fmt.Sprintf("line-%d", tailLines+4) {
++		t.Errorf("tail spans %q..%q, want line-5..line-%d", lines[0], lines[len(lines)-1], tailLines+4)
++	}
++	// A partial trailing line never reaches the ring.
++	if _, err := w.Write([]byte("partial")); err != nil {
++		t.Fatal(err)
++	}
++	if strings.Contains(w.tail(), "partial") {
++		t.Error("tail includes the unterminated partial line")
++	}
++}
+diff --git a/engine/cmd/demosrv/main.go b/engine/cmd/demosrv/main.go
+index 7ed7f67c936f867474710d690df7666ca6f4f55e..ec4eb2c89a2d075d7b5483b6071a4717b79e2e52 100644
+--- a/engine/cmd/demosrv/main.go
++++ b/engine/cmd/demosrv/main.go
+@@ -45,12 +45,16 @@ func main() {
+ 	vizDir := flag.String("viz", "viz/dist", "built viz to serve (cd viz && pnpm build): demos.html (menu) + index.html (map app)")
+ 	netcacheDir := flag.String("netcache", "data/networks/.geojson-cache", "per-demo network GeoJSON cache")
+ 	overlayDir := flag.String("overlaydir", "data/networks/overlays", "static overlay GeoJSON directory (zones/boundaries, WGS84) — a missing dir just 404s /overlay/*")
++	wsAddr := flag.String("ws", "127.0.0.1:8443", "engine WebSocket listen address for spawned runs; override when another process holds 8443 (clients are told via /api/demos + start URLs)")
+ 	flag.Parse()
+ 
++	wsListenAddr = *wsAddr
++
+ 	reg, err := LoadRegistry(*demosPath)
+ 	if err != nil {
+ 		log.Fatalf("demosrv: %v", err)
+ 	}
++	reg.WS = wsClientURL()
+ 	if err := os.MkdirAll(*netcacheDir, 0o755); err != nil {
+ 		log.Fatalf("demosrv: netcache: %v", err)
+ 	}
+@@ -146,9 +150,12 @@ func childSpawner(serveBin, replayBin string, lg *log.Logger) spawnFunc {
+ }
+ 
+ // serveArgs builds the serve command line for a live demo: scenario/run
+-// plus the optional seed/ticks/capacity overrides.
++// plus the optional seed/ticks/capacity overrides. The attach timeout is
++// raised from serve's 30 s default: the embedded driver attaches only after
++// world build + its initial exit-routing pass — ~100 s on sf-lean (303k
++// lanes), ~400 s on la-lean (1.38M lanes, the menu's biggest net).
+ func serveArgs(d *Demo) []string {
+-	args := []string{"-scenario", d.ScenarioDir, "-run", d.Run, "-ws", wsListenAddr}
++	args := []string{"-scenario", d.ScenarioDir, "-run", d.Run, "-ws", wsListenAddr, "-attach-timeout", "600s"}
+ 	if d.Seed != nil {
+ 		args = append(args, "-seed", strconv.FormatUint(*d.Seed, 10))
+ 	}
+@@ -161,14 +168,24 @@ func serveArgs(d *Demo) []string {
+ 	return args
+ }
+ 
++// tailLines is how many of a child's most recent output lines prefixWriter
++// keeps for start-error reporting (supervisor's tailSuffix): enough to carry
++// the engine's own failure line ("driver: hello: nats: no responders…")
++// into the 502 body without dumping the whole log.
++const tailLines = 20
++
+ // prefixWriter tees child output into demosrv's log line-by-line with a
+-// [id] prefix. A trailing partial line (no \n before exit) is dropped —
+-// cosmetic only.
++// [id] prefix, and keeps the last tailLines complete lines in a ring so a
++// failed start can quote the child's own error (supervisor's tailSuffix
++// reads it via tail()). A trailing partial line (no \n before exit) is
++// dropped — cosmetic only. Write/tail share mu: the child keeps writing
++// while the API handler reads the tail.
+ type prefixWriter struct {
+ 	lg     *log.Logger
+ 	prefix string
+ 	mu     sync.Mutex
+ 	buf    []byte
++	ring   []string // last complete lines, oldest first
+ }
+ 
+ func (w *prefixWriter) Write(p []byte) (int, error) {
+@@ -180,12 +197,25 @@ func (w *prefixWriter) Write(p []byte) (int, error) {
+ 		if i < 0 {
+ 			break
+ 		}
+-		w.lg.Printf("%s%s", w.prefix, w.buf[:i])
++		line := string(w.buf[:i])
++		w.lg.Printf("%s%s", w.prefix, line)
++		w.ring = append(w.ring, line)
++		if len(w.ring) > tailLines {
++			w.ring = w.ring[1:]
++		}
+ 		w.buf = w.buf[i+1:]
+ 	}
+ 	return len(p), nil
+ }
+ 
++// tail returns the last captured lines (oldest first), "" when the child
++// printed nothing. Safe against a still-writing child.
++func (w *prefixWriter) tail() string {
++	w.mu.Lock()
++	defer w.mu.Unlock()
++	return strings.Join(w.ring, "\n")
++}
++
+ type server struct {
+ 	reg  *Registry
+ 	sup  *supervisor
+@@ -291,10 +321,12 @@ func (s *server) handleStart(w http.ResponseWriter, r *http.Request) {
+ 		writeErr(w, http.StatusBadGateway, err)
+ 		return
+ 	}
+-	// Same shape as the menu page's pure buildAppURL (viz/src/demos-core.ts)
+-	// — they must agree, the running-card deep link depends on it.
++	// Same shape as the menu page's buildAppURL (viz/src/demos-core.ts)
++	// — they must agree, the running-card deep link depends on it. The ws
++	// param pins the engine this demosrv spawns to (viz defaults to 8443,
++	// which another process may hold when -ws overrode it).
+ 	writeJSON(w, http.StatusOK, map[string]string{
+-		"url": fmt.Sprintf("/app/?run=%s&net=/net/%s.geojson", d.Run, d.ID),
++		"url": fmt.Sprintf("/app/?run=%s&net=/net/%s.geojson&ws=%s", d.Run, d.ID, wsClientURL()),
+ 	})
+ }
+ 
+@@ -303,21 +335,50 @@ func (s *server) handleStop(w http.ResponseWriter, r *http.Request) {
+ 	writeJSON(w, http.StatusOK, map[string]string{"status": "stopped"})
+ }
+ 
++// netScenarioDir resolves a /net/{id} entry (demo OR recording — both
++// namespaces share /net/{id}: a recording's scenarioDir is the scenario
++// the recording was made from, so the same generation path serves it).
++func (s *server) netScenarioDir(id string) (string, bool) {
++	if d := s.reg.byID(id); d != nil {
++		return d.ScenarioDir, true
++	}
++	if rec := s.reg.recByID(id); rec != nil {
++		return rec.ScenarioDir, true
++	}
++	return "", false
++}
++
+ func (s *server) handleNet(w http.ResponseWriter, r *http.Request) {
+-	id, ok := strings.CutSuffix(r.PathValue("file"), ".geojson")
++	file := r.PathValue("file")
++	// Chunked-serving part URLs (geojson.go manifest contract):
++	// /net/{id}.geojson.part-NNN serves one part of a chunked network.
++	if base, partStr, ok := strings.Cut(file, ".geojson.part-"); ok {
++		idx, err := strconv.Atoi(partStr)
++		if err != nil || idx < 0 {
++			writeErr(w, http.StatusNotFound, fmt.Errorf("not a part index %q", partStr))
++			return
++		}
++		scenarioDir, ok := s.netScenarioDir(base)
++		if !ok {
++			writeErr(w, http.StatusNotFound, fmt.Errorf("unknown demo or recording %q", base))
++			return
++		}
++		path, err := s.nets.part(base, scenarioDir, idx)
++		if err != nil {
++			writeErr(w, http.StatusNotFound, err)
++			return
++		}
++		w.Header().Set("Content-Type", "application/geo+json")
++		http.ServeFile(w, r, path)
++		return
++	}
++	id, ok := strings.CutSuffix(file, ".geojson")
+ 	if !ok {
+ 		writeErr(w, http.StatusNotFound, fmt.Errorf("not a network geojson path"))
+ 		return
+ 	}
+-	// Both namespaces share /net/{id}: a recording's scenarioDir is the
+-	// scenario the recording was made from, so the same generation path
+-	// serves it.
+-	scenarioDir := ""
+-	if d := s.reg.byID(id); d != nil {
+-		scenarioDir = d.ScenarioDir
+-	} else if rec := s.reg.recByID(id); rec != nil {
+-		scenarioDir = rec.ScenarioDir
+-	} else {
++	scenarioDir, ok := s.netScenarioDir(id)
++	if !ok {
+ 		writeErr(w, http.StatusNotFound, fmt.Errorf("unknown demo or recording %q", id))
+ 		return
+ 	}
+diff --git a/engine/cmd/demosrv/registry.go b/engine/cmd/demosrv/registry.go
+index a3f9d703f469c6d4ae457b859a6640243f916de8..29d69e5c2c5d2b58c0841547e20484092fe0870e 100644
+--- a/engine/cmd/demosrv/registry.go
++++ b/engine/cmd/demosrv/registry.go
+@@ -63,6 +63,10 @@ type Recording struct {
+ type Registry struct {
+ 	Demos      []*Demo      `json:"demos"`
+ 	Recordings []*Recording `json:"recordings,omitempty"`
++	// WS is OUTPUT-ONLY (never read from demos.json): the engine WebSocket
++	// URL clients should dial, set by main() from the -ws flag so the
++	// menu's deep links can carry ?ws= when it differs from the viz default.
++	WS string `json:"ws,omitempty"`
+ }
+ 
+ // byID looks a demo up for the /api/demo/{id}/ and /net/{id} routes.
+diff --git a/engine/cmd/demosrv/replay.go b/engine/cmd/demosrv/replay.go
+index db747c88dead1b9ff324079ff0c0cec0db8a5d15..e54b3cd72077239e3bf3c82ab5dbd7dfc0a16abc 100644
+--- a/engine/cmd/demosrv/replay.go
++++ b/engine/cmd/demosrv/replay.go
+@@ -131,7 +131,7 @@ func (s *server) handleReplayStart(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 	writeJSON(w, http.StatusOK, map[string]string{
+-		"url": fmt.Sprintf("/app/?run=%s-replay&net=/net/%s.geojson&dt=%g", rec.Run, rec.ID, dt),
++		"url": fmt.Sprintf("/app/?run=%s-replay&net=/net/%s.geojson&dt=%g&ws=%s", rec.Run, rec.ID, dt, wsClientURL()),
+ 	})
+ }
+ 
+diff --git a/engine/cmd/demosrv/replay_test.go b/engine/cmd/demosrv/replay_test.go
+index 919939fe43a2c1299fbc34aa4b5cfdeede75e733..0dc6d2b2ecb55bf7cf84eae772ad539c4bd66fc1 100644
+--- a/engine/cmd/demosrv/replay_test.go
++++ b/engine/cmd/demosrv/replay_test.go
+@@ -246,7 +246,7 @@ func TestReplayStartStopAndNet(t *testing.T) {
+ 	if code != 200 {
+ 		t.Fatalf("replay start = %d (%v)", code, body)
+ 	}
+-	if want := "/app/?run=recrun-replay&net=/net/rec1.geojson&dt=0.05"; body["url"] != want {
++	if want := "/app/?run=recrun-replay&net=/net/rec1.geojson&dt=0.05&ws=ws://127.0.0.1:8443"; body["url"] != want {
+ 		t.Errorf("replay start url = %v, want %s", body["url"], want)
+ 	}
+ 
+diff --git a/engine/cmd/demosrv/supervisor.go b/engine/cmd/demosrv/supervisor.go
+index de09b4424929807308feb62262752a156b23aee5..08debc0f7fef74465638f9a11807612d634e342f 100644
+--- a/engine/cmd/demosrv/supervisor.go
++++ b/engine/cmd/demosrv/supervisor.go
+@@ -1,11 +1,17 @@
+ package main
+ 
+ // supervisor.go — single-active-run lifecycle for engine children (`serve`
+-// for live demos, `replay` for VCR recordings): spawn, wait for the
+-// WebSocket port to accept TCP (the menu's "you may navigate" signal — the
+-// viz opens its socket immediately on load), and SIGTERM→SIGKILL(2s) on
+-// replace/stop. One mutex serializes start/stop; the injectable spawnFunc
+-// keeps the tests on `sleep`, never the real engine.
++// for live demos, `replay` for VCR recordings): spawn, wait for readiness
++// (the menu's "you may navigate" signal — the viz opens its socket
++// immediately on load), and SIGTERM→SIGKILL(2s) on replace/stop. One mutex
++// serializes start/stop; the injectable spawnFunc keeps the tests on
++// `sleep`, never the real engine.
++//
++// Readiness for a DEMO child is two-phase (the port alone proved too weak
++// — see waitIdentity): a short TCP probe of the WebSocket port, then an
++// identity probe that confirms the broker answering on that port carries
++// OUR run's registry entry. Replay children keep the control-port probe
++// (their identity check is the /status hash verification in demosrv).
+ 
+ import (
+ 	"errors"
+@@ -15,28 +21,44 @@ import (
+ 	"sync"
+ 	"syscall"
+ 	"time"
++
++	"github.com/nats-io/nats.go"
++
++	"traffic-sim/engine/natsio"
+ )
+ 
+ const (
+-	// wsListenAddr is the ONE engine WebSocket port. Single active run means
+-	// no port allocation problem, and the viz client's default ?ws= target
+-	// (viz/src/config.ts) already points here, so the menu's deep link never
+-	// has to carry it.
+-	wsListenAddr = "127.0.0.1:8443"
+ 	// replayCtlAddr is the ONE replay control-plane port (engine/cmd/replay
+ 	// -http), fixed for the same reason as the ws port: single active run
+ 	// makes conflicts impossible. demosrv proxies it under /api/replay/.
+ 	replayCtlAddr = "127.0.0.1:8901"
+ 	// readyTimeout bounds the wait for the engine's listener. The binary is
+ 	// prebuilt at demosrv startup, so this covers process exec + embedded
+-	// broker startup, not a compile.
+-	readyTimeout = 10 * time.Second
++	// broker startup + world build, which precedes the listen and is slow on
++	// big networks (SF full extract, ~886k lanes: ~15 s). A child that DIES
++	// aborts this wait immediately (waitPort's done channel), so a generous
++	// bound costs nothing on the failure path.
++	readyTimeout = 60 * time.Second
++	// identityTimeout bounds the registry-identity phase for demo spawns:
++	// {run}/meta must land once the listener is up.
++	identityTimeout = 120 * time.Second
+ 	// killGrace is the SIGTERM grace before SIGKILL. serve traps SIGTERM and
+ 	// abandons the run (demo mode does no graceful finish — see
+ 	// engine/cmd/serve), so a healthy child exits well within this.
+ 	killGrace = 2 * time.Second
+ )
+ 
++// wsListenAddr is the ONE engine WebSocket port. Single active run means no
++// port allocation problem; the default matches the viz client's default
++// ?ws= target (viz/src/config.ts). A var, not a const: main() overrides it
++// from the -ws flag when another process already holds 8443, and the start
++// handlers + /api/demos then tell the client where to connect instead.
++var wsListenAddr = "127.0.0.1:8443"
++
++// wsClientURL is the ws:// URL the viz should dial, for embedding in /app/
++// links and the /api/demos payload.
++func wsClientURL() string { return "ws://" + wsListenAddr }
++
+ // spawnTarget identifies the child to exec: a live demo (Kind "demo",
+ // serve) or a VCR recording (Kind "replay", engine/cmd/replay). Exactly
+ // one of Demo/Rec is non-nil, matching Kind.
+@@ -76,16 +98,19 @@ type supervisor struct {
+ 	wsAddr       string
+ 	ctlAddr      string // replay control-plane port (replay-kind probes only)
+ 	readyTimeout time.Duration
+-	killGrace    time.Duration
++	// identityTimeout bounds waitIdentity (demo-kind spawns only).
++	identityTimeout time.Duration
++	killGrace       time.Duration
+ }
+ 
+ func newSupervisor(spawn spawnFunc) *supervisor {
+ 	return &supervisor{
+-		spawn:        spawn,
+-		wsAddr:       wsListenAddr,
+-		ctlAddr:      replayCtlAddr,
+-		readyTimeout: readyTimeout,
+-		killGrace:    killGrace,
++		spawn:           spawn,
++		wsAddr:          wsListenAddr,
++		ctlAddr:         replayCtlAddr,
++		readyTimeout:    readyTimeout,
++		identityTimeout: identityTimeout,
++		killGrace:       killGrace,
+ 	}
+ }
+ 
+@@ -119,17 +144,34 @@ func (s *supervisor) start(t spawnTarget, verify func() error) error {
+ 	s.active = a
+ 	if err := s.waitReady(a); err != nil {
+ 		s.stopLocked()
+-		return fmt.Errorf("%s did not become ready: %w", t.id(), err)
++		return fmt.Errorf("%s did not become ready: %w%s", t.id(), err, tailSuffix(cmd))
+ 	}
+ 	if verify != nil {
+ 		if err := verify(); err != nil {
+ 			s.stopLocked()
+-			return fmt.Errorf("%s failed post-start verification: %w", t.id(), err)
++			return fmt.Errorf("%s failed post-start verification: %w%s", t.id(), err, tailSuffix(cmd))
+ 		}
+ 	}
+ 	return nil
+ }
+ 
++// tailSuffix renders the child's captured output tail (prefixWriter's ring)
++// for inclusion in a start error — the difference between a bare 502 and
++// "engine exited during startup: … driver: hello: nats: no responders". ""
++// when the spawner captured nothing (the test sleep-stub has no
++// prefixWriter). Read after the child is down: no race with its writers.
++func tailSuffix(cmd *exec.Cmd) string {
++	w, ok := cmd.Stdout.(interface{ tail() string })
++	if !ok {
++		return ""
++	}
++	t := w.tail()
++	if t == "" {
++		return ""
++	}
++	return "\nengine output (last lines):\n" + t
++}
++
+ func (s *supervisor) stop() {
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
+@@ -198,13 +240,14 @@ func (s *supervisor) withActiveReplay(fn func(run string) error) error {
+ 	return fn(a.target.Rec.Run + "-replay")
+ }
+ 
+-// waitReady probes the child's readiness. A live demo is ready when its
+-// WebSocket port accepts TCP. A REPLAY child is ready only when BOTH the
+-// WebSocket port and its HTTP control port accept: replay's ws listener
++// waitReady probes the child's readiness. A REPLAY child is ready when BOTH
++// the WebSocket port and its HTTP control port accept: replay's ws listener
+ // (the embedded broker) opens before NewPlayer has indexed the recording
+ // and before the control listener binds (engine/cmd/replay), and demosrv's
+ // start response sends the viz straight at the control plane — answering
+-// early would race the replay panel's first probe.
++// early would race the replay panel's first probe. A live DEMO adds the
++// identity phase after the port probe (waitIdentity): the port accepting is
++// not enough to know the broker behind it is ours.
+ func (s *supervisor) waitReady(a *activeRun) error {
+ 	if s.ready != nil {
+ 		return s.ready()
+@@ -215,6 +258,64 @@ func (s *supervisor) waitReady(a *activeRun) error {
+ 	if a.target.Kind == "replay" {
+ 		return waitPort(s.ctlAddr, s.readyTimeout, a.done)
+ 	}
++	return s.waitIdentity(a.target.Demo.Run, a.done)
++}
++
++// waitIdentity answers the question the raw port probe cannot: the listener
++// on the ws port may be a FOREIGN process (another session's engine — the
++// classic incident: the port probe saw its listener, declared the child
++// ready, and the viz subscribed to a broker that had no such run and sat on
++// "waiting for the engine's first snapshot" forever). Our engine is ready
++// only once ITS run appears in the KV run registry: reg.Start writes
++// {run}/meta inside RunLive before the sim loop starts, after the world
++// build — hence the generous identityTimeout where the port probe is short.
++//
++// done aborts the wait immediately: when the port is held by a foreign
++// process our child dies on bind failure, and that error must surface in
++// seconds, not after the timeout.
++func (s *supervisor) waitIdentity(run string, done <-chan struct{}) error {
++	url := "ws://" + s.wsAddr
++	deadline := time.Now().Add(s.identityTimeout)
++	var lastErr error
++	for {
++		select {
++		case <-done:
++			return fmt.Errorf("engine exited during startup: run %q never registered in the %s bucket", run, natsio.RegistryBucket)
++		default:
++		}
++		if lastErr = probeRunMeta(url, run); lastErr == nil {
++			return nil
++		}
++		if time.Now().After(deadline) {
++			return fmt.Errorf("run %q not found in the %s registry at %s within %s (last probe: %v) — a foreign process may hold this port",
++				run, natsio.RegistryBucket, url, s.identityTimeout, lastErr)
++		}
++		time.Sleep(time.Second)
++	}
++}
++
++// probeRunMeta connects to the broker at url as a NATS-over-WebSocket
++// client (the same path the viz takes) and returns nil only when the KV run
++// registry holds {run}/meta. Any listener that answers the port but cannot
++// produce the key — a foreign engine, another session's broker, a plain
++// HTTP server — is an error, never readiness.
++func probeRunMeta(url, run string) error {
++	nc, err := nats.Connect(url, nats.Timeout(2*time.Second), nats.NoReconnect())
++	if err != nil {
++		return err
++	}
++	defer nc.Close()
++	js, err := nc.JetStream()
++	if err != nil {
++		return err
++	}
++	kv, err := js.KeyValue(natsio.RegistryBucket)
++	if err != nil {
++		return err
++	}
++	if _, err := kv.Get(run + "/meta"); err != nil {
++		return fmt.Errorf("KV get %s/meta: %w", run, err)
++	}
+ 	return nil
+ }
+ 
+diff --git a/engine/geojson.go b/engine/geojson.go
+index 59dbc31ffc56523701b2b6c5140a04e49989321f..26401a2d5fd6bda0a694e5f392e8cc77ad84f7d2 100644
+--- a/engine/geojson.go
++++ b/engine/geojson.go
+@@ -22,6 +22,9 @@ import (
+ // edge/edgeIndex are the lateral-chaining group (network-format v1): the
+ // viz draws group-boundary casing from them so same-road lanes read as one
+ // road; empty edge (junction interiors) = no lateral neighbors.
++// junction/row are the junction right-of-way annotation (ADR-0010,
++// internal lanes only): the viz clusters row="stop" lanes per junction
++// approach to place stop signs (stopsign.ts).
+ type GeoJSONLaneProperties struct {
+ 	ID         string  `json:"id"`
+ 	SpeedLimit float64 `json:"speedLimit"` // m/s
+@@ -29,6 +32,8 @@ type GeoJSONLaneProperties struct {
+ 	Internal   bool    `json:"internal"`
+ 	Edge       string  `json:"edge,omitempty"`
+ 	EdgeIndex  int     `json:"edgeIndex"`
++	Junction   string  `json:"junction,omitempty"` // junction this internal lane belongs to
++	Row        string  `json:"row,omitempty"`      // approach class: "major"|"minor"|"stop"
+ }
+ 
+ // GeoJSONFrame is the foreign member describing the local metric frame the
+@@ -60,24 +65,40 @@ type geoJSONCollection struct {
+ // WriteGeoJSON writes nf as a GeoJSON FeatureCollection (one LineString per
+ // lane, local metric frame + "frame" descriptor). Lane order is preserved.
+ func WriteGeoJSON(nf *NetFile, w io.Writer) error {
+-	if nf.Version != 1 {
+-		return fmt.Errorf("geojson: unsupported network version %d (want 1)", nf.Version)
++	return encodeGeoJSON(nf, w, geoJSONFeatures(nf, 0, len(nf.Lanes)))
++}
++
++// WriteGeoJSONRange writes lanes [start, end) as one standalone
++// FeatureCollection — the same "frame" descriptor and the same per-feature
++// encoding as WriteGeoJSON, so a range covering every lane is
++// byte-identical to the single-file output (pinned in geojson_test.go).
++// This is the PART-document encoding for demosrv's chunked network cache:
++// oversized networks are split at lane (feature) boundaries, never by
++// text-splitting JSON.
++func WriteGeoJSONRange(nf *NetFile, w io.Writer, start, end int) error {
++	if start < 0 {
++		start = 0
+ 	}
+-	coll := geoJSONCollection{Type: "FeatureCollection"}
+-	if p := nf.Provenance; p != nil {
+-		coll.Frame = &GeoJSONFrame{
+-			Projection: p.Projection,
+-			NetOffset:  p.NetOffset,
+-			OSMBbox:    p.OSMBbox,
+-		}
++	if end > len(nf.Lanes) {
++		end = len(nf.Lanes)
+ 	}
+-	for i := range nf.Lanes {
++	if start > end {
++		start = end
++	}
++	return encodeGeoJSON(nf, w, geoJSONFeatures(nf, start, end))
++}
++
++// geoJSONFeatures builds the per-lane feature blocks for lanes [start, end)
++// — the single marshaling path shared by the full document and parts.
++func geoJSONFeatures(nf *NetFile, start, end int) []geoJSONFeature {
++	var features []geoJSONFeature
++	for i := start; i < end; i++ {
+ 		nl := &nf.Lanes[i]
+ 		width := nl.Width
+ 		if width == 0 {
+ 			width = 3.5 // the loader's default; keep the file and engine in agreement
+ 		}
+-		coll.Features = append(coll.Features, geoJSONFeature{
++		features = append(features, geoJSONFeature{
+ 			Type: "Feature",
+ 			ID:   nl.ID,
+ 			Properties: GeoJSONLaneProperties{
+@@ -87,10 +108,27 @@ func WriteGeoJSON(nf *NetFile, w io.Writer) error {
+ 				Internal:   nl.Internal,
+ 				Edge:       nl.Edge,
+ 				EdgeIndex:  nl.EdgeIndex,
++				Junction:   nl.Junction,
++				Row:        nl.Row,
+ 			},
+ 			Geometry: geoJSONGeometry{Type: "LineString", Coordinates: nl.Shape},
+ 		})
+ 	}
++	return features
++}
++
++func encodeGeoJSON(nf *NetFile, w io.Writer, features []geoJSONFeature) error {
++	if nf.Version != 1 {
++		return fmt.Errorf("geojson: unsupported network version %d (want 1)", nf.Version)
++	}
++	coll := geoJSONCollection{Type: "FeatureCollection", Features: features}
++	if p := nf.Provenance; p != nil {
++		coll.Frame = &GeoJSONFrame{
++			Projection: p.Projection,
++			NetOffset:  p.NetOffset,
++			OSMBbox:    p.OSMBbox,
++		}
++	}
+ 	enc := json.NewEncoder(w)
+ 	enc.SetIndent("", "  ")
+ 	if err := enc.Encode(coll); err != nil {
+diff --git a/engine/geojson_test.go b/engine/geojson_test.go
+index d03af9152a9199cc664ed40141d501c8cde1f2dd..c1d4a9c1abc6b3682a16990bc720605f102a23c6 100644
+--- a/engine/geojson_test.go
++++ b/engine/geojson_test.go
+@@ -28,6 +28,7 @@ func TestWriteGeoJSON(t *testing.T) {
+ 			},
+ 			{
+ 				ID: "j:i_0", Length: 5, SpeedLimit: 11.18, Internal: true, // width 0 → default 3.5
++				Junction: "i", Row: "stop", // ADR-0010 right-of-way annotation
+ 				Shape: [][2]float64{{10, 0}, {15, 3}},
+ 			},
+ 		},
+@@ -53,6 +54,8 @@ func TestWriteGeoJSON(t *testing.T) {
+ 				Internal   bool    `json:"internal"`
+ 				Edge       string  `json:"edge"`
+ 				EdgeIndex  int     `json:"edgeIndex"`
++				Junction   string  `json:"junction"`
++				Row        string  `json:"row"`
+ 			} `json:"properties"`
+ 			Geometry struct {
+ 				Type        string       `json:"type"`
+@@ -91,6 +94,12 @@ func TestWriteGeoJSON(t *testing.T) {
+ 	if f1.Properties.Edge != "" {
+ 		t.Fatalf("feature 1 (internal) must carry no edge group: %+v", f1.Properties)
+ 	}
++	if f1.Properties.Junction != "i" || f1.Properties.Row != "stop" {
++		t.Fatalf("feature 1 junction/row: %+v", f1.Properties)
++	}
++	if f0.Properties.Junction != "" || f0.Properties.Row != "" {
++		t.Fatalf("feature 0 (external) must carry no junction/row: %+v", f0.Properties)
++	}
+ }
+ 
+ // TestWriteGeoJSONReferenceNet exports the real i280 network when the
+@@ -148,3 +157,53 @@ func TestWriteGeoJSONReferenceNet(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// WriteGeoJSONRange shares WriteGeoJSON's marshaling exactly: the full
++// range is byte-identical to the single document, and a sub-range is a
++// valid standalone collection carrying the frame and the lane slice.
++func TestWriteGeoJSONRange(t *testing.T) {
++	nf := &NetFile{
++		Version: 1,
++		Name:    "toy",
++		Provenance: &NetProvenance{
++			Projection: "+proj=utm +zone=10 +ellps=WGS84 +datum=WGS84 +units=m +no_defs",
++			NetOffset:  [2]float64{-1, -2},
++		},
++		Lanes: []NetLane{
++			{ID: "a", Section: "a", Length: 10, SpeedLimit: 10, Width: 3.2, Shape: [][2]float64{{0, 0}, {10, 0}}, Successors: []string{"b"}},
++			{ID: "b", Section: "b", Length: 10, SpeedLimit: 10, Width: 3.2, Shape: [][2]float64{{10, 0}, {20, 0}}, Successors: []string{"c"}},
++			{ID: "c", Section: "c", Length: 10, SpeedLimit: 10, Width: 3.2, Shape: [][2]float64{{20, 0}, {30, 0}}, Exit: true},
++		},
++	}
++	var full, ranged bytes.Buffer
++	if err := WriteGeoJSON(nf, &full); err != nil {
++		t.Fatal(err)
++	}
++	if err := WriteGeoJSONRange(nf, &ranged, 0, len(nf.Lanes)); err != nil {
++		t.Fatal(err)
++	}
++	if full.String() != ranged.String() {
++		t.Fatal("full range must be byte-identical to WriteGeoJSON")
++	}
++
++	var part bytes.Buffer
++	if err := WriteGeoJSONRange(nf, &part, 1, 3); err != nil {
++		t.Fatal(err)
++	}
++	var got struct {
++		Type     string        `json:"type"`
++		Frame    *GeoJSONFrame `json:"frame"`
++		Features []struct {
++			ID string `json:"id"`
++		} `json:"features"`
++	}
++	if err := json.Unmarshal(part.Bytes(), &got); err != nil {
++		t.Fatalf("part does not parse: %v", err)
++	}
++	if got.Type != "FeatureCollection" || got.Frame == nil || got.Frame.Projection != nf.Provenance.Projection {
++		t.Fatalf("part header: %+v", got)
++	}
++	if len(got.Features) != 2 || got.Features[0].ID != "b" || got.Features[1].ID != "c" {
++		t.Fatalf("part features: %+v", got.Features)
++	}
++}

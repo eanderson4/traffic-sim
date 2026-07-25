@@ -27,6 +27,7 @@ package driver
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -53,6 +54,22 @@ type Config struct {
 	// excluded), deterministic from the run seed and vehicle ID
 	// (ADR-0007) — see destinations.go. Ignored when Destination is set.
 	ExitRouting bool
+	// RouteBudgetPerTick caps how many vehicles per observation get their
+	// routing destination RESOLVED (default 32): the exit draw's
+	// first-touch reachability scan is O(network) per NEW origin lane
+	// (warm picks are cheap and still pass through the counter), so an
+	// unbounded claim burst on a big network stalls the tick loop
+	// (measured: the Observe path was synchronous in the tick loop,
+	// run.go). Vehicles past the budget keep the kernel's default routing
+	// and retry on the next observation. TIMING NOTE (ADR-0008
+	// invisibility bound): admission order is per-replica, so a deferred
+	// vehicle's route lands up to ceil(unrouted/budget) observations
+	// later than an unbudgeted one — ~0.3 sim-s at demo spawn rates. A
+	// fork passed in that window means default routing for that leg; the
+	// draw itself stays seed-pure (frozen first-observation lane).
+	// Strict timing-invariance needs an O(1) pickExit (global
+	// exit-reachability), future work.
+	RouteBudgetPerTick int
 	// Type is the controller_type declared at attach (default
 	// "default-driver").
 	Type string
@@ -70,6 +87,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.MetaWait <= 0 {
 		c.MetaWait = 10 * time.Second
+	}
+	if c.RouteBudgetPerTick <= 0 {
+		c.RouteBudgetPerTick = 32
 	}
 	return c
 }
@@ -92,6 +112,7 @@ type Driver struct {
 	exits   *exitCache // memoized pickExit inputs (candidates, reachability)
 
 	wantRoute map[uint64]string // destination chosen, re-sent until the obs echo confirms
+	wantLane  map[uint64]int    // lane at FIRST unrouted observation — the pickExit input (budget-deferred draws stay seed-deterministic)
 
 	subs []*nats.Subscription
 	done chan struct{}
@@ -128,6 +149,7 @@ func New(nc *nats.Conn, js nats.JetStreamContext, cfg Config) (*Driver, error) {
 		streams: map[uint64]*engine.Stream{},
 
 		wantRoute: map[uint64]string{},
+		wantLane:  map[uint64]int{},
 		done:      make(chan struct{}),
 	}
 	if len(d.types) == 0 {
@@ -152,21 +174,34 @@ func New(nc *nats.Conn, js nats.JetStreamContext, cfg Config) (*Driver, error) {
 		},
 	}
 	payload, _ := json.Marshal(hello)
-	// Retry while the engine's contract plane is still coming up — on large
-	// networks RunLive needs seconds before it answers hello, and a bare
-	// request fails instantly with "no responders". Bounded by MetaWait so a
-	// genuinely absent engine still fails fast.
+	// Like awaitMeta, the hello must tolerate an engine that is still coming
+	// up: RunLive subscribes the contract plane only AFTER the world build,
+	// the recorder, and the bus — on big networks the driver can finish its
+	// own BuildNet first and hit an unsubscribed hello subject (fast-fail
+	// "no responders"). Retry ONLY that error: the hello is not idempotent
+	// (the engine creates a controller on receipt), so retrying a TIMEOUT
+	// risks a ghost controller holding claim capacity (sol review); any
+	// other failure surfaces immediately.
+	helloDeadline := time.Now().Add(cfg.MetaWait)
 	var resp *nats.Msg
-	deadline := time.Now().Add(cfg.MetaWait)
+	var helloErr error
 	for {
-		resp, err = nc.Request(natsio.SubjectCtlHello(cfg.Run), payload, 2*time.Second)
-		if err == nil {
+		// The request timeout is the REMAINING budget (capped at 2 s), and
+		// the retry sleep never overshoots the deadline — MetaWait must
+		// actually bound the wait (sol review).
+		remaining := time.Until(helloDeadline)
+		if remaining <= 0 {
+			return nil, fmt.Errorf("driver: hello: deadline exhausted (%s): %w", cfg.MetaWait, helloErr)
+		}
+		resp, helloErr = nc.Request(natsio.SubjectCtlHello(cfg.Run), payload, min(2*time.Second, remaining))
+		if helloErr == nil {
 			break
 		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("driver: hello: %w", err)
+		if !errors.Is(helloErr, nats.ErrNoResponders) {
+			return nil, fmt.Errorf("driver: hello: %w", helloErr)
 		}
-		time.Sleep(200 * time.Millisecond)
+		// Always sleep, never hot-spin — capped so the deadline holds.
+		time.Sleep(min(250*time.Millisecond, time.Until(helloDeadline)))
 	}
 	var reply natsio.HelloReply
 	if err := json.Unmarshal(resp.Data, &reply); err != nil {
@@ -293,6 +328,7 @@ func (d *Driver) onObs(msg *nats.Msg) {
 	d.lastObsTick.Store(obs.Tick)
 	params := d.spec.Params
 	present := map[uint64]bool{}
+	routeBudget := d.cfg.RouteBudgetPerTick
 	for i := range obs.Egos {
 		ego := &obs.Egos[i]
 		present[ego.ID] = true
@@ -308,43 +344,8 @@ func (d *Driver) onObs(msg *nats.Msg) {
 			in.SignalSet = true
 			in.Signals = signalFor(lane)
 		}
-		// Routing axis: the destination parameter is persistent — send once
-		// per vehicle; the kernel follows it at every multi-successor lane
-		// (engine/routing.go), degrading to the successor default when the
-		// destination is unknown or unreachable. The destination is the
-		// configured override, or — with ExitRouting — the vehicle's per-ID
-		// drawn exit lane (tried once either way: the pick is
-		// deterministic, retrying would not change it).
 		d.mu.Lock()
-		if !d.routed[ego.ID] {
-			// Failover adoption: a re-claimed vehicle may already carry the
-			// persistent route its previous controller assigned (the obs
-			// frame round-trips it) — keep it. Re-deriving from the
-			// current lane would change the destination mid-trip
-			// (ADR-0008 §6: failover is behaviorally invisible).
-			want, ok := d.wantRoute[ego.ID]
-			if !ok {
-				want = d.cfg.Destination
-				if want == "" {
-					want = ego.Route
-				}
-				if want == "" && d.cfg.ExitRouting {
-					want, _ = pickExit(d.net, d.exitCache(), d.spec.Seed, ego.ID, ego.LaneIdx)
-				}
-				d.wantRoute[ego.ID] = want
-			}
-			// Core NATS publish has no ack: re-send until the obs frame
-			// echoes the destination — a dropped one-shot Route intent
-			// would leave the vehicle on default routing for life. Mark
-			// routed only when the engine confirms (or nothing is wanted).
-			if want == "" || ego.Route == want {
-				d.routed[ego.ID] = true
-				delete(d.wantRoute, ego.ID)
-			} else {
-				in.RouteSet = true
-				in.Route = want
-			}
-		}
+		d.routeStep(&in, ego, &routeBudget)
 		d.mu.Unlock()
 		if err := d.nc.Publish(natsio.SubjectCtlIntent(d.cfg.Run, d.id), natsio.EncodeIntent(in)); err == nil {
 			d.sentIntents.Add(1)
@@ -358,6 +359,7 @@ func (d *Driver) onObs(msg *nats.Msg) {
 			delete(d.fleet, vid)
 			delete(d.routed, vid)
 			delete(d.wantRoute, vid)
+			delete(d.wantLane, vid)
 		}
 	}
 	idle := len(d.fleet) == 0
@@ -366,6 +368,80 @@ func (d *Driver) onObs(msg *nats.Msg) {
 		// Liveness without control traffic: heartbeat so the engine's
 		// silence budget does not detach an idle standby replica.
 		_ = d.nc.Publish(natsio.SubjectCtlHeartbeat(d.cfg.Run, d.id), nil)
+	}
+}
+
+// routeStep advances ONE ego's routing axis under the per-tick budget
+// (Config.RouteBudgetPerTick). The routing axis' destination parameter is
+// persistent — sent once per vehicle; the kernel follows it at every
+// multi-successor lane (engine/routing.go), degrading to the successor
+// default when the destination is unknown or unreachable. The destination
+// is the configured override, or — with ExitRouting — the vehicle's
+// per-ID drawn exit lane (tried once either way: the pick is
+// deterministic, retrying would not change it). Only the DRAW is metered:
+// its first-touch reachability scan is O(network) per origin lane
+// (destinations.go exitCache) — the cost that stalled big-city ticks when
+// routing ran synchronously in the tick loop, and still worth metering in
+// the callback path (a burst of first-touch scans delays every intent
+// behind it); the re-send of an unconfirmed destination is a string copy.
+// The budget freezes the draw's lane at first observation, so deferred
+// vehicles may draw an exit unreachable from a lane they reached since —
+// the kernel then degrades to default routing, exactly as for any
+// unreachable destination (deterministic either way). A controller that
+// fails BEFORE an unrouted vehicle's first draw lets the replacement draw
+// from a later lane — a pre-existing limitation of lane-input draws, not
+// of the budget; the route, once assigned, round-trips via the obs echo
+// and is adopted (ADR-0008 §6). Over budget the
+// ego is left unrouted and retried next observation (only the first-obs
+// lane is remembered for determinism — unrouted-due-to-budget must not
+// read as routed). Caller holds d.mu.
+func (d *Driver) routeStep(in *engine.Intent, ego *natsio.ObsEgo, budget *int) {
+	if d.routed[ego.ID] {
+		return
+	}
+	// Failover adoption: a re-claimed vehicle may already carry the
+	// persistent route its previous controller assigned (the obs frame
+	// round-trips it) — keep it. Re-deriving from the current lane would
+	// change the destination mid-trip (ADR-0008 §6: failover is
+	// behaviorally invisible).
+	want, ok := d.wantRoute[ego.ID]
+	if !ok {
+		want = d.cfg.Destination
+		if want == "" {
+			want = ego.Route
+		}
+		if want == "" && d.cfg.ExitRouting {
+			// The draw's lane input is captured at FIRST observation, not
+			// at budget admission: pickExit(seed, id, lane) must be a pure
+			// function of the run, never of controller lag (ADR-0007/0008
+			// failover replicas must draw the SAME exit — sol review).
+			lane, seen := d.wantLane[ego.ID]
+			if !seen {
+				if d.wantLane == nil {
+					d.wantLane = map[uint64]int{} // tests construct Driver directly
+				}
+				lane = ego.LaneIdx
+				d.wantLane[ego.ID] = lane
+			}
+			if *budget <= 0 {
+				return // past the per-tick routing budget — retry next obs
+			}
+			*budget--
+			want, _ = pickExit(d.net, d.exitCache(), d.spec.Seed, ego.ID, lane)
+		}
+		d.wantRoute[ego.ID] = want
+	}
+	// Core NATS publish has no ack: re-send until the obs frame echoes the
+	// destination — a dropped one-shot Route intent would leave the
+	// vehicle on default routing for life. Mark routed only when the
+	// engine confirms (or nothing is wanted).
+	if want == "" || ego.Route == want {
+		d.routed[ego.ID] = true
+		delete(d.wantRoute, ego.ID)
+		delete(d.wantLane, ego.ID)
+	} else {
+		in.RouteSet = true
+		in.Route = want
 	}
 }
 

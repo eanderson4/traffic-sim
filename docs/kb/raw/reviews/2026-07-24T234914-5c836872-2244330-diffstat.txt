@@ -1,0 +1,6 @@
+ docs/kb/INDEX.md                                   |   2 +-
+ docs/kb/articles/decisions/adrs.md                 |   3 +-
+ .../decisions/ADR-0019-route-budget-determinism.md |  57 +++++
+ engine/natsio/driver/driver.go                     | 168 +++++++++----
+ engine/natsio/driver/driver_test.go                | 264 +++++++++++++++++++++
+ 5 files changed, 446 insertions(+), 48 deletions(-)
