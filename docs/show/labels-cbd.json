@@ -1,0 +1,10 @@
+{
+  "base": "Do nothing",
+  "transit-5": "Free CTA transfers — shift 5% of Loop trips to transit",
+  "calm-secondary": "Slow Streets — 25 km/h limit across the Loop grid",
+  "retime-short": "Shorter signal cycles — 34% shorter, same green share",
+  "retime-long": "Longer greens — 40% longer cycles on the arterials",
+  "widen-secondary": "Widen the grid — one extra lane on every Loop street",
+  "truck-ban": "Peak-hour freight ban — no trucks in the Loop",
+  "cordon-20": "Congestion charge — 20% fewer vehicles enter the Loop"
+}

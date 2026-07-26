@@ -1,0 +1,10 @@
+{
+  "base": "Do nothing",
+  "mainline-widen": "Widen the mainline — one extra lane each way",
+  "ramp-widen": "Widen the on-ramps — longer, wider merge lanes",
+  "ramp-meter": "Ramp metering — hold back 20% of on-ramp entries",
+  "speed-harmonise": "Speed harmonisation — 80 km/h posted on the mainline",
+  "retime": "Retime the ramp-terminal signals — 34% shorter cycles",
+  "truck-ban": "Peak-hour freight ban — no trucks on the corridor",
+  "transit-5": "Free CTA transfers — shift 5% of trips to transit"
+}
