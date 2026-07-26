@@ -13,7 +13,7 @@ Baseline `base`, 6 paired seeds, 12000 ticks, warmup 4000. Primary metric: `spee
 
 - **Shorter signal cycles — 34% shorter, same green share** (`retime-short`): UPGRADE, 2.1% on speed_kmh, p=0.0021
 - **Longer greens — 40% longer cycles citywide** (`retime-long`): WORSE, -3.8% on speed_kmh, p=0.0000 — CAUTION: moves 2.7% less vehicle-distance (p=0.0001), so this is not a like-for-like comparison: the network is doing less work, not doing it better
-- **Widen Lake Shore Drive — one lane each way** (`lsd-widen`): statistically real but below the 1% practical floor, 0.5% on speed_kmh, p=0.0321
+- **Widen Lake Shore Drive — one lane each way** (`lsd-widen`): no-op (effect under the 1% practical floor; p-values below ~0.3% effect are not separable from run-to-run drift), 0.5% on speed_kmh, p=0.0321
 - **Widen the Kennedy — one lane each way** (`kennedy-widen`): no-op (n.s.), 0.2% on speed_kmh, p=0.3862
 
 ## Everything tested
