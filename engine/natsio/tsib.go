@@ -29,6 +29,7 @@ package natsio
 import (
 	"encoding/binary"
 
+	"github.com/nats-io/nats.go"
 	"traffic-sim/engine"
 )
 
@@ -77,6 +78,22 @@ func EncodeTSIB(tick uint64, intents []engine.Intent) []byte {
 	}
 	binary.LittleEndian.PutUint32(buf[16:], count)
 	return buf[:off]
+}
+
+// NewTSIBMsg builds one batch message for subject: the EncodeTSIB payload
+// plus the intent_encoding: tsib demux header — the payload/header pair the
+// contract (M4) documents, assembled in one place so producers never name
+// the header themselves. Returns nil when EncodeTSIB does (more than
+// TSIBMaxRecords route-free intents — split first, as the M2 driver does).
+func NewTSIBMsg(subject string, tick uint64, intents []engine.Intent) *nats.Msg {
+	payload := EncodeTSIB(tick, intents)
+	if payload == nil {
+		return nil
+	}
+	msg := nats.NewMsg(subject)
+	msg.Data = payload
+	msg.Header.Set(headerIntentEncoding, intentEncodingTSIB)
+	return msg
 }
 
 // DecodeTSIB parses one batch into its surviving records, in record order.

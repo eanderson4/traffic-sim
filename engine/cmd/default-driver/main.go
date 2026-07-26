@@ -29,9 +29,14 @@ func main() {
 	run := flag.String("run", "", "run id to attach to (required)")
 	capacity := flag.Int("capacity", 1000, "claim capacity (max vehicles this replica holds)")
 	dest := flag.String("dest", "", "destination lane id for the routing axis (optional)")
+	intentBatch := flag.String("intent-batch", "on", "aggregate each tick's intents into TSIB batches (on|off; off restores the pre-ADR-0026 per-vehicle v2 stream, for A/B measurement and debugging)")
 	flag.Parse()
 	if *run == "" {
 		fmt.Fprintln(os.Stderr, "default-driver: -run is required")
+		os.Exit(2)
+	}
+	if *intentBatch != "on" && *intentBatch != "off" {
+		fmt.Fprintf(os.Stderr, "default-driver: -intent-batch must be on|off, got %q\n", *intentBatch)
 		os.Exit(2)
 	}
 
@@ -56,9 +61,10 @@ func main() {
 	}
 
 	d, err := driver.New(nc, js, driver.Config{
-		Run:         *run,
-		Capacity:    *capacity,
-		Destination: *dest,
+		Run:            *run,
+		Capacity:       *capacity,
+		Destination:    *dest,
+		IntentBatchOff: *intentBatch == "off",
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "default-driver:", err)

@@ -80,6 +80,7 @@ func main() {
 			"NO controller intent because the driver could not keep up. Claims are "+
 			"exclusive and engine-arbitrated, so replicas shard the fleet safely.")
 	exitRouting := flag.Bool("exit-routing", true, "driver assigns each claimed vehicle a seeded exit-lane destination (per-vehicle routing; without it vehicles take the kernel's leftmost-successor default)")
+	intentBatch := flag.String("intent-batch", "on", "driver aggregates each tick's intents into TSIB batches (on|off; off restores the pre-ADR-0026 per-vehicle v2 stream, for A/B measurement and debugging)")
 	attachTimeout := flag.Duration("attach-timeout", 30*time.Second, "bound on the client-attach barrier: serve fails if an embedded client (driver, demand director) has not reported attached within this")
 	safetyDecel := flag.Float64("safety-decel", 6,
 		"longitudinal safety gate: max emergency deceleration (m/s²) the kernel "+
@@ -94,6 +95,10 @@ func main() {
 	}
 	if *scenarioDir == "" && *netfile == "" {
 		fmt.Fprintln(os.Stderr, "serve: -scenario or -netfile is required")
+		os.Exit(2)
+	}
+	if *intentBatch != "on" && *intentBatch != "off" {
+		fmt.Fprintf(os.Stderr, "serve: -intent-batch must be on|off, got %q\n", *intentBatch)
 		os.Exit(2)
 	}
 	host, portStr, err := net.SplitHostPort(*wsAddr)
@@ -437,7 +442,7 @@ func main() {
 			}
 			expected = append(expected, name)
 			go func(name string) {
-				barrier <- attachDriver(ns, *run, per, *exitRouting, *attachTimeout, name)
+				barrier <- attachDriver(ns, *run, per, *exitRouting, *intentBatch == "off", *attachTimeout, name)
 			}(name)
 		}
 	}
@@ -645,7 +650,7 @@ type attachOutcome struct {
 // been answered and New's final Flush guarantees the server has processed
 // the observation/snapshot/unclaimed subscriptions, so tick 0's unclaimed
 // pool reaches this replica.
-func attachDriver(ns *server.Server, run string, capacity int, exitRouting bool, metaWait time.Duration, name string) attachOutcome {
+func attachDriver(ns *server.Server, run string, capacity int, exitRouting, intentBatchOff bool, metaWait time.Duration, name string) attachOutcome {
 	dnc, err := nats.Connect(nats.DefaultURL, nats.InProcessServer(ns), nats.Name(name))
 	if err != nil {
 		return attachOutcome{client: name, err: err}
@@ -655,7 +660,7 @@ func attachDriver(ns *server.Server, run string, capacity int, exitRouting bool,
 		dnc.Close()
 		return attachOutcome{client: name, err: err}
 	}
-	d, err := driver.New(dnc, djs, driver.Config{Run: run, Capacity: capacity, ExitRouting: exitRouting, MetaWait: metaWait})
+	d, err := driver.New(dnc, djs, driver.Config{Run: run, Capacity: capacity, ExitRouting: exitRouting, IntentBatchOff: intentBatchOff, MetaWait: metaWait})
 	if err != nil {
 		dnc.Close()
 		return attachOutcome{client: name, err: err}

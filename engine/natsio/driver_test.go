@@ -726,3 +726,115 @@ func TestIntrospection(t *testing.T) {
 		t.Fatalf("run: %v", out.err)
 	}
 }
+
+// resimBatchLeg re-simulates one recorded live run from its JetStream record
+// with metric collection (exact per-tick full-fidelity data, no live-plane
+// loss) — TestDifferentialLanedrop's external-leg protocol — and asserts the
+// re-sim reproduces the LIVE run's CRC chain: every recorded run replays
+// deterministically, batch mode or not (ADR-0026).
+func resimBatchLeg(t *testing.T, h *liveHandle, live *engine.Engine, ticks uint64, window [2]uint64) *macro {
+	t.Helper()
+	rec, err := natsio.MaterializeRunRecord(h.js, h.meta(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newMacro(window)
+	e, err := engine.NewEngine(rec.Log.Spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ii := 0
+	for e.Tick < ticks {
+		next := e.Tick + 1
+		for ii < len(rec.Log.Intents) && rec.Log.Intents[ii].Tick <= next {
+			if rec.Log.Intents[ii].Tick == next {
+				e.EnqueueIntent(rec.Log.Intents[ii].KeyedIntent)
+			}
+			ii++
+		}
+		e.Step()
+		m.observe(e)
+	}
+	m.finish(e)
+	if !equalCRCs(t, rec.Log.CRCs, e.CRCs) {
+		t.Fatal("re-sim diverged from the record")
+	}
+	if !equalCRCs(t, e.CRCs, live.CRCs) {
+		t.Fatal("record does not match the live run (recorded run must replay deterministically)")
+	}
+	return m
+}
+
+// Paired-seed on/off parity (ADR-0026 M2): the default driver in batched
+// (default) and per-vehicle-v2 (-intent-batch=off) mode drives the same
+// seed; macro behavior must agree under the established differential
+// tolerances (TestDifferentialLanedrop). CRCs BETWEEN legs are not compared
+// — batching holds a tick's intents until computed where v2 streams early
+// vehicles, so arrival-vs-drain timing and applied ticks legitimately
+// diverge (ADR-0026 consequences); each leg's own record must still replay
+// to its live CRCs (asserted in resimBatchLeg).
+func TestBatchOnOffParity(t *testing.T) {
+	const ticks = 600
+	const seed = 42
+	window := [2]uint64{300, ticks}
+
+	runLeg := func(t *testing.T, off bool) (*macro, *driver.Driver) {
+		t.Helper()
+		spec, err := engine.DefaultSpec("lanedrop", ticks, seed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		spec.Scen.UncontrolledPolicy = engine.PolicyHoldLast
+		h := startLive(t, spec, natsio.RecorderConfig{KeyframeEvery: 100}, natsio.ContractConfig{
+			PaceFloor: 3 * time.Millisecond, PauseAfterTicks: 1 << 40,
+		})
+		d, err := driver.New(h.srv.Connect(t), h.js, driver.Config{
+			Run: h.run, Capacity: 5000, IntentBatchOff: off,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer d.Close()
+		out := h.finish(t)
+		if out.err != nil {
+			t.Fatalf("run (off=%v): %v", off, out.err)
+		}
+		if d.SentIntents() == 0 {
+			t.Fatalf("leg off=%v: driver sent no intents", off)
+		}
+		return resimBatchLeg(t, h, out.lr.Engine, ticks, window), d
+	}
+
+	mOn, dOn := runLeg(t, false)
+	mOff, dOff := runLeg(t, true)
+	t.Logf("batch on:  fleet %d, %d intents | despawned %d (%.0f veh/h), laneChanges %d, collisions %d, meanSpeedA %.2f m/s",
+		dOn.FleetSize(), dOn.SentIntents(), mOn.despawned, mOn.dischargeRate(), mOn.laneChanges, mOn.collisions, mOn.meanSpeedA)
+	t.Logf("batch off: fleet %d, %d intents | despawned %d (%.0f veh/h), laneChanges %d, collisions %d, meanSpeedA %.2f m/s",
+		dOff.FleetSize(), dOff.SentIntents(), mOff.despawned, mOff.dischargeRate(), mOff.laneChanges, mOff.collisions, mOff.meanSpeedA)
+
+	if mOn.collisions != 0 || mOff.collisions != 0 {
+		t.Fatalf("collisions: on %d off %d", mOn.collisions, mOff.collisions)
+	}
+	// Same discharge-rate guard as the differential test: a one-vehicle
+	// window difference is 6% at these counts — demand-regime noise, not
+	// divergence.
+	if relDiff(mOn.dischargeRate(), mOff.dischargeRate()) > 0.05 && absDiff(mOn.despawned, mOff.despawned) > 1 {
+		t.Fatalf("discharge rate: on %.2f veh/h off %.2f veh/h (>5%% off and >1 vehicle)",
+			mOn.dischargeRate(), mOff.dischargeRate())
+	}
+	if relDiff(mOn.meanSpeedA, mOff.meanSpeedA) > 0.10 {
+		t.Fatalf("mean section-A speed: on %.2f off %.2f (>10%% off)", mOn.meanSpeedA, mOff.meanSpeedA)
+	}
+	if mOn.waveN > 0 && mOff.waveN > 0 {
+		if relDiff(mOn.penetration, mOff.penetration) > 0.10 {
+			t.Fatalf("wave penetration: on %.0f m off %.0f m (>10%% off)", mOn.penetration, mOff.penetration)
+		}
+		if mOff.waveP10 < mOn.waveP10-2 || mOff.waveP90 > mOn.waveP90+2 {
+			t.Fatalf("wave-speed envelopes inconsistent: on [%.2f, %.2f] off [%.2f, %.2f]",
+				mOn.waveP10, mOn.waveP90, mOff.waveP10, mOff.waveP90)
+		}
+	}
+	if relDiff(float64(mOn.laneChanges), float64(mOff.laneChanges)) > 0.40 {
+		t.Fatalf("lane changes: on %d off %d (>40%% off)", mOn.laneChanges, mOff.laneChanges)
+	}
+}

@@ -70,6 +70,13 @@ type Config struct {
 	// Strict timing-invariance needs an O(1) pickExit (global
 	// exit-reachability), future work.
 	RouteBudgetPerTick int
+	// IntentBatchOff restores the pre-ADR-0026 wire shape: one 44 B v2
+	// message per claimed vehicle per tick. Default ON: the driver
+	// aggregates the tick's route-free intents into TSIB batches — one
+	// message per cadence tick per controller, split at
+	// natsio.TSIBMaxRecords; route-update vehicles still ride standalone
+	// v2 (driver.go onObs). Exists for A/B measurement and debugging.
+	IntentBatchOff bool
 	// Type is the controller_type declared at attach (default
 	// "default-driver").
 	Type string
@@ -270,7 +277,9 @@ func (d *Driver) FleetSize() int {
 // LastObsTick is the newest observation tick the driver has worked on.
 func (d *Driver) LastObsTick() uint64 { return d.lastObsTick.Load() }
 
-// SentIntents counts intents published (observability).
+// SentIntents counts per-vehicle intents published (TSIB records plus
+// standalone v2) — the same unit in batch and batch-off mode, so the
+// counter is comparable across -intent-batch settings (observability).
 func (d *Driver) SentIntents() uint64 { return d.sentIntents.Load() }
 
 // Wait blocks until the driver stops (Close or Kill).
@@ -319,7 +328,12 @@ func (d *Driver) stream(vehicleID uint64) *engine.Stream {
 // onObs is the driving loop: one observation frame per tick, one intent per
 // claimed vehicle per tick — IDM longitudinal + MOBIL lateral computed
 // client-side from the resolved policy context, with the routing axis
-// (destination param) and informational turn signals.
+// (destination param) and informational turn signals. Wire shape (ADR-0026,
+// Config.IntentBatchOff): the tick's route-free intents collect in ego
+// (observation slice) order and flush as TSIB batches after the loop — the
+// batch goes out when the tick's intents are computed, the same moment the
+// last per-vehicle v2 would have (no barrier, no deadline); a vehicle with
+// a route update that tick rides ONE complete standalone v2 instead.
 func (d *Driver) onObs(msg *nats.Msg) {
 	obs, err := natsio.DecodeObs(msg.Data, d.types)
 	if err != nil {
@@ -329,6 +343,7 @@ func (d *Driver) onObs(msg *nats.Msg) {
 	params := d.spec.Params
 	present := map[uint64]bool{}
 	routeBudget := d.cfg.RouteBudgetPerTick
+	var batch []engine.Intent // the tick's route-free intents, ego order
 	for i := range obs.Egos {
 		ego := &obs.Egos[i]
 		present[ego.ID] = true
@@ -347,9 +362,21 @@ func (d *Driver) onObs(msg *nats.Msg) {
 		d.mu.Lock()
 		d.routeStep(&in, ego, &routeBudget)
 		d.mu.Unlock()
-		if err := d.nc.Publish(natsio.SubjectCtlIntent(d.cfg.Run, d.id), natsio.EncodeIntent(in)); err == nil {
-			d.sentIntents.Add(1)
+		switch {
+		case d.cfg.IntentBatchOff, in.RouteSet:
+			// Batch-off mode is the pre-ADR-0026 stream verbatim. So are
+			// route updates in either mode: ONE complete standalone v2
+			// carries every axis of that vehicle's tick, and the vehicle is
+			// omitted from the batch — splitting fixed axes into TSIB plus
+			// route into v2 would create competing same-vehicle intents
+			// under first-wins arbitration (ADR-0026).
+			d.publishIntent(in)
+		default:
+			batch = append(batch, in)
 		}
+	}
+	if len(batch) > 0 {
+		d.flushBatch(obs.Tick, batch)
 	}
 	// The observation's ego list is the authoritative claim view: dropped
 	// members despawned or were released engine-side.
@@ -368,6 +395,30 @@ func (d *Driver) onObs(msg *nats.Msg) {
 		// Liveness without control traffic: heartbeat so the engine's
 		// silence budget does not detach an idle standby replica.
 		_ = d.nc.Publish(natsio.SubjectCtlHeartbeat(d.cfg.Run, d.id), nil)
+	}
+}
+
+// publishIntent sends one standalone per-vehicle v2 intent (the pre-ADR-0026
+// wire shape, kept for batch-off mode and route-update ticks).
+func (d *Driver) publishIntent(in engine.Intent) {
+	if err := d.nc.Publish(natsio.SubjectCtlIntent(d.cfg.Run, d.id), natsio.EncodeIntent(in)); err == nil {
+		d.sentIntents.Add(1)
+	}
+}
+
+// flushBatch publishes the tick's collected intents as TSIB batches — one
+// message per cadence tick per controller, split at natsio.TSIBMaxRecords
+// (ADR-0026). Records stay in ego order, so engine-assigned seqs are
+// monotonic exactly as for the v2 stream; the header tick is the source
+// observation tick (informational only).
+func (d *Driver) flushBatch(tick uint64, batch []engine.Intent) {
+	subject := natsio.SubjectCtlIntent(d.cfg.Run, d.id)
+	for len(batch) > 0 {
+		n := min(len(batch), natsio.TSIBMaxRecords)
+		if err := d.nc.PublishMsg(natsio.NewTSIBMsg(subject, tick, batch[:n])); err == nil {
+			d.sentIntents.Add(uint64(n))
+		}
+		batch = batch[n:]
 	}
 }
 
