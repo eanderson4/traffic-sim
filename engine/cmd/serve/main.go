@@ -43,6 +43,19 @@ import (
 	"traffic-sim/engine/scenario"
 )
 
+// demandDeliveryWarn is the delivery fraction below which a run is called
+// out as void rather than reported as a result. Set at 95%: ordinary peak
+// congestion blocks a few percent of injections at saturated origins, which
+// is real physics, while the failure this guards against lost 84%.
+const demandDeliveryWarn = 0.95
+
+// coastWarn is the share of vehicle-ticks running with no controller intent
+// above which the run's physics are the controller's latency, not the
+// network's capacity. Deliberately low: hold-last already covers ordinary
+// message loss, so anything past a fraction of a percent is a controller
+// that stopped keeping up rather than a dropped packet.
+const coastWarn = 0.001
+
 func main() {
 	netfile := flag.String("netfile", "", "compiled network JSON (network-format v1); required unless -scenario")
 	scenarioDir := flag.String("scenario", "", "ADR-0012 scenario directory (supplies network, demand, types, seed, ticks); explicit -seed/-ticks override the manifest")
@@ -61,6 +74,10 @@ func main() {
 	capacity := flag.Int("capacity", 1000, "driver claim capacity")
 	exitRouting := flag.Bool("exit-routing", true, "driver assigns each claimed vehicle a seeded exit-lane destination (per-vehicle routing; without it vehicles take the kernel's leftmost-successor default)")
 	attachTimeout := flag.Duration("attach-timeout", 30*time.Second, "bound on the client-attach barrier: serve fails if an embedded client (driver, demand director) has not reported attached within this")
+	safetyDecel := flag.Float64("safety-decel", 6,
+		"longitudinal safety gate: max emergency deceleration (m/s²) the kernel "+
+			"applies to keep any vehicle out of its leader, capping every control "+
+			"path the way the right-of-way gate does; 0 disables it")
 	intentLog := flag.Bool("intent-log", true, "retain the engine's whole-run in-memory intent log; -intent-log=false drops it for long headless runs (the durable JetStream record and replay are unaffected — only the in-memory RunLog is lost)")
 	flag.Parse()
 
@@ -156,6 +173,15 @@ func main() {
 	// error rather than silently keep the relative path — filepath.Abs
 	// essentially never fails, so a failure here is exactly the case to not
 	// paper over.
+	// Longitudinal safety gate. Live runs need it and headless replays must
+	// not get it by surprise, so it is a flag with a live-friendly default
+	// rather than a kernel constant: an applied intent is computed from an
+	// observation a few ticks old and re-issued by hold-last for a few ticks
+	// more, which is long enough for a vehicle to hold a positive accel into
+	// a leader that has already stopped. Without the gate the kernel carries
+	// that out and books the overlap as a collision.
+	spec.Params.SafetyDecel = *safetyDecel
+
 	abs, err := filepath.Abs(spec.Net.Path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "serve: network path %s: %v\n", spec.Net.Path, err)
@@ -241,7 +267,32 @@ func main() {
 		os.Exit(1)
 	}
 	defer nc.Close()
-	js, err := nc.JetStream()
+	// The recorder publishes one message per claimed vehicle per tick and
+	// drains the whole batch in awaitBatch before the next tick, so the async
+	// pending window only ever has to hold ONE tick's worth of messages —
+	// which the driver's claim capacity already bounds. Sizing it from
+	// -capacity keeps the two in step instead of pinning a magic constant:
+	// a 1000-vehicle run gets a small window, a 60000-vehicle city run gets
+	// one that fits.
+	//
+	// nats.go defaults this to 4000 (defaultAsyncPubAckInflight), which a
+	// city-scale run blows through: a 30-minute chi-loop cut aborted at tick
+	// 13,462 with ~8,200 vehicles on "stalled with too many outstanding async
+	// published messages". The limit is soft rather than a hard cap — on
+	// overflow the client waits stallWait for pubacks to drain and only fails
+	// with ErrTooManyStalledMsgs if they don't — which is why the same run
+	// survived 4,736 vehicles earlier and only died once publish outran ack
+	// as the growing store slowed disk writes.
+	//
+	// The slack covers what rides along with the intents in a tick batch:
+	// spawn/despawn verbs, the rolling CRC, and keyframe chunks. js.pafs is a
+	// map grown on demand and maxpa is only compared against its length, so
+	// an unreached ceiling costs nothing.
+	maxPending := *capacity + 8192
+	if maxPending < 4000 {
+		maxPending = 4000 // never below the library default
+	}
+	js, err := nc.JetStream(nats.PublishAsyncMaxPending(maxPending))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "serve: JetStream:", err)
 		os.Exit(1)
@@ -311,6 +362,14 @@ func main() {
 	// runErr, so the channel receive below is the happens-before edge that
 	// makes the read race-free.
 	var finalStats engine.Stats
+	var finalExpired, finalInjected int
+	var finalExpiredByLane map[string]int
+	var finalLastInject, finalFirstExpire uint64
+	var finalDOA int
+	var finalCoast, finalCoastMoving, finalCoastMax int
+	var finalCoastFirst uint64
+	var finalVehTicks int
+	var finalGated, finalOverlapped int
 	go func() {
 		// PaceFloor = one tick of wall time at -pace 1 (1× realtime); -pace N
 		// divides it by N, -pace 0 disables pacing entirely (batch mode).
@@ -326,6 +385,14 @@ func main() {
 		}
 		if lr != nil && lr.Engine != nil {
 			finalStats = lr.Engine.Stats
+			finalExpired, finalInjected = lr.Engine.DirExpired, lr.Engine.DirInjected
+			finalExpiredByLane = lr.Engine.DirExpiredByLane
+			finalLastInject, finalFirstExpire = lr.Engine.DirLastInject, lr.Engine.DirFirstExpire
+			finalDOA = lr.Engine.DirDeadOnArrival
+			finalCoast, finalCoastMoving = lr.Engine.CoastVehTicks, lr.Engine.CoastMovingVehTicks
+			finalCoastMax, finalCoastFirst = lr.Engine.CoastMaxPerTick, lr.Engine.CoastFirstTick
+			finalVehTicks = lr.Engine.VehTicks
+			finalGated, finalOverlapped = lr.Engine.SafetyGated, lr.Engine.SafetyOverlapped
 		}
 		runErr <- err
 	}()
@@ -386,6 +453,76 @@ func main() {
 		// routed demand is reaching its destinations. A run whose arrivals
 		// are a small fraction of despawns has vehicles drifting off-route
 		// and leaving via the map edge instead.
+		// Director demand delivery. Expiry is SILENT in every other readout —
+		// it is not a denial, so denied_* stays at zero while the run quietly
+		// loses most of its demand — and a run that injects a fraction of what
+		// its scenario asked for is not the scenario anyone calibrated.
+		if tot := finalExpired + finalInjected; tot > 0 {
+			delivered := float64(finalInjected) / float64(tot)
+			fmt.Printf("serve: director demand: injected=%d expired=%d (%.0f%% of accepted directives delivered) lastInject=tick %d firstExpire=tick %d deadOnArrival=%d\n",
+				finalInjected, finalExpired, 100*delivered,
+				finalLastInject, finalFirstExpire, finalDOA)
+			// Loud, because the alternative is a run that reads as a clean
+			// measurement of a scenario it never actually simulated. Under-
+			// delivery is not a detail of the result, it invalidates it.
+			if delivered < demandDeliveryWarn {
+				fmt.Printf("serve: WARNING: %.0f%% of demand never entered the network — this run is NOT the scenario as written; treat its metrics as void\n",
+					100*(1-delivered))
+				if finalDOA > 0 {
+					fmt.Printf("serve: WARNING: %d directives arrived past the %d-tick hold window and were never attempted (the director could not keep up with declared demand)\n",
+						finalDOA, engine.DirectorSpawnHoldTicks)
+				}
+			}
+			// Localized for the same reason collisions are: a network-wide
+			// loss count cannot distinguish "demand is globally too high"
+			// from "three origin lanes are wedged".
+			if len(finalExpiredByLane) > 0 {
+				ls := make([]string, 0, len(finalExpiredByLane))
+				for k := range finalExpiredByLane {
+					ls = append(ls, k)
+				}
+				sort.Slice(ls, func(i, j int) bool {
+					if a, b := finalExpiredByLane[ls[i]], finalExpiredByLane[ls[j]]; a != b {
+						return a > b
+					}
+					return ls[i] < ls[j]
+				})
+				if len(ls) > 10 {
+					ls = ls[:10]
+				}
+				fmt.Printf("serve: expiries over %d origin lanes; worst:\n", len(finalExpiredByLane))
+				for _, l := range ls {
+					fmt.Printf("serve:   %-40s %d\n", l, finalExpiredByLane[l])
+				}
+			}
+		}
+		// Coasting: the driver-side twin of demand expiry, and just as silent.
+		// A holdlast vehicle past its hold window gets no car-following term at
+		// all, so it holds speed into whatever is stopped ahead — the resulting
+		// overlaps are booked as collisions and read as congestion. Reported
+		// against total vehicle-ticks because the absolute count means nothing
+		// without the population it is drawn from.
+		if finalVehTicks > 0 && finalCoast > 0 {
+			frac := float64(finalCoast) / float64(finalVehTicks)
+			fmt.Printf("serve: uncontrolled coasting: %d of %d vehicle-ticks (%.2f%%) had no controller intent; %d (%.2f%%) while moving >%.0f m/s; worst tick %d vehicles; first at tick %d\n",
+				finalCoast, finalVehTicks, 100*frac,
+				finalCoastMoving, 100*float64(finalCoastMoving)/float64(finalVehTicks),
+				1.0, finalCoastMax, finalCoastFirst)
+			if frac > coastWarn {
+				fmt.Printf("serve: WARNING: the driver could not keep up — %.1f%% of vehicle-ticks ran with no car-following control, which manufactures overlaps that are NOT traffic congestion\n",
+					100*frac)
+			}
+		}
+		// Safety gate. Two numbers, and they answer different questions:
+		// how often the kernel had to save a controller from its own stale
+		// intent, and how often it was already too late. The second is the
+		// one that says whether the remaining collisions are real.
+		if finalVehTicks > 0 && *safetyDecel > 0 {
+			fmt.Printf("serve: safety gate (%.1f m/s²): bound %d of %d vehicle-ticks (%.2f%%); %d saw an already-overlapped pair (%.4f%%)\n",
+				*safetyDecel, finalGated, finalVehTicks,
+				100*float64(finalGated)/float64(finalVehTicks), finalOverlapped,
+				100*float64(finalOverlapped)/float64(finalVehTicks))
+		}
 		if st := finalStats; st.Despawned > 0 {
 			fmt.Printf("serve: spawned=%d despawned=%d (arrived=%d, %.0f%% of despawns) lanechanges=%d collisions=%d\n",
 				st.Spawned, st.Despawned, st.Arrived, 100*float64(st.Arrived)/float64(st.Despawned),
@@ -620,7 +757,15 @@ func (m *metricObserver) finish(e *engine.Engine, path string, ticks uint64) err
 	if err != nil {
 		return err
 	}
-	if err := engine.WriteMetricsJSON(f, m.k, ticks); err != nil {
+	// Delivery rides in the document so an artifact read months later still
+	// carries whether the run actually simulated its own scenario.
+	dd := engine.DemandDelivery{
+		Injected:       e.DirInjected,
+		Expired:        e.DirExpired,
+		DeadOnArrival:  e.DirDeadOnArrival,
+		LastInjectTick: e.DirLastInject,
+	}
+	if err := engine.WriteMetricsJSON(f, m.k, ticks, dd); err != nil {
 		f.Close()
 		os.Remove(tmp)
 		return err

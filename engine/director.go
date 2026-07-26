@@ -31,11 +31,21 @@ import (
 
 // DirectorSpawnHoldTicks bounds how long a queued directive whose earliest
 // tick has passed waits for origin clearance or density headroom before
-// expiring: 600 ticks = 60 sim seconds at the validated dt=0.1. A verb
-// this stale is dropped rather than injected — the runtime director
+// expiring: 600 ticks = 60 sim seconds at the validated dt=0.1.
+//
+// This once claimed a stale verb was safe to drop because "the director
 // re-samples demand continuously, so stale arrivals are superseded demand,
-// not a backlog to flush (contrast the build-time Spawner, whose schedule
-// is the spec and never expires).
+// not a backlog to flush". That is not what the director does: flowSampler
+// walks a FIXED arrival schedule (demand/director.go), so a dropped verb is
+// a vehicle the scenario asked for and never got — lost demand, not
+// superseded demand. Believing otherwise is what let chi-loop-urban lose
+// 15,052 of 17,998 requested vehicles with every metric reading clean.
+//
+// Expiry is still the right policy for an origin that stays blocked — the
+// alternative is an unbounded queue that injects a rush-hour's worth of
+// backlog the instant a jam clears. But the loss is now COUNTED
+// (Engine.DirExpired and friends) rather than silent, and the counters
+// separate a blocked origin from a verb that arrived too late to try.
 const DirectorSpawnHoldTicks = 600
 
 // SpawnDirective is the kernel form of a director spawn verb: where and
@@ -219,6 +229,22 @@ func (e *Engine) stepDirectorSpawns() {
 			continue
 		}
 		if e.Tick > d.EarliestTick+DirectorSpawnHoldTicks {
+			e.DirExpired++
+			if e.DirExpiredByLane == nil {
+				e.DirExpiredByLane = map[string]int{}
+			}
+			e.DirExpiredByLane[d.Origin]++
+			if e.DirFirstExpire == 0 {
+				e.DirFirstExpire = e.Tick
+			}
+			// Dead on arrival: the directive was ALREADY past its hold window
+			// when it entered the queue, so it never got a single injection
+			// attempt. That separates "the origin was blocked for 60 s" from
+			// "the verb showed up too late to matter" — different bugs, and
+			// the second one is invisible in every other counter.
+			if d.Tick > d.EarliestTick+DirectorSpawnHoldTicks {
+				e.DirDeadOnArrival++
+			}
 			continue // expired: stale demand dropped (deterministic)
 		}
 		lane := e.Net.Lanes[d.LaneIdx]
@@ -245,6 +271,8 @@ func (e *Engine) stepDirectorSpawns() {
 			continue
 		}
 		e.injectDirective(&d, lane, speed)
+		e.DirInjected++
+		e.DirLastInject = e.Tick
 	}
 	e.dirQueue = kept
 }

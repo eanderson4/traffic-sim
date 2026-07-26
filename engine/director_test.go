@@ -309,3 +309,96 @@ func TestDirectorKeyframeResume(t *testing.T) {
 		t.Fatalf("restored run still has %d pending directives", resumed.PendingSpawns())
 	}
 }
+
+// TestDirectorExpiryIsAccounted pins the accounting for demand the kernel
+// drops. Expiry is not a denial — denied_* stays at zero through it — so
+// before these counters a run could lose the MAJORITY of its demand with
+// every metric reading clean. Measured on chi-loop-urban before the fix:
+// 17,998 accepted directives, 2,946 injections, and nothing anywhere said
+// the other 15,052 vehicles had been asked for and never delivered.
+//
+// The two expiry paths are distinguished because they are different bugs:
+// a blocked origin means the network could not absorb the demand, while
+// dead-on-arrival means the verb reached the kernel already stale and never
+// got a single injection attempt.
+func TestDirectorExpiryIsAccounted(t *testing.T) {
+	// Blocked origin: cap the density so nothing can ever inject, exactly
+	// as TestDirectorDensityCap does, and hold past the window.
+	spec := directorSpec(t, "straight", 2000)
+	spec.Scen.DensityTargetPerKm = 0.001
+	e, err := NewEngine(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.AddInitialVehicle(e.Net.Lanes[0], 0, 100, 10, 1)
+	if err := e.EnqueueSpawn(SpawnDirective{RequestID: "blocked", Origin: "S0", TypeName: "car", EarliestTick: 1}); err != nil {
+		t.Fatal(err)
+	}
+	for e.Tick < uint64(DirectorSpawnHoldTicks)+50 {
+		e.Step()
+	}
+	if e.DirExpired != 1 || e.DirInjected != 0 {
+		t.Errorf("blocked-origin expiry: DirExpired=%d DirInjected=%d, want 1 and 0",
+			e.DirExpired, e.DirInjected)
+	}
+	if e.DirDeadOnArrival != 0 {
+		t.Errorf("blocked-origin expiry counted as dead-on-arrival (%d) — it got injection attempts every tick",
+			e.DirDeadOnArrival)
+	}
+	if got := e.DirExpiredByLane["S0"]; got != 1 {
+		t.Errorf("expiry not localized to its origin: DirExpiredByLane[S0]=%d, want 1", got)
+	}
+	if e.DirFirstExpire == 0 {
+		t.Error("DirFirstExpire unset — the tick of the first loss is the one number that dates the onset")
+	}
+}
+
+// TestDirectorDeadOnArrival reproduces the failure that silently capped
+// chi-loop-urban at 2,946 vehicles. The demand director issues one
+// SYNCHRONOUS spawn verb at a time and the contract applies verbs at tick
+// boundaries, which pins it to ~1 verb/tick — 36,000 veh/h at dt=0.1. Ask
+// for more (the Chicago cut asked 41,133) and the sampler's backlog grows
+// without bound; once its lag passes DirectorSpawnHoldTicks EVERY later
+// verb arrives already expired, so injection stops permanently and does
+// NOT resume when the network empties. That last property is what made it
+// look like congestion rather than a bug.
+func TestDirectorDeadOnArrival(t *testing.T) {
+	e, err := NewEngine(directorSpec(t, "straight", 2000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Advance well past the hold window, then enqueue demand stamped for a
+	// tick that is already stale — a director running behind sim time.
+	for e.Tick < uint64(DirectorSpawnHoldTicks)*2 {
+		e.Step()
+	}
+	stale := e.Tick - uint64(DirectorSpawnHoldTicks) - 1
+	if err := e.EnqueueSpawn(SpawnDirective{RequestID: "late", Origin: "S0", TypeName: "car", EarliestTick: stale}); err != nil {
+		t.Fatal(err)
+	}
+	before := len(e.Vehicles())
+	e.Step() // enters the queue
+	e.Step() // and is expired on its first eligibility pass
+	if len(e.Vehicles()) != before {
+		t.Fatalf("a stale directive injected: vehicles %d -> %d", before, len(e.Vehicles()))
+	}
+	if e.DirExpired != 1 || e.DirDeadOnArrival != 1 {
+		t.Fatalf("dead-on-arrival not distinguished: DirExpired=%d DirDeadOnArrival=%d, want 1 and 1",
+			e.DirExpired, e.DirDeadOnArrival)
+	}
+	// The empty network is the point: nothing about the world blocked this
+	// injection, so a diagnosis that reads only occupancy learns nothing.
+	if e.PendingSpawns() != 0 {
+		t.Errorf("stale directive still queued: %d pending", e.PendingSpawns())
+	}
+	// A directive stamped for NOW still injects — the kernel is not wedged,
+	// which is exactly what made the field failure so hard to see.
+	if err := e.EnqueueSpawn(SpawnDirective{RequestID: "fresh", Origin: "S0", TypeName: "car", EarliestTick: e.Tick + 1}); err != nil {
+		t.Fatal(err)
+	}
+	e.Step()
+	e.Step()
+	if e.DirInjected != 1 {
+		t.Errorf("fresh directive after a stale one: DirInjected=%d, want 1", e.DirInjected)
+	}
+}

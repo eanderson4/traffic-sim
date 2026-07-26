@@ -171,6 +171,24 @@ def main():
                          "the arterial side and freeway demand is added on top, "
                          "so the realized grand total exceeds --total (it is "
                          "printed to stderr)")
+    ap.add_argument("--through-share", type=float, default=0.45,
+                    help="fraction of NON-freeway portal inflow that is "
+                         "THROUGH traffic — destined for a boundary exit "
+                         "rather than a workplace inside the zone. The "
+                         "remainder terminates downtown as before. Residential "
+                         "origins are never through traffic (a resident "
+                         "driving to work is by definition not passing "
+                         "through), so this applies to portals only.")
+    ap.add_argument("--freeway-through-share", type=float, default=0.75,
+                    help="--through-share for grade-separated origins, which "
+                         "run much higher: the Kennedy carries ~250k AADT past "
+                         "downtown and only a minority of it exits into the "
+                         "Loop. Setting this equal to --through-share collapses "
+                         "the distinction.")
+    ap.add_argument("--exit-lanes", type=int, default=80,
+                    help="how many boundary exit lanes become through-traffic "
+                         "destinations, taken by class capacity. Costs the same "
+                         "per-destination route table as --dest-lanes.")
     ap.add_argument("--flat-peak", action="store_true",
                     help="emit ONE constant slice at the profile's peak rate "
                          "instead of the AM ramp. For recording a watchable "
@@ -216,9 +234,50 @@ def main():
           f"{100 * sum(dest_area.values()) / sum(work.values()):.0f}% of workplace floor area",
           file=sys.stderr)
 
+    # --- Through-traffic destinations: boundary EXIT lanes.
+    #
+    # Without these the demand program has no mass balance. Every flow this
+    # script emitted — freeway portals included — terminated at one of the
+    # workplace lanes above, so the whole 27,000 veh/h of inflow drained
+    # through ~120 lanes in the densest part of the grid. Measured at 18,000
+    # ticks: 1,112 trips completed against 5,675 still circulating at the
+    # horizon. That is not congestion, it is a bathtub with the taps open —
+    # vehicle count rises monotonically and no equilibrium exists at ANY
+    # horizon, which is why the corridor speeds looked right at 6,000 ticks
+    # and had collapsed to 20.5 km/h by 18,000.
+    #
+    # Real expressway traffic past a downtown is dominantly THROUGH traffic:
+    # the Kennedy carries ~250k AADT alongside the Loop and only a minority
+    # exits into the CBD. Routing a share of portal inflow to a boundary exit
+    # closes the balance, and it does so with a trip that CROSSES the box in
+    # a few minutes instead of one that dies in the grid — so freeway trips
+    # actually complete inside a recordable horizon and become measurable.
+    exit_cap = {}
+    exit_edge = {}
+    for e in portals["exits"]:
+        cls = e.get("class")
+        if e.get("fragment") or cls not in PORTAL_RATES or e["id"] not in lanes:
+            continue
+        exit_cap[e["id"]] = float(PORTAL_RATES[cls])
+        exit_edge[e["id"]] = str(e.get("edge", "")).lstrip("-")
+    # Freeway exits are taken in full before arterial ones fill the rest: a
+    # freeway origin that cannot reach a freeway exit has nowhere plausible
+    # to go, so that pool must never be the part that gets truncated.
+    fw_exits = sorted(e for e in exit_cap
+                      if e in {x["id"] for x in portals["exits"]
+                               if x.get("class") in FREEWAY_CLASSES})
+    other = sorted((e for e in exit_cap if e not in set(fw_exits)),
+                   key=lambda e: (-exit_cap[e], e))
+    exit_lanes = fw_exits + other[:max(0, args.exit_lanes - len(fw_exits))]
+    fw_exit_set = set(fw_exits)
+    print(f"exits: {len(exit_lanes)} through-traffic destination lanes "
+          f"({len(fw_exits)} grade-separated)", file=sys.stderr)
+
     # Reverse reachability per destination — the filter that keeps a flow
     # from being handed a destination its vehicles can never steer to.
     reach = {d: can_reach(preds, d) for d in dest_lanes}
+    for d in exit_lanes:
+        reach[d] = can_reach(preds, d)
 
     def dests_for(origin):
         w = {d: dest_area[d] for d in dest_lanes if origin in reach[d]}
@@ -226,6 +285,40 @@ def main():
         if tot <= 0:
             return {}
         return {d: v / tot for d, v in w.items()}
+
+    def through_for(origin, cls, edge):
+        """Normalized boundary-exit weights for a portal origin.
+
+        Freeway origins are held to freeway exits — an interstate's through
+        movement leaves on an interstate, not by filtering onto a side
+        street. Exits on the origin's own edge are dropped: that pair is a
+        U-turn straight back out the way it came in.
+        """
+        pool = fw_exit_set if cls in FREEWAY_CLASSES else exit_lanes
+        w = {d: exit_cap[d] for d in pool
+             if origin in reach[d] and exit_edge[d] != edge}
+        tot = sum(w.values())
+        if tot <= 0:
+            return {}
+        return {d: v / tot for d, v in w.items()}
+
+    def blend(work_d, thru_d, share):
+        """Mix workplace and through destinations at `share` through.
+
+        Degenerate pools collapse the mix rather than losing demand: an
+        origin that can reach no exit sends everything downtown, and one
+        that can reach no workplace sends everything out.
+        """
+        if not thru_d:
+            share = 0.0
+        elif not work_d:
+            share = 1.0
+        out = collections.defaultdict(float)
+        for d, v in work_d.items():
+            out[d] += (1.0 - share) * v
+        for d, v in thru_d.items():
+            out[d] += share * v
+        return dict(out)
 
     profile = [max(AM_PROFILE)] if args.flat_peak else AM_PROFILE
     flows = []
@@ -239,8 +332,9 @@ def main():
         if cls not in PORTAL_RATES or p.get("fragment"):
             stats["portal skipped"] += 1
             continue
-        entries.append((p["id"], cls, PORTAL_RATES[cls]))
-    portal_raw = sum(r for _, _, r in entries)
+        entries.append((p["id"], cls, PORTAL_RATES[cls],
+                        str(p.get("edge", "")).lstrip("-")))
+    portal_raw = sum(r for _, _, r, _ in entries)
     portal_scale = (args.total * portal_share / portal_raw) if portal_raw else 0
 
     # --freeway-scale exists because ONE scalar cannot congest both road
@@ -260,8 +354,11 @@ def main():
     # totals are reported below rather than left implicit, because a flag
     # that silently invalidates another flag's meaning is a trap.
     realized = collections.Counter()
-    for i, (lid, cls, raw) in enumerate(sorted(entries)):
-        d = dests_for(lid)
+    for i, (lid, cls, raw, edge) in enumerate(sorted(entries)):
+        share = (args.freeway_through_share if cls in FREEWAY_CLASSES
+                 else args.through_share)
+        thru = through_for(lid, cls, edge)
+        d = blend(dests_for(lid), thru, share)
         if not d:
             stats["portal unreachable"] += 1
             continue
@@ -272,6 +369,9 @@ def main():
             realized["freeway"] += rate
         else:
             realized["arterial"] += rate
+        realized["through"] += rate * (share if thru else 0.0)
+        if not thru:
+            stats["portal no reachable exit"] += 1
         emit_flow(flows, f"p{i:03d}-{cls}", lid, rate, profile,
                   {"car": round(1 - truck, 3), "truck": round(truck, 3)}, d)
         stats["portal flows"] += 1
@@ -284,6 +384,14 @@ def main():
               f"unchanged from freeway-scale 1.0 and the freeway side is "
               f"{args.freeway_scale}x on top)",
               file=sys.stderr)
+    portal_tot = realized["arterial"] + realized["freeway"]
+    if portal_tot:
+        print(f"[mkod] through traffic: {realized['through']:.0f} of "
+              f"{portal_tot:.0f} veh/h portal inflow "
+              f"({100 * realized['through'] / portal_tot:.0f}%) exits at the "
+              f"boundary; the rest terminates in-zone. Through trips CLOSE "
+              f"the mass balance — without them inflow has no drain and "
+              f"vehicle count grows without bound.", file=sys.stderr)
 
     # --- Residential interior origins: residents leaving their building.
     top_res = sorted(res.items(), key=lambda kv: -kv[1])[:args.origin_lanes]
@@ -317,7 +425,12 @@ def main():
         f"# routed to workplace destinations weighted by floor area.",
         f"# Target {args.total:.0f} veh/h peak, {args.resident_share:.0%} originating in-zone.",
         f"# {stats['portal flows']} portal flows + {stats['resident flows']} residential flows,",
-        f"# {len(dest_lanes)} destination lanes. Profile {profile} per half hour"
+        f"# Through share {args.through_share:.0%} arterial / "
+        f"{args.freeway_through_share:.0%} freeway portals — that fraction of"
+        + " portal inflow is destined for a boundary EXIT rather than a",
+        f"# workplace, which is what closes the mass balance.",
+        f"# {len(dest_lanes)} workplace + {len(exit_lanes)} exit destination"
+        f" lanes. Profile {profile} per half hour"
         + (" (FLAT PEAK — a recording cut, not the AM ramp)." if args.flat_peak else "."),
         "format_version: 1",
         "flows:",

@@ -36,6 +36,7 @@ import (
 	"log"
 	"math"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -68,6 +69,29 @@ type Director struct {
 	hb        string
 	log       *log.Logger
 
+	// Verb delivery is ASYNCHRONOUS. It used to be a blocking nc.Request per
+	// spawn, and that request cannot return faster than one tick: the
+	// contract buffers wire requests in NATS callbacks and drains them once
+	// per tick (contract.go), so the reply is a tick away by construction.
+	// One blocking send at a time therefore pinned the whole director to ONE
+	// spawn per tick — 36,000 veh/h at dt=0.1 — regardless of how much demand
+	// the scenario declared.
+	//
+	// Past that ceiling the failure was silent and irreversible: the sampler
+	// backlog grew, and once its lag passed the kernel's hold window every
+	// later verb arrived already expired and was dropped without ever being
+	// attempted. Measured on chi-loop-urban (41,133 veh/h declared): 17,998
+	// verbs accepted, 2,946 vehicles injected, injection dead from tick 3,033
+	// to the 18,000-tick horizon and NOT resuming as the network emptied.
+	//
+	// The kernel side was never the constraint — its drain loop already
+	// applies every buffered request in the same tick. So the director now
+	// publishes with its own reply inbox and reconciles replies in a
+	// callback, exactly like any other event it listens to.
+	replyTo string
+	rsub    *nats.Subscription
+
+	mu                                          sync.Mutex
 	Sent, Accepted, Rejected, Claims, Unclaimed int
 }
 
@@ -176,6 +200,15 @@ func Attach(nc *nats.Conn, js nats.JetStreamContext, cfg Config, dfs []*scenario
 	// controller silent for DetachAfterTicks (10), and a Poisson flow's
 	// inter-verb gaps are far longer — heartbeats keep the attachment
 	// alive between verbs (their purpose; ADR-0006 M4 addendum).
+	// Own reply inbox: verbs are published, not requested, so their
+	// acknowledgements arrive here as ordinary events.
+	d.replyTo = nats.NewInbox()
+	rsub, err := nc.Subscribe(d.replyTo, d.onReply)
+	if err != nil {
+		return nil, fmt.Errorf("subscribe verb replies: %w", err)
+	}
+	d.rsub = rsub
+
 	d.hb = natsio.SubjectCtlHeartbeat(cfg.Run, ctlID)
 	sub, err := nc.Subscribe(natsio.SubjectStateSnap(cfg.Run), d.onSnapshot)
 	if err != nil {
@@ -191,6 +224,14 @@ func (d *Director) Close() {
 	if d.sub != nil {
 		_ = d.sub.Unsubscribe()
 	}
+	if d.rsub != nil {
+		// Flush first: in-flight verbs still owe replies, and dropping the
+		// inbox before they land would undercount Accepted for no reason.
+		_ = d.nc.Flush()
+		_ = d.rsub.Unsubscribe()
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	d.log.Printf("demand director: done — verbs=%d accepted=%d rejected=%d spawn-announcements=%d claims=%d",
 		d.Sent, d.Accepted, d.Rejected, d.Unclaimed, d.Claims)
 }
@@ -205,19 +246,45 @@ func (d *Director) onSnapshot(m *nats.Msg) {
 		if d.exhausted[i] {
 			continue
 		}
-		at := d.pending[i].at
-		if at > d.endS {
-			d.exhausted[i] = true
-			continue
-		}
-		atTick := uint64(at/d.dt + 0.5)
-		if f.Tick+d.cfg.Lead >= atTick {
+		// Drain every arrival this flow already owes, not one per
+		// snapshot. A single send per snapshot cannot shed a backlog
+		// faster than it accrues, so any transient lag became permanent.
+		for !d.exhausted[i] {
+			at := d.pending[i].at
+			if at > d.endS {
+				d.exhausted[i] = true
+				break
+			}
+			if f.Tick+d.cfg.Lead < uint64(at/d.dt+0.5) {
+				break
+			}
 			d.send(i)
 		}
 	}
 	if f.Tick%200 == 0 {
+		d.mu.Lock()
+		sent, acc, rej, claims := d.Sent, d.Accepted, d.Rejected, d.Claims
+		d.mu.Unlock()
 		d.log.Printf("  tick %d: vehicles=%d verbs=%d accepted=%d rejected=%d claimed=%d",
-			f.Tick, len(f.Vehicles), d.Sent, d.Accepted, d.Rejected, d.Claims)
+			f.Tick, len(f.Vehicles), sent, acc, rej, claims)
+	}
+}
+
+// onReply reconciles one verb acknowledgement off the request path.
+func (d *Director) onReply(msg *nats.Msg) {
+	var rep natsio.VerbReply
+	ok := json.Unmarshal(msg.Data, &rep) == nil && rep.Accepted
+	d.mu.Lock()
+	if ok {
+		d.Accepted++
+	} else {
+		d.Rejected++
+	}
+	d.mu.Unlock()
+	if !ok {
+		d.log.Printf("  verb %s REJECTED: %s", rep.RequestID, msg.Data)
+	} else if rep.Duplicate {
+		d.log.Printf("  verb %s: duplicate (already applied — restart overlap)", rep.RequestID)
 	}
 }
 
@@ -233,22 +300,12 @@ func (d *Director) send(flowIdx int) {
 		Destination:  d.pending[flowIdx].dest,
 		OffsetM:      fs.flow.OffsetM,
 	})
+	d.mu.Lock()
 	d.Sent++
-	msg, err := d.nc.Request(natsio.SubjectCtlVerb(d.cfg.Run, d.ctlID), req, 2*time.Second)
-	if err != nil {
-		d.log.Printf("  verb f%d-%06d (%s@%s tick %d): NO REPLY: %v",
+	d.mu.Unlock()
+	if err := d.nc.PublishRequest(natsio.SubjectCtlVerb(d.cfg.Run, d.ctlID), d.replyTo, req); err != nil {
+		d.log.Printf("  verb f%d-%06d (%s@%s tick %d): PUBLISH FAILED: %v",
 			flowIdx, fs.ordinal-1, d.pending[flowIdx].vtype, fs.flow.Origin, atTick, err)
-		return
-	}
-	var rep natsio.VerbReply
-	if json.Unmarshal(msg.Data, &rep) == nil && rep.Accepted {
-		d.Accepted++
-		if rep.Duplicate {
-			d.log.Printf("  verb %s: duplicate (already applied — restart overlap)", rep.RequestID)
-		}
-	} else {
-		d.Rejected++
-		d.log.Printf("  verb f%d-%06d REJECTED: %s", flowIdx, fs.ordinal-1, msg.Data)
 	}
 	at, vtype, dest, ok := fs.next(d.dt)
 	if !ok {

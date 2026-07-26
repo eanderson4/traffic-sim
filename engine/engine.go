@@ -23,6 +23,20 @@ type Params struct {
 	SpawnCooldown    uint64  // ticks a fresh spawn may not change lanes
 	SpeedFactorSigma float64 // σ of the gaussian desired-speed factor
 	SpawnJitter      float64 // ± fraction applied to the mean spawn interval
+	// SafetyDecel is the emergency deceleration (m/s²) of the longitudinal
+	// safety gate: the largest brake the kernel will apply on a controller's
+	// behalf to keep it out of its leader. 0 disables the gate entirely,
+	// which is the M1–M3 behaviour and keeps those CRCs bit-identical.
+	//
+	// The gate is the longitudinal twin of rowGate (ADR-0010): it caps EVERY
+	// control path, so no controller — in-kernel IDM, an applied intent, or
+	// nothing at all — can drive a vehicle through the one in front. It
+	// exists because the holdlast policy's uncontrolled branch sets Acc = 0
+	// with no car-following term, so a vehicle whose controller falls behind
+	// holds its speed into a standing queue and stays overlapped for the
+	// rest of the run. On chi-loop-urban that read out as 20.2 M collision
+	// observations and was indistinguishable from congestion.
+	SafetyDecel float64
 }
 
 // DefaultParams returns the validated M1 defaults.
@@ -40,6 +54,11 @@ func DefaultParams() Params {
 		SpawnCooldown:    10,
 		SpeedFactorSigma: 0.1,
 		SpawnJitter:      0.3,
+		// Off by default: the gate changes accelerations, so enabling it
+		// here would silently rewrite every recorded CRC in the repo. Live
+		// runs opt in (cmd/serve's -safety-decel), which is where absent
+		// controllers actually happen.
+		SafetyDecel: 0,
 	}
 }
 
@@ -103,6 +122,35 @@ type Engine struct {
 	appliedSpawns []TickedSpawn       // entered the queue during the last Step (reused)
 	interiorInj   []InteriorInjection // ADR-0021 mid-lane injections of the last Step (derived, per-tick)
 	SpawnLog      []TickedSpawn       // every accepted directive, in application order
+
+	// Director spawn-outcome tallies. Derived observability only — never
+	// serialized, never in the CRC, so they cannot affect replay. They exist
+	// because expiry (director.go's DirectorSpawnHoldTicks) drops demand
+	// SILENTLY: a run can lose the majority of its vehicles with denied_* at
+	// zero and nothing in the log, which is indistinguishable from demand
+	// that was never asked for. Measured on chi-loop-urban: 17,998 accepted
+	// directives, 2,946 injections.
+	DirExpired       int            // directives dropped unserved past the hold window
+	DirInjected      int            // directives that produced a vehicle
+	DirExpiredByLane map[string]int // expiries localized to their origin lane
+	DirLastInject    uint64         // tick of the most recent successful injection
+	DirFirstExpire   uint64         // tick of the first expiry
+	DirDeadOnArrival int            // expiries that never got an injection attempt
+
+	// Coasting tallies, the PolicyHoldLast analogue of the director counters
+	// above and derived observability in exactly the same sense (never
+	// serialized, never in the CRC). A holdlast vehicle whose controller went
+	// quiet past the hold window gets Acc = 0 with no car-following term
+	// (computeAccels' default branch), so it holds its speed straight into
+	// whatever is stopped ahead. That is invisible in every existing metric —
+	// the run reports congestion, not a controller that fell behind.
+	CoastVehTicks       int    // vehicle-ticks spent coasting uncontrolled
+	CoastMovingVehTicks int    // of those, with V > coastMovingV (the harmful ones)
+	CoastMaxPerTick     int    // worst single-tick coasting population
+	CoastFirstTick      uint64 // first tick any vehicle coasted
+	VehTicks            int    // total vehicle-ticks stepped, the coasting denominator
+	SafetyGated         int    // vehicle-ticks the longitudinal safety gate bound
+	SafetyOverlapped    int    // vehicle-ticks the gate saw an ALREADY-negative leader gap (it was too late)
 
 	// Route-following caches (routing.go): derived from the immutable
 	// network, never serialized, never folded into the CRC.
@@ -388,6 +436,8 @@ func (e *Engine) prevFollower(lane *Lane, rear float64) (f *Vehicle, fLane *Lane
 //     logic in the engine in live runs; the contract layer bridges them)
 func (e *Engine) computeAccels() {
 	idm := e.idmPolicy()
+	coasting := 0
+	e.VehTicks += len(e.order)
 	for _, v := range e.order {
 		switch {
 		case v.reqAccOK:
@@ -398,14 +448,102 @@ func (e *Engine) computeAccels() {
 			v.Acc = e.accelOnLane(v, v.Lane, e.leader(v))
 		default:
 			v.Acc = 0
+			coasting++
+			e.CoastVehTicks++
+			if v.V > coastMovingV {
+				e.CoastMovingVehTicks++
+			}
+			if e.CoastFirstTick == 0 {
+				e.CoastFirstTick = e.Tick
+			}
 		}
 		// Junction right-of-way guardrail (ADR-0010): caps every control
 		// path, so all controllers inherit it.
 		if w, ok := e.rowGate(v); ok && w < v.Acc {
 			v.Acc = w
 		}
+		// Longitudinal safety guardrail: same "caps every control path"
+		// contract, one axis over.
+		if a, ok := e.safetyGate(v); ok && a < v.Acc {
+			v.Acc = a
+		}
+	}
+	if coasting > e.CoastMaxPerTick {
+		e.CoastMaxPerTick = coasting
 	}
 }
+
+// safetyGate returns the largest acceleration that still leaves v able to
+// stop behind its leader, and whether the gate applies at all.
+//
+// The criterion is the mutual-braking bound in its DISCRETE-time form
+// (Krauss): with both vehicles able to shed speed at SafetyDecel b, and one
+// tick of reaction built in,
+//
+//	v_max = −b·Δt + √( (b·Δt)² + v_lead² + 2·b·gap )
+//
+// so the admissible accel over the tick is (v_max − v)/Δt. The −b·Δt term
+// is what makes it hold under integration: the continuous bound
+// √(v_lead²+2b·gap) is exactly the "can still stop" boundary, and the
+// ballistic update advances by ½(v+v_max)·Δt, which eats that margin every
+// tick and lands the pair overlapped anyway (measured: −2.48 m on the
+// two-car fixture). One tick of braking reserve closes it.
+//
+// In free flow and in IDM equilibrium following this is enormously positive
+// and never binds — at a 25 m/s equilibrium gap it permits +86 m/s². It
+// engages only when a vehicle is genuinely about to run into something,
+// which is the point: a guardrail that shapes ordinary driving is a
+// car-following model, and the kernel already has one of those.
+//
+// Clamping at −b is NOT itself a failure signal — a maximum-effort stop
+// from speed sits on that clamp for its whole approach. What is worth
+// counting is the gate arriving too late to matter: a leader gap that is
+// already negative means the pair is overlapped and the guardrail did not
+// prevent it. That is the honest denominator for "are the remaining
+// collisions real?".
+func (e *Engine) safetyGate(v *Vehicle) (float64, bool) {
+	b := e.Params.SafetyDecel
+	if b <= 0 {
+		return 0, false
+	}
+	lead := e.leader(v)
+	if !lead.OK {
+		return 0, false
+	}
+	// A standstill reserve well under the jam gap (Car.S0 = 2 m): enough
+	// that a stopped pair does not sit on the −0.01 m collision threshold
+	// through float noise, small enough that the gate stays slack at the
+	// spacing IDM actually settles at.
+	room := lead.Gap - safetyStandstill
+	if room < 0 {
+		room = 0 // already too close: brake as hard as the gate allows
+	}
+	if lead.Gap < 0 {
+		e.SafetyOverlapped++
+	}
+	bdt := b * e.Params.Dt
+	vMax := -bdt + math.Sqrt(bdt*bdt+lead.V*lead.V+2*b*room)
+	if vMax < 0 {
+		vMax = 0
+	}
+	a := (vMax - v.V) / e.Params.Dt
+	if a < -b {
+		a = -b
+	}
+	if a < v.Acc {
+		e.SafetyGated++
+	}
+	return a, true
+}
+
+// safetyStandstill is the gap the safety gate refuses to close (m).
+const safetyStandstill = 0.25
+
+// coastMovingV is the speed above which coasting is materially dangerous: a
+// vehicle at walking pace that overruns its leader overlaps by centimetres,
+// one at 20 m/s drives clean through a standing queue and stays overlapped
+// for the rest of the run.
+const coastMovingV = 1.0
 
 // idmPolicy reports whether the in-kernel reference policy drives
 // uncontrolled vehicles (Scenario.UncontrolledPolicy; ADR-0008 clarification:
@@ -581,6 +719,14 @@ const collisionGap = -0.01
 // including the pair across a lane/successor boundary (e.g. ring wrap).
 // Cross-boundary observations are filed under the successor's section — that
 // is where the follower is heading and where the leader sits.
+//
+// The boundary pair is measured against the successor the leading vehicle is
+// actually ROUTED to (pickSuccessor), not Successors[0]. Two vehicles either
+// side of a diverge are only in each other's way if they are taking the same
+// branch; measuring every lane against its first successor invents overlaps
+// wherever a queue stands at a multi-way junction, which on chi-loop-urban
+// was the single largest "collision" source in the network (one 3-successor
+// tertiary lane accounted for 59% of the run's total).
 func (e *Engine) updateStats() {
 	for _, l := range e.Net.Lanes {
 		for i := 0; i+1 < len(l.vehs); i++ {
@@ -589,7 +735,7 @@ func (e *Engine) updateStats() {
 		if len(l.vehs) == 0 || len(l.Successors) == 0 {
 			continue
 		}
-		succ := l.Successors[0]
+		succ := e.pickSuccessor(l, l.vehs[len(l.vehs)-1])
 		if len(succ.vehs) == 0 {
 			continue
 		}
