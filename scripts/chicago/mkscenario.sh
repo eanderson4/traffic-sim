@@ -6,6 +6,12 @@
 # The network JSON is HARD-LINKED rather than copied: chi-loop-urban.json is
 # 45 MB and a bracket of six variants would otherwise cost 270 MB of
 # identical bytes. Falls back to a copy across filesystems.
+#
+# Every tool that rewrites a network MUST therefore write-then-rename rather
+# than truncate in place (mknetvariant.py does). Truncating a link rewrites
+# the shared inode — which means the source network under data/networks and
+# every other scenario pointing at it. Read-only sharing is the entire point
+# of the link; in-place mutation destroys it.
 set -euo pipefail
 
 NET=${1:?network name, e.g. chi-loop-urban}

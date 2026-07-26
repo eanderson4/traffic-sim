@@ -151,6 +151,12 @@ type Engine struct {
 	VehTicks            int    // total vehicle-ticks stepped, the coasting denominator
 	SafetyGated         int    // vehicle-ticks the longitudinal safety gate bound
 	SafetyOverlapped    int    // vehicle-ticks the gate saw an ALREADY-negative leader gap (it was too late)
+	// Boundary crossings that landed on top of a vehicle already on the
+	// successor. Crossing is a PLACEMENT, so no acceleration guardrail can
+	// prevent it — only the follower stopping short of the boundary can, and
+	// this counts the times that did not happen.
+	CrossOverlaps          int
+	CrossOverlapsBySection map[string]int
 
 	// Route-following caches (routing.go): derived from the immutable
 	// network, never serialized, never folded into the CRC.
@@ -650,6 +656,22 @@ func (e *Engine) boundaries() {
 			case len(lane.Successors) > 0:
 				v.S -= lane.Length
 				next := e.pickSuccessor(lane, v)
+				// Crossing is a placement, not a motion: v is put at S on
+				// next regardless of what is already sitting there. Count the
+				// landings that arrive overlapped — car-following is supposed
+				// to have stopped the vehicle short of the boundary, so a
+				// nonzero count localizes an overlap source that no
+				// acceleration guardrail can reach.
+				if a := next.vehs; len(a) > 0 {
+					rear := v.S - v.Type.Length
+					if i := sort.Search(len(a), func(i int) bool { return a[i].S > rear }); i < len(a) && a[i].S-a[i].Type.Length < v.S {
+						e.CrossOverlaps++
+						if e.CrossOverlapsBySection == nil {
+							e.CrossOverlapsBySection = map[string]int{}
+						}
+						e.CrossOverlapsBySection[next.Section]++
+					}
+				}
 				v.Lane = next
 				v.HeldTurn = 0 // turn-at-junction is held until consumed
 				// Stop-line duty is per junction APPROACH (ADR-0010), and an

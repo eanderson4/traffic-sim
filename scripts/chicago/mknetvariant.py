@@ -40,6 +40,7 @@ import argparse
 import collections
 import json
 import math
+import os
 import sys
 
 
@@ -195,8 +196,19 @@ def main():
     prov["variant_of"] = args.network
     prov["variant_ops"] = log
 
-    with open(args.out, "w") as f:
+    # Write-then-rename, and it is NOT just crash safety. Scenario dirs
+    # hard-link the network to avoid one 45 MB copy per variant, so `open(out,
+    # "w")` truncates an inode that may be shared with the source network and
+    # every other scenario pointing at it. That is not hypothetical: it
+    # silently rewrote data/networks/chi-loop-urban/chi-loop-urban.json into a
+    # retimed 55,882-lane variant, through a chain of 23 links, and the only
+    # reason it was recoverable is that copies on another filesystem had
+    # fallen back to real copies. rename() replaces the directory entry and
+    # leaves every other link pointing at the original bytes.
+    tmp = args.out + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(net, f)
+    os.replace(tmp, args.out)
     for line in log:
         print(f"[mknetvariant] {line}", file=sys.stderr)
     print(f"[mknetvariant] wrote {args.out} ({len(net['lanes'])} lanes)",

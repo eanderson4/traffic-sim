@@ -1,7 +1,9 @@
 package natsio
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -39,6 +41,14 @@ const cursorBatch = 2048
 // end of the stream, not a slow writer — this only has to outlast a local
 // broker's response.
 const cursorWait = 5 * time.Second
+
+// cursorInactive keeps the cursor's ephemeral consumer alive across gaps
+// between fetches. The server's default for an ephemeral is a few seconds,
+// which is SHORTER than the time a paced player spends playing one batch —
+// and far shorter than a replay parked on /pause. Generous on purpose: the
+// consumer is deleted explicitly by close(), so this only bounds how long a
+// leaked one survives.
+const cursorInactive = 2 * time.Hour
 
 // tickRecords is one tick's replayable log content: the arbitrated intents
 // and director verbs to re-enqueue before Step, and the rolling CRC to
@@ -197,6 +207,20 @@ func (c *logCursor) open(fromSeq uint64) error {
 		ReplayPolicy:  nats.ReplayInstantPolicy,
 		DeliverPolicy: nats.DeliverByStartSequencePolicy,
 		OptStartSeq:   fromSeq,
+		// An ephemeral consumer with no threshold is reaped by the server
+		// after a few seconds idle, and the gap BETWEEN fetches is exactly
+		// how long the player takes to play one batch — at 1x pace a
+		// 2048-message batch is ~6 s of wall time, so the consumer dies
+		// mid-replay and the next fetch gets "no responders available".
+		// Unpaced reads (tests, bake, the A/B that validated this cursor)
+		// fetch milliseconds apart and never see it, which is why this only
+		// showed up on the paced demo path.
+		//
+		// The threshold has to outlast a PAUSED replay too, where no fetch
+		// happens at all for as long as the operator leaves it paused. This
+		// is a backstop, not the lifecycle: close() deletes the consumer,
+		// and nextMsg reopens transparently if it disappears anyway.
+		InactiveThreshold: cursorInactive,
 	}
 	if fromSeq == 0 {
 		// Sequence 0 is not a valid start sequence; "from the beginning" is
@@ -233,6 +257,31 @@ func (c *logCursor) reset(fromSeq uint64) error {
 }
 
 // close tears down the ephemeral consumer. Safe to call more than once.
+// vanishedConsumer reports whether a Fetch failed because the cursor's
+// consumer no longer exists, as opposed to a broker that is down or a
+// request that timed out with work still outstanding. Those two need
+// opposite handling: a missing consumer is recoverable by reopening at the
+// same sequence, while a real fault must surface rather than be retried
+// into a silent truncation.
+//
+// A fetch against a deleted consumer surfaces as ErrNoResponders (nothing
+// is listening on the consumer's NEXT subject); the API also reports it as
+// ErrConsumerNotFound / ErrConsumerDeleted depending on path and version,
+// so all three are matched, with a string fallback for the versions that
+// return a bare *nats.APIError.
+func vanishedConsumer(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, nats.ErrNoResponders) ||
+		errors.Is(err, nats.ErrConsumerNotFound) ||
+		errors.Is(err, nats.ErrConsumerDeleted) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "no responders") || strings.Contains(s, "consumer not found")
+}
+
 func (c *logCursor) close() {
 	if c.sub != nil {
 		_ = c.sub.Unsubscribe()
@@ -260,6 +309,18 @@ func (c *logCursor) nextMsg() (*nats.Msg, error) {
 			batch = cursorBatch
 		}
 		msgs, err := c.sub.Fetch(int(batch), nats.MaxWait(cursorWait))
+		if err != nil && len(msgs) == 0 && vanishedConsumer(err) {
+			// The consumer went away underneath us (reaped, or the broker
+			// restarted). Reading forward is idempotent — curSeq records
+			// exactly what has been delivered — so reopening at curSeq+1
+			// resumes on the same message the dead consumer would have
+			// served. Recover once per batch: a genuinely unreachable
+			// broker fails on the retry rather than spinning.
+			if rerr := c.reset(c.curSeq + 1); rerr != nil {
+				return nil, fmt.Errorf("replay cursor reopen on %s at seq %d: %w", c.stream, c.curSeq, rerr)
+			}
+			msgs, err = c.sub.Fetch(int(batch), nats.MaxWait(cursorWait))
+		}
 		if err != nil && len(msgs) == 0 {
 			// A timeout with sequences still outstanding is a real fault,
 			// not an end: report it rather than truncating the replay

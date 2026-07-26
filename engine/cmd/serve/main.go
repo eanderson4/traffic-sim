@@ -71,7 +71,14 @@ func main() {
 	pace := flag.Float64("pace", 1, "wall-time pace multiplier: PaceFloor = dt/pace (1 = realtime, >1 = faster; 0 = unpaced batch mode — the attach barrier parks tick 0 until embedded clients are ready, so any pace is allowed with the driver/director attached)")
 	store := flag.String("store", "", "durable JetStream store directory (created if missing, kept on exit, refuses to append into an existing recording of the same run id); default is a temp dir deleted on exit")
 	withDriver := flag.Bool("driver", true, "run an in-process default driver replica")
-	capacity := flag.Int("capacity", 1000, "driver claim capacity")
+	capacity := flag.Int("capacity", 1000, "driver claim capacity (total across all replicas)")
+	drivers := flag.Int("drivers", 1,
+		"number of in-process default-driver replicas to shard the fleet across. "+
+			"One replica computes every claimed vehicle's intent in a single "+
+			"goroutine per observation, which is a hard throughput ceiling: on "+
+			"chi-loop-urban at ~12,000 vehicles 35.75% of vehicle-ticks ran with "+
+			"NO controller intent because the driver could not keep up. Claims are "+
+			"exclusive and engine-arbitrated, so replicas shard the fleet safely.")
 	exitRouting := flag.Bool("exit-routing", true, "driver assigns each claimed vehicle a seeded exit-lane destination (per-vehicle routing; without it vehicles take the kernel's leftmost-successor default)")
 	attachTimeout := flag.Duration("attach-timeout", 30*time.Second, "bound on the client-attach barrier: serve fails if an embedded client (driver, demand director) has not reported attached within this")
 	safetyDecel := flag.Float64("safety-decel", 6,
@@ -370,6 +377,8 @@ func main() {
 	var finalCoastFirst uint64
 	var finalVehTicks int
 	var finalGated, finalOverlapped int
+	var finalCross int
+	var finalCrossBySec map[string]int
 	go func() {
 		// PaceFloor = one tick of wall time at -pace 1 (1× realtime); -pace N
 		// divides it by N, -pace 0 disables pacing entirely (batch mode).
@@ -393,17 +402,36 @@ func main() {
 			finalCoastMax, finalCoastFirst = lr.Engine.CoastMaxPerTick, lr.Engine.CoastFirstTick
 			finalVehTicks = lr.Engine.VehTicks
 			finalGated, finalOverlapped = lr.Engine.SafetyGated, lr.Engine.SafetyOverlapped
+			finalCross, finalCrossBySec = lr.Engine.CrossOverlaps, lr.Engine.CrossOverlapsBySection
 		}
 		runErr <- err
 	}()
 
-	barrier := make(chan attachOutcome, 2)
+	barrier := make(chan attachOutcome, *drivers+1)
 	var expected []string
 	if *withDriver {
-		expected = append(expected, "default driver")
-		go func() {
-			barrier <- attachDriver(ns, *run, *capacity, *exitRouting, *attachTimeout)
-		}()
+		if *drivers < 1 {
+			fmt.Fprintln(os.Stderr, "serve: -drivers must be >= 1")
+			os.Exit(2)
+		}
+		// Capacity is the FLEET budget, split evenly. Splitting matters: each
+		// replica claims up to its own capacity, so N replicas at the full
+		// number would let one replica claim the whole fleet and leave the
+		// others idle — the ceiling this flag exists to raise.
+		per := *capacity / *drivers
+		if per < 1 {
+			per = 1
+		}
+		for i := 0; i < *drivers; i++ {
+			name := "default driver"
+			if *drivers > 1 {
+				name = fmt.Sprintf("default driver %d/%d", i+1, *drivers)
+			}
+			expected = append(expected, name)
+			go func(name string) {
+				barrier <- attachDriver(ns, *run, per, *exitRouting, *attachTimeout, name)
+			}(name)
+		}
 	}
 	// Scenario demand parts run through the embedded reference demand
 	// director (engine/natsio/demand): sampled with the RUN seed, so the
@@ -523,6 +551,26 @@ func main() {
 				100*float64(finalGated)/float64(finalVehTicks), finalOverlapped,
 				100*float64(finalOverlapped)/float64(finalVehTicks))
 		}
+		// Crossings that landed on top of somebody. This is the overlap
+		// source no acceleration guardrail can reach: a boundary crossing is
+		// a PLACEMENT, and the only thing that prevents it is the follower
+		// stopping short of the boundary in the first place.
+		if finalCross > 0 {
+			fmt.Printf("serve: boundary crossings landing overlapped: %d\n", finalCross)
+			secs := make([]string, 0, len(finalCrossBySec))
+			for k := range finalCrossBySec {
+				secs = append(secs, k)
+			}
+			sort.Slice(secs, func(i, j int) bool {
+				if a, b := finalCrossBySec[secs[i]], finalCrossBySec[secs[j]]; a != b {
+					return a > b
+				}
+				return secs[i] < secs[j]
+			})
+			for _, sec := range secs[:min(len(secs), 8)] {
+				fmt.Printf("serve:   %-40s %d\n", sec, finalCrossBySec[sec])
+			}
+		}
 		if st := finalStats; st.Despawned > 0 {
 			fmt.Printf("serve: spawned=%d despawned=%d (arrived=%d, %.0f%% of despawns) lanechanges=%d collisions=%d\n",
 				st.Spawned, st.Despawned, st.Arrived, 100*float64(st.Arrived)/float64(st.Despawned),
@@ -589,23 +637,23 @@ type attachOutcome struct {
 // been answered and New's final Flush guarantees the server has processed
 // the observation/snapshot/unclaimed subscriptions, so tick 0's unclaimed
 // pool reaches this replica.
-func attachDriver(ns *server.Server, run string, capacity int, exitRouting bool, metaWait time.Duration) attachOutcome {
-	dnc, err := nats.Connect(nats.DefaultURL, nats.InProcessServer(ns), nats.Name("default-driver"))
+func attachDriver(ns *server.Server, run string, capacity int, exitRouting bool, metaWait time.Duration, name string) attachOutcome {
+	dnc, err := nats.Connect(nats.DefaultURL, nats.InProcessServer(ns), nats.Name(name))
 	if err != nil {
-		return attachOutcome{client: "default driver", err: err}
+		return attachOutcome{client: name, err: err}
 	}
 	djs, err := dnc.JetStream()
 	if err != nil {
 		dnc.Close()
-		return attachOutcome{client: "default driver", err: err}
+		return attachOutcome{client: name, err: err}
 	}
 	d, err := driver.New(dnc, djs, driver.Config{Run: run, Capacity: capacity, ExitRouting: exitRouting, MetaWait: metaWait})
 	if err != nil {
 		dnc.Close()
-		return attachOutcome{client: "default driver", err: err}
+		return attachOutcome{client: name, err: err}
 	}
 	return attachOutcome{
-		client:  "default driver",
+		client:  name,
 		desc:    fmt.Sprintf("id %s, capacity %d", d.ID(), capacity),
 		cleanup: func() { d.Close(); dnc.Close() },
 	}
