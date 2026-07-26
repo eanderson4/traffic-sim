@@ -1,0 +1,7 @@
+ docs/kb/INDEX.md                                |  6 ++++-
+ docs/kb/articles/decisions/adrs.md              |  2 ++
+ docs/kb/articles/integrations/osm-extraction.md | 21 +++++++++++++++++-
+ scripts/import-city.sh                          | 29 +++++++++++++++++++++++--
+ 4 files changed, 54 insertions(+), 4 deletions(-)
+ scripts/osm-urban-us.typ.xml                                 |   77 ++++ (new file)
+ docs/kb/decisions/ADR-0022-us-urban-speed-typemap.md         |  177 ++++ (new file)

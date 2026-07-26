@@ -1,0 +1,1696 @@
+diff --git a/docs/kb/INDEX.md b/docs/kb/INDEX.md
+index 5d271bc6830a0aa65a29292690a57d4f1679992c..518d3b310ea6ad6453072de902c2b800d0d57f43 100644
+--- a/docs/kb/INDEX.md
++++ b/docs/kb/INDEX.md
+@@ -50,7 +50,7 @@ back to it.
+ - [Chicago Metro](articles/chicago-metro.md) — zoned Geofabrik→netconvert pipeline, portal-weighted napkin demand, driver exit-routing + serve attach barrier it required
+ 
+ ### Decisions
+-- [ADR Index](articles/decisions/adrs.md) — ADR-0001..0019 table with rationales, research basis, and pending-ADR queue
++- [ADR Index](articles/decisions/adrs.md) — ADR-0001..0020 table with rationales, research basis, and pending-ADR queue
+ 
+ ## Raw Research
+ 
+@@ -101,6 +101,8 @@ links its source synthesis for traceability.
+ - [x] [ADR-0016](decisions/ADR-0016-tssg-chunking.md) — live-plane signal tables (TSSG) chunked like ADR-0015 (`sig_chunk: "i/n"` header, per-chunk-valid frames, no `sig_gen`), 20-tick rebroadcast + request-reply catch-up on `ts.{run}.state.sig.req`, max_payload 64MB→4MB as documented headroom
+ - [x] [ADR-0017](decisions/ADR-0017-city-import-decisions.md) — city-scale OSM import decisions: no `--junctions.join` (stop override keys by OSM node id), `priority_stop` as whole-junction approximation, relations (turn restrictions) not imported, directionless stops infer from oneway else forward with a reported count
+ - [x] [ADR-0018](decisions/ADR-0018-chunked-geojson.md) — city-scale network GeoJSON served chunked over HTTP: manifest (`frame` + empty features + `parts`), hash+schema-pinned part URLs that 404 a stale generation, sequential client fetch; small nets byte-identical
++- [x] [ADR-0019](decisions/ADR-0019-route-budget-determinism.md) — route-budget determinism bound: per-replica admission timing and mid-queue failover lane re-freeze accepted and bounded; strict fix retires the budget
++- [x] [ADR-0020](decisions/ADR-0020-demosrv-public-deployment.md) — demosrv public deployment: -wspublic verbatim ws advertisement, -admintoken bearer gate on the mutating POSTs (GETs public), -autostart with keep-serving failure semantics, -nobuild prebuilt engine binaries; all default to local-dev behavior
+ 
+ ---
+ *Last distilled: 2026-07-17 | 18 articles from 56 raw research files*
+@@ -111,4 +113,5 @@ links its source synthesis for traceability.
+ *ADR-0016 ratified 2026-07-24 (TSSG chunking + pull resync, after the LA busy-tab slow-consumer incident; Fable+Sol design round settled)*
+ *ADR-0017 ratified 2026-07-24 (city import decisions, ep-03 six-metro imports)*
+ *ADR-0018 ratified 2026-07-24 (chunked network GeoJSON, after la-lean hit the V8 string cap)*
++*ADR-0020 ratified 2026-07-25 (demosrv public deployment: GKE pod behind a 443-only TLS Ingress)*
+ *Run `/update-kb` to check freshness*
+diff --git a/docs/kb/articles/decisions/adrs.md b/docs/kb/articles/decisions/adrs.md
+index dccd4ca7eafe1d9c6984b91f3a18f654460c497e..9a9be54f0931b600280ba8ed4adf3fc59f7134a6 100644
+--- a/docs/kb/articles/decisions/adrs.md
++++ b/docs/kb/articles/decisions/adrs.md
+@@ -34,6 +34,7 @@ closed (2026-07-15..17).
+ | [ADR-0017](../../decisions/ADR-0017-city-import-decisions.md) | City-scale OSM imports: no `--junctions.join` (stop override keys by OSM node id), `priority_stop` accepted as a whole-junction approximation, OSM relations (turn restrictions) not imported, directionless stops infer from oneway else forward with a reported count | The stop-sign pipeline (netconvert ignores `highway=stop`, eclipse-sumo #5244) forced each trade-off; recording them keeps the deviations from reading as oversights | ep-03 city imports (six metros); external-review rounds 2026-07-24 ([reviews](../../raw/reviews/)) |
+ | [ADR-0018](../../decisions/ADR-0018-chunked-geojson.md) | City-scale network GeoJSON is served chunked over HTTP: manifest (`frame` + empty features + `parts`) at `/net/{id}.geojson`, hash-pinned part URLs that 404 a stale generation, sequential client fetch; small nets byte-identical | V8's ~537M-char string cap makes la-lean's ~860 MB single document unparseable; chunking keeps the existing endpoint and cache instead of a vector-tile migration | ADR-0015/0016 chunking precedent; la-lean browser verification 2026-07-24 |
+ | [ADR-0019](../../decisions/ADR-0019-route-budget-determinism.md) | Route-budget determinism bound: per-replica admission timing (~0.3 sim-s worst case) and mid-queue failover lane re-freeze are accepted and bounded; strict fix is O(1) global exit-reachability, retiring the budget | City-scale cold-origin reachability scans stalled the obs path (measured sf-lean); the budget is the throttle, its edge cases are the recorded price | sf-lean stall diagnosis 2026-07-24; sol review rounds |
++| [ADR-0020](../../decisions/ADR-0020-demosrv-public-deployment.md) | demosrv public deployment: `-wspublic` advertises one verbatim client ws URL (TLS-LB case), `-admintoken` bearer-gates exactly the mutating POSTs (GETs stay public), `-autostart` starts a demo post-listen with keep-serving failure semantics, `-nobuild` execs prebuilt serve/replay; every flag defaults to the local-dev behavior | An always-on public instance (GKE pod behind a 443-only GCE Ingress) breaks four localhost assumptions: unreconstructable ws advertisement, open mutating API, nothing runs until a click, and the go-build pre-warm needs a toolchain the image lacks; ADR-0004 local-first stays the default | Podcast demo program deploy 2026-07-25 |
+ 
+ ## Research Complete, ADR Pending
+ 
+@@ -57,4 +58,4 @@ These areas have finished research (the gate) but no drafted ADR yet — see
+   [VISION.md](../../../VISION.md).
+ 
+ ---
+-*Derived from: [decisions/](../../decisions/) ADR-0001..0019 and the raw research syntheses linked above*
++*Derived from: [decisions/](../../decisions/) ADR-0001..0020 and the raw research syntheses linked above*
+diff --git a/docs/kb/decisions/ADR-0020-demosrv-public-deployment.md b/docs/kb/decisions/ADR-0020-demosrv-public-deployment.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..1be03f8a946913556083099839bbc44d31da11fe
+--- /dev/null
++++ b/docs/kb/decisions/ADR-0020-demosrv-public-deployment.md
+@@ -0,0 +1,123 @@
++# ADR-0020: demosrv public deployment (TLS-LB ws advertisement, admin token, autostart, prebuilt engines)
++
++- **Status:** ACCEPTED
++- **Date:** 2026-07-25
++
++## Context
++
++demosrv was built as localhost process orchestration in the spirit of
++`pnpm dev` (its package doc): the operator sits next to it, clicks the
++menu, and the open POST API is fine because the loopback audience is the
++operator. The podcast demo program wants an always-on PUBLIC instance —
++a GKE pod behind a GCE Ingress that terminates TLS and forwards 443
++only. Four localhost assumptions break in that shape:
++
++1. **The advertised engine ws URL is unreconstructable.** Clients are
++   told `ws://<listen-addr>` (or the request host with the LISTEN port
++   kept, `advertisedWsURL`). Behind the LB the browser must dial
++   `wss://<public-name>` on 443 — no host/port rewrite of the pod's
++   listen address can produce that.
++2. **The mutating API is open.** `POST /api/demo/{id}/start`,
++   `/api/demo/stop`, `/api/replay/{id}/start`, and the four replay
++   control verbs kill/spawn the engine child or drive the replay. On the
++   public internet that is an unauthenticated remote-kill.
++3. **Nothing runs until a human clicks.** A freshly scheduled pod serves
++   an idle menu; the demo must start itself.
++4. **The pre-warm runs `go build`.** A minimal container image ships
++   serve/replay prebuilt and may not have a Go toolchain (or the module
++   tree `findEngineDir` looks for).
++
++ADR-0004 (local-first) is not revoked: local docker-compose + processes
++remains the primary dev shape. This ADR is additive — every flag
++defaults to the pre-existing local behavior.
++
++## Decision
++
++demosrv gains four flags (`engine/cmd/demosrv`, deploy.go):
++
++- **`-wspublic <url>`** — the client-facing engine WebSocket URL, used
++  VERBATIM for every advertised ws URL (registry `ws`, `/api/demos`,
++  demo/replay start deep links), bypassing `advertisedWsURL`'s host
++  substitution. Startup-validated as an ABSOLUTE `ws://`/`wss://` URL —
++  hostname required, no userinfo, no fragment (raw-`#` included), port
++  numeric and in range (fatal otherwise: a typo would serve a
++  healthy-looking menu whose map never connects). Setting `-wspublic`
++  REQUIRES an admin token — it explicitly selects the public deployment
++  shape, which must never serve the mutating POSTs open (fatal
++  otherwise). Empty (default) = legacy derivation from `-ws`.
++- **`-admintoken <tok>`** — when set, the MUTATING routes require
++  `Authorization: Bearer <tok>` (constant-time compare; 401 with a fixed
++  JSON error, no credential echo, `WWW-Authenticate: Bearer`). The gated
++  set is exactly the POSTs: `POST /api/demo/{id}/start`,
++  `POST /api/demo/stop`, `POST /api/replay/{id}/start`,
++  `POST /api/replay/ctl/{pause,resume,speed,seek}`. All GETs stay
++  public — menu, status, params, network/overlay fetches are the
++  audience's. Intake: a SUPPLIED flag wins; an ABSENT (default) flag
++  falls back to the `DEMOSRV_ADMIN_TOKEN` environment variable (K8s
++  Secret → env, because argv is world-readable via `/proc/*/cmdline`
++  and `kubectl describe`). Unset everywhere (default) = open, local dev
++  unchanged. Intake is whitespace-trimmed (the echo-into-Secret newline
++  footgun) and presence-aware: ANY explicitly supplied token that trims
++  to empty — flag (incl. `-admintoken=`) or env (incl. set-but-empty) —
++  fails startup CLOSED rather than deploying the gate open. The token is
++  stripped from all child environments (engine children AND the go-build
++  pre-warm) — it is demosrv's own credential, and the children expose
++  the unauthenticated ws plane described below.
++- **`-autostart <demo-id>`** — once the HTTP listener is BOUND, start
++  the demo directly through the supervisor (not via the HTTP route: the
++  internal start bypasses the token gate, which the pod itself holds no
++  token for). Up to 4 attempts with doubling backoff; exhaustion or an
++  unknown id logs and KEEPS SERVING — a pod with no demo running is
++  debuggable, a crash-looping one is not.
++- **`-nobuild <dir>`** — skip the go-build pre-warm; exec `<dir>/serve`
++  and `<dir>/replay`. Both are stat-checked at startup (exist +
++  executable) with a fatal, explicit error — a demosrv that discovers a
++  missing engine on the first start click has already answered the
++  menu's GETs and looks healthy.
++
++## Consequences
++
++- demosrv now has a security boundary, but ONLY when `-admintoken` is
++  set — the default local behavior is otherwise unchanged (one
++  unconditional delta, benign locally: a 10 s `ReadHeaderTimeout` on
++  demosrv's HTTP server, added for the public shape).
++- **DEPLOYMENT PRECONDITION (sol review, 2026-07-25): the engine's
++  WebSocket plane itself is UNAUTHENTICATED** — the embedded broker
++  (ADR-0006 §8 single-binary demo, `DontListen` + ws `NoTLS`, no
++  users/permissions) accepts publishes as well as subscriptions from any
++  client that reaches it, including `ts.{run}.ctl.intent.>` and the
++  JetStream APIs. This is pre-existing, not introduced here, and these
++  flags do not change it — but `-wspublic` exists to put that port on
++  the public internet, where ADR-0006 §9's observer-read-only discipline
++  is currently enforced by NOTHING. Before the public ws endpoint is
++  exposed, the broker needs an auth/permissions design (observer account
++  with subscribe-only, engine/controller accounts with publish) — an
++  ADR-0006 amendment with its own design round, plus viz credential
++  plumbing. Treat this as gating the go-live, not this commit.
++- The token gate sits at the mux, so the internal autostart path is
++  ungated by construction rather than by an exemption list; autostart
++  spawns only while demosrv is up (a shutdown channel aborts its retry
++  loop, a supervisor latch refuses starts after the final stop) and
++  never replaces a run an operator started (atomic idle guard in the
++  supervisor).
++- `-wspublic` makes the operator authoritative over what browsers dial;
++  demosrv stops trying to be clever about it (the loopback/wildcard
++  heuristic remains for the local cases it was designed for).
++- The ws port still binds inside the pod on `-ws`; the LB (or a
++  sidecar) owns TLS. demosrv remains plain HTTP/ws internally — no TLS
++  stack enters this codebase.
++- Deploy manifests (image build, Ingress, token plumbing) live outside
++  the repo; this ADR covers only the demosrv-side contract. `-autostart`
++  is ONE-SHOT: a demo that crashes after a successful start leaves the
++  pod idle — crash recovery is the manifests' job (K8s liveness/pod
++  restart), not a demosrv supervisor loop.
++- KNOWN GAP (deferred): the viz menu and replay panel send no
++  `Authorization` header, so with `-admintoken` set their start/stop/ctl
++  buttons 401 — the public UI is effectively view-only, with starts done
++  by `-autostart` or an operator's token-bearing client. A token-aware
++  menu UX is a follow-up in the viz workstream (sol review, 2026-07-25),
++  deliberately not bundled into this demosrv-side change.
++- CONSCIOUS DEFERRAL: with GETs public, `/net/{file}` serves city-scale
++  chunked GeoJSON (hundreds of MB) unauthenticated — egress/abuse is an
++  infra concern (LB/CDN rate limits), deliberately not demosrv's
++  (Fable, 2026-07-25).
+diff --git a/engine/cmd/demosrv/deploy.go b/engine/cmd/demosrv/deploy.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..df9d2ebfa45ca2d4d159760665de005b92216b2d
+--- /dev/null
++++ b/engine/cmd/demosrv/deploy.go
+@@ -0,0 +1,243 @@
++package main
++
++// deploy.go — the public-deployment machinery behind three of the ADR-0020
++// flags (-wspublic itself is a two-line override next to wsListenAddr):
++//   -admintoken bearer-gates the MUTATING routes (adminGate) — GETs stay
++//     public, the menu/status/network fetches are the audience's;
++//   -autostart starts one demo once the listener is up, with retries — a
++//     pod whose demo cannot start KEEPS SERVING (debuggable beats
++//     crash-looping);
++//   -nobuild skips the go-build pre-warm for images that ship serve+replay
++//     prebuilt, stat-checked LOUD at startup.
++// All three default to the local-dev behavior (open, manual start, build).
++
++import (
++	"crypto/subtle"
++	"errors"
++	"fmt"
++	"log"
++	"net/http"
++	"net/url"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"time"
++)
++
++// adminTokenEnv is the token's env intake (resolveAdminToken): the flag
++// value is world-readable in argv (/proc/*/cmdline, `kubectl describe`),
++// so a pod carries the token in a Secret-backed env var instead.
++const adminTokenEnv = "DEMOSRV_ADMIN_TOKEN"
++
++// resolveAdminToken is the -admintoken intake: the flag wins (whitespace
++// trimmed — bearer tokens never contain it); an UNSET flag falls back to
++// the environment (Fable review — K8s Secret → env keeps the token out of
++// the pod spec's args). UNSET everywhere = open (local dev). Presence-
++// aware on both sources (flagSet via flag.Visit — flag.String cannot tell
++// `-admintoken=` from an absent flag — and os.LookupEnv, which cannot
++// tell set-but-empty from unset): an explicitly SUPPLIED token that trims
++// to empty means the operator intended a gate and misconfigured it (the
++// manifest's `-admintoken="$TOK"` with $TOK expanding empty) — fail
++// CLOSED (startup refusal), never silently serve the mutating routes
++// unauthenticated on a public pod (Fable + sol, rounds 7-9).
++func resolveAdminToken(flagVal string, flagSet bool) (string, error) {
++	if flagSet {
++		if tok := strings.TrimSpace(flagVal); tok != "" {
++			return tok, nil
++		}
++		return "", fmt.Errorf("-admintoken was supplied empty — refusing to start with the admin gate OPEN (fix or drop the flag; an UNSET flag falls back to %s)", adminTokenEnv)
++	}
++	raw, set := os.LookupEnv(adminTokenEnv)
++	if !set {
++		return "", nil
++	}
++	if tok := strings.TrimSpace(raw); tok != "" {
++		return tok, nil
++	}
++	return "", fmt.Errorf("%s is set but empty — refusing to start with the admin gate OPEN (fix the Secret or unset the variable)", adminTokenEnv)
++}
++
++// stripEnv returns env without the named variable: the admin token is
++// demosrv's OWN credential and must not ride into engine children — the
++// processes that expose the unauthenticated ws plane, where their
++// environment is one /proc read away (Fable, round 7).
++func stripEnv(env []string, name string) []string {
++	prefix := name + "="
++	out := make([]string, 0, len(env))
++	for _, e := range env {
++		if !strings.HasPrefix(e, prefix) {
++			out = append(out, e)
++		}
++	}
++	return out
++}
++
++// validateWsPublic checks a -wspublic value. VERBATIM advertisement is
++// the design (the operator owns the public URL), but a value that is not
++// an ABSOLUTE, fragment-free ws:// or wss:// URL is a typo, not a choice
++// — fatal at startup, or the pod serves a healthy-looking menu whose map
++// never connects. Browsers reject fragment-bearing WebSocket URLs — and
++// a trailing "#" parses to an EMPTY fragment, so the raw string is
++// checked, not u.Fragment (sol, rounds 7-10). Hostname, not Host:
++// `wss://:443` has a Host but no dialable name; userinfo
++// (`wss://user:pass@host`) would be advertised verbatim to every client;
++// an out-of-range numeric port parses fine but is undialable (sol,
++// round 13).
++func validateWsPublic(raw string) error {
++	u, err := url.Parse(raw)
++	if err != nil || (u.Scheme != "ws" && u.Scheme != "wss") || u.Hostname() == "" || strings.Contains(raw, "#") || u.User != nil {
++		return fmt.Errorf("not an absolute ws:// or wss:// URL")
++	}
++	// url.Parse rejects a NON-numeric port; an out-of-range numeric one
++	// parses fine and yields an undialable URL.
++	if p := u.Port(); p != "" {
++		if n, err := strconv.Atoi(p); err != nil || n < 1 || n > 65535 {
++			return fmt.Errorf("invalid port %q", p)
++		}
++	}
++	return nil
++}
++
++// adminGate wraps one MUTATING handler with the -admintoken bearer check.
++// Empty token = open (local dev — the flag's default). The compare is
++// constant-time in the token CONTENT (a length mismatch still returns
++// early — acceptable for a high-entropy operator token), and the 401
++// carries no hint about the presented credential (no token echo — the
++// body is the same "unauthorized" for a missing, malformed, or wrong
++// header); WWW-Authenticate names the scheme so API clients know what to
++// send.
++func (s *server) adminGate(h http.HandlerFunc) http.HandlerFunc {
++	if s.adminToken == "" {
++		return h
++	}
++	return func(w http.ResponseWriter, r *http.Request) {
++		// The scheme is case-insensitive (RFC 7235) — a proxy or
++		// hand-rolled client may send "bearer"; the CREDENTIAL compare
++		// stays exact and constant-time in content.
++		scheme, tok, ok := strings.Cut(r.Header.Get("Authorization"), " ")
++		if !ok || !strings.EqualFold(scheme, "Bearer") || subtle.ConstantTimeCompare([]byte(tok), []byte(s.adminToken)) != 1 {
++			w.Header().Set("WWW-Authenticate", "Bearer")
++			writeErr(w, http.StatusUnauthorized, errors.New("unauthorized"))
++			return
++		}
++		h(w, r)
++	}
++}
++
++// autostartAttempts bounds -autostart's retry loop. The retries exist for
++// TRANSIENT failures (a slow port release right after a pod reschedule);
++// a demo that cannot start at all must exhaust them quickly and leave
++// demosrv serving, not loop forever.
++const autostartAttempts = 4
++
++// autostartBackoff is the first retry delay, doubling per attempt. A var so
++// tests do not wait out the real backoff.
++var autostartBackoff = 2 * time.Second
++
++// autostartDemo is -autostart: start the named demo directly through the
++// supervisor — NOT via the HTTP route, so the internal start bypasses the
++// adminGate bearer check (the pod itself holds no token; the gate is for
++// the audience). epoch0 is the supervisor's stop epoch, captured by main
++// BEFORE this goroutine was launched: a stop that completed in the
++// scheduling gap between listener-bind and this first line would
++// otherwise be snapshotted as the baseline and un-done (sol, round 19).
++// Unknown id, or a start that fails every attempt, logs and
++// RETURNS: demosrv keeps serving the menu either way — a pod with no demo
++// running is debuggable, a crash-looping one is not. Shutdown aborts the
++// retry loop on TWO levels: s.shutdown wakes the backoff sleep fast, and
++// the supervisor's closed latch (shutdownFinal, checked under the same mu
++// as the spawn) refuses any start that slips past the channel check — an
++// engine child spawned while demosrv exits would be orphaned on the ws
++// port (Fable + sol, round 3). A nil shutdown channel (tests) simply
++// never fires.
++func (s *server) autostartDemo(id string, epoch0 uint64) {
++	d := s.reg.byID(id)
++	if d == nil {
++		log.Printf("demosrv: autostart: unknown demo %q — serving the menu with no active run", id)
++		return
++	}
++	backoff := autostartBackoff
++	for attempt := 1; ; attempt++ {
++		select {
++		case <-s.shutdown:
++			log.Printf("demosrv: autostart: shutdown before attempt %d — demo %q not started", attempt, id)
++			return
++		default:
++		}
++		if s.sup.stopEpoch.Load() != epoch0 {
++			log.Printf("demosrv: autostart: demo %q NOT started — a stop was requested since autostart began, honoring it", id)
++			return
++		}
++		// startIfIdle, NOT a status check + sup.start: the idle check, the
++		// epoch check, and the spawn hold the supervisor lock TOGETHER, so
++		// an operator's start (or stop) during the backoff window wins
++		// atomically and is left alone (check-then-act would kill it —
++		// Fable + sol, rounds 2/18). sup.start copies the demo (per-spawn
++		// run nonce), so reusing d across attempts is safe.
++		run, err := s.sup.startIfIdle(spawnTarget{Kind: "demo", Demo: d}, epoch0)
++		if errors.Is(err, errAlreadyActive) {
++			log.Printf("demosrv: autostart: demo %q NOT started — %v, leaving it alone", id, err)
++			return
++		}
++		if errors.Is(err, errSupervisorClosed) {
++			// Shutdown mid-retry: not a transient failure, do NOT back off
++			// and retry into a dying process (the log must stay truthful).
++			log.Printf("demosrv: autostart: demo %q not started — demosrv is shutting down", id)
++			return
++		}
++		if errors.Is(err, errStartAborted) {
++			// An operator's STOP landed mid-start: deliberate, not
++			// transient — retrying would un-stop the demo the operator
++			// just stopped (Fable, round 12).
++			log.Printf("demosrv: autostart: demo %q start aborted by a stop request — NOT retrying", id)
++			return
++		}
++		if err == nil {
++			log.Printf("demosrv: autostart: demo %q is live (run %s)", id, run)
++			return
++		}
++		if attempt >= autostartAttempts {
++			log.Printf("demosrv: autostart: demo %q failed after %d attempts: %v — KEEPING THE SERVER UP (start a demo from the menu)", id, attempt, err)
++			return
++		}
++		log.Printf("demosrv: autostart: demo %q attempt %d/%d failed (%v) — retrying in %s", id, attempt, autostartAttempts, err, backoff)
++		select {
++		case <-s.shutdown:
++			log.Printf("demosrv: autostart: shutdown during backoff — demo %q not retried", id)
++			return
++		case <-time.After(backoff):
++		}
++		backoff *= 2
++	}
++}
++
++// prebuiltBins validates -nobuild's directory: <dir>/serve and <dir>/replay
++// must exist and be executable (the container-image layout). Fail LOUD at
++// startup — a demosrv that only discovers a missing engine on the first
++// start click has already answered the menu's GETs and looks healthy.
++// The returned paths are ABSOLUTE: filepath.Join(".", "serve") is bare
++// "serve", which exec.Command would resolve through $PATH — late-failing
++// or running an unrelated binary (sol review).
++func prebuiltBins(dir string) (serveBin, replayBin string, err error) {
++	abs, err := filepath.Abs(dir)
++	if err != nil {
++		return "", "", fmt.Errorf("-nobuild: %w", err)
++	}
++	serveBin = filepath.Join(abs, "serve")
++	replayBin = filepath.Join(abs, "replay")
++	for _, p := range []string{serveBin, replayBin} {
++		fi, err := os.Stat(p)
++		if err != nil {
++			return "", "", fmt.Errorf("-nobuild: %w", err)
++		}
++		// Regular executable file ONLY: a directory, FIFO, socket, or
++		// device would pass a bare mode&0111 check and fail at first
++		// spawn — the exact late failure this stat check exists to
++		// prevent (sol review).
++		if !fi.Mode().IsRegular() || fi.Mode()&0o111 == 0 {
++			return "", "", fmt.Errorf("-nobuild: %s is not an executable file", p)
++		}
++	}
++	return serveBin, replayBin, nil
++}
+diff --git a/engine/cmd/demosrv/deploy_test.go b/engine/cmd/demosrv/deploy_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..ffa4dc28a0fa0fd5cda0f6747202e6d9e45ff953
+--- /dev/null
++++ b/engine/cmd/demosrv/deploy_test.go
+@@ -0,0 +1,680 @@
++package main
++
++// deploy_test.go — the ADR-0020 deployment flags: -wspublic verbatim vs the
++// legacy listen-address advertisement, the -admintoken bearer gate on every
++// mutating route class (open by default), -autostart success / unknown-id /
++// retry-then-keep-serving, and -nobuild's prebuilt-binary validation + exec.
++// The engine children stay `sleep` stubs (demosrv_test.go's discipline) —
++// only the ws URL vars are package state, pinned and restored per test.
++
++import (
++	"encoding/json"
++	"errors"
++	"io"
++	"log"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"sync"
++	"syscall"
++	"testing"
++	"time"
++)
++
++// pinWSVars swaps the package-level ws advertisement state for the test and
++// restores it on cleanup (the other HTTP tests assert the legacy default).
++func pinWSVars(t *testing.T, listen, public string) {
++	t.Helper()
++	oldListen, oldPublic := wsListenAddr, wsPublicURL
++	wsListenAddr, wsPublicURL = listen, public
++	t.Cleanup(func() { wsListenAddr, wsPublicURL = oldListen, oldPublic })
++}
++
++func TestWsPublicVerbatim(t *testing.T) {
++	// Wildcard listen + a request Host the legacy path would substitute —
++	// -wspublic must bypass ALL of that, verbatim.
++	pinWSVars(t, "0.0.0.0:8443", "wss://traffic-ws.example.com")
++	r := httptest.NewRequest("GET", "http://traffic.example.com/", nil)
++	if got := advertisedWsURL(r); got != "wss://traffic-ws.example.com" {
++		t.Errorf("advertisedWsURL = %q, want the -wspublic value verbatim", got)
++	}
++	if got := wsClientURL(); got != "wss://traffic-ws.example.com" {
++		t.Errorf("wsClientURL = %q, want the -wspublic value verbatim", got)
++	}
++
++	// End to end: the registry payload and the start deep link both carry it.
++	var mu sync.Mutex
++	var cmds []*exec.Cmd
++	sup := newSupervisor(sleepSpawner(&cmds, &mu))
++	sup.ready = func() error { return nil }
++	reg := &Registry{Demos: []*Demo{{ID: "d1", Title: "Demo One", Run: "r1", ScenarioDir: t.TempDir()}}}
++	srv := &server{reg: reg, sup: sup, viz: t.TempDir(), nets: &netCache{dir: t.TempDir()}}
++	ts := httptest.NewServer(srv.routes())
++	defer ts.Close()
++
++	resp, err := http.Get(ts.URL + "/api/demos")
++	if err != nil {
++		t.Fatal(err)
++	}
++	var payload map[string]any
++	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
++		t.Fatal(err)
++	}
++	resp.Body.Close()
++	if payload["ws"] != "wss://traffic-ws.example.com" {
++		t.Errorf("/api/demos ws = %v, want the -wspublic value", payload["ws"])
++	}
++
++	old := runNonce
++	runNonce = func() (string, error) { return "t9", nil }
++	defer func() { runNonce = old }()
++	resp, err = http.Post(ts.URL+"/api/demo/d1/start", "", nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var start map[string]any
++	if err := json.NewDecoder(resp.Body).Decode(&start); err != nil {
++		t.Fatal(err)
++	}
++	resp.Body.Close()
++	want := "/app/?run=r1-t9&net=/net/d1.geojson&ws=wss%3A%2F%2Ftraffic-ws.example.com"
++	if start["url"] != want {
++		t.Errorf("start url = %v, want %s", start["url"], want)
++	}
++	sup.stop()
++}
++
++func TestWsAdvertiseLegacyDefault(t *testing.T) {
++	// No -wspublic: byte-for-byte legacy behavior — wildcard listens get the
++	// request host substituted WITH the listen port kept, loopback passes
++	// through as ws://<listen>.
++	pinWSVars(t, "0.0.0.0:8443", "")
++	r := httptest.NewRequest("GET", "http://traffic.example.com/", nil)
++	if got := advertisedWsURL(r); got != "ws://traffic.example.com:8443" {
++		t.Errorf("wildcard advertise = %q, want host substitution with the listen port kept", got)
++	}
++	pinWSVars(t, "127.0.0.1:8443", "")
++	if got := advertisedWsURL(r); got != "ws://127.0.0.1:8443" {
++		t.Errorf("loopback advertise = %q, want the listen address verbatim", got)
++	}
++	if got := wsClientURL(); got != "ws://127.0.0.1:8443" {
++		t.Errorf("wsClientURL = %q, want ws:// + listen address", got)
++	}
++}
++
++// gateServer builds the routed server with the given admin token over the
++// sleep-stub supervisor (one demo d1, no recordings).
++func gateServer(t *testing.T, token string, cmds *[]*exec.Cmd, mu *sync.Mutex) *httptest.Server {
++	t.Helper()
++	sup := newSupervisor(sleepSpawner(cmds, mu))
++	sup.ready = func() error { return nil }
++	reg := &Registry{Demos: []*Demo{{ID: "d1", Title: "Demo One", Run: "r1", ScenarioDir: t.TempDir()}}}
++	srv := &server{reg: reg, sup: sup, viz: t.TempDir(), nets: &netCache{dir: t.TempDir()}, adminToken: token}
++	ts := httptest.NewServer(srv.routes())
++	t.Cleanup(func() { sup.stop(); ts.Close() })
++	return ts
++}
++
++func postAuth(t *testing.T, url, token string) (int, []byte, http.Header) {
++	t.Helper()
++	req, err := http.NewRequest("POST", url, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if token != "" {
++		req.Header.Set("Authorization", "Bearer "+token)
++	}
++	resp, err := http.DefaultClient.Do(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer resp.Body.Close()
++	body, err := io.ReadAll(resp.Body)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return resp.StatusCode, body, resp.Header
++}
++
++func TestAdminTokenGate(t *testing.T) {
++	var mu sync.Mutex
++	var cmds []*exec.Cmd
++	ts := gateServer(t, "sekrit", &cmds, &mu)
++
++	// Every mutating route class: no token and wrong token are both 401,
++	// with a JSON error that echoes NOTHING of the presented credential.
++	mutating := []string{
++		"/api/demo/d1/start",
++		"/api/demo/stop",
++		"/api/replay/r1/start",
++		"/api/replay/ctl/pause?run=r1-replay",
++		"/api/replay/ctl/resume?run=r1-replay",
++		"/api/replay/ctl/speed?run=r1-replay",
++		"/api/replay/ctl/seek?run=r1-replay",
++	}
++	for _, path := range mutating {
++		for _, tok := range []string{"", "wrong-token"} {
++			code, body, hdr := postAuth(t, ts.URL+path, tok)
++			if code != http.StatusUnauthorized {
++				t.Errorf("POST %s (token %q) = %d, want 401", path, tok, code)
++			}
++			if !strings.Contains(string(body), "unauthorized") {
++				t.Errorf("POST %s: 401 body = %q, want a JSON error", path, body)
++			}
++			if strings.Contains(string(body), "wrong-token") || strings.Contains(string(body), "sekrit") {
++				t.Errorf("POST %s: 401 body echoes a credential: %q", path, body)
++			}
++			if hdr.Get("WWW-Authenticate") != "Bearer" {
++				t.Errorf("POST %s: WWW-Authenticate = %q, want Bearer", path, hdr.Get("WWW-Authenticate"))
++			}
++		}
++	}
++
++	// GETs stay public even with the gate on.
++	for _, path := range []string{"/api/demos", "/api/status", "/api/replay/status"} {
++		resp, err := http.Get(ts.URL + path)
++		if err != nil {
++			t.Fatal(err)
++		}
++		resp.Body.Close()
++		if resp.StatusCode == http.StatusUnauthorized {
++			t.Errorf("GET %s = 401 — GETs must stay public", path)
++		}
++	}
++
++	// The right token passes the gate: start and stop reach the handler
++	// (200 over the sleep stub); the replay routes get past the gate and
++	// fail in the HANDLER (unknown recording / no active replay = 404),
++	// which is what distinguishes "authenticated" from "authorized".
++	old := runNonce
++	runNonce = func() (string, error) { return "t9", nil }
++	defer func() { runNonce = old }()
++	if code, _, _ := postAuth(t, ts.URL+"/api/demo/d1/start", "sekrit"); code != 200 {
++		t.Errorf("authed start = %d, want 200", code)
++	}
++	if code, _, _ := postAuth(t, ts.URL+"/api/demo/stop", "sekrit"); code != 200 {
++		t.Errorf("authed stop = %d, want 200", code)
++	}
++	if code, _, _ := postAuth(t, ts.URL+"/api/replay/nope/start", "sekrit"); code != http.StatusNotFound {
++		t.Errorf("authed replay start (unknown recording) = %d, want 404 (gate passed, handler 404)", code)
++	}
++	if code, _, _ := postAuth(t, ts.URL+"/api/replay/ctl/pause?run=r1-replay", "sekrit"); code != http.StatusNotFound {
++		t.Errorf("authed ctl pause (no active replay) = %d, want 404 (gate passed, handler 404)", code)
++	}
++	// The scheme is case-insensitive (RFC 7235): "bearer" must pass too.
++	req, _ := http.NewRequest("POST", ts.URL+"/api/demo/stop", nil)
++	req.Header.Set("Authorization", "bearer sekrit")
++	resp, err := http.DefaultClient.Do(req)
++	if err != nil {
++		t.Fatalf("lowercase-scheme stop: %v", err)
++	}
++	resp.Body.Close()
++	if resp.StatusCode != 200 {
++		t.Errorf("lowercase-scheme stop = %d, want 200", resp.StatusCode)
++	}
++}
++
++func TestAdminTokenDefaultOpen(t *testing.T) {
++	// No -admintoken: the mutating routes stay open (local dev unchanged).
++	var mu sync.Mutex
++	var cmds []*exec.Cmd
++	ts := gateServer(t, "", &cmds, &mu)
++	old := runNonce
++	runNonce = func() (string, error) { return "t9", nil }
++	defer func() { runNonce = old }()
++	if code, _, _ := postAuth(t, ts.URL+"/api/demo/d1/start", ""); code != 200 {
++		t.Errorf("open start = %d, want 200", code)
++	}
++	if code, _, _ := postAuth(t, ts.URL+"/api/demo/stop", ""); code != 200 {
++		t.Errorf("open stop = %d, want 200", code)
++	}
++}
++
++// autostartServer is the supervisor-only half of -autostart (no HTTP — the
++// internal start must bypass the admin gate entirely).
++func autostartServer(t *testing.T, spawn spawnFunc) (*server, *supervisor) {
++	t.Helper()
++	sup := newSupervisor(spawn)
++	sup.ready = func() error { return nil }
++	reg := &Registry{Demos: []*Demo{{ID: "d1", Title: "Demo One", Run: "r1", ScenarioDir: t.TempDir()}}}
++	old := autostartBackoff
++	autostartBackoff = time.Millisecond
++	t.Cleanup(func() { autostartBackoff = old; sup.stop() })
++	return &server{reg: reg, sup: sup}, sup
++}
++
++func TestAutostartSuccess(t *testing.T) {
++	var mu sync.Mutex
++	var cmds []*exec.Cmd
++	srv, sup := autostartServer(t, sleepSpawner(&cmds, &mu))
++	srv.autostartDemo("d1", sup.stopEpoch.Load())
++	id, run, _, _, ok := sup.status()
++	if !ok || id != "d1" {
++		t.Fatalf("status after autostart = (%q, %v), want (d1, true)", id, ok)
++	}
++	if !strings.HasPrefix(run, "r1-") {
++		t.Errorf("run = %q, want the per-spawn unique r1-<nonce>", run)
++	}
++}
++
++func TestAutostartUnknownIDKeepsServing(t *testing.T) {
++	var mu sync.Mutex
++	var cmds []*exec.Cmd
++	srv, sup := autostartServer(t, sleepSpawner(&cmds, &mu))
++	srv.autostartDemo("nope", sup.stopEpoch.Load()) // must not panic, must not spawn
++	if _, _, _, _, ok := sup.status(); ok {
++		t.Fatal("status after unknown-id autostart = active, want idle")
++	}
++	mu.Lock()
++	n := len(cmds)
++	mu.Unlock()
++	if n != 0 {
++		t.Errorf("%d spawns for an unknown demo id, want 0", n)
++	}
++}
++
++// An operator-started run that appears during the backoff window must
++// SURVIVE: the next autostart retry bails instead of letting sup.start
++// replace it (single active run — Fable review).
++func TestAutostartBailsWhenRunAlreadyActive(t *testing.T) {
++	var mu sync.Mutex
++	var cmds []*exec.Cmd
++	srv, sup := autostartServer(t, sleepSpawner(&cmds, &mu))
++	if _, err := sup.start(spawnTarget{Kind: "demo", Demo: &Demo{ID: "manual", Run: "m1"}}, nil); err != nil {
++		t.Fatal(err)
++	}
++	srv.autostartDemo("d1", sup.stopEpoch.Load())
++	id, run, _, _, ok := sup.status()
++	if !ok || id != "manual" || !strings.HasPrefix(run, "m1-") {
++		t.Fatalf("status = (%q, %q, %v), want the operator's run (manual, m1-*, true) untouched", id, run, ok)
++	}
++	mu.Lock()
++	n := len(cmds)
++	mu.Unlock()
++	if n != 1 {
++		t.Errorf("%d spawns, want 1 — autostart must not replace the active run", n)
++	}
++}
++
++// A closed shutdown channel aborts autostart BEFORE the first attempt —
++// no spawn, no backoff (an engine child started while demosrv exits would
++// be orphaned on the ws port — Fable, round 2).
++func TestAutostartAbortsOnShutdown(t *testing.T) {
++	var mu sync.Mutex
++	var cmds []*exec.Cmd
++	srv, sup := autostartServer(t, sleepSpawner(&cmds, &mu))
++	srv.shutdown = make(chan struct{})
++	close(srv.shutdown)
++	srv.autostartDemo("d1", sup.stopEpoch.Load())
++	if _, _, _, _, ok := sup.status(); ok {
++		t.Fatal("status after shutdown-aborted autostart = active, want idle")
++	}
++	mu.Lock()
++	n := len(cmds)
++	mu.Unlock()
++	if n != 0 {
++		t.Errorf("%d spawns after shutdown, want 0", n)
++	}
++}
++
++// shutdownFinal latches the supervisor closed: EVERY later start refuses
++// (errSupervisorClosed), no spawn — the atomic half of the shutdown race
++// fix (the channel only narrows the window; the latch closes it).
++func TestShutdownFinalRefusesStarts(t *testing.T) {
++	var mu sync.Mutex
++	var cmds []*exec.Cmd
++	_, sup := autostartServer(t, sleepSpawner(&cmds, &mu))
++	sup.shutdownFinal()
++	if _, err := sup.start(spawnTarget{Kind: "demo", Demo: &Demo{ID: "d1", Run: "r1"}}, nil); !errors.Is(err, errSupervisorClosed) {
++		t.Fatalf("start after shutdownFinal = %v, want errSupervisorClosed", err)
++	}
++	if _, err := sup.startIfIdle(spawnTarget{Kind: "demo", Demo: &Demo{ID: "d1", Run: "r1"}}, sup.stopEpoch.Load()); !errors.Is(err, errSupervisorClosed) {
++		t.Fatalf("startIfIdle after shutdownFinal = %v, want errSupervisorClosed", err)
++	}
++	mu.Lock()
++	n := len(cmds)
++	mu.Unlock()
++	if n != 0 {
++		t.Errorf("%d spawns after shutdownFinal, want 0", n)
++	}
++}
++
++// A run that EXITS ON ITS OWN must not count as active for startIfIdle's
++// idle guard: the reaper clears s.active, not just the status mirror
++// (sol, round 3) — otherwise an autostart retry would give up on a corpse.
++func TestStartIfIdleAfterChildExit(t *testing.T) {
++	var mu sync.Mutex
++	var cmds []*exec.Cmd
++	_, sup := autostartServer(t, sleepSpawner(&cmds, &mu))
++	if _, err := sup.startIfIdle(spawnTarget{Kind: "demo", Demo: &Demo{ID: "d1", Run: "r1"}}, sup.stopEpoch.Load()); err != nil {
++		t.Fatal(err)
++	}
++	mu.Lock()
++	c0 := cmds[0]
++	mu.Unlock()
++	_ = c0.Process.Kill()
++	waitDead(t, c0, "first child")
++	// The reaper clears s.active asynchronously — poll the guard.
++	deadline := time.Now().Add(2 * time.Second)
++	for {
++		_, err := sup.startIfIdle(spawnTarget{Kind: "demo", Demo: &Demo{ID: "d1", Run: "r1"}}, sup.stopEpoch.Load())
++		if err == nil {
++			break
++		}
++		if !errors.Is(err, errAlreadyActive) || time.Now().After(deadline) {
++			t.Fatalf("startIfIdle after the child exited = %v, want success once reaped", err)
++		}
++		time.Sleep(20 * time.Millisecond)
++	}
++	mu.Lock()
++	n := len(cmds)
++	mu.Unlock()
++	if n != 2 {
++		t.Errorf("%d spawns, want 2 (corpse must not block the retry)", n)
++	}
++}
++
++// An operator's STOP landing mid-start is TERMINAL for autostart (the
++// abort error is the errStartAborted sentinel, not a transient failure):
++// no retry — the next attempt would un-stop the demo the operator just
++// stopped (Fable, round 12).
++func TestAutostartStopIsTerminal(t *testing.T) {
++	var mu sync.Mutex
++	var cmds []*exec.Cmd
++	srv, sup := autostartServer(t, sleepSpawner(&cmds, &mu))
++	// The readiness phase reports the abort, exactly as a stop() landing
++	// during waitReady would (start wraps it with %w — errors.Is holds).
++	sup.ready = func() error { return errStartAborted }
++	srv.autostartDemo("d1", sup.stopEpoch.Load())
++	mu.Lock()
++	n := len(cmds)
++	mu.Unlock()
++	if n != 1 {
++		t.Errorf("%d attempts after an abort, want exactly 1 (no retry)", n)
++	}
++	if _, _, _, _, ok := sup.status(); ok {
++		t.Fatal("status after aborted autostart = active, want idle")
++	}
++}
++
++// A stop landing BETWEEN attempts (during the backoff sleep) is as
++// terminal as one landing mid-start: the epoch bump since autostart
++// began ends the loop (Fable, round 17) — autostart never un-stops what
++// an operator stopped.
++func TestAutostartHonorsPriorStop(t *testing.T) {
++	var sup *supervisor
++	attempts := 0
++	spawn := func(tg spawnTarget) (*exec.Cmd, error) {
++		attempts++
++		sup.stopEpoch.Add(1) // the operator's stop lands during attempt 1
++		return nil, errors.New("transient")
++	}
++	var srv *server
++	srv, sup = autostartServer(t, spawn)
++	srv.autostartDemo("d1", sup.stopEpoch.Load())
++	if attempts != 1 {
++		t.Errorf("%d attempts, want exactly 1 — the retry after the stop's epoch bump must not fire", attempts)
++	}
++}
++
++// A start that wins the mu race against a QUEUED stop refuses fast
++// (stopPending) instead of spawning a child the stop would kill after a
++// full readiness wait (sol, round 17).
++func TestStartRefusesWhileStopPending(t *testing.T) {
++	var mu sync.Mutex
++	var cmds []*exec.Cmd
++	_, sup := autostartServer(t, sleepSpawner(&cmds, &mu))
++	sup.stopPending.Add(1) // what stop() does first: pending mark...
++	sup.stopEpoch.Add(1)   // ...THEN the epoch bump (order is load-bearing)
++	if _, err := sup.start(spawnTarget{Kind: "demo", Demo: &Demo{ID: "d1", Run: "r1"}}, nil); !errors.Is(err, errStartAborted) {
++		t.Fatalf("start with a stop pending = %v, want errStartAborted", err)
++	}
++	mu.Lock()
++	n := len(cmds)
++	mu.Unlock()
++	if n != 0 {
++		t.Errorf("%d spawns with a stop pending, want 0", n)
++	}
++}
++
++func TestAutostartRetriesThenKeepsServing(t *testing.T) {
++	// Always-failing spawner: exactly autostartAttempts attempts, then the
++	// function returns (demosrv would keep serving) with no child behind.
++	var mu sync.Mutex
++	calls := 0
++	srv, sup := autostartServer(t, func(tg spawnTarget) (*exec.Cmd, error) {
++		mu.Lock()
++		calls++
++		mu.Unlock()
++		return nil, errors.New("exec: no such binary")
++	})
++	srv.autostartDemo("d1", sup.stopEpoch.Load())
++	mu.Lock()
++	n := calls
++	mu.Unlock()
++	if n != autostartAttempts {
++		t.Errorf("%d attempts, want %d", n, autostartAttempts)
++	}
++	if _, _, _, _, ok := sup.status(); ok {
++		t.Fatal("status after exhausted autostart = active, want idle")
++	}
++
++	// Transient failure: two failures then a healthy spawn succeeds.
++	var cmds []*exec.Cmd
++	fail := 2
++	srv2, sup2 := autostartServer(t, func(tg spawnTarget) (*exec.Cmd, error) {
++		mu.Lock()
++		defer mu.Unlock()
++		if fail > 0 {
++			fail--
++			return nil, errors.New("transient")
++		}
++		cmd := exec.Command("sleep", "30")
++		if err := cmd.Start(); err != nil {
++			return nil, err
++		}
++		cmds = append(cmds, cmd)
++		return cmd, nil
++	})
++	srv2.autostartDemo("d1", sup2.stopEpoch.Load())
++	if id, _, _, _, ok := sup2.status(); !ok || id != "d1" {
++		t.Fatalf("status after flaky autostart = (%q, %v), want (d1, true)", id, ok)
++	}
++}
++
++func TestPrebuiltBins(t *testing.T) {
++	dir := t.TempDir()
++
++	// Missing entirely: the error names the binary it wanted.
++	if _, _, err := prebuiltBins(dir); err == nil || !strings.Contains(err.Error(), "serve") {
++		t.Errorf("missing dir: err = %v, want a -nobuild error naming serve", err)
++	}
++
++	// Present but not executable.
++	serve := filepath.Join(dir, "serve")
++	if err := os.WriteFile(serve, []byte("x"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err := prebuiltBins(dir); err == nil || !strings.Contains(err.Error(), "not an executable") {
++		t.Errorf("non-executable serve: err = %v, want the not-executable error", err)
++	}
++
++	// serve executable, replay still missing.
++	if err := os.Chmod(serve, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err := prebuiltBins(dir); err == nil || !strings.Contains(err.Error(), "replay") {
++		t.Errorf("missing replay: err = %v, want a -nobuild error naming replay", err)
++	}
++
++	// Both present and executable: the dir's paths come back.
++	replay := filepath.Join(dir, "replay")
++	if err := os.WriteFile(replay, []byte("x"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	gotServe, gotReplay, err := prebuiltBins(dir)
++	if err != nil {
++		t.Fatalf("valid dir: %v", err)
++	}
++	if gotServe != serve || gotReplay != replay {
++		t.Errorf("bins = (%q, %q), want (%q, %q)", gotServe, gotReplay, serve, replay)
++	}
++	// ABSOLUTE paths: a bare "serve" (from Join(".", "serve")) would make
++	// exec.Command search $PATH instead of execing the validated file.
++	if !filepath.IsAbs(gotServe) || !filepath.IsAbs(gotReplay) {
++		t.Errorf("bins = (%q, %q), want absolute paths", gotServe, gotReplay)
++	}
++
++	// An executable FIFO is NOT a regular file (sol review): it would
++	// pass a bare mode-bits check and block forever at first spawn.
++	fifoDir := t.TempDir()
++	if err := syscall.Mkfifo(filepath.Join(fifoDir, "serve"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err := prebuiltBins(fifoDir); err == nil || !strings.Contains(err.Error(), "not an executable") {
++		t.Errorf("FIFO serve: err = %v, want the not-executable error", err)
++	}
++}
++
++// resolveAdminToken: the flag wins, the env backs it up (K8s Secret →
++// env, keeping the token out of argv), UNSET everywhere = open, and any
++// explicitly SUPPLIED token that trims to empty fails CLOSED — presence-
++// aware on BOTH sources: flagSet (flag.Visit) catches `-admintoken=`,
++// LookupEnv catches a set-but-empty variable (Fable + sol, rounds 7-9).
++func TestResolveAdminToken(t *testing.T) {
++	orig, wasSet := os.LookupEnv(adminTokenEnv)
++	t.Cleanup(func() {
++		if wasSet {
++			os.Setenv(adminTokenEnv, orig)
++		} else {
++			os.Unsetenv(adminTokenEnv)
++		}
++	})
++
++	os.Setenv(adminTokenEnv, "env-tok")
++	if got, err := resolveAdminToken("flag-tok", true); err != nil || got != "flag-tok" {
++		t.Errorf("flag set = (%q, %v), want the flag value to win", got, err)
++	}
++	if got, err := resolveAdminToken("", false); err != nil || got != "env-tok" {
++		t.Errorf("flag unset = (%q, %v), want the env fallback", got, err)
++	}
++	// A trailing newline (the echo-into-Secret footgun) is trimmed.
++	os.Setenv(adminTokenEnv, "env-tok\n")
++	if got, err := resolveAdminToken("", false); err != nil || got != "env-tok" {
++		t.Errorf("env with newline = (%q, %v), want it trimmed", got, err)
++	}
++	// An explicitly supplied flag that trims to EMPTY — whitespace OR the
++	// `$TOK`-expands-empty manifest case (`-admintoken=`) — fails closed
++	// even with a valid env behind it.
++	os.Setenv(adminTokenEnv, "env-tok")
++	for _, v := range []string{"  ", ""} {
++		if _, err := resolveAdminToken(v, true); err == nil {
++			t.Errorf("supplied-empty flag %q: want a fail-closed error", v)
++		}
++	}
++	// Whitespace-only or set-but-EMPTY env: fail closed.
++	for _, v := range []string{" \n", ""} {
++		os.Setenv(adminTokenEnv, v)
++		if _, err := resolveAdminToken("", false); err == nil {
++			t.Errorf("env %q: want a fail-closed error", v)
++		}
++	}
++	// Unset everywhere: open (local dev).
++	os.Unsetenv(adminTokenEnv)
++	if got, err := resolveAdminToken("", false); err != nil || got != "" {
++		t.Errorf("unset everywhere = (%q, %v), want open", got, err)
++	}
++}
++
++// validateWsPublic's accept/reject table — the most intricate validation
++// in the change, extracted from main() precisely so it is testable
++// (Fable, round 15).
++func TestValidateWsPublic(t *testing.T) {
++	valid := []string{
++		"wss://traffic-ws.example.com",
++		"ws://127.0.0.1:8443",
++		"wss://host:443/path", // path-routed LB is legitimate
++	}
++	for _, v := range valid {
++		if err := validateWsPublic(v); err != nil {
++			t.Errorf("validateWsPublic(%q) = %v, want valid", v, err)
++		}
++	}
++	invalid := []string{
++		"https://host",              // wrong scheme
++		"traffic-ws.example.com",    // no scheme at all
++		"wss://",                    // no host
++		"wss://:443",                // port but no hostname
++		"wss://host/#",              // trailing # parses to an EMPTY fragment
++		"wss://host/#x",             // fragment
++		"wss://user:pass@host",      // userinfo, advertised verbatim
++		"wss://host:99999",          // out-of-range port
++		"wss://host:0",              // port zero
++		"wss://user@host:8443/ws?x", // userinfo again, with path+query
++	}
++	for _, v := range invalid {
++		if err := validateWsPublic(v); err == nil {
++			t.Errorf("validateWsPublic(%q) = nil, want invalid", v)
++		}
++	}
++}
++
++// stripEnv keeps the admin token out of engine children (Fable, round 7).
++func TestStripEnv(t *testing.T) {
++	env := []string{"PATH=/bin", adminTokenEnv + "=sekrit", "HOME=/root"}
++	got := stripEnv(env, adminTokenEnv)
++	if len(got) != 2 || got[0] != "PATH=/bin" || got[1] != "HOME=/root" {
++		t.Errorf("stripEnv = %v, want the token entry gone", got)
++	}
++	for _, e := range got {
++		if strings.Contains(e, "sekrit") {
++			t.Errorf("stripEnv leaked the token value: %v", got)
++		}
++	}
++	// Absent variable: the slice passes through with everything kept.
++	if got := stripEnv([]string{"PATH=/bin", "HOME=/root"}, adminTokenEnv); len(got) != 2 {
++		t.Errorf("stripEnv without the var = %v, want both entries", got)
++	}
++}
++
++// -nobuild's binaries are what actually gets execed: shell stubs in the
++// "image" directory stand in for serve/replay, spawned through the REAL
++// childSpawner wiring.
++func TestNobuildSpawnerExecsDirBinaries(t *testing.T) {
++	dir := t.TempDir()
++	for _, name := range []string{"serve", "replay"} {
++		p := filepath.Join(dir, name)
++		if err := os.WriteFile(p, []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
++			t.Fatal(err)
++		}
++	}
++	serveBin, replayBin, err := prebuiltBins(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	lg := log.New(io.Discard, "", 0)
++	spawn := childSpawner(serveBin, replayBin, lg)
++
++	demo, err := spawn(spawnTarget{Kind: "demo", Demo: &Demo{ID: "d1", Run: "r1"}})
++	if err != nil {
++		t.Fatalf("spawn demo from -nobuild dir: %v", err)
++	}
++	if demo.Path != serveBin {
++		t.Errorf("demo spawned %q, want the -nobuild serve %q", demo.Path, serveBin)
++	}
++	_ = demo.Process.Kill()
++	_, _ = demo.Process.Wait()
++
++	rec, err := spawn(spawnTarget{Kind: "replay", Rec: &Recording{ID: "rec1", Run: "r1", Store: "/tmp/s"}})
++	if err != nil {
++		t.Fatalf("spawn replay from -nobuild dir: %v", err)
++	}
++	if rec.Path != replayBin {
++		t.Errorf("replay spawned %q, want the -nobuild replay %q", rec.Path, replayBin)
++	}
++	_ = rec.Process.Kill()
++	_, _ = rec.Process.Wait()
++}
+diff --git a/engine/cmd/demosrv/main.go b/engine/cmd/demosrv/main.go
+index cdd844d8b18a42762a3173f5be19c60a57e772a6..f548ac79d2128e3b63aad4f08de8365b185d1766 100644
+--- a/engine/cmd/demosrv/main.go
++++ b/engine/cmd/demosrv/main.go
+@@ -18,6 +18,15 @@
+ // first demo start is then a process exec, not a cold compile, and there
+ // is no `go run` wrapper between demosrv and the engine to eat signals).
+ // SIGINT/SIGTERM to demosrv kills the active child too.
++//
++// Public deployment (GKE behind a 443-only Ingress, ADR-0020) adds four
++// flags, all defaulting to the local-dev behavior above: -wspublic pins the
++// client-facing engine ws URL verbatim (the LB owns the public name and the
++// wss scheme — no rewrite of the listen address reconstructs it),
++// -admintoken bearer-gates the MUTATING routes (GETs stay public),
++// -autostart starts one demo once the listener is up (failure logs and
++// keeps serving), and -nobuild execs prebuilt serve/replay binaries from a
++// directory instead of the go-build pre-warm (the container-image case).
+ package main
+ 
+ import (
+@@ -48,9 +57,45 @@ func main() {
+ 	netcacheDir := flag.String("netcache", "data/networks/.geojson-cache", "per-demo network GeoJSON cache")
+ 	overlayDir := flag.String("overlaydir", "data/networks/overlays", "static overlay GeoJSON directory (zones/boundaries, WGS84) — a missing dir just 404s /overlay/*")
+ 	wsAddr := flag.String("ws", "127.0.0.1:8443", "engine WebSocket listen address for spawned runs; override when another process holds 8443 (clients are told via /api/demos + start URLs)")
++	wsPublic := flag.String("wspublic", "", "verbatim client-facing engine WebSocket URL (e.g. wss://traffic-ws.example.com) for ALL advertised ws URLs — the TLS-terminating-LB case, where no rewrite of -ws reconstructs what browsers dial; empty = advertise the -ws listen address (legacy). Requires -admintoken/DEMOSRV_ADMIN_TOKEN (public shape must not serve the mutating POSTs open)")
++	adminToken := flag.String("admintoken", "", "bearer token required on the mutating endpoints (demo/replay start, demo stop, replay ctl verbs); GETs stay public either way, UNSET flag = DEMOSRV_ADMIN_TOKEN env fallback, unset everywhere = open (local dev); a supplied-but-empty token fatals (fail closed)")
++	autostartID := flag.String("autostart", "", "demo id to start once the HTTP listener is up (pod-style deploys); retries with backoff, then logs and KEEPS SERVING — unknown id likewise")
++	nobuildDir := flag.String("nobuild", "", "directory with PREBUILT serve+replay binaries: skip the go-build pre-warm and exec <dir>/serve + <dir>/replay (container images); stat-checked at startup, fatal when missing/non-executable")
+ 	flag.Parse()
+ 
+ 	wsListenAddr = *wsAddr
++	wsPublicURL = *wsPublic
++
++	// Flag validation FIRST — before the registry load and the go-build
++	// pre-warm, so a misconfiguration fatals in milliseconds, not after
++	// the expensive startup work (Fable, round 8).
++	if wsPublicURL != "" {
++		if err := validateWsPublic(wsPublicURL); err != nil {
++			log.Fatalf("demosrv: -wspublic %q: %v — it would be advertised verbatim to every client", wsPublicURL, err)
++		}
++	}
++	// flag.Visit, not the flag VALUE: `-admintoken=` (or a manifest's
++	// "$TOK" expanding empty) is indistinguishable from an absent flag
++	// through *adminToken, and the fail-closed rule depends on the
++	// difference (Fable + sol, round 9).
++	adminTokenSet := false
++	flag.Visit(func(f *flag.Flag) {
++		if f.Name == "admintoken" {
++			adminTokenSet = true
++		}
++	})
++	adminTok, err := resolveAdminToken(*adminToken, adminTokenSet)
++	if err != nil {
++		log.Fatalf("demosrv: %v", err)
++	}
++	if wsPublicURL != "" && adminTok == "" {
++		// -wspublic explicitly selects the PUBLIC deployment shape; with
++		// no token, every spawn/stop/replay-ctl POST is open to the
++		// internet — almost certainly a manifest that dropped the Secret,
++		// and fail-closed is the posture of everything else here (sol,
++		// round 13).
++		log.Fatalf("demosrv: -wspublic set but no admin token (-admintoken or %s) — refusing to serve the mutating POSTs OPEN on the public deployment shape", adminTokenEnv)
++	}
+ 
+ 	reg, err := LoadRegistry(*demosPath)
+ 	if err != nil {
+@@ -60,29 +105,44 @@ func main() {
+ 	if err := os.MkdirAll(*netcacheDir, 0o755); err != nil {
+ 		log.Fatalf("demosrv: netcache: %v", err)
+ 	}
+-	engineDir, err := findEngineDir()
+-	if err != nil {
+-		log.Fatalf("demosrv: %v", err)
+-	}
+ 
+-	// Pre-warm: build serve and replay once. Startup cost is ~1 s each on a
+-	// warm build cache; every demo/replay start after that is an exec of
+-	// THIS binary, so SIGTERM/SIGKILL reach the engine directly.
+-	binDir, err := os.MkdirTemp("", "traffic-sim-demosrv-")
+-	if err != nil {
+-		log.Fatalf("demosrv: %v", err)
+-	}
+-	defer os.RemoveAll(binDir)
+-	serveBin := filepath.Join(binDir, "serve")
+-	replayBin := filepath.Join(binDir, "replay")
+-	for _, b := range []struct{ bin, pkg string }{{serveBin, "./cmd/serve"}, {replayBin, "./cmd/replay"}} {
+-		log.Printf("demosrv: building %s (go build %s in %s/)", filepath.Base(b.bin), b.pkg, engineDir)
+-		build := exec.Command("go", "build", "-o", b.bin, b.pkg)
+-		build.Dir = engineDir
+-		build.Stdout = os.Stderr
+-		build.Stderr = os.Stderr
+-		if err := build.Run(); err != nil {
+-			log.Fatalf("demosrv: go build %s: %v", b.pkg, err)
++	// Engine binaries, one of two sources. Default: build serve and replay
++	// ONCE here (pre-warm — the first demo start is then a process exec,
++	// not a cold compile, and there is no `go run` wrapper between demosrv
++	// and the engine to eat signals). -nobuild instead points at prebuilt
++	// binaries (the container image ships them; the pod may not even have
++	// a Go toolchain), stat-checked up front by prebuiltBins.
++	var serveBin, replayBin string
++	if *nobuildDir != "" {
++		serveBin, replayBin, err = prebuiltBins(*nobuildDir)
++		if err != nil {
++			log.Fatalf("demosrv: %v", err)
++		}
++		log.Printf("demosrv: -nobuild: using prebuilt engines %s, %s", serveBin, replayBin)
++	} else {
++		engineDir, err := findEngineDir()
++		if err != nil {
++			log.Fatalf("demosrv: %v", err)
++		}
++		binDir, err := os.MkdirTemp("", "traffic-sim-demosrv-")
++		if err != nil {
++			log.Fatalf("demosrv: %v", err)
++		}
++		defer os.RemoveAll(binDir)
++		serveBin = filepath.Join(binDir, "serve")
++		replayBin = filepath.Join(binDir, "replay")
++		for _, b := range []struct{ bin, pkg string }{{serveBin, "./cmd/serve"}, {replayBin, "./cmd/replay"}} {
++			log.Printf("demosrv: building %s (go build %s in %s/)", filepath.Base(b.bin), b.pkg, engineDir)
++			build := exec.Command("go", "build", "-o", b.bin, b.pkg)
++			build.Dir = engineDir
++			// Same stripEnv discipline as the engine children: the admin
++			// token is demosrv's own credential (Fable, round 11).
++			build.Env = stripEnv(os.Environ(), adminTokenEnv)
++			build.Stdout = os.Stderr
++			build.Stderr = os.Stderr
++			if err := build.Run(); err != nil {
++				log.Fatalf("demosrv: go build %s: %v", b.pkg, err)
++			}
+ 		}
+ 	}
+ 
+@@ -91,24 +151,61 @@ func main() {
+ 	srv := &server{
+ 		reg: reg, sup: sup, viz: *vizDir, nets: &netCache{dir: *netcacheDir}, overlays: *overlayDir,
+ 		replayCtl: "http://" + replayCtlAddr, ctlTimeout: ctlTimeout, seekTimeout: seekTimeout,
++		adminToken: adminTok,
++		shutdown:   make(chan struct{}),
++	}
++	if srv.adminToken != "" {
++		log.Printf("demosrv: admin gate ON — mutating POSTs require a bearer token (flag or %s)", adminTokenEnv)
+ 	}
+-	hs := &http.Server{Addr: *addr, Handler: srv.routes()}
++	if wsPublicURL != "" {
++		// The HTTP gate does NOT cover this: the advertised engine ws is
++		// the embedded broker's unauthenticated, publish-capable plane —
++		// ADR-0020's go-live precondition, true with or without the token
++		// (sol, round 11).
++		log.Printf("demosrv: warning: -wspublic advertises the engine's UNAUTHENTICATED ws plane (publish-capable) — broker auth is an ADR-0020 go-live precondition, not part of this build")
++	}
++	// ReadHeaderTimeout because -admintoken exists precisely for the
++	// PUBLIC deployment: slow-loris clients must not hold the menu's
++	// connections forever (sol review). The engine's ws server is a
++	// different listener (the child's); this covers only demosrv's HTTP.
++	hs := &http.Server{Handler: srv.routes(), ReadHeaderTimeout: 10 * time.Second}
+ 
+ 	sig := make(chan os.Signal, 1)
+ 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+ 	go func() {
+ 		s := <-sig
+ 		log.Printf("demosrv: %v — killing the active run and exiting", s)
+-		sup.stop()
++		srv.signalShutdown() // first: autostart's backoff sleep aborts now
++		sup.shutdownFinal()  // and the latch refuses any start from here on
+ 		hs.Close()
+ 	}()
+ 
+ 	if _, err := os.Stat(filepath.Join(*vizDir, "demos.html")); err != nil {
+ 		log.Printf("demosrv: warning: %s/demos.html not found — build the viz first (cd viz && pnpm build)", *vizDir)
+ 	}
++	// Bind BEFORE announcing and BEFORE autostart: with -autostart the demo
++	// spawn must follow the listener actually being up (a pod whose port
++	// never binds should fatal here, not autostart into the void).
++	ln, err := net.Listen("tcp", *addr)
++	if err != nil {
++		log.Fatalf("demosrv: %v", err)
++	}
+ 	log.Printf("demosrv: %d demo(s), %d recording(s) on http://%s/ — single active run, engine ws %s",
+-		len(reg.Demos), len(reg.Recordings), *addr, wsListenAddr)
+-	if err := hs.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
++		len(reg.Demos), len(reg.Recordings), ln.Addr(), wsListenAddr)
++	if *autostartID != "" {
++		// Direct supervisor start, bypassing the HTTP route (and with it the
++		// adminGate bearer check — the pod itself holds no token). The stop
++		// epoch is captured NOW, synchronously: an HTTP stop can only land
++		// after Serve begins, and the goroutine's own snapshot could be
++		// scheduled after such a stop completed (sol, round 19).
++		go srv.autostartDemo(*autostartID, sup.stopEpoch.Load())
++	}
++	if err := hs.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
++		// Kill the engine child BEFORE fataling: with -autostart a live
++		// run is the norm, and exiting here would orphan it on the ws
++		// port (Fable).
++		srv.signalShutdown()
++		sup.shutdownFinal()
+ 		log.Fatalf("demosrv: %v", err)
+ 	}
+ }
+@@ -141,6 +238,10 @@ func childSpawner(serveBin, replayBin string, lg *log.Logger) spawnFunc {
+ 			bin, args = serveBin, serveArgs(t.Demo)
+ 		}
+ 		cmd := exec.Command(bin, args...)
++		// The admin token is demosrv's own credential — strip it from the
++		// child's inherited environment (the engine exposes the
++		// unauthenticated ws plane; its env is one /proc read away).
++		cmd.Env = stripEnv(os.Environ(), adminTokenEnv)
+ 		w := &prefixWriter{lg: lg, prefix: "[" + t.id() + "] "}
+ 		cmd.Stdout = w
+ 		cmd.Stderr = w
+@@ -159,6 +260,12 @@ func childSpawner(serveBin, replayBin string, lg *log.Logger) spawnFunc {
+ // substituting the request host would advertise a listener that refuses
+ // them, which is worse (sol review).
+ func advertisedWsURL(r *http.Request) string {
++	// -wspublic wins outright, VERBATIM: the operator has named the URL
++	// browsers dial (TLS-terminating LB, 443 only) and any host/port
++	// substitution of the listen address would corrupt it.
++	if wsPublicURL != "" {
++		return wsPublicURL
++	}
+ 	host, port, err := net.SplitHostPort(wsListenAddr)
+ 	if err == nil && (host == "" || host == "0.0.0.0" || host == "::") {
+ 		reqHost, _, herr := net.SplitHostPort(r.Host)
+@@ -255,6 +362,31 @@ type server struct {
+ 	replayCtl   string
+ 	ctlTimeout  time.Duration
+ 	seekTimeout time.Duration
++	// adminToken is -admintoken: when non-empty, the mutating routes (start/
++	// stop/replay-ctl) require it as a bearer token (adminGate). Empty = the
++	// open local-dev behavior. LOAD-BEARING: the gate binds at routes()
++	// construction — set this before calling routes() (main resolves the
++	// flag/env before building the server).
++	adminToken string
++	// shutdown, when non-nil, is closed by the signal handler BEFORE
++	// sup.shutdownFinal(): autostartDemo's retry loop selects on it so
++	// its backoff sleep aborts fast (the supervisor's closed latch then
++	// atomically refuses any later start — the child would be orphaned
++	// on the ws port — Fable, round 2/3). Nil in tests = never fires.
++	shutdown chan struct{}
++	// shutdownOnce guards close(shutdown): the signal handler AND the
++	// hs.Serve error path can both reach it (the same incident produces
++	// SIGTERM + an accept error on a public pod — Fable, round 17).
++	shutdownOnce sync.Once
++}
++
++// signalShutdown closes s.shutdown exactly once (nil-safe for tests).
++func (s *server) signalShutdown() {
++	s.shutdownOnce.Do(func() {
++		if s.shutdown != nil {
++			close(s.shutdown)
++		}
++	})
+ }
+ 
+ func (s *server) routes() *http.ServeMux {
+@@ -266,19 +398,22 @@ func (s *server) routes() *http.ServeMux {
+ 	mux.HandleFunc("GET /app/", s.handleApp)
+ 	mux.HandleFunc("GET /api/demos", s.handleDemos)
+ 	mux.HandleFunc("GET /api/status", s.handleStatus)
+-	mux.HandleFunc("POST /api/demo/{id}/start", s.handleStart)
++	// The POSTs are the MUTATING surface (spawn/kill the engine child or
++	// drive its replay) — adminGate bearer-checks them when -admintoken is
++	// set and is a pass-through otherwise. Everything GET stays public.
++	mux.HandleFunc("POST /api/demo/{id}/start", s.adminGate(s.handleStart))
+ 	mux.HandleFunc("GET /api/demo/{id}/params", s.handleParams)
+-	mux.HandleFunc("POST /api/demo/stop", s.handleStop)
+-	mux.HandleFunc("POST /api/replay/{id}/start", s.handleReplayStart)
++	mux.HandleFunc("POST /api/demo/stop", s.adminGate(s.handleStop))
++	mux.HandleFunc("POST /api/replay/{id}/start", s.adminGate(s.handleReplayStart))
+ 	mux.HandleFunc("GET /api/replay/status", s.handleReplayStatus)
+ 	// The four control verbs are registered explicitly (no {action}
+ 	// wildcard — it would conflict with /api/replay/{id}/start over paths
+ 	// like /api/replay/ctl/start): the proxy stays dumb, not open-ended,
+ 	// and unknown verbs 404 at the mux.
+-	mux.HandleFunc("POST /api/replay/ctl/pause", s.ctlRoute("/pause", false))
+-	mux.HandleFunc("POST /api/replay/ctl/resume", s.ctlRoute("/resume", false))
+-	mux.HandleFunc("POST /api/replay/ctl/speed", s.ctlRoute("/speed", false))
+-	mux.HandleFunc("POST /api/replay/ctl/seek", s.ctlRoute("/seek", true))
++	mux.HandleFunc("POST /api/replay/ctl/pause", s.adminGate(s.ctlRoute("/pause", false)))
++	mux.HandleFunc("POST /api/replay/ctl/resume", s.adminGate(s.ctlRoute("/resume", false)))
++	mux.HandleFunc("POST /api/replay/ctl/speed", s.adminGate(s.ctlRoute("/speed", false)))
++	mux.HandleFunc("POST /api/replay/ctl/seek", s.adminGate(s.ctlRoute("/seek", true)))
+ 	// Go's ServeMux wildcards are whole segments, so the .geojson suffix is
+ 	// parsed out of {file} in the handler.
+ 	mux.HandleFunc("GET /net/{file}", s.handleNet)
+diff --git a/engine/cmd/demosrv/supervisor.go b/engine/cmd/demosrv/supervisor.go
+index 75dd04265d35e1f95dad589294a5ebb59c77b0cb..c0ce89b52e326e92253081887b4136f76e390f85 100644
+--- a/engine/cmd/demosrv/supervisor.go
++++ b/engine/cmd/demosrv/supervisor.go
+@@ -59,6 +59,14 @@ const (
+ // handlers + /api/demos then tell the client where to connect instead.
+ var wsListenAddr = "127.0.0.1:8443"
+ 
++// wsPublicURL, when set (-wspublic), is THE client-facing engine WebSocket
++// URL, used verbatim everywhere a browser is told where to dial (registry
++// WS, /api/demos, start deep links). It exists for the TLS-terminating-LB
++// deployment: the public name, scheme (wss), and port (443) belong to the
++// load balancer, and no host/port rewrite of wsListenAddr can reconstruct
++// them. Empty = derive from wsListenAddr (the legacy local behavior).
++var wsPublicURL string
++
+ // wsDialURL normalizes a listen address into a dialable ws:// URL:
+ // wildcard/empty hosts are not dialable and become loopback.
+ func wsDialURL(addr string) string {
+@@ -73,8 +81,14 @@ func wsDialURL(addr string) string {
+ // links and the /api/demos payload. VERBATIM listen address — this is a
+ // public URL: normalizing a wildcard listen to loopback (wsDialURL, the
+ // probe-side helper) would point remote browsers at themselves; the
+-// operator owning -ws owns what clients dial.
+-func wsClientURL() string { return "ws://" + wsListenAddr }
++// operator owning -ws owns what clients dial. A -wspublic override wins
++// over all of this (see wsPublicURL).
++func wsClientURL() string {
++	if wsPublicURL != "" {
++		return wsPublicURL
++	}
++	return "ws://" + wsListenAddr
++}
+ 
+ // spawnTarget identifies the child to exec: a live demo (Kind "demo",
+ // serve) or a VCR recording (Kind "replay", engine/cmd/replay). Exactly
+@@ -106,12 +120,29 @@ type activeRun struct {
+ type supervisor struct {
+ 	mu     sync.Mutex
+ 	active *activeRun
+-	// Per-generation start abort: stop() stamps the CURRENT generation
+-	// before taking mu (a 660 s identity wait holds it); a queued LATER
+-	// start has a different generation and is unaffected. No stale-flag
+-	// abort of an unrelated spawn (sol review).
+-	startGen atomic.Uint64
+-	abortGen atomic.Uint64
++	// closed latches FINAL shutdown (shutdownFinal, the signal handler):
++	// once set, every start refuses (errSupervisorClosed) — a start
++	// beginning after the last stop would orphan its engine child as
++	// demosrv exits. ATOMIC, stored before shutdownFinal's stopEpoch
++	// bump and checked under mu both before AND after the start's epoch
++	// snapshot, so no start can slip the latch AND dodge the abort
++	// (sol, round 4). Distinct from stop(): the menu's stop/start cycle
++	// keeps working.
++	closed atomic.Bool
++	// stopEpoch is the abort mechanism: stop()/shutdownFinal() bump it
++	// BEFORE taking mu, and each start snapshots it under mu — the
++	// readiness probes abort on any later bump, so an in-flight start
++	// fails fast instead of holding mu through a 660 s identity wait
++	// with a stop queued behind it. No stamp/clear dance: nothing is
++	// ever cleared, so overlapping stops cannot erase each other's
++	// abort, and a start that begins after the bump simply snapshots
++	// the new epoch (Fable + sol, rounds 14-16).
++	stopEpoch atomic.Uint64
++	// stopPending counts stops between their epoch bump and their mu
++	// acquisition: a start that wins the lock race against a QUEUED stop
++	// refuses (errStartAborted) instead of spawning a child the stop
++	// will kill after a full readiness wait (sol, round 17).
++	stopPending atomic.Int64
+ 	// statusSnap is the lock-free status snapshot: /api/status polls every
+ 	// ~3 s and must not queue behind a long start's mu.
+ 	statusSnap atomic.Value // statusSnapshot
+@@ -153,6 +184,22 @@ var runNonce = func() (string, error) {
+ 	return hex.EncodeToString(b[:]), nil
+ }
+ 
++// errAlreadyActive is startIfIdle's refusal: something went active before
++// autostart's retry took the lock (an operator's authed start) — the
++// active run is LEFT ALONE, never replaced.
++var errAlreadyActive = errors.New("a run is already active")
++
++// errSupervisorClosed is every start's refusal after shutdownFinal (the
++// signal handler): a start that began after the final stop would orphan
++// its engine child on the ws port as demosrv exits (Fable + sol, round 3).
++var errSupervisorClosed = errors.New("supervisor shut down")
++
++// errStartAborted marks a start aborted by a stop()/shutdownFinal()
++// generation stamp (waitPort/waitIdentity): an operator's DELIBERATE stop,
++// not a transient failure — autostart must treat it as terminal rather
++// than retry the demo the operator just stopped (Fable, round 12).
++var errStartAborted = errors.New("start aborted (stop requested)")
++
+ // start replaces any active child with the target's engine and blocks
+ // until the child is ready (see waitReady). Kill-before-spawn covers BOTH
+ // kinds: a replay child must die before a serve starts and vice versa
+@@ -169,12 +216,71 @@ var runNonce = func() (string, error) {
+ // recording's stable id for replays) — the caller must thread exactly
+ // this into the app URL, so no status re-read can mix generations.
+ func (s *supervisor) start(t spawnTarget, verify func() error) (string, error) {
++	return s.startGuarded(t, verify, false, 0)
++}
++
++// startIfIdle is -autostart's start (deploy.go): the idle check rides the
++// SAME mu hold as the spawn, so an operator's start can never slip between
++// check and act (the check-then-act race Fable + sol flagged in round 2) —
++// whatever is active when the lock is taken wins, autostart backs off.
++// epoch0 is autostart's stop-epoch snapshot: a stop epoch that moved since
++// — even a stop that COMPLETED while this start was queued on mu — refuses
++// the start (errStartAborted), so autostart never un-stops what an
++// operator stopped (Fable, round 18).
++func (s *supervisor) startIfIdle(t spawnTarget, epoch0 uint64) (string, error) {
++	return s.startGuarded(t, nil, true, epoch0)
++}
++
++// startGuarded is start with the autostart guards. The ORDER of the first
++// three checks is load-bearing against stop()'s pending-then-bump order:
++// the epoch snapshot comes BEFORE the pending check, so a stop landing
++// mid-guard either trips pending (its mark preceded our check) or has its
++// epoch bump after our snapshot (the probes abort) — no interleaving
++// leaves a start both unrefused and unabortable (sol, round 18).
++// onlyIfIdle adds the epoch0 + s.active checks for autostart.
++func (s *supervisor) startGuarded(t spawnTarget, verify func() error, onlyIfIdle bool, epoch0 uint64) (string, error) {
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
+-	// Generation allocated UNDER mu: stop() stamps startGen to abort the
+-	// in-flight start — it is always the LATEST generation, so the abort
+-	// can never land on a queued (or already-cleared) one instead.
+-	gen := s.startGen.Add(1)
++	if s.closed.Load() {
++		return "", errSupervisorClosed
++	}
++	// Epoch snapshotted UNDER mu, BEFORE the pending check: any stop()
++	// or shutdownFinal() bump after this point aborts the start at its
++	// next probe.
++	epoch := s.stopEpoch.Load()
++	if s.stopPending.Load() > 0 {
++		// A stop is QUEUED behind this lock acquisition: refuse fast
++		// rather than spawn a child the stop will kill after a full
++		// readiness wait (sol, round 17).
++		return "", errStartAborted
++	}
++	if onlyIfIdle && epoch != epoch0 {
++		// A stop landed since the caller's snapshot — possibly one that
++		// already COMPLETED while this start queued on mu (Fable, round
++		// 18). Terminal for autostart.
++		return "", errStartAborted
++	}
++	if onlyIfIdle && s.active != nil {
++		select {
++		case <-s.active.done:
++			// EXITED but not yet reaped: the reaper clears s.active
++			// asynchronously, and errAlreadyActive is TERMINAL for
++			// autostart — a corpse in this window must read as idle,
++			// not as "someone else won" (sol, round 6).
++			s.active = nil
++			s.mirrorStatus()
++		default:
++			return "", fmt.Errorf("%w: %s", errAlreadyActive, s.active.target.id())
++		}
++	}
++	// closed AGAIN (still under mu): shutdownFinal stores closed FIRST,
++	// so a shutdown landing between the first check and this one either
++	// trips this check, or has already bumped pending (caught above) or
++	// the epoch past our snapshot — a start can never slip the latch AND
++	// dodge the abort (sol, round 4).
++	if s.closed.Load() {
++		return "", errSupervisorClosed
++	}
+ 	s.stopLocked()
+ 	if t.Kind == "demo" {
+ 		// Unique run id per spawn: the run id IS the registry key and the
+@@ -200,12 +306,15 @@ func (s *supervisor) start(t spawnTarget, verify func() error) (string, error) {
+ 		// way out) and the child's own log carries anything interesting.
+ 		cmd.Wait()
+ 		close(a.done)
+-		// A child that dies on its own must not linger in the lock-free
+-		// status mirror as "running". Only clear when THIS run is still
+-		// the active one — a swap already replaced the mirror with the
+-		// new run's status.
++		// A child that dies on its own must not linger as "running" — not
++		// in the lock-free status mirror (the menu badge must never claim
++		// a corpse is running) and not in s.active (startIfIdle's idle
++		// guard reads it under mu; a corpse there would block autostart
++		// forever — sol, round 3). Only clear when THIS run is still the
++		// active one — a swap already replaced both with the new run's.
+ 		s.mu.Lock()
+ 		if s.active == a {
++			s.active = nil
+ 			s.statusSnap.Store(statusSnapshot{})
+ 		}
+ 		s.mu.Unlock()
+@@ -216,7 +325,7 @@ func (s *supervisor) start(t spawnTarget, verify func() error) (string, error) {
+ 	// loading overlay (with its watchdog) during a long world build,
+ 	// instead of showing idle and inviting a duplicate start.
+ 	s.mirrorStatus()
+-	if err := s.waitReady(a, gen); err != nil {
++	if err := s.waitReady(a, epoch); err != nil {
+ 		s.stopLocked()
+ 		return "", fmt.Errorf("%s did not become ready: %w%s", t.id(), err, tailSuffix(cmd))
+ 	}
+@@ -250,15 +359,36 @@ func tailSuffix(cmd *exec.Cmd) string {
+ }
+ 
+ func (s *supervisor) stop() {
+-	// A start can hold s.mu through a ~660 s identity wait: abort THAT
+-	// generation BEFORE taking the lock so its probes fail fast and
+-	// release, instead of leaving demosrv + child running until the
+-	// timeout (SIGINT path — sol review). stopLocked reaps the child
+-	// after; the generation is cleared so a later start is unaffected.
+-	s.abortGen.Store(s.startGen.Load())
++	// Bump the epoch BEFORE taking mu: a start can hold mu through a
++	// ~660 s identity wait, and its probes must fail fast and release
++	// instead of leaving demosrv + child running until the timeout
++	// (SIGINT path — sol review). No clear afterwards: overlapping stops
++	// can never erase each other's abort, and a start that begins after
++	// the bump snapshots the new epoch and is unaffected (Fable + sol,
++	// rounds 14-16).
++	s.stopPending.Add(1) // pending FIRST: a start between the two marks refuses
++	s.stopEpoch.Add(1)
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	s.stopPending.Add(-1)
++	s.stopLocked()
++}
++
++// shutdownFinal is the signal handler's stop: stop() PLUS the closed
++// latch, so no start can begin after the final stop (a plain stop leaves
++// the gap the shutdown channel only narrows — autostart could pass its
++// channel check, then spawn after stop returned; Fable + sol, round 3).
++// closed is stored FIRST, then pending, then the epoch bump: startGuarded
++// checks them in the same order under mu, so a start that saw the latch
++// open either trips pending or has its epoch snapshot covered by the bump
++// (sol, round 18 — the bump order is load-bearing).
++func (s *supervisor) shutdownFinal() {
++	s.closed.Store(true)
++	s.stopPending.Add(1)
++	s.stopEpoch.Add(1)
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
+-	s.abortGen.Store(0)
++	s.stopPending.Add(-1)
+ 	s.stopLocked()
+ }
+ 
+@@ -361,17 +491,17 @@ func (s *supervisor) withActiveReplay(fn func(run string) error) error {
+ // early would race the replay panel's first probe. A live DEMO adds the
+ // identity phase after the port probe (waitIdentity): the port accepting is
+ // not enough to know the broker behind it is ours.
+-func (s *supervisor) waitReady(a *activeRun, gen uint64) error {
++func (s *supervisor) waitReady(a *activeRun, epoch uint64) error {
+ 	if s.ready != nil {
+ 		return s.ready()
+ 	}
+-	if err := waitPort(s.wsAddr, s.readyTimeout, a.done, &s.abortGen, gen); err != nil {
++	if err := s.waitPort(s.wsAddr, s.readyTimeout, a.done, epoch); err != nil {
+ 		return err
+ 	}
+ 	if a.target.Kind == "replay" {
+-		return waitPort(s.ctlAddr, s.readyTimeout, a.done, &s.abortGen, gen)
++		return s.waitPort(s.ctlAddr, s.readyTimeout, a.done, epoch)
+ 	}
+-	return s.waitIdentity(a.target.Demo.Run, a.startedAt, a.done, gen)
++	return s.waitIdentity(a.target.Demo.Run, a.startedAt, a.done, epoch)
+ }
+ 
+ // waitIdentity answers the question the raw port probe cannot: the listener
+@@ -386,13 +516,15 @@ func (s *supervisor) waitReady(a *activeRun, gen uint64) error {
+ // done aborts the wait immediately: when the port is held by a foreign
+ // process our child dies on bind failure, and that error must surface in
+ // seconds, not after the timeout.
+-func (s *supervisor) waitIdentity(run string, spawnedAt time.Time, done <-chan struct{}, gen uint64) error {
++func (s *supervisor) waitIdentity(run string, spawnedAt time.Time, done <-chan struct{}, epoch uint64) error {
+ 	url := wsDialURL(s.wsAddr)
+ 	deadline := time.Now().Add(s.identityTimeout)
+ 	var lastErr error
+ 	for {
+-		if g := s.abortGen.Load(); g != 0 && g == gen {
+-			return fmt.Errorf("start aborted (stop requested)")
++		if s.stopEpoch.Load() != epoch {
++			// A stop (or shutdown) bumped the epoch after this start
++			// snapshotted it: the abort is DELIBERATE, fail fast.
++			return errStartAborted
+ 		}
+ 		select {
+ 		case <-done:
+@@ -423,11 +555,12 @@ func (s *supervisor) waitIdentity(run string, spawnedAt time.Time, done <-chan s
+ // scenario, engine panic) must not block start for the full timeout with
+ // a generic dial error — and once the child is dead, a port that accepts
+ // belongs to some STRAY process, never to us (report the death, not OK).
+-func waitPort(addr string, timeout time.Duration, done <-chan struct{}, abortGen *atomic.Uint64, gen uint64) error {
++// The epoch check is the stop abort (see waitIdentity).
++func (s *supervisor) waitPort(addr string, timeout time.Duration, done <-chan struct{}, epoch uint64) error {
+ 	deadline := time.Now().Add(timeout)
+ 	for {
+-		if g := abortGen.Load(); g != 0 && g == gen {
+-			return fmt.Errorf("start aborted (stop requested)")
++		if s.stopEpoch.Load() != epoch {
++			return errStartAborted
+ 		}
+ 		select {
+ 		case <-done:

@@ -43,7 +43,9 @@ metadata:
   namespace: traffic-sim
 spec:
   # Every 6 hours at :17 — runs last 10 sim-hours, so the pod is always
-  # recycled before its run can complete.
+  # recycled before its run can complete. That guarantee DEPENDS on serve's
+  # realtime default (-pace 1) and scenario dt 0.1 (360k ticks ≈ 10 wall-h);
+  # if either changes, revisit this cadence.
   schedule: "17 */6 * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 2

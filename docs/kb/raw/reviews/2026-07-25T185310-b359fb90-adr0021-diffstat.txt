@@ -1,0 +1,43 @@
+ contracts/asyncapi.yaml          |  20 ++++---
+ engine/cmd/serve/main.go         |  38 +++++++++++++
+ engine/director.go               |  74 ++++++++++++++++++++++---
+ engine/engine.go                 |  34 ++++++++++--
+ engine/intent.go                 |   4 +-
+ engine/keyframe.go               |  28 +++++++++-
+ engine/metrics.go                |  80 +++++++++++++++++++++++----
+ engine/mobil.go                  | 102 +++++++++++++++++++++++++++++++++-
+ engine/natsio/contract.go        |   2 +
+ engine/natsio/demand/director.go |  53 ++++++++++++++----
+ engine/natsio/verb.go            |  20 ++++++-
+ engine/routing.go                |  92 +++++++++++++++++++++++++++++++
+ engine/scenario/scenario.go      | 115 ++++++++++++++++++++++++++++++++++-----
+ engine/scenario/variant.go       |  15 ++---
+ engine/spawn.go                  |  87 +++++++++++++++++++++++------
+ scripts/import-city.sh           |  46 +++++++++++++++-
+ viz/index.html                   |   4 ++
+ viz/src/config.ts                |   2 +
+ viz/src/layertoggles.ts          |   9 ++-
+ viz/src/legend.ts                |  13 +++++
+ viz/src/main.ts                  |  69 ++++++++++++++++++++++-
+ viz/src/overlays.ts              |  40 +++++++++++++-
+ viz/src/theme.ts                 |  13 +++++
+ viz/test/config.test.ts          |   7 ++-
+ viz/test/layertoggles.test.ts    |  16 +++++-
+ viz/test/overlays.test.ts        |  55 ++++++++++++++++++-
+ viz/test/theme.test.ts           |  15 +++++
+ 27 files changed, 959 insertions(+), 94 deletions(-)
+--- untracked (new files) ---
+   494 engine/destination_test.go
+    73 engine/natsio/demand/sampler_test.go
+   153 engine/natsio/destination_verb_test.go
+   132 engine/scenario/destination_test.go
+    92 scripts/osm-urban-us.typ.xml
+    96 scripts/chicago/boundaries.py
+   615 scripts/chicago/buildings.py
+   321 scripts/chicago/congestion.py
+   115 scripts/chicago/extract.py
+   108 scripts/chicago/mkdemand.py
+   266 scripts/chicago/mkod.py
+    74 scripts/chicago/scorecard.py
+   162 scripts/chicago/water.py
+  2701 total

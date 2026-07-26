@@ -103,6 +103,7 @@ links its source synthesis for traceability.
 - [x] [ADR-0018](decisions/ADR-0018-chunked-geojson.md) — city-scale network GeoJSON served chunked over HTTP: manifest (`frame` + empty features + `parts`), hash+schema-pinned part URLs that 404 a stale generation, sequential client fetch; small nets byte-identical
 - [x] [ADR-0019](decisions/ADR-0019-route-budget-determinism.md) — route-budget determinism bound: per-replica admission timing and mid-queue failover lane re-freeze accepted and bounded; strict fix retires the budget
 - [x] [ADR-0020](decisions/ADR-0020-demosrv-public-deployment.md) — demosrv public deployment: -wspublic verbatim ws advertisement, -admintoken bearer gate on the mutating POSTs (GETs public), -autostart with keep-serving failure semantics, -nobuild prebuilt engine binaries; all default to local-dev behavior
+- [ ] [ADR-0023](decisions/ADR-0023-baked-replay-pipeline.md) — PROPOSED: baked replay pipeline — offline re-sim of a recording into TSRB v1 binary frames (2 Hz, region-chunked by z11 tile) + TSRL v1 lane-speed aggregates (0.2 Hz), PMTiles network layer, content-addressed R2 layout, viz ?bake= shim re-encoding to synthetic TSSF
 
 ---
 *Last distilled: 2026-07-17 | 18 articles from 56 raw research files*
@@ -115,4 +116,5 @@ links its source synthesis for traceability.
 *ADR-0018 ratified 2026-07-24 (chunked network GeoJSON, after la-lean hit the V8 string cap)*
 *ADR-0019 ratified 2026-07-24 (route-budget determinism bound, after the city-scale obs-path stall)*
 *ADR-0020 ratified 2026-07-25 (demosrv public deployment: GKE pod behind a 443-only TLS Ingress)*
+*ADR-0023 PROPOSED 2026-07-25 (baked replay pipeline for phantomjam.com MVP; three design rounds — Kimi K3 brief, Claude Fable + GPT-5.6-sol)*
 *Run `/update-kb` to check freshness*

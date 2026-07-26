@@ -1,0 +1,4064 @@
+diff --git a/contracts/asyncapi.yaml b/contracts/asyncapi.yaml
+index fce1a4c1cd873688c347a172d79a1d8ff8a04d49..9754dc9386f019768013854e9479d3b46643f05f 100644
+--- a/contracts/asyncapi.yaml
++++ b/contracts/asyncapi.yaml
+@@ -20,7 +20,7 @@ asyncapi: 3.0.0
+ 
+ info:
+   title: traffic-sim engine contract
+-  version: 2.3.0
++  version: 2.4.0
+   description: |
+     The engine's NATS surface per ADR-0006 (planes, taxonomy, pipelines) and
+     ADR-0008 (the engine↔controller contract — M4, schema_version 2):
+@@ -276,16 +276,18 @@ channels:
+     description: |
+       Director verbs (ADR-0008 §5; ADR-0006 2026-07-20 M10 addendum),
+       request/reply, JSON. The sender must hold the director grant. v1
+-      implements verb "spawn": origin lane id (must be a network origin),
+-      vehicle-type name (resolved against the scenario type list), and
+-      earliest_tick (not-before, sim ticks). Every verb carries a
++      implements verb "spawn": origin lane id (a network origin, or any
++      lane when offset_m > 0), vehicle-type name (resolved against the
++      scenario type list), earliest_tick (not-before, sim ticks), and the
++      optional ADR-0021 pair destination + offset_m. Every verb carries a
+       director-assigned request_id — the engine remembers the reply per id
+       for the run's lifetime, so a retried verb (reconnect, publish retry,
+       director failover) gets the same answer with duplicate: true and
+       NEVER double-spawns. Request/reply (not fire-and-forget like raw
+       intents) because the director paces its schedule on accept/reject.
+       Validation rejections (unknown origin, lane not a spawn origin,
+-      unknown type, unsupported verb) carry a reason; accepted verbs take
++      unknown type, unknown destination, offset past the lane end,
++      unsupported verb) carry a reason; accepted verbs take
+       effect at the next tick boundary and are logged on
+       ts.{run}.log.verb. Blocked origins hold-and-retry (bounded, 600
+       ticks past earliest_tick) with the Spawner's own clearance and
+@@ -1110,9 +1112,11 @@ components:
+           type: string
+           minLength: 1
+           description: 'Director-assigned idempotency key: unique per intended spawn for the run. The engine remembers the reply per id; a retry answers duplicate: true and never double-spawns. Deterministic ids (e.g. f{flow}-{ordinal}) make director failover invisible.'
+-        origin: { type: string, description: 'Origin lane id; must be a network origin lane (rejected otherwise).' }
++        origin: { type: string, description: 'Origin lane id. Must be a network ORIGIN lane unless offset_m > 0, which admits any lane (ADR-0021 interior injection).' }
+         vtype: { type: string, description: 'Vehicle-type name, resolved against the scenario type list (rejected if unknown).' }
+         earliest_tick: { type: integer, minimum: 0, description: 'Not-before sim tick (ADR-0005 tick clock; 0 = as soon as applied). A blocked origin holds-and-retries from this tick, bounded at 600 ticks.' }
++        destination: { type: string, description: 'OPTIONAL (ADR-0021). Route destination lane id, applied as the vehicle Route axis at injection: the kernel routes toward it and ENDS the trip at its end (arrival despawn). Rejected if it is not a lane of the network. Omitted = unrouted, the pre-ADR-0021 shape.' }
++        offset_m: { type: number, minimum: 0, description: 'OPTIONAL (ADR-0021). Injection position along the origin lane in meters. Omitted/0 = portal semantics and the origin must be a network origin. Positive = interior injection (a mid-block garage): admits any lane, must be < the lane length, and is additionally clearance-checked BEHIND — an entry that would be rear-ended is denied and held as demand.' }
+ 
+     VerbReplyView:
+       title: Director verb reply
+@@ -1123,7 +1127,7 @@ components:
+         verb: { type: string }
+         request_id: { type: string, description: 'Echoed even on parse-level and not-attached rejections.' }
+         duplicate: { type: boolean, description: 'true = this request_id was seen before; the ORIGINAL reply is replayed and nothing re-queued.' }
+-        reason: { type: string, description: '"not attached" | "verb requires the director grant" | "unsupported verb" | "missing request_id" | validation message (unknown origin lane / not a spawn origin / unknown vehicle type).' }
++        reason: { type: string, description: '"not attached" | "verb requires the director grant" | "unsupported verb" | "missing request_id" | validation message (unknown origin lane / not a spawn origin / unknown vehicle type / unknown destination lane / offset past the end of lane).' }
+ 
+     LoggedVerbView:
+       title: Recorded director verb (ts.{run}.log.verb payload)
+@@ -1132,6 +1136,8 @@ components:
+       properties:
+         tick: { type: integer, minimum: 0, description: 'applied_tick — the tick the verb entered the injection queue; replay re-enqueues here.' }
+         request_id: { type: string }
++        destination: { type: string, description: 'OPTIONAL (ADR-0021), omitted when unrouted — so a recording of portal-only demand is byte-identical to a pre-ADR-0021 one.' }
++        offset_m: { type: number, minimum: 0, description: 'OPTIONAL (ADR-0021), omitted when zero (see destination).' }
+         origin: { type: string, description: 'Origin lane id; replay re-resolves it against the run spec (deterministic).' }
+         vtype: { type: string }
+         type_idx: { type: integer, minimum: 0, description: 'Resolved scenario type index (auditability).' }
+diff --git a/engine/cmd/serve/main.go b/engine/cmd/serve/main.go
+index 35986b84dac774ed52b1c08b25cbac1541ac41ca..0a59c6b5f5e05cc944c5be39253f471a6c836088 100644
+--- a/engine/cmd/serve/main.go
++++ b/engine/cmd/serve/main.go
+@@ -27,6 +27,7 @@ import (
+ 	"os"
+ 	"os/signal"
+ 	"path/filepath"
++	"sort"
+ 	"strconv"
+ 	"strings"
+ 	"syscall"
+@@ -305,6 +306,10 @@ func main() {
+ 	// directions pinned in natsio's startgate test).
+ 	startGate := make(chan struct{})
+ 	runErr := make(chan error, 1)
++	// finalStats is published by the run goroutine before it sends on
++	// runErr, so the channel receive below is the happens-before edge that
++	// makes the read race-free.
++	var finalStats engine.Stats
+ 	go func() {
+ 		// PaceFloor = one tick of wall time at -pace 1 (1× realtime); -pace N
+ 		// divides it by N, -pace 0 disables pacing entirely (batch mode).
+@@ -316,6 +321,9 @@ func main() {
+ 		if err == nil && mobs != nil {
+ 			err = mobs.finish(lr.Engine, *metricsOut, spec.Ticks)
+ 		}
++		if lr != nil && lr.Engine != nil {
++			finalStats = lr.Engine.Stats
++		}
+ 		runErr <- err
+ 	}()
+ 
+@@ -371,6 +379,36 @@ func main() {
+ 			os.Exit(1)
+ 		}
+ 		fmt.Println("serve: run complete")
++		// Arrivals vs exits (ADR-0021): the ONLY direct readout of whether
++		// routed demand is reaching its destinations. A run whose arrivals
++		// are a small fraction of despawns has vehicles drifting off-route
++		// and leaving via the map edge instead.
++		if st := finalStats; st.Despawned > 0 {
++			fmt.Printf("serve: spawned=%d despawned=%d (arrived=%d, %.0f%% of despawns) lanechanges=%d collisions=%d\n",
++				st.Spawned, st.Despawned, st.Arrived, 100*float64(st.Arrived)/float64(st.Despawned),
++				st.LaneChanges, st.Collisions)
++			// Collisions are a model-pathology indicator (ADR-0007): localize
++			// them, because a network-wide count says nothing about whether
++			// the cause is one bad junction or the whole import.
++			if len(st.CollisionsBySection) > 0 {
++				secs := make([]string, 0, len(st.CollisionsBySection))
++				for k := range st.CollisionsBySection {
++					secs = append(secs, k)
++				}
++				sort.Slice(secs, func(i, j int) bool {
++					a, b := st.CollisionsBySection[secs[i]], st.CollisionsBySection[secs[j]]
++					if a != b {
++						return a > b
++					}
++					return secs[i] < secs[j]
++				})
++				top := min(len(secs), 8)
++				fmt.Printf("serve: collision observations over %d sections; worst:\n", len(secs))
++				for _, sec := range secs[:top] {
++					fmt.Printf("serve:   %-40s %d\n", sec, st.CollisionsBySection[sec])
++				}
++			}
++		}
+ 		if mobs != nil {
+ 			fmt.Printf("serve: wrote metrics to %s\n", *metricsOut)
+ 		}
+diff --git a/engine/director.go b/engine/director.go
+index c56fd14add39f4104e50e12cf5319e05f81252ac..4aade201d769b4434749411f75639f6ac7e68c5a 100644
+--- a/engine/director.go
++++ b/engine/director.go
+@@ -45,9 +45,24 @@ const DirectorSpawnHoldTicks = 600
+ // keyframe so pending state round-trips bit-exactly).
+ type SpawnDirective struct {
+ 	RequestID    string // director-assigned idempotency key
+-	Origin       string // origin lane ID (must be a network origin)
++	Origin       string // origin lane ID (a network origin, unless OffsetM > 0)
+ 	TypeName     string // scenario vehicle-type name
+ 	EarliestTick uint64 // not-before tick (sim ticks, ADR-0005)
++	// Destination is an optional route destination lane id (ADR-0021),
++	// applied as the vehicle's Route axis at injection. The kernel follows
++	// it (routing.go) and ENDS the trip there (boundaries()). Empty leaves
++	// the vehicle unrouted, exactly as before — controllers may still set
++	// the axis later over the intent plane.
++	Destination string
++	// OffsetM is the injection position along the origin lane, in meters
++	// from its start. Zero is the portal semantics (inject at the lane
++	// start) and is the only value a network ORIGIN lane accepts. A
++	// positive offset is the INTERIOR-origin opt-in (ADR-0021: a garage or
++	// driveway mid-block): it admits any lane, and the offset being
++	// explicit is what keeps a mistyped portal id from silently becoming a
++	// mid-network injection. Interior entries are clearance-checked behind
++	// as well as ahead.
++	OffsetM float64
+ }
+ 
+ // TickedSpawn is an accepted directive with its resolution and applied_tick
+@@ -75,12 +90,33 @@ type TickedSpawn struct {
+ // Like EnqueueIntent, it must be called only from the goroutine that owns
+ // the engine, between Steps.
+ func (e *Engine) EnqueueSpawn(d SpawnDirective) error {
+-	lane := e.Net.OriginByID(d.Origin)
+-	if lane == nil {
+-		if e.Net.LaneByID(d.Origin) == nil {
++	var lane *Lane
++	switch {
++	case d.OffsetM < 0 || math.IsNaN(d.OffsetM):
++		return fmt.Errorf("bad injection offset %v (must be ≥ 0)", d.OffsetM)
++	case d.OffsetM > 0:
++		// Interior origin (ADR-0021): any lane, but the offset must leave
++		// the vehicle wholly on it — an injection point past the lane end
++		// would cross out on its first boundaries() pass, and one at the
++		// very end is the junction mouth the offset exists to avoid.
++		lane = e.Net.LaneByID(d.Origin)
++		if lane == nil {
+ 			return fmt.Errorf("unknown origin lane %q", d.Origin)
+ 		}
+-		return fmt.Errorf("lane %q is not a spawn origin", d.Origin)
++		if d.OffsetM >= lane.Length {
++			return fmt.Errorf("injection offset %.2f m is past the end of lane %q (%.2f m)", d.OffsetM, d.Origin, lane.Length)
++		}
++	default:
++		lane = e.Net.OriginByID(d.Origin)
++		if lane == nil {
++			if e.Net.LaneByID(d.Origin) == nil {
++				return fmt.Errorf("unknown origin lane %q", d.Origin)
++			}
++			return fmt.Errorf("lane %q is not a spawn origin (interior injection needs an explicit offset_m)", d.Origin)
++		}
++	}
++	if d.Destination != "" && e.Net.LaneByID(d.Destination) == nil {
++		return fmt.Errorf("unknown destination lane %q", d.Destination)
+ 	}
+ 	ti := -1
+ 	for i, t := range e.scen.Types {
+@@ -109,11 +145,30 @@ func (e *Engine) EnqueueSpawn(d SpawnDirective) error {
+ 			Origin:       d.Origin,
+ 			TypeName:     d.TypeName,
+ 			EarliestTick: d.EarliestTick,
++			Destination:  d.Destination,
++			OffsetM:      d.OffsetM,
+ 		},
+ 	})
+ 	return nil
+ }
+ 
++// InteriorInjection records one ADR-0021 mid-lane injection performed
++// during the last Step. The metric kernel needs it for two things a
++// first observation cannot otherwise distinguish: the vehicle did NOT
++// cross a boundary to reach a non-origin lane (so it must not be counted
++// as a dropped crossing), and its first tick of travel is v.S − S, not the
++// whole lane prefix v.S. Derived per-tick state — never serialized, not in
++// the CRC, reused by the next Step exactly like AppliedSpawns.
++type InteriorInjection struct {
++	ID uint64
++	S  float64 // injection position along the lane (meters)
++}
++
++// InteriorInjections returns the mid-lane injections performed during the
++// last Step. Portal injections (S = 0) are never listed — the first
++// observation of one is unambiguous already.
++func (e *Engine) InteriorInjections() []InteriorInjection { return e.interiorInj }
++
+ // AppliedSpawns returns the directives accepted into the injection queue
+ // during the last Step (stamped with their applied_tick) — the record plane
+ // logs exactly these. The slice is reused by the next Step.
+@@ -131,6 +186,7 @@ func (e *Engine) PendingSpawns() int { return len(e.dirQueue) }
+ // Spawner's per-origin states).
+ func (e *Engine) stepDirectorSpawns() {
+ 	e.appliedSpawns = e.appliedSpawns[:0]
++	e.interiorInj = e.interiorInj[:0]
+ 	if len(e.dirNew) > 0 {
+ 		for _, d := range e.dirNew {
+ 			d.Tick = e.Tick
+@@ -163,7 +219,7 @@ func (e *Engine) stepDirectorSpawns() {
+ 		// The probe is a lightweight stand-in (not ID-streamed); its ID is
+ 		// the max uint64 so the mutual-yield tie-breaks (foe.ID < v.ID) read
+ 		// as "loses to every real vehicle" — conservative, and deterministic.
+-		probe := &Vehicle{ID: ^uint64(0), Lane: lane, Type: e.scen.Types[d.TypeIdx]}
++		probe := &Vehicle{ID: ^uint64(0), Lane: lane, S: d.OffsetM, Type: e.scen.Types[d.TypeIdx]}
+ 		speed, ok := e.injectionPlan(probe)
+ 		if !ok {
+ 			kept = append(kept, d)
+@@ -189,9 +245,13 @@ func (e *Engine) injectDirective(d *TickedSpawn, lane *Lane, speed float64) {
+ 		v.F = 1.3
+ 	}
+ 	v.Lane = lane
+-	v.S = 0
++	v.S = d.OffsetM
++	v.Route = d.Destination              // routing axis set at birth (ADR-0021)
+ 	v.V = math.Min(speed, v.v0eff(lane)) // the plan is F-free; apply the driver's own factor
+ 	v.Cooldown = e.Params.SpawnCooldown
+ 	e.register(v)
+ 	e.Stats.Spawned++
++	if d.OffsetM > 0 {
++		e.interiorInj = append(e.interiorInj, InteriorInjection{ID: v.ID, S: d.OffsetM})
++	}
+ }
+diff --git a/engine/engine.go b/engine/engine.go
+index 031952dbfe3d5edccea2b8a9d19e7bf38d48e498..7b108e0fd14d5e5a894cec3652bf37d6a3d3bf05 100644
+--- a/engine/engine.go
++++ b/engine/engine.go
+@@ -54,7 +54,12 @@ type Stats struct {
+ 	LaneChanges         int
+ 	Spawned             int
+ 	Despawned           int
+-	WallHits            int // vehicles clamped at a dead-lane wall (should stay 0)
++	// Arrived counts vehicles that despawned by REACHING their route
++	// destination rather than by leaving the network at an exit lane
++	// (ADR-0021). Arrivals are included in Despawned — this is the
++	// breakdown, not a second total.
++	Arrived  int
++	WallHits int // vehicles clamped at a dead-lane wall (should stay 0)
+ }
+ 
+ // Engine is the single-threaded simulation kernel. No goroutines, no wall
+@@ -78,14 +83,16 @@ type Engine struct {
+ 	applied   []TickedIntent // applied during the last Step (reused each Step)
+ 	IntentLog []TickedIntent // arbitrated log in application order (ADR-0005)
+ 
+-	dirNew        []TickedSpawn // buffered director directives, applied next boundary
+-	dirQueue      []TickedSpawn // accepted directives awaiting injection (FIFO)
+-	appliedSpawns []TickedSpawn // entered the queue during the last Step (reused)
+-	SpawnLog      []TickedSpawn // every accepted directive, in application order
++	dirNew        []TickedSpawn       // buffered director directives, applied next boundary
++	dirQueue      []TickedSpawn       // accepted directives awaiting injection (FIFO)
++	appliedSpawns []TickedSpawn       // entered the queue during the last Step (reused)
++	interiorInj   []InteriorInjection // ADR-0021 mid-lane injections of the last Step (derived, per-tick)
++	SpawnLog      []TickedSpawn       // every accepted directive, in application order
+ 
+ 	// Route-following caches (routing.go): derived from the immutable
+ 	// network, never serialized, never folded into the CRC.
+ 	routeTabs map[int][]int32 // dest lane index → next-hop table
++	latTabs   map[int][]int32 // dest lane index → lateral-depth table
+ 	preds     [][]int32       // predecessor adjacency, built once
+ 
+ 	Stats Stats
+@@ -431,10 +438,16 @@ func (e *Engine) integrate() {
+ // had:
+ //
+ //	Exit lane:        despawn (left the network)
++//	route destination: despawn (ARRIVED — reached the lane it was routed
++//	                  to; ADR-0021, the "parked at the building" case)
+ //	lane w/ successor: cross over, s -= lane.Length — a held turn intent
+ //	                  (ADR-0008 §2) chooses the successor and is consumed
+ //	EndWall lane:     clamp at the wall (pathology guard; counted)
+ //
++// The exit case is tested FIRST, so a destination that is itself an exit
++// lane (the ExitRouting default) despawns exactly as it always did and
++// every pre-ADR-0021 recording stays bit-identical.
++//
+ // Vehicles past their lane end are bucketed by lane in one O(vehicles)
+ // pass — the previous lanes×vehicles sweep cost ~2/3 of the tick at city
+ // scale (WQ-15 profile, 2026-07-24). Bucketing is state-identical ONLY
+@@ -470,6 +483,17 @@ func (e *Engine) boundaries() {
+ 				v.Lane = nil
+ 				despawned = true
+ 				e.Stats.Despawned++
++			case v.Route != "" && v.Route == lane.ID:
++				// Arrived: the route destination is where the trip ENDS, so
++				// the vehicle leaves the world at this lane's end instead of
++				// crossing on. Without this a non-exit destination is
++				// unreachable as a trip end — the vehicle would roll past it
++				// and the route would re-steer it back (the cyclic-network
++				// loop-back recorded in ADR-0019's deferrals).
++				v.Lane = nil
++				despawned = true
++				e.Stats.Despawned++
++				e.Stats.Arrived++
+ 			case len(lane.Successors) > 0:
+ 				v.S -= lane.Length
+ 				next := e.pickSuccessor(lane, v)
+diff --git a/engine/intent.go b/engine/intent.go
+index d1e1e71617fc05f32ccae56c567c152c084f00ec..7afb089268c3568076af65fbc8c3c80402046680 100644
+--- a/engine/intent.go
++++ b/engine/intent.go
+@@ -229,8 +229,10 @@ func (v *Vehicle) intentAccel() float64 {
+ // hard lateral gaps, the kinematic collision-freedom floor, the changer's
+ // own b_safe, and the new follower's b_safe. An infeasible command expires
+ // (one-shot semantics, ADR-0008 §2).
++// The route guardrail (ADR-0021) applies here too: a commanded hop that
++// would abandon the vehicle's route is denied like an infeasible one.
+ func (e *Engine) tryForcedLaneChange(v *Vehicle) {
+-	if e.PolicyContext(v).ForcedFeasible(e.Params, v.reqLane) {
++	if e.routeHopOK(v, v.reqLane) && e.PolicyContext(v).ForcedFeasible(e.Params, v.reqLane) {
+ 		e.execLaneChange(v, v.reqLane)
+ 	}
+ }
+diff --git a/engine/keyframe.go b/engine/keyframe.go
+index d648ad10165fc88d3a9906e318c3dadda6f47a2e..cf97f880686884acee2e0e9f946c132b754d6cce 100644
+--- a/engine/keyframe.go
++++ b/engine/keyframe.go
+@@ -48,7 +48,16 @@ const (
+ 	//	nDirectives u32 | per directive:
+ 	//	  tick u64 | laneIdx u32 | typeIdx u32 | earliestTick u64 |
+ 	//	  reqIDLen u16 | reqID bytes
+-	keyframeVersion = 3
++	//
++	// Version 4 (ADR-0021, written only while some QUEUED directive carries
++	// a destination or a non-zero injection offset — a queue of plain
++	// portal spawns still marshals byte-identical v3) appends per directive:
++	//
++	//	destLen u16 | dest bytes | offsetM f64
++	keyframeVersion = 4
++	// keyframeQueueVersion is the version a non-empty director queue needs
++	// when none of its entries use the ADR-0021 fields.
++	keyframeQueueVersion = 3
+ 	// keyframeMinVersion is the oldest readable version (v2 recordings
+ 	// predate the director path; their queue is empty by definition).
+ 	keyframeMinVersion = 2
+@@ -61,7 +70,13 @@ func (e *Engine) MarshalState() ([]byte, error) {
+ 	w.u32(keyframeMagic)
+ 	version := uint16(keyframeMinVersion)
+ 	if len(e.dirQueue) > 0 {
+-		version = keyframeVersion
++		version = keyframeQueueVersion
++		for _, d := range e.dirQueue {
++			if d.Destination != "" || d.OffsetM != 0 {
++				version = keyframeVersion
++				break
++			}
++		}
+ 	}
+ 	w.u16(version)
+ 	w.u16(0)
+@@ -134,6 +149,11 @@ func (e *Engine) MarshalState() ([]byte, error) {
+ 			w.u64(d.EarliestTick)
+ 			w.u16(uint16(len(d.RequestID)))
+ 			w.bytes([]byte(d.RequestID))
++			if version >= keyframeVersion {
++				w.u16(uint16(len(d.Destination)))
++				w.bytes([]byte(d.Destination))
++				w.f64(d.OffsetM)
++			}
+ 		}
+ 	}
+ 	return w.buf, nil
+@@ -264,6 +284,10 @@ func RestoreState(spec RunSpec, data []byte) (*Engine, error) {
+ 			}
+ 			d.EarliestTick = r.u64()
+ 			d.RequestID = string(r.bytesN(int(r.u16())))
++			if ver >= keyframeVersion {
++				d.Destination = string(r.bytesN(int(r.u16())))
++				d.OffsetM = r.f64()
++			}
+ 			if r.err != nil {
+ 				return nil, fmt.Errorf("keyframe: directive %d: %w", i, r.err)
+ 			}
+diff --git a/engine/metrics.go b/engine/metrics.go
+index 0d016cd2e422d684a18ecbf64147ab3011c3bc3e..b11eb8b06254f880f5fdd12134a5afb7af4fa7ab 100644
+--- a/engine/metrics.go
++++ b/engine/metrics.go
+@@ -252,6 +252,11 @@ type mLastObs struct {
+ 	stopped bool         // v < metricStopSpeed at that observation
+ 	dtShare float64      // time booked to lane at that observation (s)
+ 	tlShare float64      // time-loss booked to lane at that observation (s)
++	// route is the vehicle's destination lane id at that observation
++	// (ADR-0021), "" when unrouted. The despawn-tick attribution resolves
++	// toward THIS lane when set: a routed vehicle's last hop is known
++	// exactly, where exitResolve can only guess among reachable exits.
++	route string
+ }
+ 
+ // tripState is the open per-vehicle trip accumulation.
+@@ -371,7 +376,7 @@ func NewKernel(e *Engine, cfg KernelConfig) (*Kernel, error) {
+ 	for _, v := range e.Vehicles() {
+ 		// dtShare is seeded at a full tick (approximation: no booking was
+ 		// observed — it only matters if the vehicle is parked overshoot).
+-		k.last[v.ID] = mLastObs{lane: v.Lane, s: v.S, v: v.V, vt: v.Type, f: v.F, stopped: v.V < metricStopSpeed, dtShare: e.Params.Dt}
++		k.last[v.ID] = mLastObs{lane: v.Lane, s: v.S, v: v.V, vt: v.Type, f: v.F, stopped: v.V < metricStopSpeed, dtShare: e.Params.Dt, route: v.Route}
+ 		k.seenIDs[v.ID] = true
+ 		if v.ID > k.maxFirstSeenID {
+ 			k.maxFirstSeenID = v.ID // pre-placed IDs seed the gap baseline
+@@ -403,6 +408,17 @@ func (k *Kernel) Observe(e *Engine) {
+ 	k.observed, k.lastTick = true, e.Tick
+ 	dt := k.dt
+ 	tick := e.Tick
++	// ADR-0021 mid-lane injections of THIS tick: a vehicle first observed
++	// off an origin lane is otherwise indistinguishable from one that
++	// crossed a boundary within its spawn tick, and the two book travel
++	// completely differently. Lookup only, never iterated (ADR-0005).
++	var injectedAt map[uint64]float64
++	if inj := e.InteriorInjections(); len(inj) > 0 {
++		injectedAt = make(map[uint64]float64, len(inj))
++		for _, in := range inj {
++			injectedAt[in.ID] = in.S
++		}
++	}
+ 	cur := make(map[uint64]mLastObs, len(k.last)+4)
+ 	for _, v := range e.Vehicles() {
+ 		lane := v.Lane
+@@ -425,7 +441,15 @@ func (k *Kernel) Observe(e *Engine) {
+ 			// wholly to the seen lane and DroppedCrossings makes it loud.
+ 			// Current networks can't reach this: the shortest origin lane
+ 			// (I-280: 13.02 m) far exceeds one tick's travel (≤ ~4.3 m).
+-			if e.Net.OriginByID(lane.ID) == nil {
++			//
++			// An ADR-0021 interior injection is the one legitimate way to
++			// be first observed off an origin lane. entryS is where it
++			// entered, so its first tick of travel is v.S − entryS rather
++			// than the whole lane prefix — booking v.S would credit the
++			// vehicle with the entire block it never drove, on every one of
++			// a scenario's residential flows.
++			entryS, interior := injectedAt[v.ID]
++			if !interior && e.Net.OriginByID(lane.ID) == nil {
+ 				k.droppedCrossings++
+ 			}
+ 			// Invisible-vehicle detection: vehicle IDs are sequential with
+@@ -446,11 +470,15 @@ func (k *Kernel) Observe(e *Engine) {
+ 			if v.ID > k.maxFirstSeenID {
+ 				k.maxFirstSeenID = v.ID
+ 			}
+-			k.addSegment(lane, v.S, dt, tick)
+-			tickLoss = k.addTimeLoss(lane, dt-v.S/v.v0eff(lane), tick)
++			firstD := v.S - entryS
++			if firstD < 0 {
++				firstD = 0
++			}
++			k.addSegment(lane, firstD, dt, tick)
++			tickLoss = k.addTimeLoss(lane, dt-firstD/v.v0eff(lane), tick)
+ 			k.addOccupancy(lane, dt*v.Type.Length, tick)
+ 			if ts != nil {
+-				ts.dist += v.S
++				ts.dist += firstD
+ 			}
+ 		case prev.lane == lane:
+ 			d := v.S - prev.s
+@@ -534,7 +562,7 @@ func (k *Kernel) Observe(e *Engine) {
+ 				}
+ 			}
+ 		}
+-		cur[v.ID] = mLastObs{lane: lane, s: v.S, v: v.V, vt: v.Type, f: v.F, stopped: stopped, dtShare: shareT, tlShare: shareTL}
++		cur[v.ID] = mLastObs{lane: lane, s: v.S, v: v.V, vt: v.Type, f: v.F, stopped: stopped, dtShare: shareT, tlShare: shareTL, route: v.Route}
+ 		if ts != nil {
+ 			ts.dest = lane.ID
+ 		}
+@@ -1229,6 +1257,30 @@ func exitShares(prev mLastObs) (shares []laneShare, exitLane *Lane, ok, ambiguou
+ 	if prev.lane.Exit {
+ 		return shares, prev.lane, true, false
+ 	}
++	// A ROUTED vehicle's last hop is known exactly: it despawned at its
++	// destination lane's end, whether that lane is an exit (ADR-0019 exit
++	// routing) or an interior arrival (ADR-0021). Resolving toward the
++	// destination is therefore exact where exitResolve is a guess — it
++	// fails outright when several exits are reachable within the depth
++	// bound, which on a dense grid is most of them (chi-loop booked 16.9k
++	// dropped crossings in 15 sim-minutes). Falls through to the exit
++	// search when the destination is not reachable from here — a vehicle
++	// that left the network without ever reaching its destination.
++	if prev.route != "" {
++		if prev.lane.ID == prev.route {
++			return shares, prev.lane, true, false
++		}
++		want := prev.route
++		if chain, dest, amb := chainResolve(prev.lane, func(l *Lane) bool { return l.ID == want }); dest != nil {
++			if amb {
++				return shares, nil, false, true
++			}
++			for _, l := range chain[1:] {
++				shares = append(shares, laneShare{lane: l, d: l.Length})
++			}
++			return shares, dest, true, false
++		}
++	}
+ 	chain, exit, amb := exitResolve(prev.lane)
+ 	if exit == nil {
+ 		return shares, nil, false, false
+@@ -1248,12 +1300,20 @@ func exitShares(prev mLastObs) (shares []laneShare, exitLane *Lane, ok, ambiguou
+ // chains reach the one exit with different booked length sums (parallel
+ // internals), ambiguous = true — the shortest books, the caller counts.
+ func exitResolve(from *Lane) (chain []*Lane, exit *Lane, ambiguous bool) {
+-	chains, truncated := findChains(from, func(l *Lane) bool { return l.Exit }, 3)
+-	exits := map[*Lane]bool{}
++	return chainResolve(from, func(l *Lane) bool { return l.Exit })
++}
++
++// chainResolve is exitResolve's general form: THE lane matching want that is
++// reachable from `from` within maxCrossDepth when exactly one exists, with
++// the shortest chain to it. With an id predicate at most one lane can match,
++// so the "several targets" rejection only ever fires for the exit search.
++func chainResolve(from *Lane, want func(*Lane) bool) (chain []*Lane, target *Lane, ambiguous bool) {
++	chains, truncated := findChains(from, want, 3)
++	targets := map[*Lane]bool{}
+ 	for _, c := range chains {
+-		exits[c[len(c)-1]] = true
++		targets[c[len(c)-1]] = true
+ 	}
+-	if len(exits) != 1 {
++	if len(targets) != 1 {
+ 		return nil, nil, false
+ 	}
+ 	// ANY second chain to the one exit (or a truncated enumeration) makes
+diff --git a/engine/mobil.go b/engine/mobil.go
+index 450dea43c91f8fdb3c2815de2f3a25962e676e2c..b597f1526dfe7be863f12773a235feb95857f856 100644
+--- a/engine/mobil.go
++++ b/engine/mobil.go
+@@ -37,6 +37,12 @@ func (e *Engine) laneChanges() {
+ 			e.tryForcedLaneChange(v)
+ 			continue
+ 		}
++		// Route recovery runs BEFORE the reference policy and in live runs
++		// too: a vehicle stranded off its route has no other way back, and
++		// in holdlast there is no in-kernel policy to piggyback on.
++		if e.tryRouteRecovery(v) {
++			continue
++		}
+ 		if !idm {
+ 			continue
+ 		}
+@@ -44,13 +50,107 @@ func (e *Engine) laneChanges() {
+ 	}
+ }
+ 
++// routeHopOK is the lateral half of the route guardrail (ADR-0021): a hop
++// that would move a ROUTED vehicle FURTHER from its route is denied. Without
++// it the route axis is only advisory — routeNextHop steers at junctions, but
++// a route-blind lateral policy (the external driver's MOBIL, which sees no
++// route) can strand the vehicle in a lane whose successors never reach the
++// destination, and nothing recovers it.
++//
++// "Further" is measured on the lateral-depth gradient (routing.go): the hop
++// is denied when the target lane needs MORE lane changes to get back on
++// route than the current one does. The first cut of this guardrail used the
++// reachability predicate instead — deny leaving the depth-0 set — which is
++// the special case depth[cur] == 0, and which said nothing at all about a
++// vehicle already off-route. Sideways moves at equal depth stay legal: MOBIL
++// may still pick the faster of two lanes that are equally far from the route.
++//
++// This caps every control path, commanded or policy, the same shape as the
++// ADR-0010 right-of-way guardrail. It is not the engine overruling a
++// controller: the route is itself a controller-set axis, so this enforces
++// consistency BETWEEN two axes the controller set, and a controller that
++// wants the hop can clear the route first.
++//
++// A vehicle whose destination is unreachable at ANY depth may hop freely —
++// vetoing there would pin it in lane forever for no gain.
++func (e *Engine) routeHopOK(v *Vehicle, dir int) bool {
++	if v.Route == "" {
++		return true
++	}
++	tgt := v.Lane.Left
++	if dir < 0 {
++		tgt = v.Lane.Right
++	}
++	if tgt == nil {
++		return true // no such neighbour; execLaneChange no-ops anyway
++	}
++	cur := e.routeLatDist(v.Lane, v.Route)
++	if cur < 0 {
++		return true // unreachable at any depth: no gradient to protect
++	}
++	next := e.routeLatDist(tgt, v.Route)
++	return next >= 0 && next <= cur
++}
++
++// tryRouteRecovery steers a routed vehicle that is off its route back down
++// the lateral-depth gradient, subject to the full commanded-hop safety gate.
++// It reports whether it took the vehicle's one hop for this tick.
++//
++// Descending the gradient — rather than requiring a neighbour that is itself
++// route-reachable — is what lets recovery cross MORE THAN ONE LANE. A vehicle
++// in the left lane of a 3-lane arterial whose exit is on the right has no
++// route-reachable neighbour at all; it does have a neighbour one lane change
++// closer, and taking that hop this tick puts it one lane change from the
++// route next tick. The one-lane rule left exactly that vehicle stranded.
++//
++// Determinism (ADR-0005): the smaller depth wins, ties break toward the LOWER
++// LANE INDEX, and neither RNG nor map iteration is involved — the choice is a
++// pure function of (network, lane, destination).
++func (e *Engine) tryRouteRecovery(v *Vehicle) bool {
++	if v.Route == "" {
++		return false
++	}
++	cur := e.routeLatDist(v.Lane, v.Route)
++	if cur <= 0 {
++		return false // 0: on route already. −1: unreachable at any depth.
++	}
++	best, bestDir := int32(-1), 0
++	var bestLane *Lane
++	for _, dir := range [2]int{1, -1} {
++		tgt := v.Lane.Left
++		if dir < 0 {
++			tgt = v.Lane.Right
++		}
++		if tgt == nil {
++			continue
++		}
++		d := e.routeLatDist(tgt, v.Route)
++		if d < 0 || d >= cur {
++			continue
++		}
++		if bestLane == nil || d < best || (d == best && tgt.Index < bestLane.Index) {
++			best, bestDir, bestLane = d, dir, tgt
++		}
++	}
++	if bestLane == nil {
++		return false // nothing closer: fall through to ordinary MOBIL
++	}
++	if e.PolicyContext(v).ForcedFeasible(e.Params, bestDir) {
++		e.execLaneChange(v, bestDir)
++	}
++	// A blocked recovery is not an error: the vehicle retries next tick and,
++	// failing that, degrades to the default routing it would have had anyway.
++	// Either way it does not also run discretionary MOBIL this tick.
++	return true
++}
++
+ // tryLaneChange evaluates the reference lateral policy (symmetric MOBIL,
+ // Kesting/Treiber/Helbing 2007 — see policy.go) for v and executes the
+ // chosen hop. Gather and decision are the shared PolicyCtx path, so the
+ // external default driver reaches the same decisions from its observations.
+ func (e *Engine) tryLaneChange(v *Vehicle) {
+ 	d := e.PolicyContext(v).DecideLaneChange(e.Params, v.rng)
+-	if d != 0 {
++	if d != 0 && e.routeHopOK(v, d) {
+ 		e.execLaneChange(v, d)
+ 	}
+ }
+diff --git a/engine/natsio/contract.go b/engine/natsio/contract.go
+index 29c181e0feb938cef8940323d1aa3ec2dfcd89f0..f980ceef62c43af6c0959b3191ba0fb019a1f46b 100644
+--- a/engine/natsio/contract.go
++++ b/engine/natsio/contract.go
+@@ -674,6 +674,8 @@ func (c *Contract) handleVerb(e *engine.Engine, r ctlReq) {
+ 		Origin:       req.Origin,
+ 		TypeName:     req.VType,
+ 		EarliestTick: req.EarliestTick,
++		Destination:  req.Destination,
++		OffsetM:      req.OffsetM,
+ 	})
+ 	if err != nil {
+ 		reply.Reason = err.Error()
+diff --git a/engine/natsio/demand/director.go b/engine/natsio/demand/director.go
+index 6fccd1261164cc777de107785f2a8259fb85fe0a..c2d17e8275ceb87cf056ce65efc44dc59d9a5f5a 100644
+--- a/engine/natsio/demand/director.go
++++ b/engine/natsio/demand/director.go
+@@ -74,6 +74,7 @@ type Director struct {
+ type pendingArrival struct {
+ 	at    float64
+ 	vtype string
++	dest  string // route destination drawn for this arrival ("" = unrouted)
+ }
+ 
+ var discard = log.New(io.Discard, "", 0)
+@@ -146,12 +147,12 @@ func Attach(nc *nats.Conn, js nats.JetStreamContext, cfg Config, dfs []*scenario
+ 		d.samplers = append(d.samplers, newFlowSampler(f, cfg.Seed, i))
+ 		d.pending = append(d.pending, pendingArrival{})
+ 		d.exhausted = append(d.exhausted, false)
+-		at, vtype, ok := d.samplers[i].next(d.dt)
++		at, vtype, dest, ok := d.samplers[i].next(d.dt)
+ 		if !ok {
+ 			d.exhausted[i] = true
+ 			continue
+ 		}
+-		d.pending[i] = pendingArrival{at: at, vtype: vtype}
++		d.pending[i] = pendingArrival{at: at, vtype: vtype, dest: dest}
+ 	}
+ 	lg.Printf("demand director: attached as %s (director grant) to run %q (dt=%.3fs, %d ticks, %d flows)",
+ 		ctlID, cfg.Run, d.dt, meta.Spec.Ticks, len(flows))
+@@ -229,6 +230,8 @@ func (d *Director) send(flowIdx int) {
+ 		Origin:       fs.flow.Origin,
+ 		VType:        d.pending[flowIdx].vtype,
+ 		EarliestTick: atTick,
++		Destination:  d.pending[flowIdx].dest,
++		OffsetM:      fs.flow.OffsetM,
+ 	})
+ 	d.Sent++
+ 	msg, err := d.nc.Request(natsio.SubjectCtlVerb(d.cfg.Run, d.ctlID), req, 2*time.Second)
+@@ -247,12 +250,12 @@ func (d *Director) send(flowIdx int) {
+ 		d.Rejected++
+ 		d.log.Printf("  verb f%d-%06d REJECTED: %s", flowIdx, fs.ordinal-1, msg.Data)
+ 	}
+-	at, vtype, ok := fs.next(d.dt)
++	at, vtype, dest, ok := fs.next(d.dt)
+ 	if !ok {
+ 		d.exhausted[flowIdx] = true
+ 		return
+ 	}
+-	d.pending[flowIdx] = pendingArrival{at: at, vtype: vtype}
++	d.pending[flowIdx] = pendingArrival{at: at, vtype: vtype, dest: dest}
+ }
+ 
+ // flowSampler walks one flow's arrival program. All draws come from the
+@@ -301,17 +304,23 @@ func rateAt(f *scenario.Flow, tS float64) float64 {
+ 	return 0
+ }
+ 
+-// next returns the next (arrival sim-seconds, vtype) and advances. ok=false
+-// when the program is exhausted (past until_s, or a zero rate with slices).
+-func (fs *flowSampler) next(dt float64) (atS float64, vtype string, ok bool) {
++// next returns the next (arrival sim-seconds, vtype, destination) and
++// advances. ok=false when the program is exhausted (past until_s, or a zero
++// rate with slices).
++//
++// Draw ORDER on the per-vehicle stream is gap → vtype → destination
++// (ADR-0021): appending the destination draw LAST means a flow that
++// declares no destinations consumes exactly the draws it always did, so
++// every pinned pre-ADR-0021 realization is unchanged.
++func (fs *flowSampler) next(dt float64) (atS float64, vtype, dest string, ok bool) {
+ 	f := fs.flow
+ 	if f.UntilS > 0 && fs.nextS >= f.UntilS {
+-		return 0, "", false
++		return 0, "", "", false
+ 	}
+ 	rate := rateAt(&f, fs.nextS)
+ 	if rate <= 0 {
+ 		if len(f.Slices) == 0 {
+-			return 0, "", false
++			return 0, "", "", false
+ 		}
+ 		// Jump to the next slice window.
+ 		best := math.Inf(1)
+@@ -321,12 +330,12 @@ func (fs *flowSampler) next(dt float64) (atS float64, vtype string, ok bool) {
+ 			}
+ 		}
+ 		if math.IsInf(best, 1) {
+-			return 0, "", false
++			return 0, "", "", false
+ 		}
+ 		fs.nextS = best
+ 		rate = rateAt(&f, fs.nextS)
+ 		if rate <= 0 {
+-			return 0, "", false
++			return 0, "", "", false
+ 		}
+ 	}
+ 	st := fs.stream()
+@@ -336,10 +345,11 @@ func (fs *flowSampler) next(dt float64) (atS float64, vtype string, ok bool) {
+ 		gapS = -math.Log(1-st.Float64()) * gapS
+ 	}
+ 	vtype = pickType(st, f.VTypes)
++	dest = pickWeighted(st, f.Destinations)
+ 	at := fs.nextS
+ 	fs.ordinal++
+ 	fs.nextS = at + gapS
+-	return at, vtype, true
++	return at, vtype, dest, true
+ }
+ 
+ // pickType draws the vehicle type from the per-vehicle stream, weights
+@@ -351,6 +361,25 @@ func pickType(st *engine.Stream, weights map[string]float64) string {
+ 	if len(weights) == 0 {
+ 		return "car"
+ 	}
++	return weightedDraw(st, weights)
++}
++
++// pickWeighted draws a destination lane from the flow's weighted
++// distribution, "" when the flow declares none (unrouted — and, crucially,
++// NO draw is consumed in that case, so pre-ADR-0021 flows keep their exact
++// stream sequence).
++func pickWeighted(st *engine.Stream, weights map[string]float64) string {
++	if len(weights) == 0 {
++		return ""
++	}
++	return weightedDraw(st, weights)
++}
++
++// weightedDraw remaps one uniform draw onto a weighted key set. BOTH the
++// total and the cumulative walk accumulate over the SORTED key list — float
++// addition is non-associative, so Go map order is forbidden anywhere near a
++// sampled path (ADR-0005; a director restart must be invisible).
++func weightedDraw(st *engine.Stream, weights map[string]float64) string {
+ 	names := make([]string, 0, len(weights))
+ 	for n := range weights {
+ 		names = append(names, n)
+diff --git a/engine/natsio/verb.go b/engine/natsio/verb.go
+index a017a38a1d3439905ec7a6bf20bcd47a68109082..e2f10cd386bf5c0b8f2f036af2ce52efaf2d083d 100644
+--- a/engine/natsio/verb.go
++++ b/engine/natsio/verb.go
+@@ -34,9 +34,18 @@ import (
+ type VerbRequest struct {
+ 	Verb         string `json:"verb"` // spawn
+ 	RequestID    string `json:"request_id"`
+-	Origin       string `json:"origin"`        // origin lane id (must be a network origin)
++	Origin       string `json:"origin"`        // origin lane id (a network origin, unless offset_m > 0)
+ 	VType        string `json:"vtype"`         // scenario vehicle-type name
+ 	EarliestTick uint64 `json:"earliest_tick"` // not-before sim tick
++	// Destination is an optional route destination lane id (ADR-0021): the
++	// engine applies it as the vehicle's Route axis at injection and ends
++	// the trip there. Omitted (the pre-ADR-0021 shape) leaves the vehicle
++	// unrouted — every extant recording decodes unchanged.
++	Destination string `json:"destination,omitempty"`
++	// OffsetM is the injection position along the origin lane in meters.
++	// Omitted/zero is portal semantics; positive is the interior-origin
++	// opt-in (ADR-0021).
++	OffsetM float64 `json:"offset_m,omitempty"`
+ }
+ 
+ // VerbReply is the engine's answer. A duplicate request_id replays the
+@@ -61,6 +70,11 @@ type loggedVerb struct {
+ 	VType        string `json:"vtype"`
+ 	TypeIdx      int    `json:"type_idx"`
+ 	EarliestTick uint64 `json:"earliest_tick"`
++	// ADR-0021, both omitempty: a recording of portal-only demand is
++	// byte-identical to a pre-ADR-0021 one, so replay of every existing
++	// recording is unaffected.
++	Destination string  `json:"destination,omitempty"`
++	OffsetM     float64 `json:"offset_m,omitempty"`
+ }
+ 
+ func encodeLoggedVerb(s engine.TickedSpawn) ([]byte, error) {
+@@ -71,6 +85,8 @@ func encodeLoggedVerb(s engine.TickedSpawn) ([]byte, error) {
+ 		VType:        s.TypeName,
+ 		TypeIdx:      s.TypeIdx,
+ 		EarliestTick: s.EarliestTick,
++		Destination:  s.Destination,
++		OffsetM:      s.OffsetM,
+ 	})
+ }
+ 
+@@ -87,6 +103,8 @@ func decodeLoggedVerb(data []byte) (engine.TickedSpawn, error) {
+ 			Origin:       lv.Origin,
+ 			TypeName:     lv.VType,
+ 			EarliestTick: lv.EarliestTick,
++			Destination:  lv.Destination,
++			OffsetM:      lv.OffsetM,
+ 		},
+ 	}, nil
+ }
+diff --git a/engine/routing.go b/engine/routing.go
+index d353fbfd139f1a4f7d88ddeba48ca1615af157a4..2624427b8e4593a53711af99bef1ac35eb759c51 100644
+--- a/engine/routing.go
++++ b/engine/routing.go
+@@ -49,6 +49,98 @@ func (e *Engine) routeNextHop(lane *Lane, destID string) *Lane {
+ 	return nil
+ }
+ 
++// routeLatDist returns the LATERAL DEPTH of lane toward destID: the minimum
++// number of lane changes a vehicle on lane must still make before it sits on
++// a lane whose successors reach the destination. 0 means the destination is
++// reachable from here by driving alone; −1 means it is unreachable at ANY
++// depth.
++//
++// This is the LATERAL half of route following (ADR-0021). routeNextHop only
++// chooses among a lane's successors, so a vehicle that changes into a lane
++// the destination is unreachable from has silently abandoned its route —
++// measured on chi-loop, 28% of multi-lane positions that can reach a given
++// destination have a lateral neighbour that cannot, and route-blind MOBIL
++// walked 92% of routed vehicles off their route before they arrived.
++//
++// The first cut of that fix used the boolean predicate "depth == 0". A
++// GRADIENT is what makes recovery work more than one lane out: a vehicle in
++// the left lane of a 3-lane arterial whose exit is on the right has NO
++// route-reachable neighbour at all, so a predicate leaves it stranded, while
++// a gradient walks it across one lane per hop.
++//
++// An unknown destination reads as depth 0 everywhere, so the lateral
++// guardrail degrades to pre-ADR-0021 behavior rather than pinning vehicles in
++// lane — the same convention routeNextHop uses.
++func (e *Engine) routeLatDist(lane *Lane, destID string) int32 {
++	dest := e.Net.LaneByID(destID)
++	if dest == nil {
++		return 0
++	}
++	return e.routeLatDepth(dest.Index)[lane.Index]
++}
++
++// routeLatDepth returns — computing and memoizing on first use — the lateral
++// depth table toward the destination lane at destIdx. One int32 array per
++// destination, alongside the next-hop table, on the same never-invalidates
++// grounds (the network is immutable for the run).
++//
++// It is a 0-1 BFS from the destination over the REVERSED lane graph:
++// a successor edge p→u costs 0 lane changes (the vehicle just drives it) and
++// a lateral link costs 1 (it has to hop). Written in the LAYERED form rather
++// than with a deque — expand the 0-cost closure of the current layer, then
++// take one lateral step to seed the next — which is the same algorithm and
++// the same O(V+E), needs no container/list, and makes the two edge costs
++// legible as two loops.
++//
++// Determinism (ADR-0005): predecessor lists are in fixed lane-then-successor
++// order, laterals are visited Left then Right, first assignment wins, and no
++// map iteration feeds the result.
++func (e *Engine) routeLatDepth(destIdx int) []int32 {
++	if t, ok := e.latTabs[destIdx]; ok {
++		return t
++	}
++	n := len(e.Net.Lanes)
++	preds := e.routePreds()
++	depth := make([]int32, n)
++	for i := range depth {
++		depth[i] = -1
++	}
++	depth[destIdx] = 0
++	frontier := []int32{int32(destIdx)}
++	for d := int32(0); len(frontier) > 0; d++ {
++		// 0-cost closure: everything that can DRIVE to this layer is in it.
++		layer := frontier
++		for i := 0; i < len(layer); i++ {
++			for _, p := range preds[layer[i]] {
++				if depth[p] < 0 {
++					depth[p] = d
++					layer = append(layer, p)
++				}
++			}
++		}
++		// 1-cost step: the lateral neighbours of the whole layer seed d+1.
++		// Lateral links are mutual at every construction site (network.go,
++		// netfile.go, scenario_i80.go), so the lanes that can hop INTO u are
++		// exactly u.Left and u.Right.
++		var next []int32
++		for _, u := range layer {
++			l := e.Net.Lanes[u]
++			for _, nb := range [2]*Lane{l.Left, l.Right} {
++				if nb != nil && depth[nb.Index] < 0 {
++					depth[nb.Index] = d + 1
++					next = append(next, int32(nb.Index))
++				}
++			}
++		}
++		frontier = next
++	}
++	if e.latTabs == nil {
++		e.latTabs = map[int][]int32{}
++	}
++	e.latTabs[destIdx] = depth
++	return depth
++}
++
+ // routeTable returns — computing and memoizing on first use — the next-hop
+ // table toward the destination lane at destIdx: tab[i] is the index of the
+ // successor of lane i on the shortest path to the destination, −1 when
+diff --git a/engine/scenario/scenario.go b/engine/scenario/scenario.go
+index d0b5bff019a5147fc98f6b0926488da23369451f..018ec2e19050283a0a736f02bcde410be3164aa0 100644
+--- a/engine/scenario/scenario.go
++++ b/engine/scenario/scenario.go
+@@ -111,6 +111,20 @@ type Flow struct {
+ 	VTypes  map[string]float64 `yaml:"vtypes,omitempty"`
+ 	Slices  []Slice            `yaml:"slices,omitempty"`
+ 	UntilS  float64            `yaml:"until_s,omitempty"`
++	// Destinations is an optional weighted destination-lane distribution
++	// (ADR-0021): the director draws one per vehicle and the engine ends
++	// the trip there. Weights are relative, drawn over the SORTED key list
++	// exactly like VTypes — Go map order can never reach a sampled path
++	// (ADR-0005). Empty leaves the vehicle unrouted, so the driver's own
++	// exit routing (ADR-0019) still applies.
++	Destinations map[string]float64 `yaml:"destinations,omitempty"`
++	// OffsetM is the injection position along the origin lane in meters.
++	// Zero (omitted) means a boundary PORTAL and the origin must be one.
++	// A positive value is the interior-origin opt-in (ADR-0021): a
++	// mid-block garage or driveway. The explicitness is the safety
++	// property — a mistyped portal id cannot silently become a
++	// mid-network injection.
++	OffsetM float64 `yaml:"offset_m,omitempty"`
+ }
+ 
+ // Slice is one piecewise-constant demand window [StartS, EndS) in sim
+@@ -128,7 +142,7 @@ type Scenario struct {
+ 	Demands  []*DemandFile  // aligned with Manifest.Demand
+ 	Metrics  []*MetricsFile // aligned with Manifest.Metrics
+ 	NetPath  string         // resolved network path (absolute)
+-	origins  map[string]bool
++	lanes    *netLanes
+ 	parts    []hashPart // everything the content hash covers
+ }
+ 
+@@ -210,10 +224,7 @@ func Load(dir string) (*Scenario, error) {
+ 		return nil, fmt.Errorf("scenario network %s: %w", m.Network, err)
+ 	}
+ 	s.NetPath = netPath
+-	s.origins = make(map[string]bool, len(net.Origins))
+-	for _, l := range net.Origins {
+-		s.origins[l.ID] = true
+-	}
++	s.lanes = newNetLanes(net)
+ 	s.parts = append(s.parts, hashPart{rel: m.Network, data: canonicalJSON(rawNet, m.Network)})
+ 
+ 	typeSet := make(map[string]bool, len(m.Types))
+@@ -225,7 +236,7 @@ func Load(dir string) (*Scenario, error) {
+ 		if err != nil {
+ 			return nil, fmt.Errorf("scenario demand: %w", err)
+ 		}
+-		df, canonical, err := loadDemandFile(p, s.origins, typeSet)
++		df, canonical, err := loadDemandFile(p, s.lanes, typeSet)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("scenario demand %s: %w", ref, err)
+ 		}
+@@ -282,22 +293,77 @@ func LoadDemandFile(path string) (*DemandFile, error) {
+ 	return df, err
+ }
+ 
+-func loadDemandFile(path string, origins, typeSet map[string]bool) (*DemandFile, []byte, error) {
++// netLanes is the network view demand validation needs: which lanes are
++// boundary portals, and the length of EVERY lane — interior injection
++// offsets and destination ids are checked against the whole lane set, not
++// just the portals. A nil *netLanes disables the network-dependent checks
++// (the network-free load path used by `scenario fmt`).
++type netLanes struct {
++	origin map[string]bool
++	length map[string]float64
++}
++
++// validateDestinations checks a flow's weighted destination distribution
++// (ADR-0021): every key must name a lane of the network and every weight
++// must be a positive finite number. An empty map is valid and means
++// "unrouted" — a zero-weight or negative entry is not, because it would be
++// dead config that silently never draws.
++func validateDestinations(where string, dests map[string]float64, lanes *netLanes) error {
++	if len(dests) == 0 {
++		return nil
++	}
++	names := make([]string, 0, len(dests))
++	for n := range dests {
++		names = append(names, n)
++	}
++	sort.Strings(names) // errors must not depend on map order
++	for _, n := range names {
++		w := dests[n]
++		if err := finite(fmt.Sprintf("%s destination %q weight", where, n), w); err != nil {
++			return err
++		}
++		if w <= 0 {
++			return fmt.Errorf("%s: destination %q weight must be > 0", where, n)
++		}
++		if lanes != nil {
++			if _, ok := lanes.length[n]; !ok {
++				return fmt.Errorf("%s: destination %q is not a lane of the network", where, n)
++			}
++		}
++	}
++	return nil
++}
++
++func newNetLanes(net *engine.Network) *netLanes {
++	nl := &netLanes{
++		origin: make(map[string]bool, len(net.Origins)),
++		length: make(map[string]float64, len(net.Lanes)),
++	}
++	for _, l := range net.Origins {
++		nl.origin[l.ID] = true
++	}
++	for _, l := range net.Lanes {
++		nl.length[l.ID] = l.Length
++	}
++	return nl
++}
++
++func loadDemandFile(path string, lanes *netLanes, typeSet map[string]bool) (*DemandFile, []byte, error) {
+ 	data, err := os.ReadFile(path)
+ 	if err != nil {
+ 		return nil, nil, err
+ 	}
+-	return parseDemand(data, origins, typeSet)
++	return parseDemand(data, lanes, typeSet)
+ }
+ 
+ // parseDemand is the byte-level core of loadDemandFile — variant loading
+ // feeds it patched documents without touching the base's files on disk.
+-func parseDemand(data []byte, origins, typeSet map[string]bool) (*DemandFile, []byte, error) {
++func parseDemand(data []byte, lanes *netLanes, typeSet map[string]bool) (*DemandFile, []byte, error) {
+ 	var df DemandFile
+ 	if err := strictDecode(data, &df); err != nil {
+ 		return nil, nil, err
+ 	}
+-	if err := validateDemand(&df, origins, typeSet); err != nil {
++	if err := validateDemand(&df, lanes, typeSet); err != nil {
+ 		return nil, nil, err
+ 	}
+ 	return &df, canonicalYAML(&df), nil
+@@ -552,7 +618,7 @@ func validateManifest(m *Manifest) error {
+ 	return nil
+ }
+ 
+-func validateDemand(df *DemandFile, origins, typeSet map[string]bool) error {
++func validateDemand(df *DemandFile, lanes *netLanes, typeSet map[string]bool) error {
+ 	if df.FormatVersion != FormatVersion {
+ 		return fmt.Errorf("unsupported format_version %d (loader supports %d)", df.FormatVersion, FormatVersion)
+ 	}
+@@ -571,8 +637,31 @@ func validateDemand(df *DemandFile, origins, typeSet map[string]bool) error {
+ 		if f.Origin == "" {
+ 			return fmt.Errorf("flow %d: missing origin", i)
+ 		}
+-		if origins != nil && !origins[f.Origin] {
+-			return fmt.Errorf("%s: not a spawn origin lane of the network", where)
++		if err := finite(where+" offset_m", f.OffsetM); err != nil {
++			return err
++		}
++		switch {
++		case f.OffsetM < 0:
++			return fmt.Errorf("%s: offset_m must be ≥ 0", where)
++		case f.OffsetM > 0:
++			// Interior origin (ADR-0021): any lane, but the offset must
++			// leave the vehicle wholly on it.
++			if lanes != nil {
++				ln, ok := lanes.length[f.Origin]
++				if !ok {
++					return fmt.Errorf("%s: not a lane of the network", where)
++				}
++				if f.OffsetM >= ln {
++					return fmt.Errorf("%s: offset_m %.2f is past the end of the %.2f m lane", where, f.OffsetM, ln)
++				}
++			}
++		default:
++			if lanes != nil && !lanes.origin[f.Origin] {
++				return fmt.Errorf("%s: not a spawn origin lane of the network (interior injection needs an explicit offset_m)", where)
++			}
++		}
++		if err := validateDestinations(where, f.Destinations, lanes); err != nil {
++			return err
+ 		}
+ 		if f.Spacing != "constant" && f.Spacing != "poisson" {
+ 			return fmt.Errorf("%s: spacing %q (want constant|poisson)", where, f.Spacing)
+diff --git a/engine/scenario/variant.go b/engine/scenario/variant.go
+index 9f221ed0ab14187f50acfe555e68c7df34ed46b5..23eb8a13db2e538a685a1f7e25d07acb1f9179f7 100644
+--- a/engine/scenario/variant.go
++++ b/engine/scenario/variant.go
+@@ -171,7 +171,7 @@ func loadVariant(dir string) (*Scenario, error) {
+ 	// list — a replacement that invalidates base demand fails HERE, at
+ 	// variant load, not at spawn time.
+ 	netPath, netRel := base.NetPath, base.Manifest.Network
+-	origins := base.origins
++	lanes := base.lanes
+ 	rawNet := baseParts[base.Manifest.Network] // already canonical JSON
+ 	effNet := (*engine.Network)(nil)           // the effective network (resolved below)
+ 	if v.Network != "" {
+@@ -200,10 +200,7 @@ func loadVariant(dir string) (*Scenario, error) {
+ 			return nil, fmt.Errorf("variant network %s: %w", v.Network, err)
+ 		}
+ 		effNet = net
+-		origins = make(map[string]bool, len(net.Origins))
+-		for _, l := range net.Origins {
+-			origins[l.ID] = true
+-		}
++		lanes = newNetLanes(net)
+ 		netPath, netRel, rawNet = p, v.Network, canonicalJSON(raw, v.Network)
+ 	}
+ 	typeSet := make(map[string]bool, len(eff.Types))
+@@ -211,7 +208,7 @@ func loadVariant(dir string) (*Scenario, error) {
+ 		typeSet[t] = true
+ 	}
+ 
+-	s := &Scenario{Dir: dir, Manifest: eff, NetPath: netPath, origins: origins}
++	s := &Scenario{Dir: dir, Manifest: eff, NetPath: netPath, lanes: lanes}
+ 	hm := eff
+ 	hm.Seed, hm.Ticks = 0, 0 // run coordinates stripped (see Load)
+ 	s.parts = append(s.parts, hashPart{rel: ManifestFile, data: canonicalYAML(&hm)})
+@@ -229,7 +226,7 @@ func loadVariant(dir string) (*Scenario, error) {
+ 				return nil, err
+ 			}
+ 			delete(patchesByPart, ref)
+-			df, canonical, err := parseDemand(patched, origins, typeSet)
++			df, canonical, err := parseDemand(patched, lanes, typeSet)
+ 			if err != nil {
+ 				return nil, fmt.Errorf("variant demand %s (after patching — line numbers cite the patched document, not the base file): %w", ref, err)
+ 			}
+@@ -240,7 +237,7 @@ func loadVariant(dir string) (*Scenario, error) {
+ 		// Unpatched: reuse the base's loaded model and captured canonical
+ 		// bytes, re-validated against the EFFECTIVE origins and types.
+ 		df := base.Demands[i]
+-		if err := validateDemand(df, origins, typeSet); err != nil {
++		if err := validateDemand(df, lanes, typeSet); err != nil {
+ 			return nil, fmt.Errorf("variant demand %s: %w", ref, err)
+ 		}
+ 		s.Demands = append(s.Demands, df)
+@@ -259,7 +256,7 @@ func loadVariant(dir string) (*Scenario, error) {
+ 		if err != nil {
+ 			return nil, fmt.Errorf("variant demand: %w", err)
+ 		}
+-		df, canonical, err := loadDemandFile(pth, origins, typeSet)
++		df, canonical, err := loadDemandFile(pth, lanes, typeSet)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("variant demand %s: %w", ref, err)
+ 		}
+diff --git a/engine/spawn.go b/engine/spawn.go
+index 9d725ebe2d31b45d817e4847cf3a8295b730ad36..34d00426fcb1985fcb92ffd5a32448fb58340bc4 100644
+--- a/engine/spawn.go
++++ b/engine/spawn.go
+@@ -1,6 +1,9 @@
+ package engine
+ 
+-import "math"
++import (
++	"math"
++	"sort"
++)
+ 
+ // Scenario describes everything a run consumes beyond the network: spawn
+ // demand, density cap, initial population, and the vehicle-type mix. It is
+@@ -93,11 +96,11 @@ func (sp *Spawner) init(e *Engine) {
+ 	}
+ }
+ 
+-// injectionPlan decides whether the pending vehicle v (Lane and Type set,
+-// S = 0, not yet registered) may enter this tick, and the physical entry
+-// cap. ok=false holds the spawn — unmet demand carries over. The entry is
+-// safe when v can brake COMFORTABLY (its Type.B) to whichever constraint
+-// is nearer:
++// injectionPlan decides whether the pending vehicle v (Lane, Type and the
++// injection position S set, not yet registered) may enter this tick, and
++// the physical entry cap. ok=false holds the spawn — unmet demand carries
++// over. The entry is safe when v can brake COMFORTABLY (its Type.B) to
++// whichever constraint is nearer:
+ //
+ //   - the nearest leader measured THROUGH the connection (leaderAt from
+ //     the lane start) — the old rule (8+0.8·v buffer against vehicles ON
+@@ -111,24 +114,33 @@ func (sp *Spawner) init(e *Engine) {
+ //     is where the fixtures' mass red crossings came from.
+ //
+ // The entry speed caps at what can still stop short of the constraint:
+-// v² ≤ v_leader² + 2·B·(gap − s0). There is no speed floor: origin lanes
+-// have no predecessors, so nothing can rear-end a slow entry, and joining
+-// a queue tail at crawl speed is how real queues grow (the prototype's
+-// 8 m/s floor only starved congested origins). F-free by design — the
+-// plan may be probed for a vehicle whose desired-speed factor has not
+-// been drawn (the director probe); callers apply their own F via
++// v² ≤ v_leader² + 2·B·(gap − s0). There is no speed floor at a PORTAL:
++// origin lanes have no predecessors, so nothing can rear-end a slow entry,
++// and joining a queue tail at crawl speed is how real queues grow (the
++// prototype's 8 m/s floor only starved congested origins). F-free by
++// design — the plan may be probed for a vehicle whose desired-speed factor
++// has not been drawn (the director probe); callers apply their own F via
+ // min(cap, v0eff) at injection.
++//
++// INTERIOR injection (v.S > 0, ADR-0021) has traffic behind it, so the
++// portal reasoning above does not hold: the entry additionally requires
++// that the nearest follower can brake comfortably to the injected rear
++// bumper. Without it a garage exit materializes in front of moving traffic
++// and is rear-ended — the one failure mode a portal can't have.
+ func (e *Engine) injectionPlan(v *Vehicle) (float64, bool) {
+ 	lane := v.Lane
+ 	gap := math.Inf(1)
+ 	vl := 0.0
+-	// leaderAt from a hair BEFORE the lane start: its strict S > s search
+-	// would miss a vehicle injected at exactly S = 0 earlier in the same
+-	// events phase (the director queue's same-tick backlog stack).
+-	if li := e.leaderAt(lane, -1e-9, nil); li.OK {
++	// leaderAt from a hair BEFORE the injection point: its strict S > s
++	// search would miss a vehicle injected at exactly this S earlier in the
++	// same events phase (the director queue's same-tick backlog stack).
++	if li := e.leaderAt(lane, v.S-1e-9, nil); li.OK {
+ 		gap = li.Gap
+ 		vl = li.V
+ 	}
++	if v.S > 0 && !e.rearClear(v) {
++		return 0, false
++	}
+ 	if next, dist := e.gateTarget(v); next != nil && dist < gap && e.junctionHold(v, next) {
+ 		gap = dist
+ 		vl = 0
+@@ -143,6 +155,49 @@ func (e *Engine) injectionPlan(v *Vehicle) (float64, bool) {
+ 	return math.Sqrt(vl*vl + 2*v.Type.B*room), true
+ }
+ 
++// rearClear reports whether an interior injection of v (Lane and S set,
++// not yet registered) leaves its nearest follower able to brake COMFORTABLY
++// — the mirror of the leader rule, with the same Type.B/S0 comfort
++// criterion applied to the follower's own type. The follower is searched on
++// the injection lane first, then through predecessors (prevFollower, same
++// sight bounds as the leader walk) so a vehicle about to cross in from
++// upstream is not missed.
++//
++// Note the asymmetry with the leader rule: an unsafe leader gap only CAPS
++// the entry speed, but an unsafe follower gap denies the entry outright.
++// There is no entry speed that fixes being materialized on top of someone —
++// the vehicle simply waits for a gap, which is what a car nosing out of a
++// garage actually does. Denials carry over as demand exactly like a blocked
++// portal (director.go's hold-and-retry).
++func (e *Engine) rearClear(v *Vehicle) bool {
++	rear := v.S - v.Type.Length
++	f, _, gap, ok := e.followerAt(v.Lane, rear)
++	if !ok {
++		return true // nobody behind within sight
++	}
++	room := gap - f.Type.S0
++	if room <= 0 {
++		return false
++	}
++	// The follower must be able to shed its speed over the room available:
++	// v_f² ≤ 2·B_f·room, the leader rule read from the other side.
++	return f.V*f.V <= 2*f.Type.B*room
++}
++
++// followerAt resolves the nearest follower behind a hypothetical rear
++// bumper at `rear` on lane: the last vehicle strictly behind it ON the lane,
++// else prevFollower's cross-boundary walk. Gap is the clear distance from
++// the follower's front bumper to `rear`.
++func (e *Engine) followerAt(lane *Lane, rear float64) (f *Vehicle, fLane *Lane, gap float64, ok bool) {
++	a := lane.vehs
++	i := sort.Search(len(a), func(i int) bool { return a[i].S > rear })
++	if i > 0 {
++		b := a[i-1]
++		return b, lane, rear - b.S, true
++	}
++	return e.prevFollower(lane, rear)
++}
++
+ // step attempts the scheduled spawn on each origin lane, in fixed lane
+ // order. A blocked entry (density cap, unsafe injection) holds and retries
+ // next tick — the schedule is demand, and unmet demand carries over.
+diff --git a/scripts/import-city.sh b/scripts/import-city.sh
+index 07f8ee36616db4e63a5e4e956976e86f68e738ec..f129d3424c84e80195efecd9dd8f448cd5dad73a 100755
+--- a/scripts/import-city.sh
++++ b/scripts/import-city.sh
+@@ -23,12 +23,46 @@ NET_DIR="$ROOT/data/networks/$NAME"
+ SCN_DIR="$ROOT/data/scenarios/$NAME"
+ mkdir -p "$NET_DIR" "$SCN_DIR"
+ 
++# Speed defaults (ADR-0022). netconvert's built-in OSM typemap is
++# German-derived — unposted secondary/primary/trunk default to 27.78 m/s
++# (100 km/h) — and `maxspeed` is tagged on only ~12% of ways, so US imports
++# compiled their arterials as autobahn. Free-flow speed is the denominator
++# of every congestion number the metric kernel reports, so this is not a
++# tuning knob. Region is a PARAMETER, not a default: set TYPEMAP= (empty)
++# for a non-US import (de-roundabouts) to get netconvert's stock behavior.
++TYPEMAP="${TYPEMAP-$ROOT/scripts/osm-urban-us.typ.xml}"
++TYPE_ARGS=()
++if [ -n "$TYPEMAP" ]; then
++  [ -f "$TYPEMAP" ] || { echo "typemap not found: $TYPEMAP (set TYPEMAP= to use netconvert's stock defaults)" >&2; exit 1; }
++  # The typemap is HALF the fix. netconvert has a second speed-derived
++  # German default: --junctions.right-before-left.speed-threshold (13.6111
++  # m/s), which types an unsignalized junction right_before_left when ALL
++  # its incoming edges are below that speed. 30 mph = 13.41 m/s is 0.2 m/s
++  # under it, so lowering arterials to the statutory urban limit flips
++  # right-of-way wholesale — measured on chi-loop, 1,218 junctions went
++  # priority -> right_before_left (275 -> 1,493). Setting the threshold to
++  # 0 disables rbl entirely.
++  #
++  # This is a deliberate MODEL choice, not just a restore: rbl is legally
++  # real in the US at genuinely uncontrolled intersections, but a US city
++  # intersection almost always carries a signal or a stop sign. Signals are
++  # imported; stop signs ride the ADR-0017 pass-2 override where the
++  # extract has them. For everything left over, `priority` (major road
++  # proceeds, minor yields) approximates US stop control far better than
++  # mutual yield-to-the-right, which is also a well-known SUMO
++  # mutual-blocking gridlock source. See ADR-0022.
++  TYPE_ARGS=(--type-files "$TYPEMAP" --junctions.right-before-left.speed-threshold 0)
++  echo "== [$NAME] typemap: $TYPEMAP (right-before-left disabled)"
++else
++  echo "== [$NAME] typemap: netconvert stock (German OSM defaults)"
++fi
++
+ echo "== [$NAME] overpass json -> .osm"
+ python3 "$ROOT/scripts/overpass2osm.py" "$SRC" "$NET_DIR/$NAME.osm"
+ 
+ echo "== [$NAME] netconvert -> .net.xml"
+ "$NC" --osm-files "$NET_DIR/$NAME.osm" -o "$NET_DIR/$NAME.base.net.xml" \
+-  --proj.utm --no-turnarounds
++  "${TYPE_ARGS[@]}" --proj.utm --no-turnarounds
+ 
+ # Stop signs: netconvert (1.27.1) ignores OSM highway=stop nodes on import,
+ # so stop junctions are re-typed in a SECOND pass from a PlainXML node
+@@ -37,6 +71,10 @@ echo "== [$NAME] netconvert -> .net.xml"
+ # Pass 2 repeats --no-turnarounds so connection recomputation at retyped
+ # junctions cannot re-add the U-turn loops pass 1 excluded. No --proj.utm
+ # here on purpose: the base .net.xml carries its own <location> block.
++# Deliberately NO --type-files here either: pass 2 reimports a .net.xml
++# whose edge speeds are already resolved, and ADR-0017 verified pass 2
++# changes ONLY the retyped junctions. Re-applying types would put that
++# guarantee back in question for no gain.
+ # Deliberately NO --junctions.join anywhere: the override keys junctions by
+ # OSM node id, which joining rewrites to cluster ids; the KB's consolidation
+ # guidance conflicts with that keying and loses to stop fidelity (ADR-0017).
+@@ -66,7 +104,11 @@ EXTRACT_TS=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get
+ # scripts AND the Go importer): stable across clones and unrelated
+ # commits, changes exactly when the importer changes (the provenance
+ # feeds the ADR-0012 content hash).
+-REPO_REV=$(cat "$ROOT/scripts/overpass2osm.py" "$ROOT/scripts/osm-stop-nodes.py" "$ROOT/scripts/import-city.sh" "$ROOT/engine/cmd/netimport/main.go" "$ROOT/engine/netimport/netimport.go" | sha256sum | cut -c1-12)
++# The typemap is IN the hash (ADR-0022 §4): it shapes the compiled network
++# as much as any script here, so editing a speed must move the provenance
++# string. Absent (stock netconvert defaults) it contributes nothing, which
++# is itself the distinguishing input.
++REPO_REV=$(cat "$ROOT/scripts/overpass2osm.py" "$ROOT/scripts/osm-stop-nodes.py" "$ROOT/scripts/import-city.sh" ${TYPEMAP:+"$TYPEMAP"} "$ROOT/engine/cmd/netimport/main.go" "$ROOT/engine/netimport/netimport.go" | sha256sum | cut -c1-12)
+ (cd "$ROOT/engine" && go run ./cmd/netimport \
+   -in "$NET_DIR/$NAME.net.xml" \
+   -out "$SCN_DIR/$NAME.json" \
+diff --git a/viz/index.html b/viz/index.html
+index dd82f7e6545c930c2587a5fc83b6cb1149b351d7..611397462092302932454942dcb93b914c933bbf 100644
+--- a/viz/index.html
++++ b/viz/index.html
+@@ -73,6 +73,9 @@
+         clip-path: polygon(29% 0%, 71% 0%, 100% 29%, 100% 71%, 71% 100%, 29% 100%, 0% 71%, 0% 29%);
+       }
+       .legend-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex: none; }
++      /* Building-footprint swatch — a small block, kind color injected
++         from theme.ts (legend.ts). */
++      .legend-bld { display: inline-block; width: 10px; height: 10px; border-radius: 1px; flex: none; }
+       .legend-sep { border-top: 1px solid rgba(46, 91, 255, 0.4); margin: 7px 0 2px; }
+       .legend-ramp { height: 8px; border-radius: 2px; margin-top: 5px; }
+       .legend-ramp-labels { display: flex; justify-content: space-between; font-size: 10px; color: var(--t-text-dim); }
+@@ -87,6 +90,7 @@
+       .legend-toggle.legend-off .legend-veh,
+       .legend-toggle.legend-off .legend-sig,
+       .legend-toggle.legend-off .legend-stop,
++      .legend-toggle.legend-off .legend-bld,
+       .legend-toggle.legend-off .legend-ramp { filter: grayscale(1); }
+       /* Demo switcher — in-map demosrv control (switcher.ts). Interactive
+          (overrides .hud's pointer-events: none); hidden unless the
+diff --git a/viz/src/config.ts b/viz/src/config.ts
+index a5c1fdb0c8b4dd1b29e50226d9bc736197c5aff8..fe0c1f6d498b7de349dc4d7cf921514b662e51a2 100644
+--- a/viz/src/config.ts
++++ b/viz/src/config.ts
+@@ -12,6 +12,7 @@ export interface VizConfig {
+   zonesUrl: string;
+   boundariesUrl: string;
+   waterUrl: string;
++  buildingsUrl: string;
+   bufferMs: number;
+   dt: number; // engine timestep, s — sim seconds per tick
+   theme: string; // theme.ts THEMES key (navy default, resolved by getTheme)
+@@ -53,6 +54,7 @@ export function loadConfig(search: string, hostname: string): VizConfig {
+     zonesUrl: p.get("zones") ?? "/overlay/zones.geojson",
+     boundariesUrl: p.get("boundaries") ?? "/overlay/boundaries.geojson",
+     waterUrl: p.get("water") ?? "/overlay/water.geojson",
++    buildingsUrl: p.get("buildings") ?? "/overlay/buildings.geojson",
+     bufferMs: Number.isFinite(buffer) && buffer >= 0 ? buffer : 250,
+     dt: Number.isFinite(dt) && dt > 0 ? dt : 0.1,
+     theme: resolveThemeName(p.get("theme"), stored),
+diff --git a/viz/src/layertoggles.ts b/viz/src/layertoggles.ts
+index 1c959385a33ffb2ee2df6bd9ec0e402014cb18c2..ced490889405867d0e533f33e9576695b54ed497 100644
+--- a/viz/src/layertoggles.ts
++++ b/viz/src/layertoggles.ts
+@@ -4,7 +4,7 @@
+ // applied by main.ts) so node --test can pin the mapping; legend.ts deals
+ // only in ToggleKeys, main.ts only in the ops returned here.
+ 
+-export type ToggleKey = "car" | "truck" | "signals" | "stops" | "congestion";
++export type ToggleKey = "car" | "truck" | "signals" | "stops" | "congestion" | "buildings";
+ 
+ export type ToggleState = Record<ToggleKey, boolean>;
+ 
+@@ -15,6 +15,7 @@ export const DEFAULT_TOGGLES: ToggleState = {
+   signals: true,
+   stops: true,
+   congestion: true,
++  buildings: true,
+ };
+ 
+ export interface LayerOps {
+@@ -38,7 +39,9 @@ export interface LayerOps {
+ //   - "network-line" + "network-internal-line" are the congestion overlay
+ //     (external lanes / zoom-gated junction interiors, WQ-3);
+ //     "network-casing" + "network-internal-casing" (the road geometry
+-//     itself) are NEVER toggled.
++//     itself) are NEVER toggled;
++//   - "buildings-fill" + "buildings-outline" are the footprint overlay
++//     (zoom-gated context UNDER the roads; both move as one group).
+ export function layerOpsFor(state: ToggleState): LayerOps {
+   const cls: number[] = [];
+   if (state.car) cls.push(0);
+@@ -57,6 +60,8 @@ export function layerOpsFor(state: ToggleState): LayerOps {
+       ["stop-signs", state.stops],
+       ["network-line", state.congestion],
+       ["network-internal-line", state.congestion],
++      ["buildings-fill", state.buildings],
++      ["buildings-outline", state.buildings],
+     ],
+   };
+ }
+diff --git a/viz/src/legend.ts b/viz/src/legend.ts
+index 94cae88afd48dd5ed88df0931987f25a0d75d97d..519f0444b6543170c1bb16e6f4c0102a17adcef9 100644
+--- a/viz/src/legend.ts
++++ b/viz/src/legend.ts
+@@ -81,6 +81,19 @@ export class Legend {
+       `<div class="legend-ramp-labels"><span>stopped</span><span>free flow</span></div>` +
+       `<div class="legend-caption">lane mean speed / limit</div></div>` +
+       `<div class="legend-sep"></div>` +
++      // Building footprints (buildings.geojson overlay): one toggle, two
++      // swatches — the residential/workplace split IS the layer, and the
++      // caption states the zoom gate so an empty city-zoom map reads as
++      // "not yet" rather than "broken".
++      `<div class="legend-toggle" data-toggle="buildings">` +
++      `<div class="legend-row">` +
++      `<span class="legend-bld" style="background:${theme.buildingResidential}"></span>` +
++      `<span>residential</span></div>` +
++      `<div class="legend-row">` +
++      `<span class="legend-bld" style="background:${theme.buildingWorkplace}"></span>` +
++      `<span>workplace</span></div>` +
++      `<div class="legend-caption">buildings, zoom 14+; shade = storeys</div></div>` +
++      `<div class="legend-sep"></div>` +
+       `<div class="legend-row"><span>sim time</span><span class="legend-clock">00:00:00</span></div>`;
+ 
+     const clock = el.querySelector(".legend-clock");
+diff --git a/viz/src/main.ts b/viz/src/main.ts
+index c3928dba4ba4bd7ca6f13337a25e24d4f8fa7868..82abca8fbda1200bf38c0d79ee89b09f9f631ec1 100644
+--- a/viz/src/main.ts
++++ b/viz/src/main.ts
+@@ -26,7 +26,7 @@ import "maplibre-gl/dist/maplibre-gl.css";
+ import type { Feature, FeatureCollection, LineString, Point } from "geojson";
+ 
+ import { loadConfig, THEME_STORAGE_KEY } from "./config.ts";
+-import { parseOverlay, prepareZones } from "./overlays.ts";
++import { parseOverlay, prepareBuildings, prepareZones } from "./overlays.ts";
+ import { decodeFrame } from "./tssf.ts";
+ import { decodeSignalFrame, parseSigChunkHeader, SignalTableAccumulator, type SigColor, type SignalTable } from "./tssg.ts";
+ import { headStatesAtTick, signalHeads, type SignalHead } from "./signals.ts";
+@@ -215,10 +215,11 @@ async function main(): Promise<void> {
+       return null;
+     }
+   };
+-  const [zonesFC, boundariesFC, waterFC] = await Promise.all([
++  const [zonesFC, boundariesFC, waterFC, buildingsFC] = await Promise.all([
+     fetchOverlay(cfg.zonesUrl).then((fc) => (fc === null ? null : prepareZones(fc))),
+     fetchOverlay(cfg.boundariesUrl),
+     fetchOverlay(cfg.waterUrl),
++    fetchOverlay(cfg.buildingsUrl).then((fc) => (fc === null ? null : prepareBuildings(fc))),
+   ]);
+ 
+   // Static channel: project lane polylines once (local metric → WGS84).
+@@ -470,6 +471,70 @@ async function main(): Promise<void> {
+         paint: { "fill-color": theme.water },
+       });
+     }
++    // Buildings SECOND: on top of the water fill (they stand on land) but
++    // still under every road layer — footprints are context, they must
++    // never hide the network. Source is added even when the overlay 404'd
++    // (EMPTY_FC) so the layer ids layertoggles.ts names always exist.
++    //
++    // Zoom-gated to >=14 like the signal heads / junction interiors (WQ-1,
++    // WQ-3): chi-loop alone is 42k polygons and at city zoom they are a
++    // solid smear over the roads. A fill (not fill-extrusion) because the
++    // camera is top-down — extrusion draws in a separate 3D pass that
++    // cannot be ordered under line layers, which is exactly the property
++    // this layer needs.
++    map.addSource("buildings", {
++      type: "geojson",
++      data: buildingsFC ?? EMPTY_FC,
++    });
++    // Kind → hue (residential vs workplace is the point of the layer);
++    // both fill and outline read the same expression so they can't drift.
++    const buildingColor: maplibregl.ExpressionSpecification = [
++      "match",
++      ["get", "bkind"],
++      "residential", theme.buildingResidential,
++      "workplace", theme.buildingWorkplace,
++      theme.buildingOther,
++    ];
++    // Storeys drive opacity, so a 60-storey tower reads as a tower on a
++    // flat map: 1 storey barely tints, 40+ is a solid block. Scaled down at
++    // the minzoom boundary so the layer fades in instead of popping — and
++    // written as ONE top-level zoom interpolate whose stop outputs are the
++    // storey ramp, because MapLibre rejects ["zoom"] anywhere but as the
++    // direct input of a top-level step/interpolate (so the obvious
++    // ["*", zoomRamp, storeyRamp] does not validate).
++    const storeyOpacity = (scale: number): maplibregl.ExpressionSpecification =>
++      [
++        "interpolate", ["linear"], ["to-number", ["get", "blevels"], 1],
++        1, 0.16 * scale,
++        4, 0.28 * scale,
++        20, 0.55 * scale,
++        40, 0.72 * scale,
++      ] as maplibregl.ExpressionSpecification;
++    const buildingWeight: maplibregl.ExpressionSpecification = [
++      "interpolate", ["linear"], ["zoom"],
++      14, storeyOpacity(0.35),
++      15.5, storeyOpacity(1),
++    ];
++    map.addLayer({
++      id: "buildings-fill",
++      type: "fill",
++      source: "buildings",
++      minzoom: 14,
++      paint: { "fill-color": buildingColor, "fill-opacity": buildingWeight },
++    });
++    // Outline only once individual footprints are worth resolving —
++    // at z14 it would just thicken the smear.
++    map.addLayer({
++      id: "buildings-outline",
++      type: "line",
++      source: "buildings",
++      minzoom: 16,
++      paint: {
++        "line-color": buildingColor,
++        "line-opacity": ["interpolate", ["linear"], ["zoom"], 16, 0, 17, 0.5],
++        "line-width": 0.8,
++      },
++    });
+     map.addSource("network", { type: "geojson", data: networkFC, promoteId: "id" });
+     map.addSource("vehicles", { type: "geojson", data: EMPTY_FC, promoteId: "id" });
+     // Lane paint shared by the external and internal layer pairs below so
+diff --git a/viz/src/overlays.ts b/viz/src/overlays.ts
+index ed268003345c628f75f27fdd0fead5cafc940d0a..19302f1efcf14cd37754ad308173fdb74996082e 100644
+--- a/viz/src/overlays.ts
++++ b/viz/src/overlays.ts
+@@ -1,5 +1,6 @@
+ // overlays.ts — pure, DOM-free helpers for the static WGS84 overlays
+-// (zones + administrative boundaries, served by demosrv under /overlay/).
++// (zones, administrative boundaries, water, building footprints — served by
++// demosrv under /overlay/).
+ // Unlike the network channel these arrive ALREADY in lon/lat, so there is
+ // no projection here — only doc validation and the per-feature style
+ // classification main.ts stamps onto the zone source (MapLibre's
+@@ -61,3 +62,40 @@ export function prepareZones(fc: FeatureCollection): FeatureCollection {
+     }),
+   };
+ }
++
++export type BuildingKind = "residential" | "workplace" | "other";
++
++// buildingKind classifies a building feature's `kind` property
++// (scripts/chicago/buildings.py). Only the two demand-relevant kinds are
++// recognised; anything else — including a missing or misspelled kind —
++// degrades to "other" (the quiet fill), so an unexpected value paints as
++// context rather than masquerading as a tower.
++export function buildingKind(props: Record<string, unknown> | null | undefined): BuildingKind {
++  const k = props?.["kind"];
++  return k === "residential" || k === "workplace" ? k : "other";
++}
++
++// buildingLevels coerces the `levels` property to a storey count >= 1.
++// The fill-opacity ramp interpolates on it, and MapLibre's ["interpolate"]
++// throws on a non-number input, so a string/missing/garbage value must be
++// resolved HERE rather than trusted at render time.
++export function buildingLevels(props: Record<string, unknown> | null | undefined): number {
++  const n = Number(props?.["levels"]);
++  return Number.isFinite(n) && n >= 1 ? Math.round(n) : 1;
++}
++
++// prepareBuildings stamps the resolved classification onto every feature as
++// plain properties (bkind, blevels) for the style layers — same contract as
++// prepareZones: the layers read only the stamped values, never the raw ones.
++export function prepareBuildings(fc: FeatureCollection): FeatureCollection {
++  return {
++    type: "FeatureCollection",
++    features: fc.features.map((f) => {
++      const props = (f.properties ?? {}) as Record<string, unknown>;
++      return {
++        ...f,
++        properties: { ...props, bkind: buildingKind(props), blevels: buildingLevels(props) },
++      };
++    }),
++  };
++}
+diff --git a/viz/src/theme.ts b/viz/src/theme.ts
+index a0cae73c37ad92f970073e5043f5584c99789c0c..d64d6fe436ecfc5b3ffa520fdede63e36aebced1 100644
+--- a/viz/src/theme.ts
++++ b/viz/src/theme.ts
+@@ -28,6 +28,13 @@ export interface ThemeSpec {
+   district: string; // zone district outline/fill
+   corridor: string; // zone corridor outline
+   water: string; // water fill, UNDER the road lines
++  // Building footprints (buildings.geojson overlay, UNDER the road lines,
++  // zoom-gated): the demand-relevant kinds are split by hue — residential
++  // violet / workplace warm ochre — because that distinction IS the layer.
++  // Hues deliberately avoid the water blue and the congestion ramp.
++  buildingResidential: string;
++  buildingWorkplace: string;
++  buildingOther: string; // non-demand structures: barely above the canvas
+   // Stop sign (stopsign.ts): semantic red in every theme, like the lenses.
+   stopFace: string;
+   stopRim: string;
+@@ -63,6 +70,9 @@ export const THEMES = {
+     // Water fill (Lake Michigan, rivers) — a shade off the math-900 canvas
+     // so the shoreline reads without competing with congestion.
+     water: "#122a70",
++    buildingResidential: "#6a5bb0", // muted violet — homes
++    buildingWorkplace: "#a97a45", // muted ochre — offices/retail
++    buildingOther: "#1e2c68", // garages/sheds/roofs: canvas + a hair
+     stopFace: "#e5484d", // semantic stop red, both themes
+     stopRim: "#ffffff",
+     hudBg: "rgba(14, 29, 92, 0.82)",
+@@ -90,6 +100,9 @@ export const THEMES = {
+     district: "#2563eb", // the paper accent blue
+     corridor: "#d97706", // amber, darkened to read on paper
+     water: "#d7e6f5", // pale blue-gray fill under the road hairlines
++    buildingResidential: "#8d7cc4", // violet, darkened to read on paper
++    buildingWorkplace: "#c08a4e", // ochre, darkened to read on paper
++    buildingOther: "#c9c9d0", // ink-300: quiet paper gray
+     stopFace: "#e5484d", // semantic stop red, both themes
+     stopRim: "#ffffff",
+     hudBg: "#ffffff",
+diff --git a/viz/test/config.test.ts b/viz/test/config.test.ts
+index f179a659f0f2583c730aac26b395f2d8feaaed7b..9e763faf4e53e9d05b5276bcecbec28ed618c5c4 100644
+--- a/viz/test/config.test.ts
++++ b/viz/test/config.test.ts
+@@ -25,8 +25,13 @@ test("overlay URLs default to the demosrv /overlay/ route, overridable", () => {
+   assert.equal(def.zonesUrl, "/overlay/zones.geojson");
+   assert.equal(def.boundariesUrl, "/overlay/boundaries.geojson");
+   assert.equal(def.waterUrl, "/overlay/water.geojson");
+-  const custom = loadConfig("?zones=/o/z.geojson&boundaries=/o/b.geojson&water=/o/w.geojson", "localhost");
++  assert.equal(def.buildingsUrl, "/overlay/buildings.geojson");
++  const custom = loadConfig(
++    "?zones=/o/z.geojson&boundaries=/o/b.geojson&water=/o/w.geojson&buildings=/o/bl.geojson",
++    "localhost",
++  );
+   assert.equal(custom.zonesUrl, "/o/z.geojson");
+   assert.equal(custom.boundariesUrl, "/o/b.geojson");
+   assert.equal(custom.waterUrl, "/o/w.geojson");
++  assert.equal(custom.buildingsUrl, "/o/bl.geojson");
+ });
+diff --git a/viz/test/layertoggles.test.ts b/viz/test/layertoggles.test.ts
+index bd66bef4caf64783322957847de934fe4a0a1786..75ccdb3432eabf74d1feb6d1164977d035d805e0 100644
+--- a/viz/test/layertoggles.test.ts
++++ b/viz/test/layertoggles.test.ts
+@@ -69,8 +69,22 @@ test("congestion off: both congestion line layers hide; the casings are never to
+   assert.ok(!v.has("network-internal-casing"), "internal casing is road geometry too");
+ });
+ 
++test("buildings off: both footprint layers hide; nothing else moves", () => {
++  const v = vis(layerOpsFor({ ...DEFAULT_TOGGLES, buildings: false }));
++  assert.equal(v.get("buildings-fill"), false);
++  assert.equal(v.get("buildings-outline"), false);
++  assert.equal(v.get("network-line"), true, "roads are a different toggle");
++});
++
+ test("every toggle key off still names only real layers, exactly once", () => {
+-  const ops = layerOpsFor({ car: false, truck: false, signals: false, stops: false, congestion: false });
++  const ops = layerOpsFor({
++    car: false,
++    truck: false,
++    signals: false,
++    stops: false,
++    congestion: false,
++    buildings: false,
++  });
+   const ids = ops.visibility.map(([id]) => id);
+   assert.equal(new Set(ids).size, ids.length);
+   for (const [, on] of ops.visibility) assert.equal(on, false);
+diff --git a/viz/test/overlays.test.ts b/viz/test/overlays.test.ts
+index ccd86ce7ad5878fe245e60fc373017caceb110ad..e7ab0ebe1858fc9d2b7d79856574cbf614297db3 100644
+--- a/viz/test/overlays.test.ts
++++ b/viz/test/overlays.test.ts
+@@ -7,7 +7,15 @@
+ import { test } from "node:test";
+ import assert from "node:assert/strict";
+ 
+-import { parseOverlay, prepareZones, zoneKind, zoneRunnable } from "../src/overlays.ts";
++import {
++  buildingKind,
++  buildingLevels,
++  parseOverlay,
++  prepareBuildings,
++  prepareZones,
++  zoneKind,
++  zoneRunnable,
++} from "../src/overlays.ts";
+ 
+ test("parseOverlay accepts a FeatureCollection and keeps it verbatim", () => {
+   const fc = {
+@@ -87,3 +95,48 @@ test("prepareZones stamps zkind/zrun and falls back from label to name", () => {
+   assert.equal(c?.properties?.["zrun"], 1);
+   assert.equal(c?.properties?.["label"], "i90"); // label fell back to name
+ });
++
++test("buildingKind: only the two demand kinds are recognised, all else is other", () => {
++  assert.equal(buildingKind({ kind: "residential" }), "residential");
++  assert.equal(buildingKind({ kind: "workplace" }), "workplace");
++  assert.equal(buildingKind({ kind: "other" }), "other");
++  assert.equal(buildingKind({ kind: "Residential" }), "other"); // case-sensitive
++  assert.equal(buildingKind({ kind: 7 }), "other");
++  assert.equal(buildingKind({}), "other");
++  assert.equal(buildingKind(null), "other");
++});
++
++test("buildingLevels clamps to a storey count >= 1 the opacity ramp can interpolate", () => {
++  assert.equal(buildingLevels({ levels: 83 }), 83);
++  assert.equal(buildingLevels({ levels: "12" }), 12); // JSON string coerces
++  assert.equal(buildingLevels({ levels: 2.6 }), 3); // rounded
++  assert.equal(buildingLevels({ levels: 0 }), 1);
++  assert.equal(buildingLevels({ levels: -4 }), 1);
++  assert.equal(buildingLevels({ levels: "tall" }), 1);
++  assert.equal(buildingLevels({}), 1);
++  assert.equal(buildingLevels(null), 1);
++});
++
++test("prepareBuildings stamps bkind/blevels and keeps the original properties", () => {
++  const fc = prepareBuildings({
++    type: "FeatureCollection",
++    features: [
++      {
++        type: "Feature",
++        properties: { osm_id: "w64388609", kind: "workplace", levels: 83, name: "Aon Center" },
++        geometry: { type: "Polygon", coordinates: [[[0, 0], [1, 0], [1, 1], [0, 0]]] },
++      },
++      {
++        type: "Feature",
++        properties: { osm_id: "w1", kind: "garage" },
++        geometry: { type: "Polygon", coordinates: [[[0, 0], [1, 0], [1, 1], [0, 0]]] },
++      },
++    ],
++  });
++  const [tower, junk] = fc.features;
++  assert.equal(tower?.properties?.["bkind"], "workplace");
++  assert.equal(tower?.properties?.["blevels"], 83);
++  assert.equal(tower?.properties?.["name"], "Aon Center");
++  assert.equal(junk?.properties?.["bkind"], "other"); // unknown kind → context fill
++  assert.equal(junk?.properties?.["blevels"], 1); // missing levels → floor of the ramp
++});
+diff --git a/viz/test/theme.test.ts b/viz/test/theme.test.ts
+index d5596f9d54b13aeb0a0817a76360a15d1aedc709..5ac79ed32009b9fcf85205acbfe80fce68990411 100644
+--- a/viz/test/theme.test.ts
++++ b/viz/test/theme.test.ts
+@@ -123,3 +123,18 @@ test("loadConfig resolves the theme (no Web Storage in node → navy)", () => {
+   assert.equal(loadConfig("", "localhost").theme, "navy");
+   assert.equal(loadConfig("?net=/net/x.geojson", "localhost").theme, "navy");
+ });
++
++test("residential and workplace buildings are distinguishable in every theme", () => {
++  for (const [name, spec] of Object.entries(THEMES)) {
++    assert.notEqual(
++      spec.buildingResidential,
++      spec.buildingWorkplace,
++      `${name}: the two demand kinds must not share a color — the split is the layer`,
++    );
++    assert.notEqual(spec.buildingOther, spec.buildingResidential, name);
++    assert.notEqual(spec.buildingOther, spec.buildingWorkplace, name);
++    // Buildings sit under the roads: they must not be the water fill either.
++    assert.notEqual(spec.buildingResidential, spec.water, name);
++    assert.notEqual(spec.buildingWorkplace, spec.water, name);
++  }
++});
+diff --git a/engine/destination_test.go b/engine/destination_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..b1e6a3f9f1fc473b3c99e560eeaa8662f27f3f8e
+--- /dev/null
++++ b/engine/destination_test.go
+@@ -0,0 +1,494 @@
++package engine
++
++import (
++	"strings"
++	"testing"
++)
++
++// destination_test.go — ADR-0021: the route destination as a TRIP END
++// (arrival despawn) and interior mid-block injection. The three properties
++// these pin are (1) an interior destination ends the trip where an exit
++// destination always did, (2) every pre-ADR-0021 path stays bit-identical,
++// and (3) an interior injection can never be materialized on top of
++// traffic behind it.
++
++// destSpec builds the lanedrop network with the in-kernel IDM policy so
++// injected vehicles actually drive without a controller attached. The
++// topology is what makes it useful here: A0 (600 m, origin, NOT an exit)
++// feeds B0 (600 m, exit), so "A0" is a legitimate non-exit destination and
++// "B0" is an exit one.
++func destSpec(t *testing.T, ticks uint64) RunSpec {
++	t.Helper()
++	spec, err := DefaultSpec("lanedrop", ticks, 1)
++	if err != nil {
++		t.Fatal(err)
++	}
++	spec.Scen.Types = []*VehicleType{&Car, &Truck}
++	spec.Scen.SpawnRatePerLaneHour = 0 // director-only demand
++	spec.Scen.UncontrolledPolicy = PolicyIDM
++	return spec
++}
++
++// runOne injects one directive and steps to the horizon, returning the tick
++// the vehicle left the world (0 if it never did) and the lane it was on the
++// tick before.
++func runOne(t *testing.T, e *Engine, ticks uint64, d SpawnDirective) (goneAt uint64, lastLane string, maxS float64) {
++	t.Helper()
++	if err := e.EnqueueSpawn(d); err != nil {
++		t.Fatalf("EnqueueSpawn: %v", err)
++	}
++	seen := false
++	for e.Tick < ticks {
++		e.Step()
++		vs := e.Vehicles()
++		switch {
++		case len(vs) > 0:
++			seen = true
++			lastLane = vs[0].Lane.ID
++			maxS = vs[0].S
++		case seen && goneAt == 0:
++			goneAt = e.Tick
++		}
++	}
++	if !seen {
++		t.Fatal("directive never injected")
++	}
++	return goneAt, lastLane, maxS
++}
++
++// TestArrivalDespawnAtNonExitDestination: a vehicle routed to a lane that
++// is NOT an exit ends its trip at that lane's end instead of crossing on.
++// The control run — identical but unrouted — proves the difference is the
++// destination and nothing else.
++func TestArrivalDespawnAtNonExitDestination(t *testing.T) {
++	// Routed to A0, the lane it is born on: the trip ends at A0's end.
++	e, err := NewEngine(destSpec(t, 2000))
++	if err != nil {
++		t.Fatal(err)
++	}
++	goneAt, lastLane, _ := runOne(t, e, 2000, SpawnDirective{
++		RequestID: "arr", Origin: "A0", TypeName: "car", Destination: "A0",
++	})
++	if goneAt == 0 {
++		t.Fatal("routed vehicle never arrived")
++	}
++	if lastLane != "A0" {
++		t.Errorf("last lane before arrival = %q, want A0 (it must not cross into B0)", lastLane)
++	}
++	if e.Stats.Arrived != 1 || e.Stats.Despawned != 1 {
++		t.Errorf("arrived=%d despawned=%d, want 1 and 1 (arrivals are a breakdown of despawns)",
++			e.Stats.Arrived, e.Stats.Despawned)
++	}
++
++	// Control: same run, no destination — crosses A0 and leaves via B0.
++	e2, err := NewEngine(destSpec(t, 2000))
++	if err != nil {
++		t.Fatal(err)
++	}
++	goneAt2, lastLane2, _ := runOne(t, e2, 2000, SpawnDirective{
++		RequestID: "ctl", Origin: "A0", TypeName: "car",
++	})
++	if lastLane2 != "B0" {
++		t.Errorf("unrouted last lane = %q, want B0", lastLane2)
++	}
++	if e2.Stats.Arrived != 0 || e2.Stats.Despawned != 1 {
++		t.Errorf("unrouted: arrived=%d despawned=%d, want 0 and 1", e2.Stats.Arrived, e2.Stats.Despawned)
++	}
++	if goneAt2 <= goneAt {
++		t.Errorf("unrouted vehicle left at tick %d, arrival at %d — the arrival must come FIRST (half the distance)",
++			goneAt2, goneAt)
++	}
++}
++
++// TestArrivalDespawnExitWins: a destination that IS an exit lane despawns
++// through the unchanged exit path — the case ordering in boundaries() is
++// what keeps every pre-ADR-0021 recording (where exit routing put an exit
++// lane in Route) bit-identical.
++func TestArrivalDespawnExitWins(t *testing.T) {
++	e, err := NewEngine(destSpec(t, 2000))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, lastLane, _ := runOne(t, e, 2000, SpawnDirective{
++		RequestID: "x", Origin: "A0", TypeName: "car", Destination: "B0",
++	}); lastLane != "B0" {
++		t.Errorf("last lane = %q, want B0", lastLane)
++	}
++	if e.Stats.Arrived != 0 {
++		t.Errorf("arrived=%d, want 0 — an exit destination is an exit despawn, not an arrival", e.Stats.Arrived)
++	}
++	if e.Stats.Despawned != 1 {
++		t.Errorf("despawned=%d, want 1", e.Stats.Despawned)
++	}
++}
++
++// TestSpawnDirectiveValidation pins the ADR-0021 reject reasons alongside
++// the pre-existing ones.
++func TestSpawnDirectiveValidation(t *testing.T) {
++	e, err := NewEngine(destSpec(t, 10))
++	if err != nil {
++		t.Fatal(err)
++	}
++	cases := []struct {
++		name string
++		d    SpawnDirective
++		want string
++	}{
++		{"interior needs offset", SpawnDirective{RequestID: "a", Origin: "B0", TypeName: "car"},
++			"interior injection needs an explicit offset_m"},
++		{"offset past lane end", SpawnDirective{RequestID: "b", Origin: "B0", TypeName: "car", OffsetM: 600},
++			"past the end of lane"},
++		{"negative offset", SpawnDirective{RequestID: "c", Origin: "A0", TypeName: "car", OffsetM: -1},
++			"must be ≥ 0"},
++		{"unknown interior lane", SpawnDirective{RequestID: "d", Origin: "Z9", TypeName: "car", OffsetM: 5},
++			"unknown origin lane"},
++		{"unknown destination", SpawnDirective{RequestID: "e", Origin: "A0", TypeName: "car", Destination: "Z9"},
++			"unknown destination lane"},
++	}
++	for _, tc := range cases {
++		err := e.EnqueueSpawn(tc.d)
++		if err == nil || !strings.Contains(err.Error(), tc.want) {
++			t.Errorf("%s: got %v, want reason containing %q", tc.name, err, tc.want)
++		}
++	}
++	if e.PendingSpawns() != 0 {
++		t.Fatalf("rejected verbs entered the queue: %d pending", e.PendingSpawns())
++	}
++}
++
++// TestInteriorInjectionOffset: a positive offset admits a non-origin lane
++// and places the vehicle there.
++func TestInteriorInjectionOffset(t *testing.T) {
++	e, err := NewEngine(destSpec(t, 5))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := e.EnqueueSpawn(SpawnDirective{
++		RequestID: "g", Origin: "B0", TypeName: "car", OffsetM: 250,
++	}); err != nil {
++		t.Fatalf("interior directive rejected: %v", err)
++	}
++	e.Step()
++	vs := e.Vehicles()
++	if len(vs) != 1 {
++		t.Fatalf("vehicles after tick 1: %d, want 1", len(vs))
++	}
++	// Injected at the offset, then integrated within the same tick (the
++	// Spawner's own semantics), so S has advanced a little past it.
++	if vs[0].Lane.ID != "B0" || vs[0].S < 250 || vs[0].S > 254 {
++		t.Fatalf("interior vehicle at lane=%s s=%.2f, want B0 just past 250", vs[0].Lane.ID, vs[0].S)
++	}
++}
++
++// TestInteriorInjectionRearClearance is the safety property: an interior
++// injection in front of fast traffic is DENIED (held as demand) rather than
++// materialized to be rear-ended. The same directive on an empty lane
++// injects immediately — so the denial is the follower, not the offset.
++func TestInteriorInjectionRearClearance(t *testing.T) {
++	e, err := NewEngine(destSpec(t, 3))
++	if err != nil {
++		t.Fatal(err)
++	}
++	// A car 12 m behind the injection point at 30 m/s cannot brake
++	// comfortably into that gap.
++	e.AddInitialVehicle(e.Net.LaneByID("B0"), 0, 238, 30, 1)
++	if err := e.EnqueueSpawn(SpawnDirective{
++		RequestID: "blocked", Origin: "B0", TypeName: "car", OffsetM: 250,
++	}); err != nil {
++		t.Fatal(err)
++	}
++	e.Step()
++	if len(e.Vehicles()) != 1 {
++		t.Fatalf("vehicles=%d — the injection was NOT denied despite a fast follower", len(e.Vehicles()))
++	}
++	if e.PendingSpawns() != 1 {
++		t.Fatalf("pending=%d, want 1 (a denied interior entry holds as demand)", e.PendingSpawns())
++	}
++
++	// Control: identical directive, empty lane → injects at once.
++	e2, err := NewEngine(destSpec(t, 3))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := e2.EnqueueSpawn(SpawnDirective{
++		RequestID: "clear", Origin: "B0", TypeName: "car", OffsetM: 250,
++	}); err != nil {
++		t.Fatal(err)
++	}
++	e2.Step()
++	if len(e2.Vehicles()) != 1 || e2.PendingSpawns() != 0 {
++		t.Fatalf("clear lane: vehicles=%d pending=%d, want 1 and 0", len(e2.Vehicles()), e2.PendingSpawns())
++	}
++}
++
++// TestKeyframeDirectiveRoundTrip: a queued directive carrying ADR-0021
++// fields survives MarshalState/RestoreState, and a queue WITHOUT them still
++// writes the v3 encoding — the version gate is what keeps portal-only
++// recordings byte-identical.
++func TestKeyframeDirectiveRoundTrip(t *testing.T) {
++	e, err := NewEngine(destSpec(t, 10))
++	if err != nil {
++		t.Fatal(err)
++	}
++	// Far-future earliest tick keeps both entries parked IN the queue.
++	if err := e.EnqueueSpawn(SpawnDirective{
++		RequestID: "kf", Origin: "B0", TypeName: "truck",
++		Destination: "A0", OffsetM: 123.5, EarliestTick: 1 << 40,
++	}); err != nil {
++		t.Fatal(err)
++	}
++	e.Step()
++	if e.PendingSpawns() != 1 {
++		t.Fatalf("pending=%d, want 1", e.PendingSpawns())
++	}
++	blob, err := e.MarshalState()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := keyframeVersionOf(blob); got != keyframeVersion {
++		t.Errorf("keyframe version %d, want %d for a queue using ADR-0021 fields", got, keyframeVersion)
++	}
++	back, err := RestoreState(destSpec(t, 10), blob)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if back.PendingSpawns() != 1 {
++		t.Fatalf("restored pending=%d, want 1", back.PendingSpawns())
++	}
++	got := back.dirQueue[0]
++	if got.Destination != "A0" || got.OffsetM != 123.5 || got.Origin != "B0" || got.RequestID != "kf" {
++		t.Errorf("restored directive = %+v, want destination A0 / offset 123.5 / origin B0", got.SpawnDirective)
++	}
++
++	// A queue of plain portal spawns must still marshal as v3.
++	e2, err := NewEngine(destSpec(t, 10))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := e2.EnqueueSpawn(SpawnDirective{
++		RequestID: "plain", Origin: "A0", TypeName: "car", EarliestTick: 1 << 40,
++	}); err != nil {
++		t.Fatal(err)
++	}
++	e2.Step()
++	blob2, err := e2.MarshalState()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := keyframeVersionOf(blob2); got != keyframeQueueVersion {
++		t.Errorf("keyframe version %d for an ADR-0021-free queue, want %d", got, keyframeQueueVersion)
++	}
++}
++
++// keyframeVersionOf reads the version field out of a TSKF header (magic u32
++// then version u16, little-endian).
++func keyframeVersionOf(blob []byte) int {
++	if len(blob) < 6 {
++		return -1
++	}
++	return int(blob[4]) | int(blob[5])<<8
++}
++
++// TestInteriorInjectionMetricBooking: the metric kernel must book an
++// interior injection's FIRST tick as the distance actually travelled from
++// the injection point — not the whole lane prefix — and must not count it
++// as a dropped crossing. Booking v.S would credit every resident with the
++// entire block they never drove (on a 144-flow scenario that is a large,
++// silent VMT inflation) and would make dropped_crossings fire once per
++// injected vehicle.
++func TestInteriorInjectionMetricBooking(t *testing.T) {
++	e, err := NewEngine(destSpec(t, 3))
++	if err != nil {
++		t.Fatal(err)
++	}
++	k, err := NewKernel(e, KernelConfig{Trips: true})
++	if err != nil {
++		t.Fatal(err)
++	}
++	const offset = 250.0
++	if err := e.EnqueueSpawn(SpawnDirective{
++		RequestID: "m", Origin: "B0", TypeName: "car", OffsetM: offset,
++	}); err != nil {
++		t.Fatal(err)
++	}
++	e.Step()
++	k.Observe(e)
++
++	vs := e.Vehicles()
++	if len(vs) != 1 {
++		t.Fatalf("vehicles = %d, want 1", len(vs))
++	}
++	if got := e.InteriorInjections(); len(got) != 1 || got[0].ID != vs[0].ID || got[0].S != offset {
++		t.Fatalf("InteriorInjections() = %+v, want one entry at S=%v", got, offset)
++	}
++	tot := k.Totals()
++	if tot.DroppedCrossings != 0 {
++		t.Errorf("dropped_crossings = %d, want 0 — an interior injection is not an unattributable crossing",
++			tot.DroppedCrossings)
++	}
++	// One tick of travel from the injection point, never the 250 m prefix.
++	if tot.VMT >= offset {
++		t.Errorf("VMT = %.2f m after one tick — the lane prefix was booked as travel (offset %.0f m)", tot.VMT, offset)
++	}
++	if tot.VMT <= 0 || tot.VMT > 5 {
++		t.Errorf("VMT = %.4f m, want one tick of travel (≤ ~4.3 m at dt=0.1)", tot.VMT)
++	}
++
++	// A PORTAL injection is unchanged: it enters at S=0, so its first tick
++	// books the whole (small) distance it really moved.
++	e2, err := NewEngine(destSpec(t, 3))
++	if err != nil {
++		t.Fatal(err)
++	}
++	k2, err := NewKernel(e2, KernelConfig{Trips: true})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := e2.EnqueueSpawn(SpawnDirective{RequestID: "p", Origin: "A0", TypeName: "car"}); err != nil {
++		t.Fatal(err)
++	}
++	e2.Step()
++	k2.Observe(e2)
++	if got := e2.InteriorInjections(); len(got) != 0 {
++		t.Errorf("portal injection listed as interior: %+v", got)
++	}
++	if t2 := k2.Totals(); t2.VMT != e2.Vehicles()[0].S {
++		t.Errorf("portal first-tick VMT = %.4f, want the vehicle's S %.4f", t2.VMT, e2.Vehicles()[0].S)
++	}
++}
++
++// TestRouteLatDepthTable pins the lateral-depth gradient (ADR-0021) on the
++// lanedrop network toward B0. The topology is the exact configuration the
++// original one-lane recovery rule could not solve: A0→B0 is the only way to
++// the destination, A1→B1 dead-ends at an exit that is not B0, and A2 is the
++// dropped lane with no successor at all — so A2's ONLY neighbour, A1, is
++// itself off-route.
++func TestRouteLatDepthTable(t *testing.T) {
++	e, err := NewEngine(destSpec(t, 1))
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, tc := range []struct {
++		lane string
++		want int32
++		why  string
++	}{
++		{"B0", 0, "the destination itself"},
++		{"A0", 0, "drives straight into B0"},
++		{"B1", 1, "one hop right onto B0"},
++		{"A1", 1, "one hop right onto A0"},
++		{"A2", 2, "two hops right: A2→A1→A0"},
++	} {
++		got := e.routeLatDist(e.Net.LaneByID(tc.lane), "B0")
++		if got != tc.want {
++			t.Errorf("latDepth[%s] toward B0 = %d, want %d (%s)", tc.lane, got, tc.want, tc.why)
++		}
++	}
++	// An unknown destination reads as depth 0 everywhere, so the guardrail
++	// degrades to pre-ADR-0021 behavior instead of pinning vehicles in lane.
++	if got := e.routeLatDist(e.Net.LaneByID("A2"), "nosuchlane"); got != 0 {
++		t.Errorf("latDepth toward an unknown destination = %d, want 0", got)
++	}
++	// A destination unreachable at any depth is −1, not a large number: the
++	// guardrail must let those vehicles hop freely.
++	if got := e.routeLatDist(e.Net.LaneByID("B0"), "A2"); got != -1 {
++		t.Errorf("latDepth[B0] toward the unreachable A2 = %d, want -1", got)
++	}
++}
++
++// TestRouteRecoveryCrossesTwoLanes: a vehicle born TWO lane changes away
++// from its route walks back down the depth gradient and completes the trip.
++//
++// This is the ADR-0021 open item closed. Under the one-lane rule recovery
++// required a neighbour that was ITSELF route-reachable; A2's only neighbour
++// A1 is not, so the vehicle never recovered, rode A2 to its EndWall and
++// never left the world. Reaching B0 at all is therefore the discriminator,
++// not just a nicety.
++func TestRouteRecoveryCrossesTwoLanes(t *testing.T) {
++	const ticks = 3000
++	e, err := NewEngine(destSpec(t, ticks))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := e.EnqueueSpawn(SpawnDirective{
++		RequestID: "rec", Origin: "A2", TypeName: "car", Destination: "B0",
++	}); err != nil {
++		t.Fatalf("EnqueueSpawn: %v", err)
++	}
++	var visited []string
++	seen, gone := false, false
++	for e.Tick < ticks && !gone {
++		e.Step()
++		vs := e.Vehicles()
++		if len(vs) == 0 {
++			gone = seen
++			continue
++		}
++		seen = true
++		if len(visited) == 0 || visited[len(visited)-1] != vs[0].Lane.ID {
++			visited = append(visited, vs[0].Lane.ID)
++		}
++	}
++	if !seen {
++		t.Fatal("directive never injected")
++	}
++	if !gone {
++		t.Fatalf("vehicle never left the world; lanes visited: %v "+
++			"(stranded on the dropped lane is the pre-fix behavior)", visited)
++	}
++	want := []string{"A2", "A1", "A0", "B0"}
++	if len(visited) != len(want) {
++		t.Fatalf("lanes visited = %v, want %v", visited, want)
++	}
++	for i := range want {
++		if visited[i] != want[i] {
++			t.Fatalf("lanes visited = %v, want %v", visited, want)
++		}
++	}
++	if e.Stats.LaneChanges != 2 {
++		t.Errorf("lanechanges = %d, want exactly 2 (one per depth step, no drift)", e.Stats.LaneChanges)
++	}
++	if e.Stats.WallHits != 0 {
++		t.Errorf("wallhits = %d, want 0 — the vehicle must never reach A2's end wall", e.Stats.WallHits)
++	}
++	// B0 is an exit, so the trip ends through the unchanged exit path.
++	if e.Stats.Despawned != 1 || e.Stats.Arrived != 0 {
++		t.Errorf("despawned=%d arrived=%d, want 1 and 0 (an exit destination is an exit despawn)",
++			e.Stats.Despawned, e.Stats.Arrived)
++	}
++}
++
++// TestRouteHopVetoUsesGradient: the guardrail denies a hop that INCREASES
++// lateral depth and permits one that does not — including a hop between two
++// lanes that are equally far off-route, which the old leave-the-depth-0-set
++// rule had nothing to say about.
++func TestRouteHopVetoUsesGradient(t *testing.T) {
++	e, err := NewEngine(destSpec(t, 1))
++	if err != nil {
++		t.Fatal(err)
++	}
++	v := &Vehicle{ID: 999, Type: &Car, Route: "B0"}
++	for _, tc := range []struct {
++		lane string
++		dir  int
++		want bool
++		why  string
++	}{
++		{"A0", 1, false, "A0 (depth 0) → A1 (depth 1) leaves the route"},
++		{"A1", -1, true, "A1 (depth 1) → A0 (depth 0) descends"},
++		{"A1", 1, false, "A1 (depth 1) → A2 (depth 2) climbs"},
++		{"A2", -1, true, "A2 (depth 2) → A1 (depth 1) descends"},
++		{"A0", -1, true, "no right neighbour: execLaneChange no-ops anyway"},
++	} {
++		v.Lane = e.Net.LaneByID(tc.lane)
++		if got := e.routeHopOK(v, tc.dir); got != tc.want {
++			t.Errorf("routeHopOK(%s, %+d) = %v, want %v (%s)", tc.lane, tc.dir, got, tc.want, tc.why)
++		}
++	}
++	// An unrouted vehicle is never vetoed — the pre-ADR-0021 path, which the
++	// CRC-pinned fixtures depend on being untouched.
++	u := &Vehicle{ID: 1000, Type: &Car, Lane: e.Net.LaneByID("A0")}
++	if !e.routeHopOK(u, 1) {
++		t.Error("an unrouted vehicle was vetoed")
++	}
++}
+diff --git a/engine/natsio/demand/sampler_test.go b/engine/natsio/demand/sampler_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..988758237343e0aefb326a5aecec9bec10c1bfee
+--- /dev/null
++++ b/engine/natsio/demand/sampler_test.go
+@@ -0,0 +1,73 @@
++package demand
++
++import (
++	"testing"
++
++	"traffic-sim/engine"
++	"traffic-sim/engine/scenario"
++)
++
++// sampler_test.go — the determinism property ADR-0021 has to preserve: a
++// flow that declares no destinations must consume EXACTLY the draws it
++// consumed before the destination axis existed, or every pinned demand
++// realization moves.
++
++// TestDestinationDrawIsAppendOnly: the arrival program of a
++// destination-free flow is unchanged by the ADR-0021 code path, and a flow
++// WITH destinations keeps the same arrival times (the destination draw
++// comes after the gap and type draws, so it cannot perturb them).
++func TestDestinationDrawIsAppendOnly(t *testing.T) {
++	base := scenario.Flow{
++		Origin: "a_0", VehPerH: 900, Spacing: "poisson",
++		VTypes: map[string]float64{"car": 0.9, "truck": 0.1},
++	}
++	routed := base
++	routed.Destinations = map[string]float64{"b_0": 0.75, "c_0": 0.25}
++
++	plainS := newFlowSampler(base, 42, 0)
++	routedS := newFlowSampler(routed, 42, 0)
++	for i := range 200 {
++		atP, vtP, destP, okP := plainS.next(0.1)
++		atR, vtR, destR, okR := routedS.next(0.1)
++		if okP != okR || atP != atR || vtP != vtR {
++			t.Fatalf("draw %d diverged: plain=(%v,%q,%v) routed=(%v,%q,%v) — the destination draw perturbed the arrival program",
++				i, atP, vtP, okP, atR, vtR, okR)
++		}
++		if destP != "" {
++			t.Fatalf("draw %d: destination-free flow produced %q", i, destP)
++		}
++		if destR != "b_0" && destR != "c_0" {
++			t.Fatalf("draw %d: routed flow produced destination %q", i, destR)
++		}
++	}
++}
++
++// TestDestinationDrawDistribution: the weighted draw honors the weights and
++// walks the SORTED key list, so it cannot depend on Go map order.
++func TestDestinationDrawDistribution(t *testing.T) {
++	weights := map[string]float64{"b_0": 3, "c_0": 1}
++	counts := map[string]int{}
++	for i := range 4000 {
++		st := engine.DeriveStream(7, uint64(i))
++		counts[pickWeighted(st, weights)]++
++	}
++	total := counts["b_0"] + counts["c_0"]
++	if total != 4000 {
++		t.Fatalf("draws produced %d in-set results out of 4000: %v", total, counts)
++	}
++	// 3:1 weights → b_0 near 75%. A wide band: this pins the weighting, not
++	// the RNG's exact realization.
++	if share := float64(counts["b_0"]) / float64(total); share < 0.72 || share > 0.78 {
++		t.Errorf("b_0 share %.3f, want ≈0.75 for 3:1 weights (%v)", share, counts)
++	}
++	// An empty distribution draws nothing at all — and consumes no draw,
++	// which is what keeps destination-free flows bit-identical.
++	st := engine.DeriveStream(7, 1)
++	before := st.Draws()
++	if got := pickWeighted(st, nil); got != "" {
++		t.Errorf("empty distribution returned %q, want \"\"", got)
++	}
++	if st.Draws() != before {
++		t.Errorf("empty distribution consumed %d draws, want 0", st.Draws()-before)
++	}
++}
+diff --git a/engine/natsio/destination_verb_test.go b/engine/natsio/destination_verb_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..bebc45336ff586cb5683d6bee151ef057de13f10
+--- /dev/null
++++ b/engine/natsio/destination_verb_test.go
+@@ -0,0 +1,153 @@
++package natsio
++
++import (
++	"encoding/json"
++	"testing"
++	"time"
++
++	"github.com/nats-io/nats.go"
++	"traffic-sim/engine"
++)
++
++// destination_verb_test.go — ADR-0021 on the wire: a spawn verb carrying a
++// route destination and an interior injection offset must round-trip
++// through the record plane and replay bit-identically. This is the
++// contract-sacred property — the fields are additive, so the ONLY way they
++// can break an existing recording is by moving the replay CRC.
++
++func sendRouted(nc *nats.Conn, run, ctl, id, origin, vtype, dest string, offset float64) VerbReply {
++	req, _ := json.Marshal(VerbRequest{
++		Verb: "spawn", RequestID: id, Origin: origin, VType: vtype,
++		Destination: dest, OffsetM: offset,
++	})
++	msg, err := nc.Request(SubjectCtlVerb(run, ctl), req, 2*time.Second)
++	if err != nil {
++		return VerbReply{Reason: "no reply: " + err.Error()}
++	}
++	var rep VerbReply
++	if err := json.Unmarshal(msg.Data, &rep); err != nil {
++		return VerbReply{Reason: "bad reply: " + err.Error()}
++	}
++	return rep
++}
++
++// TestRoutedVerbRecordReplay: destination + interior-offset verbs are
++// recorded, drive arrivals, and replay to the identical CRC.
++func TestRoutedVerbRecordReplay(t *testing.T) {
++	srv := NewTestServer(t)
++	nc, js := srv.JetStream(t)
++	spec, err := engine.DefaultSpec("lanedrop", 300, 11)
++	if err != nil {
++		t.Fatal(err)
++	}
++	spec.Scen.Types = []*engine.VehicleType{&engine.Car, &engine.Truck}
++	// Live runs are holdlast by contract (ADR-0008 §6 — the idm harness
++	// exists only where no bus is attached). With no drive controller the
++	// injected vehicles coast at their entry speed, which is enough to
++	// carry them to a destination; the pause gate never arms because no
++	// controller ever claims.
++	run := "dr1"
++
++	replies := make(chan VerbReply, 8)
++	dirConn := srv.Connect(t)
++	go func() {
++		ctl := directorClient(t, dirConn, run, []string{"director"}, 0)
++		plan := map[uint64]bool{}
++		_, err := dirConn.Subscribe(SubjectStateSnap(run), func(m *nats.Msg) {
++			f, err := ParseFrame(m.Data)
++			if err != nil || plan[f.Tick] {
++				return
++			}
++			var rep VerbReply
++			switch f.Tick {
++			case 5: // portal origin, INTERIOR destination → arrival
++				rep = sendRouted(dirConn, run, ctl, "d1", "A0", "car", "A0", 0)
++			case 15: // INTERIOR origin (offset opt-in), exit destination
++				rep = sendRouted(dirConn, run, ctl, "d2", "B0", "truck", "B1", 220)
++			case 25: // interior origin, no destination
++				rep = sendRouted(dirConn, run, ctl, "d3", "B1", "car", "", 300)
++			case 35: // rejected: offset past the lane end
++				rep = sendRouted(dirConn, run, ctl, "d4", "B0", "car", "", 99999)
++			case 45: // rejected: unknown destination lane
++				rep = sendRouted(dirConn, run, ctl, "d5", "A1", "car", "Z9", 0)
++			default:
++				return
++			}
++			plan[f.Tick] = true
++			replies <- rep
++		})
++		if err != nil {
++			t.Errorf("director subscribe: %v", err)
++		}
++	}()
++
++	lr, err := RunLive(nc, js, run, spec, RecorderConfig{KeyframeEvery: 50, CRCEvery: 1},
++		ContractConfig{PaceFloor: time.Millisecond})
++	if err != nil {
++		t.Fatalf("RunLive: %v", err)
++	}
++	e := lr.Engine
++	close(replies)
++
++	var accepted, rejected int
++	for r := range replies {
++		if r.Accepted {
++			accepted++
++		} else {
++			rejected++
++		}
++	}
++	if accepted != 3 || rejected != 2 {
++		t.Fatalf("verb outcomes: accepted=%d rejected=%d (want 3/2)", accepted, rejected)
++	}
++	if len(e.SpawnLog) != 3 || lr.Recorder.VerbsWritten != 3 {
++		t.Fatalf("spawn log %d, verbs written %d — want 3/3", len(e.SpawnLog), lr.Recorder.VerbsWritten)
++	}
++	// The recorded directives must carry the ADR-0021 fields — a verb whose
++	// destination is dropped on the record plane replays as a DIFFERENT run.
++	var sawDest, sawOffset bool
++	for _, s := range e.SpawnLog {
++		if s.Destination != "" {
++			sawDest = true
++		}
++		if s.OffsetM > 0 {
++			sawOffset = true
++		}
++	}
++	if !sawDest || !sawOffset {
++		t.Fatalf("spawn log lost the ADR-0021 fields: dest=%v offset=%v", sawDest, sawOffset)
++	}
++	if e.Stats.Arrived == 0 {
++		t.Error("no arrival recorded — the interior destination never ended a trip")
++	}
++
++	// --- The acceptance test: replay reproduces the run bit-identically.
++	meta, err := lr.Registry.Meta(run)
++	if err != nil {
++		t.Fatalf("registry meta: %v", err)
++	}
++	sawVerbs := false
++	for _, target := range []uint64{49, 175, 299, 300} {
++		rep, err := ReplayFromStream(js, meta, target)
++		if err != nil {
++			t.Fatalf("ReplayFromStream(%d): %v", target, err)
++		}
++		if rep.FinalCRC != e.CRCs[target-1] {
++			t.Fatalf("target %d: replay crc %016x, live %016x", target, rep.FinalCRC, e.CRCs[target-1])
++		}
++		if rep.VerbsReplayed > 0 {
++			sawVerbs = true
++		}
++	}
++	if !sawVerbs {
++		t.Fatal("no replay target re-enqueued a verb — the routed-verb path is untested")
++	}
++
++	rec, err := MaterializeRunRecord(js, meta)
++	if err != nil {
++		t.Fatalf("MaterializeRunRecord: %v", err)
++	}
++	if _, err := engine.Replay(rec.Log); err != nil {
++		t.Fatalf("in-memory replay of the record: %v", err)
++	}
++}
+diff --git a/engine/scenario/destination_test.go b/engine/scenario/destination_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..699f8f161b4d867a429371f9e2c0f603b3533d39
+--- /dev/null
++++ b/engine/scenario/destination_test.go
+@@ -0,0 +1,132 @@
++package scenario
++
++import (
++	"strings"
++	"testing"
++)
++
++// destination_test.go — ADR-0021 scenario grammar: weighted flow
++// destinations and the interior-origin offset opt-in. The strictness is the
++// point: a mistyped lane id must fail at LOAD, never at spawn time.
++
++const odDemand = `format_version: 1
++flows:
++  - id: portal-inbound
++    origin: a_0
++    veh_per_h: 600
++    spacing: poisson
++    destinations:
++      b_0: 0.75
++      a_0: 0.25
++  - id: garage
++    origin: b_0
++    offset_m: 120
++    veh_per_h: 30
++    spacing: constant
++    destinations:
++      b_0: 1
++`
++
++// TestODDemandLoads: the full ADR-0021 grammar round-trips through load,
++// including an interior origin on a lane that is NOT a network portal.
++func TestODDemandLoads(t *testing.T) {
++	dir := t.TempDir()
++	writeNet(t, dir)
++	writeFile(t, dir, ManifestFile, goodManifest)
++	writeFile(t, dir, "demand/main.yaml", odDemand)
++	s, err := Load(dir)
++	if err != nil {
++		t.Fatalf("Load: %v", err)
++	}
++	if len(s.Demands) != 1 || len(s.Demands[0].Flows) != 2 {
++		t.Fatalf("loaded %d demand files", len(s.Demands))
++	}
++	portal, garage := s.Demands[0].Flows[0], s.Demands[0].Flows[1]
++	if got := portal.Destinations["b_0"]; got != 0.75 {
++		t.Errorf("portal destination weight b_0 = %v, want 0.75", got)
++	}
++	if garage.OffsetM != 120 {
++		t.Errorf("garage offset_m = %v, want 120", garage.OffsetM)
++	}
++	if garage.Origin != "b_0" {
++		t.Errorf("garage origin = %q, want b_0 (a non-portal lane, admitted by the offset)", garage.Origin)
++	}
++}
++
++// TestODDemandValidation pins the reject reasons.
++func TestODDemandValidation(t *testing.T) {
++	cases := []struct {
++		name   string
++		demand string
++		want   string
++	}{
++		{"unknown destination lane",
++			strings.Replace(odDemand, "b_0: 0.75", "nope_0: 0.75", 1),
++			"is not a lane of the network"},
++		{"zero destination weight",
++			strings.Replace(odDemand, "b_0: 0.75", "b_0: 0", 1),
++			"weight must be > 0"},
++		{"negative destination weight",
++			strings.Replace(odDemand, "b_0: 0.75", "b_0: -1", 1),
++			"weight must be > 0"},
++		{"offset past the lane end",
++			strings.Replace(odDemand, "offset_m: 120", "offset_m: 9000", 1),
++			"past the end of the"},
++		{"negative offset",
++			strings.Replace(odDemand, "offset_m: 120", "offset_m: -5", 1),
++			"offset_m must be ≥ 0"},
++		{"interior origin without an offset",
++			strings.Replace(odDemand, "    offset_m: 120\n", "", 1),
++			"interior injection needs an explicit offset_m"},
++		{"interior origin on an unknown lane",
++			strings.Replace(odDemand, "origin: b_0\n    offset_m: 120", "origin: ghost_0\n    offset_m: 120", 1),
++			"not a lane of the network"},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			dir := t.TempDir()
++			writeNet(t, dir)
++			writeFile(t, dir, ManifestFile, goodManifest)
++			writeFile(t, dir, "demand/main.yaml", tc.demand)
++			_, err := Load(dir)
++			if err == nil || !strings.Contains(err.Error(), tc.want) {
++				t.Fatalf("err = %v, want substring %q", err, tc.want)
++			}
++		})
++	}
++}
++
++// TestODDemandHashMoves: adding a destination distribution is CONTENT, so
++// it must move the scenario's content hash — otherwise two materially
++// different demand programs would share a run identity (ADR-0012 §6).
++func TestODDemandHashMoves(t *testing.T) {
++	hashOf := func(demand string) string {
++		t.Helper()
++		dir := t.TempDir()
++		writeNet(t, dir)
++		writeFile(t, dir, ManifestFile, goodManifest)
++		writeFile(t, dir, "demand/main.yaml", demand)
++		s, err := Load(dir)
++		if err != nil {
++			t.Fatalf("Load: %v", err)
++		}
++		return s.Hash()
++	}
++	plain := `format_version: 1
++flows:
++  - origin: a_0
++    veh_per_h: 600
++    spacing: poisson
++`
++	routed := `format_version: 1
++flows:
++  - origin: a_0
++    veh_per_h: 600
++    spacing: poisson
++    destinations:
++      b_0: 1
++`
++	if hashOf(plain) == hashOf(routed) {
++		t.Fatal("destinations did not move the content hash — two different demand programs share a run identity")
++	}
++}
+diff --git a/scripts/osm-urban-us.typ.xml b/scripts/osm-urban-us.typ.xml
+new file mode 100644
+index 0000000000000000000000000000000000000000..257558ce02cb6dc2799471acaad82cf45b18430f
+--- /dev/null
++++ b/scripts/osm-urban-us.typ.xml
+@@ -0,0 +1,92 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!-- osm-urban-us.typ.xml — netconvert type overrides for US URBAN imports.
++     See ADR-0022 (docs/kb/decisions/ADR-0022-us-urban-speed-typemap.md).
++
++     netconvert's built-in OSM typemap is German-derived: highway.secondary,
++     primary and trunk all default to 27.78 m/s (100 km/h). Only 19% of
++     chi-loop's secondary ways carry a maxspeed tag, so 12,945 of its 15,975
++     secondary lanes compiled at 62 mph — Michigan Avenue, Wells, Wabash and
++     State Street all simulated as autobahn. Measured across the tree, 25 US
++     networks were affected; worst was houston-lean at 51.8% of lanes sitting
++     at exactly 100 km/h.
++
++     The unposted defaults here are the STATUTORY urban-district limit —
++     30 mph in Illinois, Texas, Georgia and Florida — not fitted values.
++     Known approximation: California's business/residence default is 25 mph
++     (CVC 22352), so SF/LA imports run 5 mph fast on unposted streets. Fork
++     a per-state map if that ever needs to be exact.
++
++     ONLY the speed attribute differs from the stock typemap: numLanes,
++     priority, oneway, width, allow/disallow and discard are copied
++     verbatim, and no type id is added or dropped. That keeps the diff
++     auditable — it does NOT mean the import is speed-only. netconvert
++     derives right-of-way and signal timing FROM speed:
++
++       * This file MUST be paired with netconvert's
++         "junctions.right-before-left.speed-threshold" option set to 0.
++         (Spelled without its leading dashes here because an XML comment
++         may not contain a double hyphen.) 30 mph = 13.41 m/s is 0.2 m/s
++         below netconvert's default rbl threshold of 13.6111, so without
++         that flag 1,218 chi-loop junctions silently retype from priority
++         to yield-to-the-right. import-city.sh passes both together; do
++         not use this file without it.
++       * Signal phase durations shift (1,936 of chi-loop's 2,217 programs).
++         Yellow tracks approach speed — 3 s at 30 mph instead of 6 s at
++         100 km/h — which is correct, but it means A/B recordings are not
++         comparable at signal-timing level.
++
++     Lane-level topology IS preserved: the chi-loop A/B has identical
++     external lane id sets, origins, exits and signal-program counts.
++     An OSM maxspeed tag still wins over the default.
++
++     NOT for non-US imports — de-roundabouts is German and wants the stock
++     map. Region is a parameter here, not a default.
++
++     Generated from the stock osmNetconvert.typ.xml — regenerate rather
++     than hand-edit if SUMO's typemap changes.
++-->
++<types xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/types_file.xsd">
++    <type id="highway.motorway"       numLanes="2" speed="24.59" priority="14" oneway="true"  disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship pedestrian bicycle moped"/>
++    <type id="highway.trunk"          numLanes="2" speed="20.12" priority="13" oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship pedestrian bicycle"/>
++    <type id="highway.primary"        numLanes="2" speed="13.41" priority="12" oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
++    <type id="highway.secondary"      numLanes="1" speed="13.41" priority="11" oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
++    <type id="highway.tertiary"       numLanes="1" speed="13.41" priority="10" oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
++    <type id="highway.motorway_link"  numLanes="1" speed="17.88" priority="9"  oneway="true"  disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship pedestrian bicycle moped"/>
++    <type id="highway.trunk_link"     numLanes="1" speed="15.65" priority="8"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship pedestrian bicycle"/>
++    <type id="highway.primary_link"   numLanes="1" speed="11.18" priority="7"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
++    <type id="highway.secondary_link" numLanes="1" speed="11.18" priority="6"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
++    <type id="highway.tertiary_link"  numLanes="1" speed="11.18" priority="5"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
++    <type id="highway.unclassified"   numLanes="1" speed="11.18" priority="4"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
++    <type id="highway.residential"    numLanes="1" speed="11.18" priority="3"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
++    <type id="highway.living_street"  numLanes="1" speed="4.47"  priority="2"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
++    <type id="highway.unsurfaced"     numLanes="1" speed="8.33"  priority="1"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
++    <type id="highway.service"        numLanes="1" speed="6.71"  priority="1"  oneway="false" allow="delivery pedestrian bicycle"/>
++    <type id="highway.service|psv"    numLanes="1" speed="13.89" priority="1"  oneway="false" allow="delivery pedestrian bicycle bus"/>
++    <type id="highway.service|bus"    numLanes="1" speed="13.89" priority="1"  oneway="false" allow="delivery pedestrian bicycle bus"/>
++
++    <!-- everything which serves mainly pedestrians is oneway because all current pedestrian models do not care about direction -->
++    <type id="highway.track"          numLanes="1" speed="5.56"  priority="1"  oneway="false"           allow="motorcycle moped pedestrian bicycle"/>
++    <type id="highway.footway"        numLanes="1" speed="2.78"  priority="1"  oneway="true"  width="2" allow="pedestrian"/>
++    <type id="highway.pedestrian"     numLanes="1" speed="2.78"  priority="1"  oneway="true"  width="2" allow="pedestrian"/>
++    <type id="highway.path"           numLanes="1" speed="5.56"  priority="1"  oneway="false" width="2" allow="pedestrian bicycle"/>
++    <type id="highway.bridleway"      numLanes="1" speed="2.78"  priority="1"  oneway="true"  width="2" allow="pedestrian"/>
++    <type id="highway.cycleway"       numLanes="1" speed="5.56"  priority="1"  oneway="false" width="2" allow="bicycle"/>
++    <type id="highway.step"           numLanes="1" speed="1.39"  priority="1"  oneway="true"  width="2" allow="pedestrian"/>
++    <type id="highway.steps"          numLanes="1" speed="1.39"  priority="1"  oneway="true"  width="2" allow="pedestrian"/>
++    <type id="highway.stairs"         numLanes="1" speed="1.39"  priority="1"  oneway="true"  width="2" allow="pedestrian"/>
++
++    <type id="highway.bus_guideway"   numLanes="1" speed="27.78" priority="1"  oneway="true"  allow="bus"/>
++    <type id="highway.busway"         numLanes="1" speed="27.78" priority="1"  oneway="true"  allow="bus"/>
++    <type id="highway.raceway"        numLanes="2" speed="83.33" priority="15" oneway="false" allow="vip"/>
++    <type id="highway.ford"           numLanes="1" speed="2.78"  priority="1"  oneway="false" allow="army"/>
++
++    <type id="railway.preserved"      numLanes="1" speed="27.78" priority="16" oneway="true"  allow="rail"/>
++    <type id="railway.tram"           numLanes="1" speed="13.89" priority="17" oneway="true"  allow="tram"/>
++    <type id="railway.subway"         numLanes="1" speed="27.78" priority="18" oneway="true"  allow="subway"/>
++    <type id="railway.light_rail"     numLanes="1" speed="27.78" priority="19" oneway="true"  allow="rail_urban"/>
++    <type id="railway.rail"           numLanes="1" speed="44.44" priority="20" oneway="true"  allow="rail"/>
++    <type id="railway.highspeed"      numLanes="1" speed="69.44" priority="21" oneway="true"  allow="rail_fast rail rail_electric"/>
++
++    <type id="highway.construction"   numLanes="1" speed="13.89" priority="4"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram tram drone aircraft scooter container wheelchair subway cable_car ship" discard="true"/>
++    <type id="railway.construction"   numLanes="1" speed="13.89" priority="20"  oneway="true" allow="rail" discard="true"/>
++</types>
+diff --git a/scripts/chicago/buildings.py b/scripts/chicago/buildings.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d49289a4f4efc512228494a47c49876b5f68c8f6
+--- /dev/null
++++ b/scripts/chicago/buildings.py
+@@ -0,0 +1,615 @@
++#!/usr/bin/env python3
++"""Extract building footprints for a Chicago zone and snap them to the network.
++
++Two artifacts from one pass, for two consumers:
++
++  (a) --out-geojson  WGS84 polygons for the viz overlay (demosrv -overlaydir,
++      served at /overlay/buildings.geojson). Includes `other` buildings —
++      they are the urban texture the towers sit in.
++  (b) --out-index    the machine-readable building -> lane index the demand
++      generator consumes to place trip origins (residential) and trip
++      destinations (workplace) on the road network. Contains ONLY
++      demand-relevant buildings (residential + workplace); `other` is
++      rendering context, never demand.
++
++Usage:
++  buildings.py --pbf illinois.osm.pbf --zones zones.geojson --zone loop \
++      --network data/networks/chi-loop/chi-loop.json \
++      --road-osm data/networks/chi-loop/loop.osm \
++      --out-geojson data/networks/chicago/buildings.geojson \
++      --out-index   data/networks/chi-loop/buildings.json
++
++Requires: pyosmium, shapely, pyproj (tools/sumo-venv).
++
++--------------------------------------------------------------------------
++CLASSIFICATION (kind)
++--------------------------------------------------------------------------
++`residential` and `workplace` are the demand-relevant kinds; everything else
++is `other` and is excluded from the index and from every demand-relevant
++total. The two lists below are the OSM `building=*` values that carry an
++unambiguous trip-generation signal:
++
++  residential: apartments, residential, dormitory, house, terrace,
++               detached, semidetached_house, bungalow, houseboat
++  workplace:   office, commercial, retail, hotel, government, civic,
++               industrial, university, hospital, public, school, college,
++               kindergarten, warehouse, supermarket, train_station,
++               fire_station, museum, exhibition_hall, manufacture
++
++`building=yes` is 71% of the footprints in chi-loop (30,804 of 43,281) and
++carries NO signal on its own, so it defaults to `other`. It is promoted only
++when another tag disambiguates it:
++
++  -> workplace when the way also carries office=*, shop=*, healthcare=*,
++     tourism in {hotel,hostel,motel,guest_house}, or amenity in the
++     WORKPLACE_AMENITIES set below (restaurants, schools, clinics, civic
++     buildings — places people travel TO for a sustained stay).
++  -> workplace when building:levels >= YES_TOWER_LEVELS (8) and nothing else
++     disambiguates. Rationale: an 8+-storey untagged structure inside this
++     zone is a real downtown tower, and dropping it from the demand model
++     entirely is a worse error than filing some residential towers under
++     workplace. In chi-loop this promotes 89 buildings; the count is
++     reported so the call can be revisited with better data.
++  -> NEVER promoted to residential: nothing in the chi-loop data
++     distinguishes an untagged 2-flat from an untagged storefront (0 of the
++     30,804 building=yes ways carry a `residential=*` or `building:use=*`
++     tag). This is a KNOWN under-count of residential mass — Chicago's
++     ubiquitous 2- and 3-flats are overwhelmingly tagged `building=yes` with
++     building:levels 2-3. Treating all of them as residential would be a
++     guess; treating them as `other` is merely conservative.
++
++`building=no` and `building:part=*` without a `building=*` tag are dropped
++outright (the latter are 3D sub-volumes of a footprint that is already
++mapped, and counting them would double-count floor area).
++
++--------------------------------------------------------------------------
++LEVELS
++--------------------------------------------------------------------------
++  1. `building:levels`, if parseable and > 0            -> "tag"
++  2. else `height` (m) / STOREY_M (3.5), rounded, min 1 -> "height"
++  3. else a per-kind default                            -> "default"
++
++Defaults: residential 3, workplace 3, other 1. Three is the modal tagged
++value for both kinds in this zone (Chicago's 3-flat / 3-storey storefront);
++one is right for the garages, roofs and sheds that dominate `other`.
++
++Level data is patchy and sometimes plainly wrong — verified in chi-loop:
++Willis Tower (108 storeys) carries neither tag and takes the default 3;
++Lake Point Tower (197 m) is tagged height=12; Marina City is tagged
++height=45 (actual 179 m). floor_area_m2 is therefore a RANKING signal, not
++a survey. No attempt is made to repair heights from an external source.
++
++floor_area_m2 = footprint_m2 * levels, footprint measured in UTM 16N metres.
++
++--------------------------------------------------------------------------
++ACCESS-LANE SNAPPING
++--------------------------------------------------------------------------
++Each demand-relevant building is snapped to the nearest ELIGIBLE lane,
++measured from the building FOOTPRINT (not its centroid — for a footprint the
++size of the Merchandise Mart the centroid can be 90 m from every street and
++would pick the wrong frontage).
++
++Eligibility, in order of how much it matters:
++  1. NOT a motorway / motorway_link / trunk / trunk_link. A tower does not
++     have a driveway onto the Kennedy. Without this filter the whole demand
++     model is nonsense.
++  2. NOT `internal` (the network JSON's own flag for junction interiors —
++     31,705 of chi-loop's 55,538 lanes). Injecting inside a junction is not
++     a driveway.
++  3. length >= MIN_LANE_M (30 m). netconvert leaves 0.2-3.5 m clipping stubs
++     everywhere; they are useless as injection points and the same 30 m bar
++     is what mkdemand.py/portals already use for "fragment".
++
++Lane class comes from the edge id: netimport edge ids are the OSM way id
++with an optional leading `-` (reverse direction) and an optional `#N` segment
++suffix, so `-1125009030#1` -> way 1125009030 -> highway=* from the road
++extract. Verified exact: this resolves a class for all 23,833 external lanes
++in chi-loop and agrees with portals.json on all 1,663 portal lanes. If a
++class ever fails to resolve, the documented FALLBACK is a speed-limit bar
++(> FAST_LANE_MPS, 22.3 m/s ~ 80 km/h => treated as motorway-like and
++excluded); it fires 0 times on chi-loop and the count is reported.
++
++Among the MAX_CANDIDATES nearest eligible lanes, mid-block access is
++preferred over a junction mouth with a soft penalty:
++
++    score = distance_m + (END_PENALTY_M if the nearest point lands within
++                          END_ZONE_M of either end of the lane else 0)
++
++with END_ZONE_M = 10 and END_PENALTY_M = 25 — a junction-mouth lane wins only
++when it is more than 25 m closer than the best mid-block alternative. The
++count of buildings that still ended up within 10 m of a lane end is reported.
++
++Nothing eligible within MAX_SNAP_M (150 m) => access_lane null, counted in
++summary.unsnapped. A bad snap is worse than no snap.
++"""
++import argparse
++import json
++import re
++import sys
++import time
++
++import numpy as np
++import osmium
++import shapely
++from pyproj import Transformer
++from shapely import STRtree, from_wkb
++from shapely.affinity import translate
++from shapely.geometry import LineString, mapping, shape
++from shapely.ops import nearest_points, transform
++from shapely.prepared import prep
++
++TO_UTM = Transformer.from_crs("EPSG:4326", "EPSG:32616", always_xy=True).transform
++TO_WGS = Transformer.from_crs("EPSG:32616", "EPSG:4326", always_xy=True).transform
++
++STOREY_M = 3.5  # metres per storey when only `height` is tagged
++YES_TOWER_LEVELS = 8  # building=yes at/above this many levels -> workplace
++MIN_LANE_M = 30.0  # shorter lanes are netconvert clipping stubs
++MAX_SNAP_M = 150.0  # beyond this, record no access lane at all
++END_ZONE_M = 10.0  # "at a junction mouth"
++END_PENALTY_M = 25.0  # soft penalty for snapping to a junction mouth
++MAX_CANDIDATES = 6  # nearest eligible lanes re-ranked with the penalty
++FAST_LANE_MPS = 22.3  # ~80 km/h — fallback motorway test when class unknown
++
++RESIDENTIAL_BUILDINGS = frozenset((
++    "apartments", "residential", "dormitory", "house", "terrace",
++    "detached", "semidetached_house", "bungalow", "houseboat",
++))
++
++WORKPLACE_BUILDINGS = frozenset((
++    "office", "commercial", "retail", "hotel", "government", "civic",
++    "industrial", "university", "hospital", "public", "school", "college",
++    "kindergarten", "warehouse", "supermarket", "train_station",
++    "fire_station", "museum", "exhibition_hall", "manufacture",
++))
++
++# amenity=* values that make an otherwise-untagged building a place people
++# travel to and stay at. Deliberately excludes drive-by amenities
++# (fuel, car_wash, atm, parking, shelter, toilets, bench...).
++WORKPLACE_AMENITIES = frozenset((
++    "restaurant", "cafe", "bar", "pub", "fast_food", "nightclub",
++    "school", "university", "college", "kindergarten", "childcare",
++    "library", "theatre", "cinema", "arts_centre", "community_centre",
++    "events_venue", "conference_centre", "exhibition_centre",
++    "hospital", "clinic", "doctors", "dentist", "veterinary",
++    "townhall", "courthouse", "police", "fire_station", "prison",
++    "post_office", "bank", "social_facility", "marketplace",
++))
++
++WORKPLACE_TOURISM = frozenset(("hotel", "hostel", "motel", "guest_house"))
++
++# Lane classes a building can never have a driveway onto.
++EXCLUDED_LANE_CLASSES = frozenset((
++    "motorway", "motorway_link", "trunk", "trunk_link",
++))
++
++LEVEL_DEFAULTS = {"residential": 3, "workplace": 3, "other": 1}
++
++EDGE_WAY_RE = re.compile(r"^-?(\d+)")
++
++
++def parse_number(raw):
++    """First numeric value out of a messy OSM tag ("12;14", "40 m", "3,5")."""
++    if raw is None:
++        return None
++    m = re.search(r"-?\d+(?:[.,]\d+)?", str(raw))
++    if m is None:
++        return None
++    try:
++        return float(m.group(0).replace(",", "."))
++    except ValueError:
++        return None
++
++
++def classify(tags):
++    """-> (kind, promoted_from_yes). See the module docstring."""
++    b = tags.get("building")
++    if b in RESIDENTIAL_BUILDINGS:
++        return "residential", False
++    if b in WORKPLACE_BUILDINGS:
++        return "workplace", False
++    if b != "yes":
++        return "other", False
++    # building=yes: promote only on a disambiguating tag.
++    if ("office" in tags or "shop" in tags or "healthcare" in tags
++            or tags.get("tourism") in WORKPLACE_TOURISM
++            or tags.get("amenity") in WORKPLACE_AMENITIES):
++        return "workplace", True
++    levels = parse_number(tags.get("building:levels"))
++    if levels is not None and levels >= YES_TOWER_LEVELS:
++        return "workplace", True
++    return "other", False
++
++
++def resolve_levels(tags, kind):
++    """-> (levels:int, source:'tag'|'height'|'default')."""
++    lv = parse_number(tags.get("building:levels"))
++    if lv is not None and lv >= 1:
++        return int(round(lv)), "tag"
++    h = parse_number(tags.get("height"))
++    if h is None:
++        h = parse_number(tags.get("building:height"))
++    if h is not None and h > 0:
++        return max(1, int(round(h / STOREY_M))), "height"
++    return LEVEL_DEFAULTS[kind], "default"
++
++
++def road_classes(path):
++    """way id -> highway=* from the road-only OSM extract that was imported."""
++    out = {}
++    for obj in osmium.FileProcessor(path):
++        if obj.is_way():
++            h = obj.tags.get("highway")
++            if h:
++                out[obj.id] = h
++    return out
++
++
++def edge_way_id(edge):
++    m = EDGE_WAY_RE.match(edge or "")
++    return int(m.group(1)) if m else None
++
++
++def load_lanes(net_path, classes):
++    """Eligible lanes as (name, offset, ids, classes, lengths, lines) + stats.
++
++    Lane shapes are already in the network-local metric frame; the caller
++    converts building geometry into that frame with netOffset.
++    """
++    with open(net_path) as f:
++        net = json.load(f)
++    offset = net["provenance"]["netOffset"]
++    name = net.get("name", "")
++    ids, cls, lens, lines = [], [], [], []
++    stats = {"total": 0, "internal": 0, "short": 0, "class": 0,
++             "speed_fallback": 0, "degenerate": 0, "eligible": 0}
++    for lane in net["lanes"]:
++        stats["total"] += 1
++        if lane.get("internal"):
++            stats["internal"] += 1
++            continue
++        if lane.get("length", 0.0) < MIN_LANE_M:
++            stats["short"] += 1
++            continue
++        klass = classes.get(edge_way_id(lane.get("edge")))
++        if klass is None:
++            # Documented fallback: no class => judge by speed limit.
++            if lane.get("speedLimit", 0.0) > FAST_LANE_MPS:
++                stats["speed_fallback"] += 1
++                continue
++        elif klass in EXCLUDED_LANE_CLASSES:
++            stats["class"] += 1
++            continue
++        pts = lane.get("shape") or []
++        if len(pts) < 2:
++            stats["degenerate"] += 1
++            continue
++        line = LineString(pts)
++        if line.length <= 0:
++            stats["degenerate"] += 1
++            continue
++        ids.append(lane["id"])
++        cls.append(klass)
++        lens.append(float(lane.get("length", line.length)))
++        lines.append(line)
++        stats["eligible"] += 1
++    return name, offset, ids, cls, lens, lines, stats
++
++
++class BuildingScan:
++    """Assembles building areas (closed ways AND multipolygon relations)."""
++
++    def __init__(self, clip):
++        self.clip = prep(clip)
++        self.bounds = clip.bounds
++        self.wkb = osmium.geom.WKBFactory()
++        self.rows = []
++        self.broken = 0
++        self.parts = 0
++
++    def area(self, a):
++        tags = a.tags
++        b = tags.get("building")
++        if b is None:
++            # building:part=* with no building=* is a 3D sub-volume of a
++            # footprint that is already mapped — counting it double-counts.
++            if "building:part" in tags:
++                self.parts += 1
++            return
++        if b == "no":
++            return
++        try:
++            geom = from_wkb(self.wkb.create_multipolygon(a))
++        except Exception:
++            self.broken += 1
++            return
++        if geom.is_empty:
++            return
++        bx = geom.bounds
++        if (bx[2] < self.bounds[0] or bx[0] > self.bounds[2]
++                or bx[3] < self.bounds[1] or bx[1] > self.bounds[3]):
++            return
++        if not self.clip.intersects(geom):
++            return
++        osm_id = ("w" if a.from_way() else "r") + str(a.orig_id())
++        self.rows.append((osm_id, dict(tags), geom))
++
++
++def round_coords(coords, ndigits=6):
++    if isinstance(coords[0], (int, float)):
++        return [round(c, ndigits) for c in coords]
++    return [round_coords(c, ndigits) for c in coords]
++
++
++def snap(buildings, offset, ids, cls, lens, lines):
++    """Attach access-lane fields to every demand-relevant building in place.
++
++    Vectorised: one STRtree dwithin query for the whole batch, one vectorised
++    distance call over the resulting pairs, then the mid-block re-rank in
++    Python over at most MAX_CANDIDATES lanes per building.
++    """
++    targets = [b for b in buildings if b["kind"] != "other"]
++    for b in buildings:
++        b["access"] = None
++    if not targets or not lines:
++        return targets, {"end_snapped": 0}
++
++    # Building footprints into the network-local metric frame (local = utm +
++    # netOffset — see the compiled network's provenance block).
++    dx, dy = offset
++    local = np.empty(len(targets), dtype=object)
++    for i, b in enumerate(targets):
++        local[i] = translate(b["utm"], xoff=dx, yoff=dy)
++    lanes = np.empty(len(lines), dtype=object)
++    for i, ln in enumerate(lines):
++        lanes[i] = ln
++
++    tree = STRtree(lines)
++    pairs = tree.query(local, predicate="dwithin", distance=MAX_SNAP_M)
++    if pairs.size == 0:
++        return targets, {"end_snapped": 0}
++    dists = shapely.distance(local[pairs[0]], lanes[pairs[1]])
++
++    # Group pairs by building (query returns them sorted by input index).
++    order = np.lexsort((dists, pairs[0]))
++    bi, li, dd = pairs[0][order], pairs[1][order], dists[order]
++    starts = np.searchsorted(bi, np.arange(len(targets)), side="left")
++    ends = np.searchsorted(bi, np.arange(len(targets)), side="right")
++
++    end_snapped = 0
++    for k, b in enumerate(targets):
++        lo, hi = starts[k], min(starts[k] + MAX_CANDIDATES, ends[k])
++        if lo >= ends[k]:
++            continue
++        poly = local[k]
++        best = None
++        for j in range(lo, hi):
++            idx = int(li[j])
++            line = lines[idx]
++            dist = float(dd[j])
++            pt = nearest_points(poly, line)[1]
++            off = float(line.project(pt))
++            length = lens[idx]
++            off = min(max(off, 0.0), length)
++            at_end = off < END_ZONE_M or (length - off) < END_ZONE_M
++            score = dist + (END_PENALTY_M if at_end else 0.0)
++            if best is None or score < best[0]:
++                best = (score, idx, dist, off, at_end)
++        if best is None:
++            continue
++        _, idx, dist, off, at_end = best
++        if at_end:
++            end_snapped += 1
++        b["access"] = {
++            "lane": ids[idx],
++            "dist": round(dist, 2),
++            "offset": round(off, 2),
++            "class": cls[idx],
++            "length": round(lens[idx], 2),
++        }
++    return targets, {"end_snapped": end_snapped}
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
++    ap.add_argument("--pbf", required=True)
++    ap.add_argument("--zones", required=True)
++    ap.add_argument("--zone", required=True)
++    ap.add_argument("--network", required=True, help="compiled network JSON")
++    ap.add_argument("--road-osm", required=True,
++                    help="road-only OSM extract that was imported (way -> highway class)")
++    ap.add_argument("--buffer-m", type=float, default=0.0,
++                    help="grow the zone polygon before clipping (metres, UTM 16N)")
++    ap.add_argument("--simplify-m", type=float, default=0.3,
++                    help="footprint simplification tolerance in metres (geojson only)")
++    ap.add_argument("--min-footprint-m2", type=float, default=0.0,
++                    help="drop footprints smaller than this")
++    ap.add_argument("--geojson-kinds", default="residential,workplace,other",
++                    help="kinds to emit into the geojson overlay")
++    ap.add_argument("--out-geojson", required=True)
++    ap.add_argument("--out-index", required=True)
++    args = ap.parse_args()
++
++    t0 = time.time()
++    with open(args.zones) as f:
++        zones = json.load(f)
++    feat = next((ft for ft in zones["features"]
++                 if ft["properties"].get("name") == args.zone), None)
++    if feat is None:
++        sys.exit(f"buildings: no zone named {args.zone!r} in {args.zones}")
++    clip = shape(feat["geometry"])
++    if args.buffer_m > 0:
++        clip = transform(TO_WGS, transform(TO_UTM, clip).buffer(args.buffer_m))
++    else:
++        clip = clip.buffer(0)
++
++    classes = road_classes(args.road_osm)
++    network_name, offset, ids, cls, lens, lines, lane_stats = load_lanes(
++        args.network, classes)
++    print(f"lanes: {lane_stats['eligible']} eligible of {lane_stats['total']} "
++          f"(internal {lane_stats['internal']}, <{MIN_LANE_M:g}m {lane_stats['short']}, "
++          f"excluded class {lane_stats['class']}, speed fallback "
++          f"{lane_stats['speed_fallback']}, degenerate {lane_stats['degenerate']}); "
++          f"{len(classes)} classed ways")
++    if lane_stats["eligible"] == 0:
++        sys.exit("buildings: no eligible lanes — check --network/--road-osm")
++
++    scan = BuildingScan(clip)
++    fp = osmium.FileProcessor(args.pbf).with_areas(
++        osmium.filter.KeyFilter("building", "building:part"))
++    for obj in fp:
++        if obj.is_area():
++            scan.area(obj)
++    print(f"scan: {len(scan.rows)} building areas in zone {args.zone!r} "
++          f"({scan.parts} building:part-only skipped, {scan.broken} unassemblable) "
++          f"[{time.time() - t0:.0f}s]")
++
++    buildings = []
++    promoted = 0
++    lvl_src = {"tag": 0, "height": 0, "default": 0}
++    for osm_id, tags, geom_wgs in scan.rows:
++        utm = transform(TO_UTM, geom_wgs)
++        footprint = utm.area
++        if footprint < args.min_footprint_m2:
++            continue
++        kind, from_yes = classify(tags)
++        promoted += from_yes
++        levels, source = resolve_levels(tags, kind)
++        lvl_src[source] += 1
++        c = utm.centroid
++        buildings.append({
++            "osm_id": osm_id,
++            "name": tags.get("name", ""),
++            "kind": kind,
++            "building_tag": tags.get("building", ""),
++            "levels": levels,
++            "levels_source": source,
++            "footprint_m2": round(footprint, 1),
++            "floor_area_m2": round(footprint * levels, 1),
++            "utm": utm,
++            "wgs": geom_wgs,
++            "cx": c.x,
++            "cy": c.y,
++        })
++
++    targets, snap_stats = snap(buildings, offset, ids, cls, lens, lines)
++    print(f"snap: {len(targets)} demand-relevant buildings vs "
++          f"{len(ids)} eligible lanes [{time.time() - t0:.0f}s]")
++
++    # ---- index (demand-relevant only) ----
++    dx, dy = offset
++    entries = []
++    summary = {"buildings": 0, "residential": 0, "workplace": 0, "unsnapped": 0,
++               "residential_floor_area_m2": 0.0, "workplace_floor_area_m2": 0.0}
++    dist_samples = []
++    for b in targets:
++        a = b["access"]
++        entries.append({
++            "osm_id": b["osm_id"],
++            "name": b["name"],
++            "kind": b["kind"],
++            "building_tag": b["building_tag"],
++            "levels": b["levels"],
++            "levels_source": b["levels_source"],
++            "footprint_m2": b["footprint_m2"],
++            "floor_area_m2": b["floor_area_m2"],
++            "centroid": {
++                "lon": round(b["wgs"].centroid.x, 6),
++                "lat": round(b["wgs"].centroid.y, 6),
++                "x": round(b["cx"] + dx, 2),
++                "y": round(b["cy"] + dy, 2),
++            },
++            "access_lane": a["lane"] if a else None,
++            "access_lane_dist_m": a["dist"] if a else None,
++            "access_lane_offset_m": a["offset"] if a else None,
++            "access_lane_class": (a["class"] if a else None),
++            "access_lane_length_m": a["length"] if a else None,
++        })
++        summary["buildings"] += 1
++        summary[b["kind"]] += 1
++        summary[f"{b['kind']}_floor_area_m2"] += b["floor_area_m2"]
++        if a is None:
++            summary["unsnapped"] += 1
++        else:
++            dist_samples.append(a["dist"])
++    summary["residential_floor_area_m2"] = round(summary["residential_floor_area_m2"], 1)
++    summary["workplace_floor_area_m2"] = round(summary["workplace_floor_area_m2"], 1)
++
++    index = {
++        "zone": args.zone,
++        "network": network_name,
++        "generated_from": args.pbf.rsplit("/", 1)[-1],
++        "summary": summary,
++        # Additive provenance (the six summary fields above are the contract).
++        "other_buildings": sum(1 for b in buildings if b["kind"] == "other"),
++        "params": {
++            "storey_m": STOREY_M,
++            "yes_tower_levels": YES_TOWER_LEVELS,
++            "level_defaults": LEVEL_DEFAULTS,
++            "min_lane_m": MIN_LANE_M,
++            "max_snap_m": MAX_SNAP_M,
++            "end_zone_m": END_ZONE_M,
++            "end_penalty_m": END_PENALTY_M,
++            "excluded_lane_classes": sorted(EXCLUDED_LANE_CLASSES),
++            "eligible_lanes": len(ids),
++            "net_offset": offset,
++        },
++        "buildings": entries,
++    }
++    with open(args.out_index, "w") as f:
++        json.dump(index, f)
++
++    # ---- geojson overlay ----
++    want = set(k.strip() for k in args.geojson_kinds.split(",") if k.strip())
++    feats = []
++    for b in buildings:
++        if b["kind"] not in want:
++            continue
++        g = b["utm"]
++        if args.simplify_m > 0:
++            g = g.simplify(args.simplify_m)
++        g = transform(TO_WGS, g)
++        geo = mapping(g)
++        if "coordinates" not in geo:
++            continue  # GeometryCollection degeneracy — nothing to fill
++        geo["coordinates"] = round_coords(geo["coordinates"])
++        feats.append({
++            "type": "Feature",
++            "properties": {
++                "osm_id": b["osm_id"],
++                "kind": b["kind"],
++                "levels": b["levels"],
++                "floor_area_m2": b["floor_area_m2"],
++                "name": b["name"],
++            },
++            "geometry": geo,
++        })
++    doc = {"type": "FeatureCollection",
++           "comment": f"building footprints in zone {args.zone!r} (OSM, simplified) — "
++                      f"kind: residential | workplace | other",
++           "features": feats}
++    with open(args.out_geojson, "w") as f:
++        json.dump(doc, f)
++
++    # ---- report ----
++    print(f"index:   {summary['buildings']} buildings "
++          f"({summary['residential']} residential, {summary['workplace']} workplace, "
++          f"{summary['unsnapped']} unsnapped) -> {args.out_index}")
++    print(f"         floor area: residential {summary['residential_floor_area_m2']:,.0f} m2, "
++          f"workplace {summary['workplace_floor_area_m2']:,.0f} m2")
++    print(f"         building=yes promoted to workplace: {promoted}; "
++          f"other (geojson only): {index['other_buildings']}")
++    print(f"         levels from tag {lvl_src['tag']}, height {lvl_src['height']}, "
++          f"default {lvl_src['default']}")
++    print(f"         snapped within {END_ZONE_M:g} m of a lane end: "
++          f"{snap_stats['end_snapped']}")
++    if dist_samples:
++        d = sorted(dist_samples)
++        def pct(p):
++            return d[min(len(d) - 1, int(p * len(d)))]
++        print(f"         snap distance m: min {d[0]:.1f} p25 {pct(.25):.1f} "
++              f"med {pct(.5):.1f} p75 {pct(.75):.1f} p95 {pct(.95):.1f} max {d[-1]:.1f}")
++    print(f"geojson: {len(feats)} features -> {args.out_geojson}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/chicago/congestion.py b/scripts/chicago/congestion.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9fee6dc9ad01f63bbf9d9bd03cbea89a924552d8
+--- /dev/null
++++ b/scripts/chicago/congestion.py
+@@ -0,0 +1,321 @@
++#!/usr/bin/env python3
++"""Rank congestion by STREET NAME from an M13 metrics JSON (ADR-0014 §6).
++
++scorecard.py reports the worst lanes by id (`n24203057_1_0`), which is the
++right primitive and the wrong unit for a human: nobody recognizes a lane id,
++and a single street is split across dozens of them by netconvert. This
++resolves lanes back to their OSM way names and aggregates there, so the
++output is "N Michigan Ave, 41 min of delay" instead of a list of hashes.
++
++Lane → edge is in the network file; edge → OSM way is netimport's id
++convention (the way id, optionally with a leading `-` for the reversed
++direction and a `#N` split suffix); way → name/highway comes from the OSM
++extract the network was imported from.
++
++Usage:
++  congestion.py metrics.json --network chi-loop.json --osm loop.osm \\
++      [--top 20] [--by-interval] [--occupancy car=1.2,truck=1.0]
++
++Reports:
++  * network totals (VMT, VHT, mean speed, delay share, arrivals)
++  * delay PER PERSON and total PERSON-HOURS of delay (see below)
++  * the worst streets by total time loss, with their mean speed, the
++    share of the network's delay each carries, the delay an individual
++    driver loses crossing them, and their person-hour cost
++  * the worst individual lanes, named
++  * with --by-interval, how the worst streets evolve across the run — the
++    peak-building view a static ranking hides
++
++--------------------------------------------------------------------------
++PERSON-DELAY
++--------------------------------------------------------------------------
++The metric kernel measures VEHICLE delay. The civic question (VISION.md use
++case 4 — "this street costs commuters N person-hours every morning") is
++about PEOPLE, and the conversion needs an occupancy assumption that the
++simulation does not contain. It is therefore an explicit flag, it is printed
++with every report, and it is never applied silently:
++
++  --occupancy car=1.2,truck=1.0     (the default)
++
++1.2 is the usual US work-trip auto occupancy (NHTS work-trip vehicle
++occupancy sits at ~1.1-1.2; all-purpose travel is ~1.5-1.7, which is the
++WRONG number for an AM commute peak). Trucks are one driver. A vehicle type
++absent from the map is counted at 1.0 and named in the output.
++
++Two different quantities are reported and they answer different questions:
++
++  * mean delay per person — what a randomly chosen PERSON experiences.
++    Every occupant of a vehicle experiences that vehicle's full delay, so
++    this is the occupancy-WEIGHTED mean of per-vehicle delay, not the
++    per-vehicle delay divided by anything. With a uniform occupancy it
++    equals mean delay per vehicle; the two diverge only when the type mix
++    and the occupancy assumption disagree.
++  * person-hours of delay — the aggregate social cost, delay summed over
++    occupants. This is the number that scales with the size of the city and
++    the one worth quoting.
++
++Per-street person-hours are the street's vehicle delay times the FLEET mean
++occupancy: interval records are not typed, so a per-street type mix is not
++available. On a network whose truck share is near-uniform the error is
++small; where a street is disproportionately truck (a dock approach, a
++freeway) its person-hours are overstated by at most the car/truck occupancy
++ratio.
++
++Per-street vehicle counts are Edie traversal-equivalents (sum_dist_m over
++lane length), not distinct vehicles: a vehicle that crosses half a lane
++counts half. That is the right denominator for "seconds lost per driver
++crossing this street" and it is what the interval records can support.
++
++Pure stdlib.
++"""
++import argparse
++import collections
++import json
++import re
++import sys
++import xml.etree.ElementTree as ET
++
++# netimport edge id → OSM way id: optional leading '-' (reversed direction)
++# and optional '#N' split suffix.
++EDGE_RE = re.compile(r"^-?(\d+)(?:#\d+)?$")
++
++
++def way_attrs(osm_path):
++    """way id → (name, highway) from an OSM XML extract, streaming."""
++    out = {}
++    for _, el in ET.iterparse(osm_path, events=("end",)):
++        if el.tag != "way":
++            continue
++        tags = {t.get("k"): t.get("v") for t in el.findall("tag")}
++        if "highway" in tags:
++            out[el.get("id")] = (tags.get("name") or "", tags["highway"])
++        el.clear()
++    return out
++
++
++def lane_street(lanes, ways):
++    """lane id → (street label, highway class). Unnamed ways fall back to a
++    class label rather than being dropped: unnamed links and ramps carry
++    real delay and hiding them would flatter the network."""
++    out = {}
++    for l in lanes:
++        if l.get("internal"):
++            continue
++        m = EDGE_RE.match(l.get("edge", ""))
++        name, hwy = ("", "")
++        if m:
++            name, hwy = ways.get(m.group(1), ("", ""))
++        label = name or (f"<unnamed {hwy}>" if hwy else "<unknown>")
++        out[l["id"]] = (label, hwy)
++    return out
++
++
++DEFAULT_OCCUPANCY = "car=1.2,truck=1.0"
++
++
++def parse_occupancy(spec):
++    """"car=1.2,truck=1.0" -> {"car": 1.2, "truck": 1.0}. Strict: a malformed
++    entry or a non-positive value is an error, not a silent default — the
++    whole point of the flag is that the assumption is visible."""
++    out = {}
++    for part in spec.split(","):
++        part = part.strip()
++        if not part:
++            continue
++        if "=" not in part:
++            raise SystemExit(f"--occupancy: expected type=value, got {part!r}")
++        name, _, val = part.partition("=")
++        try:
++            occ = float(val)
++        except ValueError:
++            raise SystemExit(f"--occupancy: {name}: {val!r} is not a number")
++        if not (occ > 0) or occ != occ or occ == float("inf"):
++            raise SystemExit(f"--occupancy: {name}: occupancy must be positive and finite")
++        out[name.strip()] = occ
++    if not out:
++        raise SystemExit("--occupancy: empty")
++    return out
++
++
++def person_delay(trips, occ_map):
++    """Person-delay statistics over COMPLETED trips.
++
++    Returns (person_hours, mean_s_per_person, mean_s_per_vehicle, n_trips,
++             fleet_mean_occupancy, unknown_types).
++
++    Every occupant of a vehicle experiences that vehicle's full delay, so
++    person-seconds = occupancy x vehicle delay, and the mean a PERSON
++    experiences is the occupancy-weighted mean of vehicle delay.
++    """
++    person_s = 0.0
++    veh_s = 0.0
++    persons = 0.0
++    n = 0
++    unknown = collections.Counter()
++    for t in trips:
++        if not t.get("completed"):
++            continue
++        occ = occ_map.get(t.get("type", ""))
++        if occ is None:
++            unknown[t.get("type", "")] += 1
++            occ = 1.0
++        d = t.get("time_loss_s", 0.0)
++        person_s += occ * d
++        veh_s += d
++        persons += occ
++        n += 1
++    return (person_s / 3600.0,
++            person_s / persons if persons > 0 else 0.0,
++            veh_s / n if n > 0 else 0.0,
++            n,
++            persons / n if n > 0 else 0.0,
++            unknown)
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("metrics")
++    ap.add_argument("--network", required=True)
++    ap.add_argument("--osm", required=True)
++    ap.add_argument("--top", type=int, default=20)
++    ap.add_argument("--by-interval", action="store_true")
++    ap.add_argument("--occupancy", default=DEFAULT_OCCUPANCY,
++                    help="persons per vehicle by type, e.g. "
++                         f"{DEFAULT_OCCUPANCY!r} (the default). The simulation "
++                         "measures VEHICLE delay; this is the assumption that "
++                         "converts it to PERSON delay, and it is printed with "
++                         "every report. US work-trip auto occupancy is ~1.1-1.2.")
++    args = ap.parse_args()
++    occ_map = parse_occupancy(args.occupancy)
++
++    with open(args.metrics) as f:
++        m = json.load(f)
++    with open(args.network) as f:
++        net = json.load(f)
++    ways = way_attrs(args.osm)
++    street = lane_street(net["lanes"], ways)
++    lane_len = {l["id"]: l["length"] for l in net["lanes"]}
++
++    tot = m["totals"]
++    dt = m["dt"]
++    vmt, vht, loss = tot["vmt"], tot["vht"], tot["total_time_loss_s"]
++
++    # One measurement set only — aggregating across overlapping sets would
++    # double-count (the scorecard.py rule, kept).
++    lanes_by_set, sets_with_tl = collections.defaultdict(set), set()
++    for iv in m["intervals"]:
++        lanes_by_set[iv["set_id"]].add(iv["lane_id"])
++        if "time_loss_s" in iv:
++            sets_with_tl.add(iv["set_id"])
++    if not lanes_by_set:
++        print("no interval records in this metrics file", file=sys.stderr)
++        return
++    pool = sets_with_tl or set(lanes_by_set)
++    set_id = max(pool, key=lambda s: (len(lanes_by_set[s]), s))
++
++    st_loss = collections.Counter()
++    st_dist = collections.Counter()
++    st_time = collections.Counter()
++    st_stops = collections.Counter()
++    st_lanes = collections.defaultdict(set)
++    st_veh = collections.Counter()   # Edie traversal-equivalents
++    lane_loss = collections.Counter()
++    per_interval = collections.defaultdict(collections.Counter)
++
++    for iv in m["intervals"]:
++        if iv["set_id"] != set_id:
++            continue
++        lid = iv["lane_id"]
++        s = street.get(lid)
++        if s is None:
++            continue  # junction interior: delay belongs to its approach
++        label = s[0]
++        tl = iv.get("time_loss_s", 0.0)
++        dist = iv.get("sum_dist_m", 0.0)
++        st_loss[label] += tl
++        st_dist[label] += dist
++        st_time[label] += iv.get("sum_time_s", 0.0)
++        st_stops[label] += iv.get("stops", 0)
++        st_lanes[label].add(lid)
++        # Edie: vehicle-traversals of the lane = travelled distance / length.
++        # Guard a zero/absent length rather than dividing by it.
++        ll = lane_len.get(lid, 0.0)
++        if ll > 0:
++            st_veh[label] += dist / ll
++        lane_loss[lid] += tl
++        if args.by_interval:
++            per_interval[iv["begin_tick"]][label] += tl
++
++    print(f"=== {args.metrics}")
++    print(f"horizon {m['ticks']} ticks = {m['ticks']*dt/3600:.2f} sim hours (dt={dt})")
++    print(f"trips: {tot['completed_trips']:,} completed, {tot['active_at_horizon']:,} still moving at the horizon")
++    print(f"VMT {vmt/1000:,.0f} km   VHT {vht/3600:,.0f} h   mean speed {3.6*vmt/vht:.1f} km/h"
++          if vht > 0 else "VHT is zero")
++    print(f"delay {loss/3600:,.0f} h ({100*loss/vht:.0f}% of all time in the network), "
++          f"mean {tot['mean_time_loss_s']:.0f} s/vehicle")
++    if tot.get("dropped_crossings"):
++        print(f"dropped_crossings {tot['dropped_crossings']:,} "
++              f"(metric-attribution integrity signal, not a sim failure)")
++
++    # --- person-delay. ASSUMPTION, stated every time (see module docstring).
++    ph, per_person_s, per_veh_s, n_trips, fleet_occ, unknown = person_delay(
++        m.get("trips", []), occ_map)
++    if n_trips == 0:
++        # Nothing completed: fall back to the unweighted mean of the map so the
++        # per-street person-hour column is still meaningful, and say so.
++        fleet_occ = sum(occ_map.values()) / len(occ_map)
++    occ_str = ", ".join(f"{k}={v:g}" for k, v in sorted(occ_map.items()))
++    print(f"\n--- person-delay  [ASSUMPTION: occupancy {occ_str}; "
++          f"fleet mean {fleet_occ:.3f} persons/veh]")
++    if unknown:
++        print("  WARNING: no occupancy given for type(s) "
++              + ", ".join(f"{t!r} ({c:,} trips)" for t, c in unknown.most_common())
++              + " — counted at 1.0")
++    if n_trips == 0:
++        print("  no completed trips: no person-delay to report "
++              f"(per-street person-hours use the unweighted mean {fleet_occ:.3f})")
++    else:
++        print(f"  completed trips {n_trips:,}")
++        # One decimal: with a near-uniform occupancy the two means are nearly
++        # equal BY CONSTRUCTION, and rounding them to the same integer reads
++        # as a bug rather than as the arithmetic it is.
++        print(f"  mean delay per vehicle {per_veh_s:8.1f} s ({per_veh_s/60:.1f} min)"
++              "   [completed trips only]")
++        print(f"  mean delay per person  {per_person_s:8.1f} s ({per_person_s/60:.1f} min)"
++              "   [occupancy-weighted: every occupant loses the whole delay]")
++        print(f"  total person-hours of delay {ph:,.0f} over "
++              f"{m['ticks']*dt/3600:.2f} sim hours")
++        # The civic framing: cost per morning, extrapolated at the run's rate.
++        print(f"  = {ph/(m['ticks']*dt/3600):,.0f} person-hours per sim hour")
++
++    print(f"\n--- worst {args.top} streets by total delay (set {set_id})")
++    print(f"  [person-h = street vehicle delay x fleet mean occupancy "
++          f"{fleet_occ:.3f}; veh = Edie traversal-equivalents]")
++    print(f"{'street':30s} {'delay h':>8s} {'% net':>6s} {'km/h':>6s} "
++          f"{'veh':>9s} {'s/veh':>7s} {'person-h':>9s} {'lanes':>6s} {'stops':>8s}")
++    for label, tl in st_loss.most_common(args.top):
++        t, d = st_time[label], st_dist[label]
++        kmh = 3.6 * d / t if t > 0 else 0
++        veh = st_veh[label]
++        s_per_veh = tl / veh if veh > 0 else 0.0
++        print(f"{label[:30]:30s} {tl/3600:8.1f} {100*tl/loss:5.1f}% {kmh:6.1f} "
++              f"{veh:9,.0f} {s_per_veh:7.1f} {tl*fleet_occ/3600:9,.0f} "
++              f"{len(st_lanes[label]):6d} {int(st_stops[label]):8,d}")
++
++    print(f"\n--- worst {args.top} individual lanes by delay")
++    for lid, tl in lane_loss.most_common(args.top):
++        label, hwy = street.get(lid, ("?", "?"))
++        print(f"  {label[:30]:30s} {lid:26s} {hwy:14s} {lane_len.get(lid,0):6.0f} m {tl/3600:7.2f} h")
++
++    if args.by_interval:
++        worst = [s for s, _ in st_loss.most_common(8)]
++        print(f"\n--- delay (h) per interval for the worst 8 streets")
++        hdr = "".join(f"{s[:11]:>12s}" for s in worst)
++        print(f"{'from (sim h)':>12s}{hdr}")
++        for begin in sorted(per_interval):
++            row = "".join(f"{per_interval[begin][s]/3600:12.2f}" for s in worst)
++            print(f"{begin*dt/3600:12.2f}{row}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/chicago/mkod.py b/scripts/chicago/mkod.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7d1ab7f9b2f23bf146a48a121bad8d54106bf8d0
+--- /dev/null
++++ b/scripts/chicago/mkod.py
+@@ -0,0 +1,266 @@
++#!/usr/bin/env python3
++"""Generate a building-anchored origin–destination demand YAML (ADR-0021).
++
++Where mkdemand.py produces portal inflow with no destinations — every vehicle
++born at the map edge, every vehicle leaving by whichever exit it drifts to —
++this produces an AM-peak OD program:
++
++  * INBOUND flows on boundary portals (freeways and arterials), rated by OSM
++    road class, carrying weighted destinations.
++  * RESIDENTIAL flows injected mid-block (ADR-0021 `offset_m`) at the access
++    lanes of apartment/residential buildings, rated by residential floor area.
++  * DESTINATIONS drawn from workplace-building access lanes, weighted by
++    workplace floor area.
++  * A piecewise AM profile via `slices`, so the peak builds and decays
++    instead of being a step function.
++
++Buildings come from buildings.py's index; the road network supplies lane
++lengths and the successor graph for the reachability filter.
++
++Usage:
++  mkod.py --buildings data/networks/chi-loop/buildings.json \\
++      --network data/networks/chi-loop/chi-loop.json \\
++      --portals data/networks/chi-loop/portals.json \\
++      --total 12000 --resident-share 0.25 --out demand/main.yaml
++
++Napkin-math posture (inherited from mkdemand.py and the chi-loop README):
++rates are peak-hour estimates anchored to published cordon counts, NOT a
++calibrated demand model. Floor area is a production/attraction PROXY — there
++is no mode share, no car-ownership rate and no parking supply here, and
++downtown Chicago's transit share is very high. Absolute rates are a
++calibration target; the SHAPE (where trips start and end) is what this
++script exists to get right.
++
++Pure stdlib.
++"""
++import argparse
++import collections
++import json
++import sys
++
++# Peak-hour veh/h per boundary origin LANE by OSM road class — mkdemand.py's
++# table, kept identical so the two generators stay comparable.
++PORTAL_RATES = {
++    "motorway": 1400, "trunk": 900, "primary": 500, "secondary": 300,
++    "tertiary": 200, "motorway_link": 500, "trunk_link": 400,
++    "primary_link": 300, "secondary_link": 200, "tertiary_link": 150,
++}
++TRUCK_HEAVY = {"motorway", "trunk", "motorway_link", "trunk_link"}
++
++# AM profile: fraction of the peak-hour rate in each half hour of a 3-hour
++# 06:00–09:00 window. Builds to a 07:30–08:30 plateau and decays — the shape
++# every urban peak-period count set shows. Mean ≈ 0.76 of peak.
++AM_PROFILE = [0.45, 0.70, 1.00, 1.00, 0.80, 0.60]
++SLICE_S = 1800.0
++
++# A residential access lane needs enough demand to be worth a flow of its
++# own; below this the arrival process is so sparse it is noise.
++MIN_RESIDENT_RATE = 4.0
++# Injection offsets are clamped away from both lane ends: an injection at a
++# junction mouth is exactly what ADR-0021's offset exists to avoid.
++MIN_OFFSET_M = 8.0
++END_MARGIN_M = 8.0
++
++
++def reachable_from(succ, starts):
++    """Lanes reachable from any of starts through the successor graph."""
++    seen = set(starts)
++    q = collections.deque(starts)
++    while q:
++        for v in succ.get(q.popleft(), ()):
++            if v not in seen:
++                seen.add(v)
++                q.append(v)
++    return seen
++
++
++def can_reach(preds, dest):
++    """Lanes that can reach dest through the successor graph (reverse BFS).
++
++    This is SUCCESSOR-ONLY reachability — deliberately the same relation the
++    kernel's route table uses (engine/routing.go), so a destination this
++    filter accepts is one the kernel can actually steer to. It is
++    conservative: with ADR-0021 lateral recovery a vehicle can also change
++    lanes back onto a reachable lane, so some rejected pairs would in fact
++    work.
++    """
++    R = {dest}
++    q = collections.deque([dest])
++    while q:
++        for p in preds.get(q.popleft(), ()):
++            if p not in R:
++                R.add(p)
++                q.append(p)
++    return R
++
++
++def emit_flow(out, fid, origin, rate, profile, vtypes, dests, offset=None):
++    out.append(f"  - id: {fid}")
++    out.append(f"    origin: {origin}")
++    if offset is not None:
++        out.append(f"    offset_m: {offset:.1f}")
++    out.append("    spacing: poisson")
++    out.append("    slices:")
++    for i, f in enumerate(profile):
++        r = rate * f
++        if r <= 0:
++            continue
++        out.append(f"      - {{start_s: {i * SLICE_S:.0f}, end_s: {(i + 1) * SLICE_S:.0f}, veh_per_h: {r:.1f}}}")
++    if vtypes:
++        out.append("    vtypes:")
++        for k in sorted(vtypes):
++            out.append(f"      {k}: {vtypes[k]}")
++    if dests:
++        out.append("    destinations:")
++        for lane in sorted(dests):
++            out.append(f"      {lane}: {dests[lane]:.4f}")
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--buildings", required=True)
++    ap.add_argument("--network", required=True)
++    ap.add_argument("--portals", required=True)
++    ap.add_argument("--out", required=True)
++    ap.add_argument("--total", type=float, default=12000,
++                    help="target peak-hour veh/h across all flows")
++    ap.add_argument("--resident-share", type=float, default=0.25,
++                    help="fraction of demand originating INSIDE the zone "
++                         "(residential buildings) vs entering at a portal")
++    ap.add_argument("--dest-lanes", type=int, default=120,
++                    help="how many workplace access lanes become destinations. "
++                         "Each costs one memoized next-hop table in the kernel "
++                         "(~4 bytes/lane: ~222 KB on a 56k-lane network), so "
++                         "this is a real memory knob, not just a fidelity one.")
++    ap.add_argument("--origin-lanes", type=int, default=150,
++                    help="how many residential access lanes become interior origins")
++    ap.add_argument("--truck", type=float, default=0.08)
++    ap.add_argument("--flat-peak", action="store_true",
++                    help="emit ONE constant slice at the profile's peak rate "
++                         "instead of the AM ramp. For recording a watchable "
++                         "cut under peak conditions: a recording covers the "
++                         "whole run from tick 0, so a 15-minute store of the "
++                         "ramped scenario would only ever capture 06:00-06:15.")
++    args = ap.parse_args()
++
++    with open(args.buildings) as f:
++        bidx = json.load(f)
++    with open(args.network) as f:
++        net = json.load(f)
++    with open(args.portals) as f:
++        portals = json.load(f)
++
++    lanes = {l["id"]: l for l in net["lanes"]}
++    succ = {l["id"]: l.get("successors", []) for l in net["lanes"]}
++    preds = collections.defaultdict(list)
++    for lid, ss in succ.items():
++        for s in ss:
++            preds[s].append(lid)
++
++    # --- Destinations: workplace floor area pooled by access lane.
++    work = collections.defaultdict(float)
++    res = collections.defaultdict(float)
++    res_offset = {}
++    for b in bidx["buildings"]:
++        lane = b.get("access_lane")
++        if not lane or lane not in lanes:
++            continue
++        if b["kind"] == "workplace":
++            work[lane] += b["floor_area_m2"]
++        elif b["kind"] == "residential":
++            res[lane] += b["floor_area_m2"]
++            # The largest building on a lane sets the injection point.
++            cur = res_offset.get(lane)
++            if cur is None or b["floor_area_m2"] > cur[1]:
++                res_offset[lane] = (b.get("access_lane_offset_m") or 0.0, b["floor_area_m2"])
++
++    dest_lanes = [l for l, _ in sorted(work.items(), key=lambda kv: -kv[1])[:args.dest_lanes]]
++    dest_area = {l: work[l] for l in dest_lanes}
++    print(f"destinations: {len(dest_lanes)} lanes, "
++          f"{100 * sum(dest_area.values()) / sum(work.values()):.0f}% of workplace floor area",
++          file=sys.stderr)
++
++    # Reverse reachability per destination — the filter that keeps a flow
++    # from being handed a destination its vehicles can never steer to.
++    reach = {d: can_reach(preds, d) for d in dest_lanes}
++
++    def dests_for(origin):
++        w = {d: dest_area[d] for d in dest_lanes if origin in reach[d]}
++        tot = sum(w.values())
++        if tot <= 0:
++            return {}
++        return {d: v / tot for d, v in w.items()}
++
++    profile = [max(AM_PROFILE)] if args.flat_peak else AM_PROFILE
++    flows = []
++    stats = collections.Counter()
++
++    # --- Portal inflow: commuters and freight entering the zone.
++    portal_share = 1.0 - args.resident_share
++    entries = []
++    for p in portals["origins"]:
++        cls = p.get("class")
++        if cls not in PORTAL_RATES or p.get("fragment"):
++            stats["portal skipped"] += 1
++            continue
++        entries.append((p["id"], cls, PORTAL_RATES[cls]))
++    portal_raw = sum(r for _, _, r in entries)
++    portal_scale = (args.total * portal_share / portal_raw) if portal_raw else 0
++
++    for i, (lid, cls, raw) in enumerate(sorted(entries)):
++        d = dests_for(lid)
++        if not d:
++            stats["portal unreachable"] += 1
++            continue
++        truck = args.truck if cls in TRUCK_HEAVY else args.truck / 2
++        emit_flow(flows, f"p{i:03d}-{cls}", lid, raw * portal_scale, profile,
++                  {"car": round(1 - truck, 3), "truck": round(truck, 3)}, d)
++        stats["portal flows"] += 1
++
++    # --- Residential interior origins: residents leaving their building.
++    top_res = sorted(res.items(), key=lambda kv: -kv[1])[:args.origin_lanes]
++    res_raw = sum(a for _, a in top_res)
++    res_scale = (args.total * args.resident_share / res_raw) if res_raw else 0
++
++    for i, (lid, area) in enumerate(sorted(top_res)):
++        rate = area * res_scale
++        if rate < MIN_RESIDENT_RATE:
++            stats["resident below min rate"] += 1
++            continue
++        lane = lanes[lid]
++        # Clamp the offset inside the lane, away from both ends.
++        hi = lane["length"] - END_MARGIN_M
++        if hi <= MIN_OFFSET_M:
++            stats["resident lane too short"] += 1
++            continue
++        off = min(max(res_offset[lid][0], MIN_OFFSET_M), hi)
++        d = dests_for(lid)
++        if not d:
++            stats["resident unreachable"] += 1
++            continue
++        # Residents are cars: a tower's garage does not emit semis.
++        emit_flow(flows, f"r{i:03d}-resident", lid, rate, profile,
++                  {"car": 1.0}, d, offset=off)
++        stats["resident flows"] += 1
++
++    header = [
++        "# Generated by scripts/chicago/mkod.py — building-anchored OD demand",
++        "# (ADR-0021). Portal inflow + residential interior origins, both",
++        f"# routed to workplace destinations weighted by floor area.",
++        f"# Target {args.total:.0f} veh/h peak, {args.resident_share:.0%} originating in-zone.",
++        f"# {stats['portal flows']} portal flows + {stats['resident flows']} residential flows,",
++        f"# {len(dest_lanes)} destination lanes. Profile {profile} per half hour"
++        + (" (FLAT PEAK — a recording cut, not the AM ramp)." if args.flat_peak else "."),
++        "format_version: 1",
++        "flows:",
++    ]
++    with open(args.out, "w") as f:
++        f.write("\n".join(header + flows) + "\n")
++
++    for k in sorted(stats):
++        print(f"  {k}: {stats[k]}", file=sys.stderr)
++    print(f"wrote {args.out}", file=sys.stderr)
++
++
++if __name__ == "__main__":
++    main()

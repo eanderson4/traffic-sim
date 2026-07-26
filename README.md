@@ -27,6 +27,16 @@ renders live vehicles and congestion heatmaps from the same streams. JetStream g
 durable event logs for deterministic replay; scenarios (network + demand + control
 config) are first-class and diffable so alternatives can be ranked on metrics.
 
+## See It
+
+**[phantomjam.com](https://phantomjam.com)** is the public face of this engine:
+an atlas of the imported city networks (LA, SF, Miami, Atlanta, Houston,
+Dallas, Chicago — down to the stop signs) and, as they land, in-browser
+replays of the simulation experiments, baked to static data and served from
+the edge. A live shared sim (`app.phantomjam.com`, deployment in `deploy/`)
+follows once ADR-0020's two go-live preconditions (ws-plane broker auth AND
+engine `/healthz`) land.
+
 ## Repo Map
 
 | Path | What |
@@ -38,6 +48,7 @@ config) are first-class and diffable so alternatives can be ranked on metrics.
 | `contracts/` | AsyncAPI message contract + network file format v1 |
 | `viz/` | MapLibre realtime client (TypeScript, pnpm, no framework) |
 | `analysis/ngsim/` | NGSIM x-t field tooling + I-80 wave validation |
+| `deploy/` | Public-deployment artifacts: Dockerfile, demos registry, GKE manifests (see `deploy/README.md` — gated on ADR-0020 preconditions) |
 | `prototypes/` | Throwaway engine-fork demos (pre-implementation) |
 
 ## Getting Started

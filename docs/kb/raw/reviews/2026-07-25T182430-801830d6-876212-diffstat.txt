@@ -1,0 +1,11 @@
+ .dockerignore                 | 13 ++++++
+ Dockerfile                    | 34 ++++++++++++++++
+ deploy/README.md              | 53 ++++++++++++++++++++++++
+ deploy/demos.public.json      | 94 +++++++++++++++++++++++++++++++++++++++++++
+ deploy/docker-entrypoint.sh   | 19 +++++++++
+ deploy/k8s/backendconfig.yaml | 24 +++++++++++
+ deploy/k8s/deployment.yaml    | 80 ++++++++++++++++++++++++++++++++++++
+ deploy/k8s/ingress.yaml       | 43 ++++++++++++++++++++
+ deploy/k8s/namespace.yaml     |  4 ++
+ deploy/k8s/service.yaml       | 17 ++++++++
+ 10 files changed, 381 insertions(+)

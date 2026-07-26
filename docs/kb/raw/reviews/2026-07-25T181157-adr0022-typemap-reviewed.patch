@@ -1,0 +1,407 @@
+diff --git a/docs/kb/INDEX.md b/docs/kb/INDEX.md
+index 737e2ac..e726ee8 100644
+--- a/docs/kb/INDEX.md
++++ b/docs/kb/INDEX.md
+@@ -50,7 +50,7 @@ back to it.
+ - [Chicago Metro](articles/chicago-metro.md) — zoned Geofabrik→netconvert pipeline, portal-weighted napkin demand, driver exit-routing + serve attach barrier it required
+ 
+ ### Decisions
+-- [ADR Index](articles/decisions/adrs.md) — ADR-0001..0020 table with rationales, research basis, and pending-ADR queue
++- [ADR Index](articles/decisions/adrs.md) — ADR-0001..0021 table with rationales, research basis, and pending-ADR queue
+ 
+ ## Raw Research
+ 
+@@ -102,7 +102,9 @@ links its source synthesis for traceability.
+ - [x] [ADR-0017](decisions/ADR-0017-city-import-decisions.md) — city-scale OSM import decisions: no `--junctions.join` (stop override keys by OSM node id), `priority_stop` as whole-junction approximation, relations (turn restrictions) not imported, directionless stops infer from oneway else forward with a reported count
+ - [x] [ADR-0018](decisions/ADR-0018-chunked-geojson.md) — city-scale network GeoJSON served chunked over HTTP: manifest (`frame` + empty features + `parts`), hash+schema-pinned part URLs that 404 a stale generation, sequential client fetch; small nets byte-identical
+ - [x] [ADR-0019](decisions/ADR-0019-route-budget-determinism.md) — route-budget determinism bound: per-replica admission timing and mid-queue failover lane re-freeze accepted and bounded; strict fix retires the budget
++- [ ] [ADR-0021](decisions/ADR-0021-od-demand-buildings.md) — PROPOSED: origin–destination demand — the route destination becomes a TRIP END (arrival despawn), `destination`/`offset_m` ride the spawn verb (omitempty, TSKF v4 only when used), interior injection is clearance-checked behind, and OD is anchored to OSM building floor area
+ - [x] [ADR-0020](decisions/ADR-0020-demosrv-public-deployment.md) — demosrv public deployment: -wspublic verbatim ws advertisement, -admintoken bearer gate on the mutating POSTs (GETs public), -autostart with keep-serving failure semantics, -nobuild prebuilt engine binaries; all default to local-dev behavior
++- [ ] [ADR-0022](decisions/ADR-0022-us-urban-speed-typemap.md) — PROPOSED: US urban speed typemap — netconvert's German-derived OSM defaults gave unposted secondary/primary 100 km/h across all 25 US networks; an explicit speed-only typemap sets the 30 mph statutory urban default, joins the importer identity hash, and is region-scoped (de-roundabouts keeps stock)
+ 
+ ---
+ *Last distilled: 2026-07-17 | 18 articles from 56 raw research files*
+@@ -115,4 +117,6 @@ links its source synthesis for traceability.
+ *ADR-0018 ratified 2026-07-24 (chunked network GeoJSON, after la-lean hit the V8 string cap)*
+ *ADR-0019 ratified 2026-07-24 (route-budget determinism bound, after the city-scale obs-path stall)*
+ *ADR-0020 ratified 2026-07-25 (demosrv public deployment: GKE pod behind a 443-only TLS Ingress)*
++*ADR-0021 PROPOSED 2026-07-25 (building-anchored OD demand for chi-loop; awaiting the external-review round)*
++*ADR-0022 PROPOSED 2026-07-25 (US urban speed typemap; found while chasing chi-loop's collision hotspot — 79.7% of its lanes were ≥80 km/h)*
+ *Run `/update-kb` to check freshness*
+diff --git a/docs/kb/articles/decisions/adrs.md b/docs/kb/articles/decisions/adrs.md
+index 9a9be54..c206e69 100644
+--- a/docs/kb/articles/decisions/adrs.md
++++ b/docs/kb/articles/decisions/adrs.md
+@@ -35,6 +35,8 @@ closed (2026-07-15..17).
+ | [ADR-0018](../../decisions/ADR-0018-chunked-geojson.md) | City-scale network GeoJSON is served chunked over HTTP: manifest (`frame` + empty features + `parts`) at `/net/{id}.geojson`, hash-pinned part URLs that 404 a stale generation, sequential client fetch; small nets byte-identical | V8's ~537M-char string cap makes la-lean's ~860 MB single document unparseable; chunking keeps the existing endpoint and cache instead of a vector-tile migration | ADR-0015/0016 chunking precedent; la-lean browser verification 2026-07-24 |
+ | [ADR-0019](../../decisions/ADR-0019-route-budget-determinism.md) | Route-budget determinism bound: per-replica admission timing (~0.3 sim-s worst case) and mid-queue failover lane re-freeze are accepted and bounded; strict fix is O(1) global exit-reachability, retiring the budget | City-scale cold-origin reachability scans stalled the obs path (measured sf-lean); the budget is the throttle, its edge cases are the recorded price | sf-lean stall diagnosis 2026-07-24; sol review rounds |
+ | [ADR-0020](../../decisions/ADR-0020-demosrv-public-deployment.md) | demosrv public deployment: `-wspublic` advertises one verbatim client ws URL (TLS-LB case), `-admintoken` bearer-gates exactly the mutating POSTs (GETs stay public), `-autostart` starts a demo post-listen with keep-serving failure semantics, `-nobuild` execs prebuilt serve/replay; every flag defaults to the local-dev behavior | An always-on public instance (GKE pod behind a 443-only GCE Ingress) breaks four localhost assumptions: unreconstructable ws advertisement, open mutating API, nothing runs until a click, and the go-build pre-warm needs a toolchain the image lacks; ADR-0004 local-first stays the default | Podcast demo program deploy 2026-07-25 |
++| [ADR-0021](../../decisions/ADR-0021-od-demand-buildings.md) | **PROPOSED.** Origin–destination demand: the route destination becomes a TRIP END (arrival despawn, exit case tested first so pre-0021 recordings are bit-identical); `destination` + `offset_m` ride the spawn verb as omitempty fields (TSKF v4 written only when a queued directive uses them); interior injection is clearance-checked BEHIND and denies rather than caps; flow `destinations` are a weighted sorted-key draw appended LAST in the per-vehicle stream; OD weights come from OSM building floor area | chi-loop's demand was portal inflow with random egress — nobody born inside the zone, nobody arriving anywhere — which produces diffuse delay instead of the localized, nameable failures a resident recognizes; ADR-0019 had already deferred the non-exit-destination case | chi-loop 15-min baseline (2026-07-25): delay spread with no defect lane, 16.9k dropped crossings, fleet unbounded; ADR-0019 deferrals |
++| [ADR-0022](../../decisions/ADR-0022-us-urban-speed-typemap.md) | **PROPOSED.** US urban imports pass an explicit `scripts/osm-urban-us.typ.xml` to netconvert, generated from the stock map with ONLY `speed` changed (topology and right-of-way provably untouched); unposted primary/secondary/tertiary become the 30 mph statutory urban-district limit; the typemap joins `import-city.sh`'s importer identity hash; region-scoped and opt-in, and networks are re-imported deliberately under a new name rather than in place | netconvert's OSM typemap is German-derived — unposted secondary/primary/trunk default to 100 km/h, and only 19% of chi-loop's secondary ways carry `maxspeed`, so Michigan Ave, Wells, Wabash and State St simulated as autobahn; free-flow speed is the denominator of every delay number the metric kernel reports | Measured across all 25 US networks (worst houston-lean: 51.8% of lanes at exactly 100 km/h); chi-loop vs chi-loop-urban A/B confirms identical drivable topology |
+ 
+ ## Research Complete, ADR Pending
+ 
+diff --git a/docs/kb/articles/integrations/osm-extraction.md b/docs/kb/articles/integrations/osm-extraction.md
+index 20a9dc3..68a0a2a 100644
+--- a/docs/kb/articles/integrations/osm-extraction.md
++++ b/docs/kb/articles/integrations/osm-extraction.md
+@@ -51,6 +51,25 @@ Tag sparsity (taginfo, 2026-07-17, against ~177.9 M motor-road ways) is the foun
+ - **No default lane width is codified anywhere** in OSM: osm2streets hard-codes sidewalk 1.5 m / shoulder 0.5 m / service road 2.0 m; SUMO's lane-width default is 3.2 m. Our table must own this explicitly.
+ - Cross-validation is a pass, not an assumption: real data carries `lanes=4` next to a 5-value `turn:lanes` pipe list (OsmAnd#5221). Conflicts degrade to **warnings + default fallback, never import failures**.
+ 
++> **This prediction came true, and we shipped 25 networks before catching it**
++> (2026-07-25, [ADR-0022](../../decisions/ADR-0022-us-urban-speed-typemap.md)).
++> The "not trusting them" and "per-region parameters" warnings above were
++> written, then not acted on: every US network in `data/networks/` was
++> imported on the stock German typemap, where unposted
++> `secondary`/`primary`/`trunk` default to 27.78 m/s (100 km/h). With
++> `maxspeed` present on only 19% of chi-loop's secondary ways, 12,945 of its
++> 15,975 secondary lanes compiled at 62 mph — 79.7% of the whole network at
++> ≥80 km/h, mean 85.9 km/h. Worst case measured was `houston-lean`: 51.8% of
++> lanes at exactly 100 km/h.
++>
++> The lesson is about *where* the defaults table bites. Sparsity was known
++> and quantified here at ~12% `maxspeed` coverage; what was missed is that
++> free-flow speed is the **denominator of every congestion number** the
++> metric kernel produces, so an unverified default does not degrade results
++> gracefully — it silently rescales them. Defaults whose errors compound
++> into headline metrics need verification before first use, not "our table
++> must own this explicitly" as future work.
++
+ ### 4. Turn fabric: generate from geometry, filter by relations, never orphan a lane
+ 
+ - Generate candidate lane-to-lane connections from geometry + junction topology using A/B Street's lane-type pairing (straight = Cartesian product of driving lanes; side-lane-originated turns), guided by `turn:lanes` where present — treating partial markings as *unknown*, not through-lanes (netconvert's documented trap; `--osm.turn-lanes` defaults off for this reason).
+@@ -94,7 +113,7 @@ Nobody publishes the middle artifact — a typed lane list + restriction-resolve
+ - **Counts say how many, never which**: `lanes:bus=1` carries no position; only the `bus:lanes=` pipe-list form does.
+ - **Indicated ≠ legal**: `turn:lanes` records road markings; restriction relations record law. Both must be imported and reconciled — they disagree in real data.
+ - **Hard-failing on bad tags is an anti-pattern**: a wrong restriction or pipe-count mismatch degrades to warning + fallback. The invariant "every lane leads somewhere" outranks any single tag.
+-- **No global rules where OSM diverges regionally**: three maxspeed zone notations, US-vs-international `motorway_link` extent, two signal conventions — these need per-region parameters.
++- **No global rules where OSM diverges regionally**: three maxspeed zone notations, US-vs-international `motorway_link` extent, two signal conventions — these need per-region parameters. **Confirmed the expensive way**: netconvert's typemap is German, and applying it to 25 US networks put unposted arterials at 100 km/h ([ADR-0022](../../decisions/ADR-0022-us-urban-speed-typemap.md)). The region parameter is not a refinement — it is load-bearing from the first import.
+ 
+ ## Open Questions
+ 
+diff --git a/scripts/import-city.sh b/scripts/import-city.sh
+index 07f8ee3..4700589 100755
+--- a/scripts/import-city.sh
++++ b/scripts/import-city.sh
+@@ -23,12 +23,29 @@ NET_DIR="$ROOT/data/networks/$NAME"
+ SCN_DIR="$ROOT/data/scenarios/$NAME"
+ mkdir -p "$NET_DIR" "$SCN_DIR"
+ 
++# Speed defaults (ADR-0022). netconvert's built-in OSM typemap is
++# German-derived — unposted secondary/primary/trunk default to 27.78 m/s
++# (100 km/h) — and `maxspeed` is tagged on only ~12% of ways, so US imports
++# compiled their arterials as autobahn. Free-flow speed is the denominator
++# of every congestion number the metric kernel reports, so this is not a
++# tuning knob. Region is a PARAMETER, not a default: set TYPEMAP= (empty)
++# for a non-US import (de-roundabouts) to get netconvert's stock behavior.
++TYPEMAP="${TYPEMAP-$ROOT/scripts/osm-urban-us.typ.xml}"
++TYPE_ARGS=()
++if [ -n "$TYPEMAP" ]; then
++  [ -f "$TYPEMAP" ] || { echo "typemap not found: $TYPEMAP (set TYPEMAP= to use netconvert's stock defaults)" >&2; exit 1; }
++  TYPE_ARGS=(--type-files "$TYPEMAP")
++  echo "== [$NAME] typemap: $TYPEMAP"
++else
++  echo "== [$NAME] typemap: netconvert stock (German OSM defaults)"
++fi
++
+ echo "== [$NAME] overpass json -> .osm"
+ python3 "$ROOT/scripts/overpass2osm.py" "$SRC" "$NET_DIR/$NAME.osm"
+ 
+ echo "== [$NAME] netconvert -> .net.xml"
+ "$NC" --osm-files "$NET_DIR/$NAME.osm" -o "$NET_DIR/$NAME.base.net.xml" \
+-  --proj.utm --no-turnarounds
++  "${TYPE_ARGS[@]}" --proj.utm --no-turnarounds
+ 
+ # Stop signs: netconvert (1.27.1) ignores OSM highway=stop nodes on import,
+ # so stop junctions are re-typed in a SECOND pass from a PlainXML node
+@@ -37,6 +54,10 @@ echo "== [$NAME] netconvert -> .net.xml"
+ # Pass 2 repeats --no-turnarounds so connection recomputation at retyped
+ # junctions cannot re-add the U-turn loops pass 1 excluded. No --proj.utm
+ # here on purpose: the base .net.xml carries its own <location> block.
++# Deliberately NO --type-files here either: pass 2 reimports a .net.xml
++# whose edge speeds are already resolved, and ADR-0017 verified pass 2
++# changes ONLY the retyped junctions. Re-applying types would put that
++# guarantee back in question for no gain.
+ # Deliberately NO --junctions.join anywhere: the override keys junctions by
+ # OSM node id, which joining rewrites to cluster ids; the KB's consolidation
+ # guidance conflicts with that keying and loses to stop fidelity (ADR-0017).
+@@ -66,7 +87,11 @@ EXTRACT_TS=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get
+ # scripts AND the Go importer): stable across clones and unrelated
+ # commits, changes exactly when the importer changes (the provenance
+ # feeds the ADR-0012 content hash).
+-REPO_REV=$(cat "$ROOT/scripts/overpass2osm.py" "$ROOT/scripts/osm-stop-nodes.py" "$ROOT/scripts/import-city.sh" "$ROOT/engine/cmd/netimport/main.go" "$ROOT/engine/netimport/netimport.go" | sha256sum | cut -c1-12)
++# The typemap is IN the hash (ADR-0022 §4): it shapes the compiled network
++# as much as any script here, so editing a speed must move the provenance
++# string. Absent (stock netconvert defaults) it contributes nothing, which
++# is itself the distinguishing input.
++REPO_REV=$(cat "$ROOT/scripts/overpass2osm.py" "$ROOT/scripts/osm-stop-nodes.py" "$ROOT/scripts/import-city.sh" ${TYPEMAP:+"$TYPEMAP"} "$ROOT/engine/cmd/netimport/main.go" "$ROOT/engine/netimport/netimport.go" | sha256sum | cut -c1-12)
+ (cd "$ROOT/engine" && go run ./cmd/netimport \
+   -in "$NET_DIR/$NAME.net.xml" \
+   -out "$SCN_DIR/$NAME.json" \
+diff --git a/scripts/osm-urban-us.typ.xml b/scripts/osm-urban-us.typ.xml
+new file mode 100644
+index 0000000..7acb846
+--- /dev/null
++++ b/scripts/osm-urban-us.typ.xml
+@@ -0,0 +1,77 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!-- osm-urban-us.typ.xml — netconvert type overrides for US URBAN imports.
++     See ADR-0022 (docs/kb/decisions/ADR-0022-us-urban-speed-typemap.md).
++
++     netconvert's built-in OSM typemap is German-derived: highway.secondary,
++     primary and trunk all default to 27.78 m/s (100 km/h). Only 19% of
++     chi-loop's secondary ways carry a maxspeed tag, so 12,945 of its 15,975
++     secondary lanes compiled at 62 mph — Michigan Avenue, Wells, Wabash and
++     State Street all simulated as autobahn. Measured across the tree, 25 US
++     networks were affected; worst was houston-lean at 51.8% of lanes sitting
++     at exactly 100 km/h.
++
++     The unposted defaults here are the STATUTORY urban-district limit —
++     30 mph in Illinois, Texas, Georgia and Florida — not fitted values.
++     Known approximation: California's business/residence default is 25 mph
++     (CVC 22352), so SF/LA imports run 5 mph fast on unposted streets. Fork
++     a per-state map if that ever needs to be exact.
++
++     ONLY the speed attribute differs from the stock typemap: numLanes,
++     priority, oneway, width, allow/disallow and discard are copied
++     verbatim, so this changes speeds and NOTHING about topology or
++     right-of-way. Verified on chi-loop: external lanes, origins, exits,
++     signal programs and signal links are all identical across the A/B; only
++     netconvert's speed-dependent junction-INTERIOR construction shifts.
++     An OSM maxspeed tag still wins over the default.
++
++     NOT for non-US imports — de-roundabouts is German and wants the stock
++     map. Region is a parameter here, not a default.
++
++     Generated from the stock osmNetconvert.typ.xml — regenerate rather
++     than hand-edit if SUMO's typemap changes.
++-->
++<types xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/types_file.xsd">
++    <type id="highway.motorway"       numLanes="2" speed="24.59" priority="14" oneway="true"  disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship pedestrian bicycle moped"/>
++    <type id="highway.trunk"          numLanes="2" speed="20.12" priority="13" oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship pedestrian bicycle"/>
++    <type id="highway.primary"        numLanes="2" speed="13.41" priority="12" oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
++    <type id="highway.secondary"      numLanes="1" speed="13.41" priority="11" oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
++    <type id="highway.tertiary"       numLanes="1" speed="13.41" priority="10" oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
++    <type id="highway.motorway_link"  numLanes="1" speed="17.88" priority="9"  oneway="true"  disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship pedestrian bicycle moped"/>
++    <type id="highway.trunk_link"     numLanes="1" speed="15.65" priority="8"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship pedestrian bicycle"/>
++    <type id="highway.primary_link"   numLanes="1" speed="11.18" priority="7"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
++    <type id="highway.secondary_link" numLanes="1" speed="11.18" priority="6"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
++    <type id="highway.tertiary_link"  numLanes="1" speed="11.18" priority="5"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
++    <type id="highway.unclassified"   numLanes="1" speed="11.18" priority="4"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
++    <type id="highway.residential"    numLanes="1" speed="11.18" priority="3"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
++    <type id="highway.living_street"  numLanes="1" speed="4.47"  priority="2"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
++    <type id="highway.unsurfaced"     numLanes="1" speed="8.33"  priority="1"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
++    <type id="highway.service"        numLanes="1" speed="6.71"  priority="1"  oneway="false" allow="delivery pedestrian bicycle"/>
++    <type id="highway.service|psv"    numLanes="1" speed="13.89" priority="1"  oneway="false" allow="delivery pedestrian bicycle bus"/>
++    <type id="highway.service|bus"    numLanes="1" speed="13.89" priority="1"  oneway="false" allow="delivery pedestrian bicycle bus"/>
++
++    <!-- everything which serves mainly pedestrians is oneway because all current pedestrian models do not care about direction -->
++    <type id="highway.track"          numLanes="1" speed="5.56"  priority="1"  oneway="false"           allow="motorcycle moped pedestrian bicycle"/>
++    <type id="highway.footway"        numLanes="1" speed="2.78"  priority="1"  oneway="true"  width="2" allow="pedestrian"/>
++    <type id="highway.pedestrian"     numLanes="1" speed="2.78"  priority="1"  oneway="true"  width="2" allow="pedestrian"/>
++    <type id="highway.path"           numLanes="1" speed="5.56"  priority="1"  oneway="false" width="2" allow="pedestrian bicycle"/>
++    <type id="highway.bridleway"      numLanes="1" speed="2.78"  priority="1"  oneway="true"  width="2" allow="pedestrian"/>
++    <type id="highway.cycleway"       numLanes="1" speed="5.56"  priority="1"  oneway="false" width="2" allow="bicycle"/>
++    <type id="highway.step"           numLanes="1" speed="1.39"  priority="1"  oneway="true"  width="2" allow="pedestrian"/>
++    <type id="highway.steps"          numLanes="1" speed="1.39"  priority="1"  oneway="true"  width="2" allow="pedestrian"/>
++    <type id="highway.stairs"         numLanes="1" speed="1.39"  priority="1"  oneway="true"  width="2" allow="pedestrian"/>
++
++    <type id="highway.bus_guideway"   numLanes="1" speed="27.78" priority="1"  oneway="true"  allow="bus"/>
++    <type id="highway.busway"         numLanes="1" speed="27.78" priority="1"  oneway="true"  allow="bus"/>
++    <type id="highway.raceway"        numLanes="2" speed="83.33" priority="15" oneway="false" allow="vip"/>
++    <type id="highway.ford"           numLanes="1" speed="2.78"  priority="1"  oneway="false" allow="army"/>
++
++    <type id="railway.preserved"      numLanes="1" speed="27.78" priority="16" oneway="true"  allow="rail"/>
++    <type id="railway.tram"           numLanes="1" speed="13.89" priority="17" oneway="true"  allow="tram"/>
++    <type id="railway.subway"         numLanes="1" speed="27.78" priority="18" oneway="true"  allow="subway"/>
++    <type id="railway.light_rail"     numLanes="1" speed="27.78" priority="19" oneway="true"  allow="rail_urban"/>
++    <type id="railway.rail"           numLanes="1" speed="44.44" priority="20" oneway="true"  allow="rail"/>
++    <type id="railway.highspeed"      numLanes="1" speed="69.44" priority="21" oneway="true"  allow="rail_fast rail rail_electric"/>
++
++    <type id="highway.construction"   numLanes="1" speed="13.89" priority="4"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram tram drone aircraft scooter container wheelchair subway cable_car ship" discard="true"/>
++    <type id="railway.construction"   numLanes="1" speed="13.89" priority="20"  oneway="true" allow="rail" discard="true"/>
++</types>
+diff --git a/docs/kb/decisions/ADR-0022-us-urban-speed-typemap.md b/docs/kb/decisions/ADR-0022-us-urban-speed-typemap.md
+new file mode 100644
+index 0000000..dd8bf56
+--- /dev/null
++++ b/docs/kb/decisions/ADR-0022-us-urban-speed-typemap.md
+@@ -0,0 +1,177 @@
++# ADR-0022: US urban speed typemap for OSM imports
++
++- **Status:** PROPOSED
++- **Date:** 2026-07-25
++- **Amends:** [ADR-0017](ADR-0017-city-import-decisions.md) (city-scale import posture)
++- **Relates to:** [ADR-0009](ADR-0009-osm-import-strategy.md), [ADR-0012](ADR-0012-scenario-format.md)
++
++## Context
++
++netconvert's built-in OSM typemap (`osmNetconvert.typ.xml`) is
++German-derived. Its unposted-road defaults encode German practice:
++
++| OSM class | stock default | as km/h |
++|---|---|---|
++| `highway.secondary` | 27.78 m/s | 100 |
++| `highway.primary` | 27.78 m/s | 100 |
++| `highway.trunk` | 27.78 m/s | 100 |
++| `highway.tertiary` | 22.22 m/s | 80 |
++| `highway.residential` | 13.89 m/s | 50 |
++| `highway.motorway` | 39.44 m/s | 142 |
++
++An OSM `maxspeed` tag overrides the default, so the error only surfaces
++where the tag is absent — which in US extracts is the common case. In
++`chi-loop`, only 19% of secondary ways carry `maxspeed`, so 12,945 of
++15,975 secondary lanes compiled at 100 km/h. Michigan Avenue, Wells,
++Wabash and State Street were all simulated as autobahn.
++
++This is not a tuning nit. Free-flow speed sets the IDM desired speed,
++which sets headway, which sets capacity and delay. Every congestion
++number produced on these networks — mean speed, time loss, the ranked
++worst-streets table — is computed against a free-flow reference that is
++2–3× the real posted limit. The delay figures are not merely imprecise;
++their denominator is wrong.
++
++**Measured blast radius.** Every US network in `data/networks/` was
++imported with the stock typemap. External (non-junction-interior) lanes:
++
++| network | lanes | mean km/h | ≥80 km/h | exactly 100 km/h |
++|---|---|---|---|---|
++| houston-lean | 323,007 | 88.8 | 61.2% | 51.8% |
++| chi-loop | 23,833 | 85.9 | 79.7% | 57.1% |
++| atlanta-lean | 155,473 | 80.3 | 35.4% | 25.8% |
++| chi-north-lakefront | 24,189 | 79.1 | 64.8% | 48.4% |
++| la-arterial | 535,348 | 76.3 | 38.8% | 28.8% |
++| chi-kennedy | 7,533 | 75.8 | 51.3% | 20.1% |
++| la-lean | 639,856 | 75.1 | 32.7% | 24.2% |
++| dallas-lean | 376,684 | 74.6 | 27.0% | 16.8% |
++| sf-lean | 140,751 | 74.2 | 36.9% | 28.4% |
++| miami-lean | 222,326 | 71.9 | 18.3% | 11.5% |
++| houston | 798,814 | 68.4 | 28.2% | 24.3% |
++| la | 1,173,489 | 64.5 | 18.8% | 14.1% |
++| dallas | 747,158 | 63.4 | 14.8% | 9.4% |
++| stress-dtla | 14,903 | 62.2 | 41.7% | 34.5% |
++| atlanta | 455,570 | 62.0 | 13.6% | 10.2% |
++| miami | 583,054 | 58.6 | 7.7% | 5.1% |
++
++…and the smaller US cuts (`manhattan-grid`, `phoenix-arterial`,
++`macarthur-maze`, `sf-octavia`, `la-wilshire`, `merge-101-380`,
++`i280-woodside`, `boston-core`) on the same footing. 25 of the 28
++networks in the tree are affected. `de-roundabouts` is German and is
++correctly served by the stock typemap — which is exactly why the fix
++cannot be a global default change.
++
++The `-lean` cuts are consistently *worse* than their full counterparts
++because filtering to arterial-and-up raises the share of secondary and
++primary lanes, the two classes the stock map misprices hardest. The
++networks cut down for demos are the most wrong.
++
++## Decision
++
++1. **US urban imports use an explicit typemap,
++   `scripts/osm-urban-us.typ.xml`, passed to netconvert pass 1 via
++   `--type-files`.** It is generated from the stock
++   `osmNetconvert.typ.xml` with **only the `speed` attribute changed** —
++   `numLanes`, `priority`, `oneway`, `width`, `allow`/`disallow` and
++   `discard` are copied verbatim. The change is therefore provably
++   confined to free-flow speed: it cannot move topology, lane counts or
++   right-of-way. (Verified on `chi-loop`; see Consequences.)
++
++2. **Unposted urban defaults are the statutory urban-district limit,
++   30 mph / 13.41 m/s**, applied to `primary`, `secondary` and
++   `tertiary`. This is a legal value, not a fitted one: Illinois,
++   Texas, Georgia and Florida all set 30 mph as the urban-district
++   default for a street that is not posted otherwise. Residential and
++   unclassified drop to 25 mph (11.18), service to 15 mph (6.71),
++   motorway to 55 mph (24.59) and trunk to 45 mph (20.12).
++
++   **Known approximation:** California's statutory business/residence
++   default is 25 mph (CVC 22352), so `sf`, `sf-lean`, `sf-octavia`,
++   `la*`, `i280-woodside`, `macarthur-maze` and `merge-101-380` run
++   5 mph fast on unposted streets. Accepted rather than forked: a
++   per-state typemap is the natural next step if a California scenario
++   ever needs the precision, and 30 mph is far closer than 62.
++
++3. **The typemap is region-scoped and opt-in, not a new global
++   default.** `import-city.sh` gains a `TYPEMAP` variable defaulting to
++   the US urban map; a non-US import sets `TYPEMAP=` to get stock
++   behavior. `de-roundabouts` is the standing counterexample.
++
++4. **The typemap file joins the importer identity hash.**
++   `import-city.sh`'s `REPO_REV` currently hashes the pipeline scripts
++   and the Go importer. The typemap now shapes the compiled network as
++   much as any of them, so it is added to that hash — otherwise editing
++   a speed silently produces a different network under an unchanged
++   provenance string, and ADR-0012 content hashes stop meaning what
++   they claim.
++
++5. **Existing networks are not silently re-imported.** Networks are
++   re-imported deliberately, one at a time, under a new directory name
++   (`chi-loop` → `chi-loop-urban`) rather than in place. Recordings and
++   scenario hashes bound to the old networks stay valid *as recordings
++   of the old network*; nothing is invalidated retroactively, and the
++   two can be compared.
++
++## Consequences
++
++- **Verified on chi-loop** (`chi-loop` vs `chi-loop-urban`, same OSM
++  extract, same flags, typemap the only difference):
++
++  | | chi-loop | chi-loop-urban |
++  |---|---|---|
++  | external lanes | 23,833 | 23,833 |
++  | origins / exits | 246 / 1,432 | 246 / 1,432 |
++  | signal programs / links | 2,217 / 13,181 | 2,217 / 13,181 |
++  | connections | 61,229 | 61,113 |
++  | internal lanes | 31,705 | 31,587 |
++  | yield approaches | 1,089 | 987 |
++  | conflict pairs | 29,360 | 29,104 |
++  | mean speed limit | 85.9 km/h | 50.5 km/h |
++  | lanes ≥ 80 km/h | 79.7% | 4.3% |
++
++  Every drivable-topology count is identical. The deltas are confined
++  to netconvert's **speed-dependent junction-interior construction** —
++  internal-junction split points, and the right-of-way conflict set
++  that follows from them. Lower approach speeds need fewer in-junction
++  waiting positions. This is a consequence of the decision, not a
++  regression, but it does mean **`chi-loop` and `chi-loop-urban`
++  recordings are not comparable at junction level.**
++
++- Residual lanes above 80 km/h in `chi-loop-urban` are 975 motorway
++  lanes at 89 km/h plus explicitly tagged `maxspeed` values (64, 72
++  km/h). Observed speeds in the compiled network include 24/32/40/48/56
++  km/h — the 15/20/25/30/35 mph tag ladder — confirming OSM tags still
++  win over the type default.
++
++- **Demand tuned against a fast network does not transfer.**
++  `chi-loop-od`'s 12,000 veh/h target was set against the 62-mph
++  network; capacity at 30 mph is materially lower and the same demand
++  will gridlock. Every scenario re-pointed at a re-imported network
++  must be re-tuned, and its README tuning log must say which network
++  the numbers were taken on.
++
++- Congestion reports produced before this ADR (`scorecard.py`,
++  `congestion.py` output archived under `data/scenarios/`) quote delay
++  against an autobahn free-flow reference and should be regenerated or
++  labelled, not cited.
++
++- Re-importing the remaining 24 networks is deferred. Each is a
++  multi-GB netconvert run; they are re-imported when a scenario needs
++  them, not en masse. The affected list above is the work queue.
++
++## Alternatives considered
++
++- **Patch speeds post-import in `netimport`.** Rejected: netconvert
++  uses edge speed while *building* the network (junction internal
++  geometry, right-of-way), so a post-hoc rewrite would produce a
++  network whose junctions were laid out for speeds it no longer has —
++  strictly worse than the honest re-import, and silently so.
++
++- **Replace SUMO's stock typemap in the venv.** Rejected: invisible,
++  unversioned, lost on any SUMO reinstall, and it would break
++  `de-roundabouts` without a trace.
++
++- **Infer limits from road class + land use / building density.**
++  Rejected for now as a model where a statute is available. Worth
++  revisiting once the ADR-0021 building index is a first-class input to
++  import rather than a post-processing step.

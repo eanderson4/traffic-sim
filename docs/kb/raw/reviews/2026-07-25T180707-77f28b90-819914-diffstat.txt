@@ -1,0 +1,9 @@
+ docs/kb/INDEX.md                                   |   6 +-
+ docs/kb/articles/decisions/adrs.md                 |   4 +-
+ .../ADR-0020-demosrv-public-deployment.md          | 146 ++++
+ engine/cmd/demosrv/deploy.go                       | 244 +++++++
+ engine/cmd/demosrv/deploy_test.go                  | 756 +++++++++++++++++++++
+ engine/cmd/demosrv/main.go                         | 212 +++++-
+ engine/cmd/demosrv/replay.go                       |   8 +-
+ engine/cmd/demosrv/supervisor.go                   | 217 +++++-
+ 8 files changed, 1520 insertions(+), 73 deletions(-)

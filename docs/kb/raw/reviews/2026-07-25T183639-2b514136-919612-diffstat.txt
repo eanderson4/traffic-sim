@@ -1,0 +1,12 @@
+ .dockerignore                                      | 13 +++
+ Dockerfile                                         | 34 ++++++++
+ deploy/README.md                                   | 73 +++++++++++++++++
+ deploy/demos.public.json                           | 94 ++++++++++++++++++++++
+ deploy/docker-entrypoint.sh                        | 19 +++++
+ deploy/k8s/backendconfig.yaml                      | 28 +++++++
+ deploy/k8s/deployment.yaml                         | 83 +++++++++++++++++++
+ deploy/k8s/ingress.yaml                            | 59 ++++++++++++++
+ deploy/k8s/namespace.yaml                          |  4 +
+ deploy/k8s/service.yaml                            | 17 ++++
+ .../ADR-0020-demosrv-public-deployment.md          |  4 +-
+ 11 files changed, 426 insertions(+), 2 deletions(-)

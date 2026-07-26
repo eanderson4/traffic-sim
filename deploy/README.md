@@ -40,14 +40,18 @@ manifests are staged infrastructure, not a deployable system.
 ```sh
 # 1. image (from repo root; requires the demosrv flags -wspublic/-autostart/
 #    -nobuild and the engine /healthz endpoint).
-#    UNIQUE tag per build — re-pushing a tag the manifest references
-#    produces no rollout and can serve a stale cached image.
-TAG=v0.1.0-$(git rev-parse --short HEAD)
+#    UNIQUE tag per build — per-HEAD alone ignores dirty trees and rebuilds,
+#    so add seconds + entropy; re-pushing a referenced tag produces no
+#    rollout and can serve a stale cached image.
+TAG=v0.1.0-$(git rev-parse --short HEAD)-$(date +%Y%m%d%H%M%S)-$(head -c2 /dev/urandom | od -An -tx1 | tr -d ' ')
 docker build --platform linux/amd64 -t us-central1-docker.pkg.dev/roaring-bots/carbon-dev-repo/traffic-sim:$TAG .
 docker push us-central1-docker.pkg.dev/roaring-bots/carbon-dev-repo/traffic-sim:$TAG
 
 # 2. admin token (once; generate a real one). NOTE: re-running this rotates
-#    the token (kubectl apply overwrites) and invalidates the old one.
+#    the token (kubectl apply overwrites), invalidating the old one — and the
+#    RUNNING pod keeps the OLD token until restarted (env is injected at pod
+#    creation), so follow any rotation with:
+#    kubectl rollout restart deployment/demosrv -n traffic-sim
 kubectl create namespace traffic-sim 2>/dev/null || true
 kubectl -n traffic-sim create secret generic traffic-sim-admin \
   --from-literal=token="$(openssl rand -hex 24)" --dry-run=client -o yaml | kubectl apply -f -
