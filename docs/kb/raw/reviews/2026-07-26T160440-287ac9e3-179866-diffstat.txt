@@ -1,0 +1,7 @@
+ engine/cmd/default-driver/main.go  |  12 +-
+ engine/cmd/serve/main.go           |  11 +-
+ engine/natsio/driver/batch_test.go | 310 +++++++++++++++++++++++++++++++++++++
+ engine/natsio/driver/driver.go     |  59 ++++++-
+ engine/natsio/driver_test.go       | 112 ++++++++++++++
+ engine/natsio/tsib.go              |  17 ++
+ 6 files changed, 511 insertions(+), 10 deletions(-)

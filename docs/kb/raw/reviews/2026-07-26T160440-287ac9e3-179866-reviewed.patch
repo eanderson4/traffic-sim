@@ -1,0 +1,663 @@
+diff --git a/engine/cmd/default-driver/main.go b/engine/cmd/default-driver/main.go
+index 8f74c35e8a55c380ad1cfe68b5de64123da51365..24030cebf9d4781c8204508bae90f9e4ae85571b 100644
+--- a/engine/cmd/default-driver/main.go
++++ b/engine/cmd/default-driver/main.go
+@@ -29,11 +29,16 @@ func main() {
+ 	run := flag.String("run", "", "run id to attach to (required)")
+ 	capacity := flag.Int("capacity", 1000, "claim capacity (max vehicles this replica holds)")
+ 	dest := flag.String("dest", "", "destination lane id for the routing axis (optional)")
++	intentBatch := flag.String("intent-batch", "on", "aggregate each tick's intents into TSIB batches (on|off; off restores the pre-ADR-0026 per-vehicle v2 stream, for A/B measurement and debugging)")
+ 	flag.Parse()
+ 	if *run == "" {
+ 		fmt.Fprintln(os.Stderr, "default-driver: -run is required")
+ 		os.Exit(2)
+ 	}
++	if *intentBatch != "on" && *intentBatch != "off" {
++		fmt.Fprintf(os.Stderr, "default-driver: -intent-batch must be on|off, got %q\n", *intentBatch)
++		os.Exit(2)
++	}
+ 
+ 	nc, err := nats.Connect(*url,
+ 		nats.Name("default-driver"),
+@@ -56,9 +61,10 @@ func main() {
+ 	}
+ 
+ 	d, err := driver.New(nc, js, driver.Config{
+-		Run:         *run,
+-		Capacity:    *capacity,
+-		Destination: *dest,
++		Run:            *run,
++		Capacity:       *capacity,
++		Destination:    *dest,
++		IntentBatchOff: *intentBatch == "off",
+ 	})
+ 	if err != nil {
+ 		fmt.Fprintln(os.Stderr, "default-driver:", err)
+diff --git a/engine/cmd/serve/main.go b/engine/cmd/serve/main.go
+index 2ffc7aa0a823d11355dcadea497f3b61ae8d7ef9..0c12aa47017f7fbf2e4620aa3cbd09848f0f416b 100644
+--- a/engine/cmd/serve/main.go
++++ b/engine/cmd/serve/main.go
+@@ -80,6 +80,7 @@ func main() {
+ 			"NO controller intent because the driver could not keep up. Claims are "+
+ 			"exclusive and engine-arbitrated, so replicas shard the fleet safely.")
+ 	exitRouting := flag.Bool("exit-routing", true, "driver assigns each claimed vehicle a seeded exit-lane destination (per-vehicle routing; without it vehicles take the kernel's leftmost-successor default)")
++	intentBatch := flag.String("intent-batch", "on", "driver aggregates each tick's intents into TSIB batches (on|off; off restores the pre-ADR-0026 per-vehicle v2 stream, for A/B measurement and debugging)")
+ 	attachTimeout := flag.Duration("attach-timeout", 30*time.Second, "bound on the client-attach barrier: serve fails if an embedded client (driver, demand director) has not reported attached within this")
+ 	safetyDecel := flag.Float64("safety-decel", 6,
+ 		"longitudinal safety gate: max emergency deceleration (m/s²) the kernel "+
+@@ -96,6 +97,10 @@ func main() {
+ 		fmt.Fprintln(os.Stderr, "serve: -scenario or -netfile is required")
+ 		os.Exit(2)
+ 	}
++	if *intentBatch != "on" && *intentBatch != "off" {
++		fmt.Fprintf(os.Stderr, "serve: -intent-batch must be on|off, got %q\n", *intentBatch)
++		os.Exit(2)
++	}
+ 	host, portStr, err := net.SplitHostPort(*wsAddr)
+ 	if err != nil {
+ 		fmt.Fprintln(os.Stderr, "serve: -ws:", err)
+@@ -437,7 +442,7 @@ func main() {
+ 			}
+ 			expected = append(expected, name)
+ 			go func(name string) {
+-				barrier <- attachDriver(ns, *run, per, *exitRouting, *attachTimeout, name)
++				barrier <- attachDriver(ns, *run, per, *exitRouting, *intentBatch == "off", *attachTimeout, name)
+ 			}(name)
+ 		}
+ 	}
+@@ -645,7 +650,7 @@ type attachOutcome struct {
+ // been answered and New's final Flush guarantees the server has processed
+ // the observation/snapshot/unclaimed subscriptions, so tick 0's unclaimed
+ // pool reaches this replica.
+-func attachDriver(ns *server.Server, run string, capacity int, exitRouting bool, metaWait time.Duration, name string) attachOutcome {
++func attachDriver(ns *server.Server, run string, capacity int, exitRouting, intentBatchOff bool, metaWait time.Duration, name string) attachOutcome {
+ 	dnc, err := nats.Connect(nats.DefaultURL, nats.InProcessServer(ns), nats.Name(name))
+ 	if err != nil {
+ 		return attachOutcome{client: name, err: err}
+@@ -655,7 +660,7 @@ func attachDriver(ns *server.Server, run string, capacity int, exitRouting bool,
+ 		dnc.Close()
+ 		return attachOutcome{client: name, err: err}
+ 	}
+-	d, err := driver.New(dnc, djs, driver.Config{Run: run, Capacity: capacity, ExitRouting: exitRouting, MetaWait: metaWait})
++	d, err := driver.New(dnc, djs, driver.Config{Run: run, Capacity: capacity, ExitRouting: exitRouting, IntentBatchOff: intentBatchOff, MetaWait: metaWait})
+ 	if err != nil {
+ 		dnc.Close()
+ 		return attachOutcome{client: name, err: err}
+diff --git a/engine/natsio/driver/batch_test.go b/engine/natsio/driver/batch_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..019cba8b1d7c1c0ba4ce2637c527171de0ba6166
+--- /dev/null
++++ b/engine/natsio/driver/batch_test.go
+@@ -0,0 +1,310 @@
++package driver
++
++// batch_test.go — ADR-0026 M2: the driver's per-tick TSIB aggregation on
++// the wire. One batch per cadence tick per controller with records in ego
++// (observation slice) order; a route-update vehicle rides ONE complete
++// standalone v2 and is omitted from that tick's batch; fleets past
++// natsio.TSIBMaxRecords split into well-formed batches covering every
++// vehicle exactly once; IntentBatchOff restores the pre-M2 per-vehicle v2
++// stream byte-for-byte. The harness is the route-budget tests' pattern: a
++// directly-constructed Driver against an in-process broker, obs frames
++// crafted via natsio.EncodeObs, the intent subject tapped.
++
++import (
++	"encoding/binary"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/nats-io/nats.go"
++	"traffic-sim/engine"
++	"traffic-sim/engine/natsio"
++)
++
++// The demux header key/value are unexported in natsio (producers go through
++// natsio.NewTSIBMsg); the wire contract strings are pinned here literally.
++const (
++	tapHeaderKey  = "intent_encoding"
++	tapHeaderTSIB = "tsib"
++)
++
++// wireTap records every message on the driver's intent subject (payload +
++// headers) for batch-shape assertions.
++type wireTap struct {
++	mu   sync.Mutex
++	msgs []*nats.Msg
++}
++
++func (w *wireTap) subscribe(t *testing.T, nc *nats.Conn, run, id string) {
++	t.Helper()
++	_, err := nc.Subscribe(natsio.SubjectCtlIntent(run, id), func(m *nats.Msg) {
++		w.mu.Lock()
++		w.msgs = append(w.msgs, m)
++		w.mu.Unlock()
++	})
++	if err != nil {
++		t.Fatalf("subscribe intents: %v", err)
++	}
++}
++
++// waitCount blocks until at least want messages arrived and returns a copy.
++func (w *wireTap) waitCount(t *testing.T, want int) []*nats.Msg {
++	t.Helper()
++	deadline := time.Now().Add(10 * time.Second)
++	for time.Now().Before(deadline) {
++		w.mu.Lock()
++		n := len(w.msgs)
++		w.mu.Unlock()
++		if n >= want {
++			break
++		}
++		time.Sleep(2 * time.Millisecond)
++	}
++	w.mu.Lock()
++	defer w.mu.Unlock()
++	if len(w.msgs) < want {
++		t.Fatalf("intent messages = %d, want %d", len(w.msgs), want)
++	}
++	return append([]*nats.Msg(nil), w.msgs...)
++}
++
++// settle returns the message count after a quiet interval — the only honest
++// way to assert NOTHING further is published (the subscriber runs on a
++// delivery goroutine; a single lucky read false-passes, sol review).
++func (w *wireTap) settle() int {
++	stable, final := 0, -1
++	deadline := time.Now().Add(1 * time.Second)
++	for time.Now().Before(deadline) {
++		w.mu.Lock()
++		n := len(w.msgs)
++		w.mu.Unlock()
++		if n == final {
++			stable++
++			if stable >= 10 { // ~100 ms quiet
++				return final
++			}
++		} else {
++			stable, final = 0, n
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	return final
++}
++
++// batchDriver builds a directly-constructed Driver (the route-budget test
++// pattern). No Destination/ExitRouting: every ego adopts routing on arrival
++// (routeStep's want == "" branch), so the steady-state batch path is what
++// the wire shows unless a test configures otherwise.
++func batchDriver(nc *nats.Conn, cfg Config) *Driver {
++	cfg.Run = "t"
++	d := &Driver{
++		nc:        nc,
++		cfg:       cfg.withDefaults(),
++		id:        "drv",
++		spec:      engine.RunSpec{Seed: 42},
++		types:     []*engine.VehicleType{&engine.Car},
++		fleet:     map[uint64]bool{},
++		pending:   map[uint64]bool{},
++		routed:    map[uint64]bool{},
++		streams:   map[uint64]*engine.Stream{},
++		wantRoute: map[uint64]string{},
++		wantLane:  map[uint64]int{},
++		done:      make(chan struct{}),
++	}
++	return d
++}
++
++func obsMsg(tick uint64, features uint16, egos []natsio.ObsEgo) *nats.Msg {
++	return &nats.Msg{Data: natsio.EncodeObs(tick, features, egos, nil)}
++}
++
++// decodeTSIBMsg unwraps one tapped message as a TSIB batch, asserting the
++// demux header and a clean decode.
++func decodeTSIBMsg(t *testing.T, m *nats.Msg, tick uint64) []engine.Intent {
++	t.Helper()
++	if enc := m.Header.Get(tapHeaderKey); enc != tapHeaderTSIB {
++		t.Fatalf("intent_encoding = %q, want %q", enc, tapHeaderTSIB)
++	}
++	recs, drops, ok := natsio.DecodeTSIB(m.Data)
++	if !ok || drops != 0 {
++		t.Fatalf("TSIB decode: ok %v drops %d", ok, drops)
++	}
++	if got := binary.LittleEndian.Uint64(m.Data[8:]); got != tick {
++		t.Fatalf("batch header tick = %d, want %d (source obs tick)", got, tick)
++	}
++	return recs
++}
++
++// One observation frame ⇒ exactly ONE TSIB message on the intent subject,
++// records in ego (frame slice) order, header tick = source obs tick — one
++// batch per cadence tick per controller.
++func TestBatchOnePerTickInEgoOrder(t *testing.T) {
++	_, nc := startTestBroker(t)
++	d := batchDriver(nc, Config{})
++	var tap wireTap
++	tap.subscribe(t, nc, "t", "drv")
++
++	// Deliberately unsorted ids: record order must be the frame's, not id
++	// order — engine-assigned seqs stay monotonic in arrival order.
++	egos := []natsio.ObsEgo{{ID: 11}, {ID: 7}, {ID: 42}, {ID: 3}, {ID: 28}}
++	d.onObs(obsMsg(1, 0, egos))
++	msgs := tap.waitCount(t, 1)
++	recs := decodeTSIBMsg(t, msgs[0], 1)
++	if len(recs) != len(egos) {
++		t.Fatalf("batch records = %d, want %d", len(recs), len(egos))
++	}
++	for i, r := range recs {
++		if r.VehicleID != egos[i].ID {
++			t.Fatalf("record %d vehicle = %d, want %d (ego order)", i, r.VehicleID, egos[i].ID)
++		}
++	}
++
++	// Next cadence tick: exactly one more batch — one per tick, no strays.
++	d.onObs(obsMsg(2, 0, egos))
++	tap.waitCount(t, 2)
++	if got := tap.settle(); got != 2 {
++		t.Fatalf("messages after 2 obs ticks = %d, want 2 (one batch per tick)", got)
++	}
++}
++
++// Route-update tick (ADR-0026): a vehicle whose destination goes out that
++// tick rides ONE complete standalone v2 — every computed axis plus the
++// route, no intent_encoding header — and is omitted from the tick's batch.
++// Once the obs echo confirms the route, the vehicle returns to the batch.
++func TestBatchRouteUpdateTickStandaloneV2(t *testing.T) {
++	_, nc := startTestBroker(t)
++	d := batchDriver(nc, Config{Destination: "D1"})
++	var tap wireTap
++	tap.subscribe(t, nc, "t", "drv")
++
++	// A minimal policy ctx (Cooldown 1 skips the lateral decision): enough
++	// for a finite IDM accel, so the standalone v2 provably carries the
++	// computed axes, not just the route.
++	ctx := &engine.PolicyCtx{Type: &engine.Car, CurLimit: 33.3, CurLen: 1000, V: 10, F: 1, S: 100}
++	wantAccel := ctx.DecideAccel()
++	mkEgos := func(route string) []natsio.ObsEgo {
++		return []natsio.ObsEgo{
++			{ID: 1, Route: route, Cooldown: 1, V: 10, F: 1, S: 100, Ctx: ctx},
++			{ID: 2, Route: route, Cooldown: 1, V: 10, F: 1, S: 100, Ctx: ctx},
++			{ID: 3, Route: route, Cooldown: 1, V: 10, F: 1, S: 100, Ctx: ctx},
++		}
++	}
++
++	// Tick 1: every ego needs its route sent → ALL traffic is standalone
++	// v2; no batch exists to publish.
++	d.onObs(obsMsg(1, natsio.ObsFeaturePolicyCtx, mkEgos("")))
++	msgs := tap.waitCount(t, 3)
++	if got := tap.settle(); got != 3 {
++		t.Fatalf("tick 1 messages = %d, want 3 standalone v2 (no batch)", got)
++	}
++	for i, m := range msgs {
++		if _, present := m.Header[tapHeaderKey]; present {
++			t.Fatalf("msg %d: route-update v2 carries an intent_encoding header", i)
++		}
++		in, ok := natsio.DecodeIntent(m.Data)
++		if !ok {
++			t.Fatalf("msg %d: not a valid v2 intent", i)
++		}
++		wantID := uint64(i + 1) // publish order = ego order
++		if in.VehicleID != wantID || !in.RouteSet || in.Route != "D1" {
++			t.Fatalf("msg %d: %+v, want vehicle %d route D1", i, in, wantID)
++		}
++		if !in.AccelSet || in.Accel != wantAccel || !in.SignalSet {
++			t.Fatalf("msg %d: axes lost in the standalone v2: %+v (want accel %v)", i, in, wantAccel)
++		}
++	}
++
++	// Tick 2: the obs echoes the destinations (engine applied them) → all
++	// three egos routed, all three back in ONE batch, no new v2.
++	d.onObs(obsMsg(2, natsio.ObsFeaturePolicyCtx, mkEgos("D1")))
++	msgs = tap.waitCount(t, 4)
++	if got := tap.settle(); got != 4 {
++		t.Fatalf("tick 2 messages = %d, want 4 (3 v2 + 1 batch)", got)
++	}
++	recs := decodeTSIBMsg(t, msgs[3], 2)
++	if len(recs) != 3 {
++		t.Fatalf("tick 2 batch records = %d, want 3 (route-confirmed egos back in the batch)", len(recs))
++	}
++	for i, r := range recs {
++		if r.VehicleID != uint64(i+1) || r.RouteSet {
++			t.Fatalf("record %d = %+v, want vehicle %d route-free", i, r, i+1)
++		}
++	}
++}
++
++// Past TSIBMaxRecords claimed vehicles the tick splits into multiple
++// well-formed batches, every record ≤ cap, every vehicle covered exactly
++// once, ego order preserved across the split.
++func TestBatchSplitAtCap(t *testing.T) {
++	_, nc := startTestBroker(t)
++	d := batchDriver(nc, Config{})
++	var tap wireTap
++	tap.subscribe(t, nc, "t", "drv")
++
++	const extra = 5
++	n := natsio.TSIBMaxRecords + extra
++	egos := make([]natsio.ObsEgo, n)
++	for i := range egos {
++		egos[i] = natsio.ObsEgo{ID: uint64(i + 1)}
++	}
++	d.onObs(obsMsg(1, 0, egos))
++	msgs := tap.waitCount(t, 2)
++	if got := tap.settle(); got != 2 {
++		t.Fatalf("messages = %d, want 2 split batches", got)
++	}
++
++	seen := map[uint64]int{}
++	var order []uint64
++	for i, m := range msgs {
++		recs := decodeTSIBMsg(t, m, 1)
++		want := natsio.TSIBMaxRecords
++		if i == 1 {
++			want = extra
++		}
++		if len(recs) != want {
++			t.Fatalf("batch %d records = %d, want %d", i, len(recs), want)
++		}
++		for _, r := range recs {
++			seen[r.VehicleID]++
++			order = append(order, r.VehicleID)
++		}
++	}
++	if len(order) != n {
++		t.Fatalf("covered %d records, want %d", len(order), n)
++	}
++	for i, id := range order {
++		if id != egos[i].ID {
++			t.Fatalf("record %d vehicle = %d, want %d (ego order across the split)", i, id, egos[i].ID)
++		}
++	}
++	for _, e := range egos {
++		if seen[e.ID] != 1 {
++			t.Fatalf("vehicle %d covered %d times, want exactly once", e.ID, seen[e.ID])
++		}
++	}
++}
++
++// IntentBatchOff is the pre-M2 wire shape byte-for-byte: one headerless 44 B
++// v2 message per ego per tick, in ego order.
++func TestBatchOffByteIdenticalV2(t *testing.T) {
++	_, nc := startTestBroker(t)
++	d := batchDriver(nc, Config{IntentBatchOff: true})
++	var tap wireTap
++	tap.subscribe(t, nc, "t", "drv")
++
++	egos := []natsio.ObsEgo{{ID: 5}, {ID: 9}, {ID: 1}}
++	d.onObs(obsMsg(1, 0, egos))
++	msgs := tap.waitCount(t, 3)
++	if got := tap.settle(); got != 3 {
++		t.Fatalf("batch-off messages = %d, want 3 (per-vehicle v2)", got)
++	}
++	for i, m := range msgs {
++		if _, present := m.Header[tapHeaderKey]; present {
++			t.Fatalf("msg %d: batch-off v2 carries an intent_encoding header", i)
++		}
++		want := natsio.EncodeIntent(engine.Intent{VehicleID: egos[i].ID})
++		if string(m.Data) != string(want) {
++			t.Fatalf("msg %d payload = % x, want the pre-M2 v2 bytes % x", i, m.Data, want)
++		}
++	}
++}
+diff --git a/engine/natsio/driver/driver.go b/engine/natsio/driver/driver.go
+index 10f7c50964b50c06776c56c60d3d1013f35be88e..7360db804ac0f89e16d646322c36540727e69878 100644
+--- a/engine/natsio/driver/driver.go
++++ b/engine/natsio/driver/driver.go
+@@ -70,6 +70,13 @@ type Config struct {
+ 	// Strict timing-invariance needs an O(1) pickExit (global
+ 	// exit-reachability), future work.
+ 	RouteBudgetPerTick int
++	// IntentBatchOff restores the pre-ADR-0026 wire shape: one 44 B v2
++	// message per claimed vehicle per tick. Default ON: the driver
++	// aggregates the tick's route-free intents into TSIB batches — one
++	// message per cadence tick per controller, split at
++	// natsio.TSIBMaxRecords; route-update vehicles still ride standalone
++	// v2 (driver.go onObs). Exists for A/B measurement and debugging.
++	IntentBatchOff bool
+ 	// Type is the controller_type declared at attach (default
+ 	// "default-driver").
+ 	Type string
+@@ -270,7 +277,9 @@ func (d *Driver) FleetSize() int {
+ // LastObsTick is the newest observation tick the driver has worked on.
+ func (d *Driver) LastObsTick() uint64 { return d.lastObsTick.Load() }
+ 
+-// SentIntents counts intents published (observability).
++// SentIntents counts per-vehicle intents published (TSIB records plus
++// standalone v2) — the same unit in batch and batch-off mode, so the
++// counter is comparable across -intent-batch settings (observability).
+ func (d *Driver) SentIntents() uint64 { return d.sentIntents.Load() }
+ 
+ // Wait blocks until the driver stops (Close or Kill).
+@@ -319,7 +328,12 @@ func (d *Driver) stream(vehicleID uint64) *engine.Stream {
+ // onObs is the driving loop: one observation frame per tick, one intent per
+ // claimed vehicle per tick — IDM longitudinal + MOBIL lateral computed
+ // client-side from the resolved policy context, with the routing axis
+-// (destination param) and informational turn signals.
++// (destination param) and informational turn signals. Wire shape (ADR-0026,
++// Config.IntentBatchOff): the tick's route-free intents collect in ego
++// (observation slice) order and flush as TSIB batches after the loop — the
++// batch goes out when the tick's intents are computed, the same moment the
++// last per-vehicle v2 would have (no barrier, no deadline); a vehicle with
++// a route update that tick rides ONE complete standalone v2 instead.
+ func (d *Driver) onObs(msg *nats.Msg) {
+ 	obs, err := natsio.DecodeObs(msg.Data, d.types)
+ 	if err != nil {
+@@ -329,6 +343,7 @@ func (d *Driver) onObs(msg *nats.Msg) {
+ 	params := d.spec.Params
+ 	present := map[uint64]bool{}
+ 	routeBudget := d.cfg.RouteBudgetPerTick
++	var batch []engine.Intent // the tick's route-free intents, ego order
+ 	for i := range obs.Egos {
+ 		ego := &obs.Egos[i]
+ 		present[ego.ID] = true
+@@ -347,10 +362,22 @@ func (d *Driver) onObs(msg *nats.Msg) {
+ 		d.mu.Lock()
+ 		d.routeStep(&in, ego, &routeBudget)
+ 		d.mu.Unlock()
+-		if err := d.nc.Publish(natsio.SubjectCtlIntent(d.cfg.Run, d.id), natsio.EncodeIntent(in)); err == nil {
+-			d.sentIntents.Add(1)
++		switch {
++		case d.cfg.IntentBatchOff, in.RouteSet:
++			// Batch-off mode is the pre-ADR-0026 stream verbatim. So are
++			// route updates in either mode: ONE complete standalone v2
++			// carries every axis of that vehicle's tick, and the vehicle is
++			// omitted from the batch — splitting fixed axes into TSIB plus
++			// route into v2 would create competing same-vehicle intents
++			// under first-wins arbitration (ADR-0026).
++			d.publishIntent(in)
++		default:
++			batch = append(batch, in)
+ 		}
+ 	}
++	if len(batch) > 0 {
++		d.flushBatch(obs.Tick, batch)
++	}
+ 	// The observation's ego list is the authoritative claim view: dropped
+ 	// members despawned or were released engine-side.
+ 	d.mu.Lock()
+@@ -371,6 +398,30 @@ func (d *Driver) onObs(msg *nats.Msg) {
+ 	}
+ }
+ 
++// publishIntent sends one standalone per-vehicle v2 intent (the pre-ADR-0026
++// wire shape, kept for batch-off mode and route-update ticks).
++func (d *Driver) publishIntent(in engine.Intent) {
++	if err := d.nc.Publish(natsio.SubjectCtlIntent(d.cfg.Run, d.id), natsio.EncodeIntent(in)); err == nil {
++		d.sentIntents.Add(1)
++	}
++}
++
++// flushBatch publishes the tick's collected intents as TSIB batches — one
++// message per cadence tick per controller, split at natsio.TSIBMaxRecords
++// (ADR-0026). Records stay in ego order, so engine-assigned seqs are
++// monotonic exactly as for the v2 stream; the header tick is the source
++// observation tick (informational only).
++func (d *Driver) flushBatch(tick uint64, batch []engine.Intent) {
++	subject := natsio.SubjectCtlIntent(d.cfg.Run, d.id)
++	for len(batch) > 0 {
++		n := min(len(batch), natsio.TSIBMaxRecords)
++		if err := d.nc.PublishMsg(natsio.NewTSIBMsg(subject, tick, batch[:n])); err == nil {
++			d.sentIntents.Add(uint64(n))
++		}
++		batch = batch[n:]
++	}
++}
++
+ // routeStep advances ONE ego's routing axis under the per-tick budget
+ // (Config.RouteBudgetPerTick). The routing axis' destination parameter is
+ // persistent — sent once per vehicle; the kernel follows it at every
+diff --git a/engine/natsio/driver_test.go b/engine/natsio/driver_test.go
+index 67b7e7781b147ed5038c1dd5d83de817c799bc98..e467e56cb94c938ee77a0767d3cc192330f74454 100644
+--- a/engine/natsio/driver_test.go
++++ b/engine/natsio/driver_test.go
+@@ -726,3 +726,115 @@ func TestIntrospection(t *testing.T) {
+ 		t.Fatalf("run: %v", out.err)
+ 	}
+ }
++
++// resimBatchLeg re-simulates one recorded live run from its JetStream record
++// with metric collection (exact per-tick full-fidelity data, no live-plane
++// loss) — TestDifferentialLanedrop's external-leg protocol — and asserts the
++// re-sim reproduces the LIVE run's CRC chain: every recorded run replays
++// deterministically, batch mode or not (ADR-0026).
++func resimBatchLeg(t *testing.T, h *liveHandle, live *engine.Engine, ticks uint64, window [2]uint64) *macro {
++	t.Helper()
++	rec, err := natsio.MaterializeRunRecord(h.js, h.meta(t))
++	if err != nil {
++		t.Fatal(err)
++	}
++	m := newMacro(window)
++	e, err := engine.NewEngine(rec.Log.Spec)
++	if err != nil {
++		t.Fatal(err)
++	}
++	ii := 0
++	for e.Tick < ticks {
++		next := e.Tick + 1
++		for ii < len(rec.Log.Intents) && rec.Log.Intents[ii].Tick <= next {
++			if rec.Log.Intents[ii].Tick == next {
++				e.EnqueueIntent(rec.Log.Intents[ii].KeyedIntent)
++			}
++			ii++
++		}
++		e.Step()
++		m.observe(e)
++	}
++	m.finish(e)
++	if !equalCRCs(t, rec.Log.CRCs, e.CRCs) {
++		t.Fatal("re-sim diverged from the record")
++	}
++	if !equalCRCs(t, e.CRCs, live.CRCs) {
++		t.Fatal("record does not match the live run (recorded run must replay deterministically)")
++	}
++	return m
++}
++
++// Paired-seed on/off parity (ADR-0026 M2): the default driver in batched
++// (default) and per-vehicle-v2 (-intent-batch=off) mode drives the same
++// seed; macro behavior must agree under the established differential
++// tolerances (TestDifferentialLanedrop). CRCs BETWEEN legs are not compared
++// — batching holds a tick's intents until computed where v2 streams early
++// vehicles, so arrival-vs-drain timing and applied ticks legitimately
++// diverge (ADR-0026 consequences); each leg's own record must still replay
++// to its live CRCs (asserted in resimBatchLeg).
++func TestBatchOnOffParity(t *testing.T) {
++	const ticks = 600
++	const seed = 42
++	window := [2]uint64{300, ticks}
++
++	runLeg := func(t *testing.T, off bool) (*macro, *driver.Driver) {
++		t.Helper()
++		spec, err := engine.DefaultSpec("lanedrop", ticks, seed)
++		if err != nil {
++			t.Fatal(err)
++		}
++		spec.Scen.UncontrolledPolicy = engine.PolicyHoldLast
++		h := startLive(t, spec, natsio.RecorderConfig{KeyframeEvery: 100}, natsio.ContractConfig{
++			PaceFloor: 3 * time.Millisecond, PauseAfterTicks: 1 << 40,
++		})
++		d, err := driver.New(h.srv.Connect(t), h.js, driver.Config{
++			Run: h.run, Capacity: 5000, IntentBatchOff: off,
++		})
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer d.Close()
++		out := h.finish(t)
++		if out.err != nil {
++			t.Fatalf("run (off=%v): %v", off, out.err)
++		}
++		if d.SentIntents() == 0 {
++			t.Fatalf("leg off=%v: driver sent no intents", off)
++		}
++		return resimBatchLeg(t, h, out.lr.Engine, ticks, window), d
++	}
++
++	mOn, dOn := runLeg(t, false)
++	mOff, dOff := runLeg(t, true)
++	t.Logf("batch on:  fleet %d, %d intents | despawned %d (%.0f veh/h), laneChanges %d, collisions %d, meanSpeedA %.2f m/s",
++		dOn.FleetSize(), dOn.SentIntents(), mOn.despawned, mOn.dischargeRate(), mOn.laneChanges, mOn.collisions, mOn.meanSpeedA)
++	t.Logf("batch off: fleet %d, %d intents | despawned %d (%.0f veh/h), laneChanges %d, collisions %d, meanSpeedA %.2f m/s",
++		dOff.FleetSize(), dOff.SentIntents(), mOff.despawned, mOff.dischargeRate(), mOff.laneChanges, mOff.collisions, mOff.meanSpeedA)
++
++	if mOn.collisions != 0 || mOff.collisions != 0 {
++		t.Fatalf("collisions: on %d off %d", mOn.collisions, mOff.collisions)
++	}
++	// Same discharge-rate guard as the differential test: a one-vehicle
++	// window difference is 6% at these counts — demand-regime noise, not
++	// divergence.
++	if relDiff(mOn.dischargeRate(), mOff.dischargeRate()) > 0.05 && absDiff(mOn.despawned, mOff.despawned) > 1 {
++		t.Fatalf("discharge rate: on %.2f veh/h off %.2f veh/h (>5%% off and >1 vehicle)",
++			mOn.dischargeRate(), mOff.dischargeRate())
++	}
++	if relDiff(mOn.meanSpeedA, mOff.meanSpeedA) > 0.10 {
++		t.Fatalf("mean section-A speed: on %.2f off %.2f (>10%% off)", mOn.meanSpeedA, mOff.meanSpeedA)
++	}
++	if mOn.waveN > 0 && mOff.waveN > 0 {
++		if relDiff(mOn.penetration, mOff.penetration) > 0.10 {
++			t.Fatalf("wave penetration: on %.0f m off %.0f m (>10%% off)", mOn.penetration, mOff.penetration)
++		}
++		if mOff.waveP10 < mOn.waveP10-2 || mOff.waveP90 > mOn.waveP90+2 {
++			t.Fatalf("wave-speed envelopes inconsistent: on [%.2f, %.2f] off [%.2f, %.2f]",
++				mOn.waveP10, mOn.waveP90, mOff.waveP10, mOff.waveP90)
++		}
++	}
++	if relDiff(float64(mOn.laneChanges), float64(mOff.laneChanges)) > 0.40 {
++		t.Fatalf("lane changes: on %d off %d (>40%% off)", mOn.laneChanges, mOff.laneChanges)
++	}
++}
+diff --git a/engine/natsio/tsib.go b/engine/natsio/tsib.go
+index 261ae007ff84d868d166c11b537503ef8f3945b3..43889a90ae466095885d509812996f0099b199fc 100644
+--- a/engine/natsio/tsib.go
++++ b/engine/natsio/tsib.go
+@@ -29,6 +29,7 @@ package natsio
+ import (
+ 	"encoding/binary"
+ 
++	"github.com/nats-io/nats.go"
+ 	"traffic-sim/engine"
+ )
+ 
+@@ -79,6 +80,22 @@ func EncodeTSIB(tick uint64, intents []engine.Intent) []byte {
+ 	return buf[:off]
+ }
+ 
++// NewTSIBMsg builds one batch message for subject: the EncodeTSIB payload
++// plus the intent_encoding: tsib demux header — the payload/header pair the
++// contract (M4) documents, assembled in one place so producers never name
++// the header themselves. Returns nil when EncodeTSIB does (more than
++// TSIBMaxRecords route-free intents — split first, as the M2 driver does).
++func NewTSIBMsg(subject string, tick uint64, intents []engine.Intent) *nats.Msg {
++	payload := EncodeTSIB(tick, intents)
++	if payload == nil {
++		return nil
++	}
++	msg := nats.NewMsg(subject)
++	msg.Data = payload
++	msg.Header.Set(headerIntentEncoding, intentEncodingTSIB)
++	return msg
++}
++
+ // DecodeTSIB parses one batch into its surviving records, in record order.
+ // ok=false means the batch is structurally invalid and must be dropped WHOLE
+ // (counted intentBatchDropped), never partially applied. ok=true may return
