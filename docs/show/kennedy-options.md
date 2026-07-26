@@ -12,7 +12,7 @@ Baseline `base`, 8 paired seeds, 12000 ticks, warmup 4000. Primary metric: `spee
 ## Answer key
 
 - **Peak-hour freight ban — no trucks on the corridor** (`truck-ban`): UPGRADE, 3.9% on speed_kmh, p=0.0000
-- **Speed harmonisation — 80 km/h posted on the mainline** (`speed-harmonise`): WORSE, -3.1% on speed_kmh, p=0.0000 — CAUTION: moves -0.6% less vehicle-distance (p=0.0125), so this is not a like-for-like comparison: the network is doing less work, not doing it better
+- **Speed harmonisation — 80 km/h posted on the mainline** (`speed-harmonise`): WORSE, -3.1% on speed_kmh, p=0.0000 — CAUTION: moves 0.6% less vehicle-distance (p=0.0125), so this is not a like-for-like comparison: the network is doing less work, not doing it better
 - **Widen the mainline — one extra lane each way** (`mainline-widen`): no-op (n.s.), 0.7% on speed_kmh, p=0.0890
 - **Widen the on-ramps — longer, wider merge lanes** (`ramp-widen`): no-op (n.s.), -0.3% on speed_kmh, p=0.3456
 

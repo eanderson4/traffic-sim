@@ -29,7 +29,7 @@ the label, which is the point.
 | scenario | the winner | the trap | the no-ops |
 |---|---|---|---|
 | the Loop and the expressways | **Shorter signal cycles** +2.1% (p=0.0021, VMT **+1.5%**) | Longer greens −3.8% | Widen LSD (+0.5%, below the practical floor), Widen the Kennedy (n.s.) |
-| Loop CBD | **Free CTA transfers** +5.0% (p=0.042, VMT flat) | Slow Streets −9.5% | Longer greens, freight ban (both n.s.) |
+| Loop CBD | **Free CTA transfers** +3.4% (p=0.012, 18 seeds, VMT flat) | Slow Streets −9.9% | Freight ban, longer greens (both n.s.) |
 | Kennedy corridor | **Peak-hour freight ban** +3.9% (p<0.0001, VMT **+1.8%**) | Speed harmonisation −3.1% | Widen the mainline, widen the on-ramps (both n.s.) |
 
 Each winner carries at least as much traffic as its baseline, so none of
@@ -50,7 +50,7 @@ Three things worth saying out loud when the reveal comes:
   −3.8%. Cycle length is the single largest lever found anywhere in this
   work, in both directions.
 - **The freight ban wins on the Kennedy and does nothing in the CBD**
-  (+3.9% against +1.0%, n.s.). Trucks cost you where vehicles are fast and
+  (+3.9% against +1.9%, n.s.). Trucks cost you where vehicles are fast and
   merging; in a grid where nothing exceeds 13 km/h, a truck is just another
   vehicle waiting at a light.
 
@@ -65,7 +65,7 @@ same ten paired seeds:
 |---|---|---|
 | `mean_time_loss_s` | Slow Streets (−11.0%) | measured against each lane's free-flow reference; lowering the speed limit lowers the reference, and this option's real trip times are 5.5% **worse** |
 | `mean_trip_s` | shorter cycles (−8.2%) | averages over **completed** trips only; this option completes 7.8% fewer of them, finishing the easy trips and stranding the rest |
-| `speed_kmh` | congestion charge (+9.3%) | correct as far as it goes, but see the VMT guard |
+| `speed_kmh` | congestion charge (+11.7%) | correct as far as it goes, but the charge moves 10% less traffic — see the VMT guard |
 
 **Every result is guarded by VMT** (total vehicle-distance in the window).
 An option that raises average speed while moving less traffic has not made
@@ -76,6 +76,11 @@ significantly reduce vehicle-distance are ranked ahead of those that do,
 and the rest are annotated. On the Loop this is what separates the two
 +2.1% results: shorter signal cycles carry 1.5% MORE traffic, while a 5%
 mode shift carries 3.1% less.
+
+**Effect estimates shrink with more seeds — expect it.** The CBD winner
+measured +5.0% (p=0.042) on ten seeds and +3.4% (p=0.012) on eighteen. The
+effect is real and got *more* certain; the point estimate regressed, as a
+first significant result usually does. Present the deeper number.
 
 **Statistical significance is not practical significance.** Six paired seeds
 of a low-variance simulation put the seed-to-seed spread on chi-loop-urban

@@ -197,7 +197,7 @@ def main():
         # measured over every vehicle, finished or not.
         if not carries_its_traffic(v):
             d, pv = vmt_test(v)
-            note = (f" — CAUTION: moves {100 * d / base_vmt:.1f}% less "
+            note = (f" — CAUTION: moves {abs(100 * d / base_vmt):.1f}% less "
                     f"vehicle-distance (p={fmt(pv, 4)}), so this is not a "
                     f"like-for-like comparison: the network is doing less "
                     f"work, not doing it better")
