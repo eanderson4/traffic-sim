@@ -26,6 +26,33 @@ exercise has taught everyone something false.
 Effect sizes are reported alongside p, because n is small by construction
 (each seed is a full simulation) and |d| >= 0.8 with p just over alpha
 means underpowered, not absent.
+
+CHOOSING THE PRIMARY METRIC IS PART OF THE EXPERIMENT
+--------------------------------------------------------------------------
+On the CBD pod, three defensible metrics named three different winners from
+the SAME ten paired seeds:
+
+  mean_time_loss_s -> calm-secondary  (-11.0%, p=0.003)
+  mean_trip_s      -> retime-short     (-8.2%, p=0.004)
+  speed_kmh        -> cordon-20        (+9.3%, p=0.001)
+
+Two of those three are artifacts:
+
+  * `time_loss` is measured against each lane's FREE-FLOW reference time.
+    Lower the posted speed limit and you lower the reference, so a variant
+    that makes every trip slower can still book less "loss". calm-secondary
+    wins on time loss while its actual trip times are 5.5% WORSE.
+
+  * `mean_trip_s` and `mean_time_loss_s` both average over COMPLETED trips
+    only. A variant that changes which trips finish changes the population
+    being averaged. retime-short's trips look 8.2% faster while completing
+    7.8% fewer of them — it finishes the easy ones and strands the rest.
+
+So the default primary is `speed_kmh`: Edie's definition over every
+vehicle-second in the window, which has no completed-trip population and no
+free-flow reference. It is still not sufficient alone, because a variant can
+raise speed by carrying less traffic — hence the VMT guard below, which is
+why cordon-20's "win" is annotated rather than celebrated.
 """
 import argparse
 import json
@@ -43,6 +70,9 @@ def main():
     ap.add_argument("--alpha", type=float, default=0.05)
     ap.add_argument("--title", default=None)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--vmt-guard", type=float, default=0.03,
+                    help="flag any option whose vehicle-distance falls more "
+                         "than this fraction below baseline")
     ap.add_argument("--labels", default=None,
                     help="JSON file mapping variant name -> guest-facing label")
     args = ap.parse_args()
@@ -61,9 +91,24 @@ def main():
     # disagreement with the table the numbers came from.
     cands = {k: v for k, v in rep["variants"].items() if k != base}
 
+    base_vmt = rep["variants"][base].get("all_metrics", {}).get("vmt_km")
+
+    def carries_its_traffic(v):
+        """True unless the option moves materially less vehicle-distance."""
+        ct = v.get("all_metrics", {}).get("vmt_km")
+        if not base_vmt or not ct:
+            return True
+        return ct >= base_vmt * (1 - args.vmt_guard)
+
+    # Winners are ranked by whether they carry the traffic FIRST and by p
+    # second. An option that raises speed while moving 11% less
+    # vehicle-distance has not made the network better at its job, and
+    # presenting it as the answer teaches the opposite of the lesson. A
+    # guard-failing option can still be the winner if nothing else qualifies,
+    # but only behind every option that does.
     winners = sorted((v for v in cands.values()
                       if v["verdict"] == "UPGRADE" and v["p"] <= args.alpha),
-                     key=lambda v: v["p"])
+                     key=lambda v: (not carries_its_traffic(v), v["p"]))
     others = sorted((v for v in cands.values() if v["verdict"] != "UPGRADE"),
                     key=lambda v: -abs(v.get("cohen_d") or 0))
 
@@ -101,13 +146,17 @@ def main():
         am = v.get("all_metrics", {})
         note = ""
         # An option that "wins" by carrying less traffic is not an upgrade to
-        # the network, and throughput is the only place that shows.
-        bt = rep["variants"][base].get("all_metrics", {}).get("completed")
-        ct = am.get("completed")
-        if bt and ct and ct < bt * 0.97:
-            note = (f" — CAUTION: completes {100 * (1 - ct / bt):.0f}% fewer "
-                    f"trips than baseline; any gain here is partly from "
-                    f"carrying less traffic")
+        # the network. VMT is the guard rather than completed-trip count,
+        # because completions are themselves subject to the survivorship
+        # effect described above: vehicle-distance covered in the window is
+        # measured over every vehicle, finished or not.
+        bt = rep["variants"][base].get("all_metrics", {}).get("vmt_km")
+        ct = am.get("vmt_km")
+        if bt and ct and ct < bt * (1 - args.vmt_guard):
+            note = (f" — CAUTION: moves {100 * (1 - ct / bt):.0f}% less "
+                    f"vehicle-distance than baseline, so this is not a "
+                    f"like-for-like comparison: the network is doing less "
+                    f"work, not doing it better")
         lines.append(f"- **{labels.get(n, n)}** (`{n}`): {v['verdict']}, "
                      f"{fmt(v['delta_pct'], 1)}% on {metric}, p={fmt(v['p'], 4)}"
                      f"{note}")

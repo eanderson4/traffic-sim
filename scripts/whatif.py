@@ -133,6 +133,10 @@ def paired_t(diffs):
     return t, student_sf(t, n - 1), m / s
 
 
+# ADDED_LANE_SUFFIX must match mknetvariant.py's --add-lane naming.
+ADDED_LANE_SUFFIX = "_w1"
+
+
 # ------------------------------------------------------------------ metrics
 
 def load_metrics(path, warmup, corridors=None):
@@ -155,7 +159,15 @@ def load_metrics(path, warmup, corridors=None):
         dist += d
         time_s += t
         if corridors:
-            key = corridors.get(iv["lane_id"])
+            lid = iv["lane_id"]
+            key = corridors.get(lid)
+            if key is None and lid.endswith(ADDED_LANE_SUFFIX):
+                # A lane added by mknetvariant --add-lane is not in the base
+                # network's corridor lookup, so it would be dropped from the
+                # corridor average — silently excluding exactly the capacity
+                # the variant added, and biasing the widened arm against
+                # itself. Attribute the clone to its donor's corridor.
+                key = corridors.get(lid[:-len(ADDED_LANE_SUFFIX)])
             if key:
                 cdist[key] += d
                 ctime[key] += t
