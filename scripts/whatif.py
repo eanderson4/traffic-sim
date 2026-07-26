@@ -201,9 +201,17 @@ def run_one(serve_bin, scenario, seed, ticks, port, workdir, capacity, extra):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pod", required=True,
+    ap.add_argument("--report",
+                    help="re-score a saved --out report on a different "
+                         "--metric instead of running anything. Which metric "
+                         "is primary changes the answer — on the CBD grid, "
+                         "retiming leaves network mean SPEED flat while "
+                         "cutting mean trip time 7.5%, because a spatial mean "
+                         "speed is dominated by where vehicles are and a trip "
+                         "time by how long they wait.")
+    ap.add_argument("--pod", required=False,
                     help="directory of variant scenario dirs (one per option)")
-    ap.add_argument("--baseline", required=True,
+    ap.add_argument("--baseline", required=False,
                     help="variant name inside --pod that every other is compared to")
     ap.add_argument("--seeds", type=int, default=6)
     ap.add_argument("--seed-base", type=int, default=1000)
@@ -228,6 +236,25 @@ def main():
     ap.add_argument("--lower-is-better", dest="higher_is_better",
                     action="store_false")
     args = ap.parse_args()
+
+    if args.report:
+        with open(args.report) as f:
+            saved = json.load(f)
+        seeds = saved["seeds"]
+        variants = sorted(saved["variants"])
+        results = {}
+        for v, rec in saved["variants"].items():
+            for s, m in rec["per_seed"].items():
+                results[(v, int(s))] = m
+        args.pod = saved["pod"]
+        args.baseline = saved["baseline"]
+        args.warmup = saved.get("warmup", 0)
+        args.ticks = saved.get("ticks", 0)
+        report_pod(results, variants, seeds, args)
+        return
+
+    if not args.pod or not args.baseline:
+        sys.exit("--pod and --baseline are required unless --report is given")
 
     corridors = None
     if args.corridors:
@@ -273,7 +300,13 @@ def main():
             print(f"[whatif] done {v} seed {s}: "
                   f"{results[(v, s)]['speed_kmh']:.1f} km/h", file=sys.stderr)
 
-    # ----------------------------------------------------------- reporting
+    report_pod(results, variants, seeds, args)
+    if not args.keep:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def report_pod(results, variants, seeds, args):
+    """Rank and score. Split out so --report can re-score a saved run."""
     keys = sorted({k for r in results.values() for k in r})
     base_by_seed = {s: results[(args.baseline, s)] for s in seeds
                     if (args.baseline, s) in results}
@@ -339,8 +372,6 @@ def main():
         with open(args.out, "w") as f:
             json.dump(report, f, indent=2)
         print(f"\n[whatif] wrote {args.out}", file=sys.stderr)
-    if not args.keep:
-        shutil.rmtree(workdir, ignore_errors=True)
 
 
 if __name__ == "__main__":

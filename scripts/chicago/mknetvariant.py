@@ -157,7 +157,15 @@ def main():
         for edge, group in by_edge.items():
             if len(group) < 2:
                 continue
-            drop.add(max(group, key=lambda L: L["edgeIndex"])["id"])
+            # An origin or exit lane is a PORTAL: demand flows name it by id,
+            # and removing it makes every flow that enters there unloadable
+            # ("not a spawn origin lane of the network"). Take the outermost
+            # lane that is not one — a real bus-lane conversion also does not
+            # delete the point where traffic enters the network.
+            cand = [L for L in group if not L.get("origin") and not L.get("exit")]
+            if not cand:
+                continue
+            drop.add(max(cand, key=lambda L: L["edgeIndex"])["id"])
         net["lanes"] = lanes = [L for L in lanes if L["id"] not in drop]
         by_id = {L["id"]: L for L in lanes}
         # A dropped lane must not linger as anybody's successor. Exit lanes
@@ -167,6 +175,45 @@ def main():
             succ = L.get("successors")
             if succ:
                 L["successors"] = [s for s in succ if s not in drop]
+
+        # Cascade. Removing a lane orphans the junction-internal lanes whose
+        # ONLY successor it was, and the loader rejects those outright
+        # ("no successors and neither exit nor endWall"). Semantically this
+        # is right: taking a lane away also takes away the turn movements
+        # that fed only that lane. Iterate to a fixpoint, since removing an
+        # internal can orphan the internal feeding it.
+        cascaded = 0
+        while True:
+            dangling = {L["id"] for L in lanes
+                        if not L.get("successors")
+                        and not L.get("exit") and not L.get("endWall")}
+            if not dangling:
+                break
+            cascaded += len(dangling)
+            lanes = [L for L in lanes if L["id"] not in dangling]
+            for L in lanes:
+                succ = L.get("successors")
+                if succ:
+                    L["successors"] = [s for s in succ if s not in dangling]
+        # Right-of-way conflict lists name other internal lanes, and the
+        # loader rejects a reference to one that is gone ("unknown foesCross
+        # lane"). Prune both after the cascade has settled — a conflict with
+        # a movement that no longer exists is not a conflict.
+        alive = {L["id"] for L in lanes}
+        for L in lanes:
+            for field in ("foesMerge", "foesCross"):
+                if field in L:
+                    kept = [x for x in L[field] if x in alive]
+                    if kept:
+                        L[field] = kept
+                    else:
+                        del L[field]
+        net["lanes"] = lanes
+        by_id = {L["id"]: L for L in lanes}
+        if cascaded:
+            log.append(f"drop-lane {keys}: cascaded {cascaded} orphaned "
+                       f"junction-internal lanes (turn movements that fed "
+                       f"only a dropped lane)")
         log.append(f"drop-lane {keys}: removed {len(drop)} lanes "
                    f"over {len(by_edge)} edges")
 

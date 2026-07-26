@@ -84,8 +84,15 @@ else
     variant widen-secondary
     netvar --add-lane secondary --name "$NET+widen-secondary" --out "$POD/widen-secondary/$NET.json"
 
-    variant bus-lane
-    netvar --drop-lane secondary --name "$NET+bus-lane" --out "$POD/bus-lane/$NET.json"
+    # "Slow streets": a 25 km/h posted limit on the secondary grid. This
+    # stands in for the bus/bike-lane conversion originally wanted here.
+    # --drop-lane is the literal model and it does not survive this network:
+    # taking a lane off a dense grid cascades through the junction internals
+    # that fed only it, and the cascade eventually orphans a demand ORIGIN
+    # lane, which no amount of pruning makes loadable. Speed is the lever
+    # that expresses the same policy without restructuring the graph.
+    variant calm-secondary
+    netvar --speed secondary=25 --name "$NET+calm-secondary" --out "$POD/calm-secondary/$NET.json"
 
     variant cordon-20
     demvar --out "$POD/cordon-20/demand/main.yaml" --scale 0.8 --all

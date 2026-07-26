@@ -113,7 +113,12 @@ def main():
             vt = fl["vtypes"]
             if vt.get("truck"):
                 vt["car"] = round(vt.get("car", 0) + vt["truck"], 3)
-                vt["truck"] = 0.0
+                # DELETE the key rather than zero it: the scenario loader
+                # requires every named vtype weight to be > 0 and rejects a
+                # zero outright ("vtype \"truck\" weight must be > 0"). A
+                # banned vehicle class is absent from the mix, not present
+                # with no share of it.
+                del vt["truck"]
 
     if n == 0:
         sys.exit("scaledemand: selection matched no flows — refusing to write "
