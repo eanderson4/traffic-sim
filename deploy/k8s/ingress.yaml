@@ -1,0 +1,61 @@
+apiVersion: networking.gke.io/v1beta1
+kind: FrontendConfig
+metadata:
+  name: https-redirect
+  namespace: traffic-sim
+spec:
+  redirectToHttps:
+    enabled: true
+    responseCodeName: MOVED_PERMANENTLY_DEFAULT
+---
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: phantomjam-cert
+  namespace: traffic-sim
+spec:
+  domains:
+    - app.phantomjam.com
+    - ws.phantomjam.com
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demosrv
+  namespace: traffic-sim
+  # DO NOT APPLY before the go-live preconditions in deploy/README.md land:
+  # (1) ADR-0020 gates public exposure of the engine ws plane on a broker
+  #     auth/permissions amendment — ws.phantomjam.com is that plane;
+  # (2) the ws BackendConfig health-checks /healthz, which the engine does
+  #     not serve yet — the ws backend would be permanently unhealthy.
+  annotations:
+    networking.gke.io/v1beta1.FrontendConfig: https-redirect
+    networking.gke.io/managed-certificates: phantomjam-cert
+    # GKE keys off this annotation — load-bearing (the cluster has NO
+    # IngressClass objects, so spec.ingressClassName would strand the LB).
+    kubernetes.io/ingress.class: gce
+    # Reserved global static IP (gcloud compute addresses create
+    # traffic-sim-ip --global): keeps DNS stable across ingress recreation.
+    kubernetes.io/ingress.global-static-ip-name: traffic-sim-ip
+spec:
+  rules:
+    - host: app.phantomjam.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: demosrv
+                port:
+                  name: http
+    - host: ws.phantomjam.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: demosrv
+                port:
+                  name: ws

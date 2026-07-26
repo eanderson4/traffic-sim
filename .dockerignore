@@ -1,0 +1,13 @@
+# Build context is the repo root; the image only needs engine/, viz/, deploy/.
+.git/
+data/
+docs/
+analysis/
+prototypes/
+tools/
+scripts/
+.github/
+*.md
+node_modules/
+viz/node_modules/
+viz/dist/

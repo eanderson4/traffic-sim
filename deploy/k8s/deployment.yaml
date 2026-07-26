@@ -1,0 +1,118 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demosrv
+  namespace: traffic-sim
+spec:
+  # demosrv is a single-active-run supervisor: JetStream store exclusivity
+  # and the one ws port make replicas > 1 incorrect, not just wasteful.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: demosrv
+  template:
+    metadata:
+      labels:
+        app: demosrv
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      nodeSelector:
+        workload: traffic
+      initContainers:
+        - name: pull-data
+          image: gcr.io/google.com/cloudsdktool/google-cloud-cli:548.0.0-slim
+          # ~5 GB of scenario networks + pre-baked geojson cache; same-region
+          # pull is seconds-to-a-minute. Re-runs on every pod start, keeping
+          # data stateless — update the bucket, restart the pod.
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              # retry-safe: the emptyDir survives an initContainer retry, so
+              # copy into a clean tree rather than risking nested/partial dirs
+              rm -rf /data/scenarios /data/networks /data/tmp
+              mkdir -p /data/networks/.geojson-cache /data/tmp
+              gcloud storage cp -r gs://roaring-bots-traffic-sim/scenarios /data/
+              gcloud storage cp "gs://roaring-bots-traffic-sim/netcache/*" /data/networks/.geojson-cache/
+          # HOME: pod runs non-root (uid 1000, no passwd entry); gcloud
+          # needs a writable HOME for its config/credential cache.
+          env:
+            - name: HOME
+              value: /tmp
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "100m"
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+      containers:
+        - name: demosrv
+          # :TAG is a placeholder — the deploy flow (deploy/README.md) pipes
+          # the manifests through sed to substitute a unique per-build tag
+          # before kubectl apply. Never push a build over a referenced tag.
+          image: us-central1-docker.pkg.dev/roaring-bots/carbon-dev-repo/traffic-sim:TAG
+          env:
+            # DEMOSRV_ADMIN_TOKEN is demosrv's documented env intake
+            # (ADR-0020): it is stripped from engine children, unlike any
+            # other env var name, and never appears on argv.
+            - name: DEMOSRV_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: traffic-sim-admin
+                  key: token
+            - name: WS_PUBLIC_URL
+              value: wss://ws.phantomjam.com
+            - name: AUTOSTART_DEMO
+              value: sf
+            # the engine's JetStream store defaults to /tmp with unlimited
+            # retention (serve -store) — put it inside the bounded emptyDir
+            # so a long run can't eat the node's writable layer
+            - name: TMPDIR
+              value: /data/tmp
+          ports:
+            - name: http
+              containerPort: 8900
+            - name: ws
+              containerPort: 8443
+          resources:
+            requests:
+              cpu: "1500m"
+              memory: 4Gi
+              ephemeral-storage: 2Gi
+            limits:
+              cpu: "2"
+              memory: 6Gi
+              # pod ephemeral storage INCLUDES the 12Gi emptyDir (5 GB data
+              # pull + JetStream scratch) plus the writable layer
+              ephemeral-storage: 16Gi
+          readinessProbe:
+            httpGet:
+              path: /api/status
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/status
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir:
+            # ~5 GB data pull + demosrv's geojson regen scratch; bound it so
+            # a runaway cache can't eat the node's 100 GB boot disk.
+            sizeLimit: 12Gi

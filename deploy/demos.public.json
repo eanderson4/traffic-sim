@@ -1,0 +1,94 @@
+{
+  "demos": [
+    {
+      "id": "la",
+      "title": "Los Angeles \u2014 full basin",
+      "blurb": "Full-city Overpass import (33.70,-118.75 \u2192 34.35,-117.60; 1.38M lanes \u2014 the sprawl is the story.) Demand-free; spawner-driven smoke runs.",
+      "tags": [
+        "urban",
+        "city-scale",
+        "los-angeles"
+      ],
+      "scenarioDir": "data/scenarios/la-lean",
+      "run": "la",
+      "ticks": 360000,
+      "seed": 42,
+      "capacity": 50000
+    },
+    {
+      "id": "sf",
+      "title": "San Francisco \u2014 city + bayshore",
+      "blurb": "Full-city Overpass import (37.50,-122.52 \u2192 38.05,-122.00; 303k lanes from the Ferry Building to San Bruno.) Demand-free; spawner-driven smoke runs.",
+      "tags": [
+        "urban",
+        "city-scale",
+        "san-francisco"
+      ],
+      "scenarioDir": "data/scenarios/sf-lean",
+      "run": "sf",
+      "ticks": 360000,
+      "seed": 42,
+      "capacity": 50000
+    },
+    {
+      "id": "miami",
+      "title": "Miami \u2014 metro core",
+      "blurb": "Full-city Overpass import (25.55,-80.55 \u2192 26.45,-80.00; 480k lanes \u2014 Homestead to Fort Lauderdale.) Demand-free; spawner-driven smoke runs.",
+      "tags": [
+        "urban",
+        "city-scale",
+        "miami"
+      ],
+      "scenarioDir": "data/scenarios/miami-lean",
+      "run": "miami",
+      "ticks": 360000,
+      "seed": 42,
+      "capacity": 50000
+    },
+    {
+      "id": "atlanta",
+      "title": "Atlanta \u2014 inside the perimeter and beyond",
+      "blurb": "Full-city Overpass import (33.45,-84.75 \u2192 34.05,-84.05; 339k lanes centered on the Downtown Connector.) Demand-free; spawner-driven smoke runs.",
+      "tags": [
+        "urban",
+        "city-scale",
+        "atlanta"
+      ],
+      "scenarioDir": "data/scenarios/atlanta-lean",
+      "run": "atlanta",
+      "ticks": 360000,
+      "seed": 42,
+      "capacity": 50000
+    },
+    {
+      "id": "houston",
+      "title": "Houston \u2014 the 610 loop",
+      "blurb": "Full-city Overpass import (29.45,-95.85 \u2192 30.15,-95.05; 713k lanes \u2014 bayou grids and freeway spokes.) Demand-free; spawner-driven smoke runs.",
+      "tags": [
+        "urban",
+        "city-scale",
+        "houston"
+      ],
+      "scenarioDir": "data/scenarios/houston-lean",
+      "run": "houston",
+      "ticks": 360000,
+      "seed": 42,
+      "capacity": 50000
+    },
+    {
+      "id": "dallas",
+      "title": "Dallas \u2014 downtown mixmaster",
+      "blurb": "Full-city Overpass import (32.55,-97.15 \u2192 33.20,-96.45; 823k lanes across the I-35E/I-30 stack.) Demand-free; spawner-driven smoke runs.",
+      "tags": [
+        "urban",
+        "city-scale",
+        "dallas"
+      ],
+      "scenarioDir": "data/scenarios/dallas-lean",
+      "run": "dallas",
+      "ticks": 360000,
+      "seed": 42,
+      "capacity": 50000
+    }
+  ]
+}

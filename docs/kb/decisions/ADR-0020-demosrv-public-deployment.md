@@ -112,6 +112,21 @@ demosrv gains four flags (`engine/cmd/demosrv`, deploy.go):
   with subscribe-only, engine/controller accounts with publish) — an
   ADR-0006 amendment with its own design round, plus viz credential
   plumbing. Treat this as gating the go-live, not this commit.
+- **SECOND GO-LIVE PRECONDITION (deploy review, 2026-07-25): `/healthz`
+  on the engine ws listener** — the LB BackendConfig health-checks it on
+  the ws port and the engine serves no HTTP paths today. The two
+  preconditions are INDEPENDENT and may land in either order (healthz is
+  trivial; broker auth is the design round); both must land before
+  `deploy/k8s/ingress.yaml` is applied. See deploy/README.md.
+  Constraint on the auth amendment: `/healthz` must stay UNAUTHENTICATED —
+  the GCE health checker carries no credentials, so an auth scheme that
+  covers it would keep the ws backend permanently unhealthy.
+- **DEFERRED (deploy review): child-aware liveness.** demosrv's
+  `/api/status` is 200 with a dead engine child; k8s probes therefore
+  can't see a crashed run. v1 accepts up-to-6-hour idle windows
+  (CronJob restart cadence); the fix is a demosrv health endpoint that
+  reflects child state with intentional-stop semantics — an engine change
+  with its own round, tracked in deploy/README.md.
 - The token gate sits at the mux, so the internal autostart path is
   ungated by construction rather than by an exemption list; autostart
   spawns only while demosrv is up (a shutdown channel aborts its retry
@@ -127,8 +142,8 @@ demosrv gains four flags (`engine/cmd/demosrv`, deploy.go):
 - The ws port still binds inside the pod on `-ws`; the LB (or a
   sidecar) owns TLS. demosrv remains plain HTTP/ws internally — no TLS
   stack enters this codebase.
-- Deploy manifests (image build, Ingress, token plumbing) live outside
-  the repo; this ADR covers only the demosrv-side contract. `-autostart`
+- Deploy manifests (image build, Ingress, token plumbing) live in
+  `deploy/` (this ADR covers only the demosrv-side contract). `-autostart`
   is ONE-SHOT: a demo that crashes after a successful start leaves the
   pod idle — crash recovery is the manifests' job (K8s liveness/pod
   restart), not a demosrv supervisor loop.

@@ -1,0 +1,28 @@
+# The L7 LB defaults to a 30 s backend timeout, which would sever any
+# websocket that goes quiet (paused run, slow viewer) and gives the /healthz
+# checks explicit paths on both backends.
+#
+# GO-LIVE PRECONDITION: the ws backend's /healthz does not exist yet (the
+# engine's embedded ws listener serves no HTTP paths). Do not apply the
+# Ingress until the engine ships /healthz — see deploy/README.md.
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: demosrv-http-bc
+  namespace: traffic-sim
+spec:
+  timeoutSec: 3600
+  healthCheck:
+    requestPath: /api/status
+    port: 8900
+---
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: demosrv-ws-bc
+  namespace: traffic-sim
+spec:
+  timeoutSec: 86400
+  healthCheck:
+    requestPath: /healthz
+    port: 8443

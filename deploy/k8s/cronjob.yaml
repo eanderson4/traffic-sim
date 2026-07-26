@@ -1,0 +1,77 @@
+# Run-freshness supervision: demosrv autostart is one-shot (ADR-0020) and
+# every demo has a finite tick horizon, so without this the site goes idle
+# after the run ends or the engine child crashes. The CronJob forces a pod
+# restart — initContainer re-pulls data, autostart starts a fresh run —
+# on a cadence well inside the 10-sim-hour run horizon. Viewer connections
+# drop at restart; acceptable while the app is pre-launch.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: demosrv-restarter
+  namespace: traffic-sim
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: demosrv-restarter
+  namespace: traffic-sim
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["demosrv"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: demosrv-restarter
+  namespace: traffic-sim
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: demosrv-restarter
+subjects:
+  - kind: ServiceAccount
+    name: demosrv-restarter
+    namespace: traffic-sim
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: demosrv-restart
+  namespace: traffic-sim
+spec:
+  # Every 6 hours at :17 — runs last 10 sim-hours, so the pod is always
+  # recycled before its run can complete.
+  schedule: "17 */6 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          serviceAccountName: demosrv-restarter
+          restartPolicy: Never
+          containers:
+            - name: kubectl
+              # pinned to the cluster's minor (carbon-dev is 1.35.5) —
+              # keep within ±1 minor when the cluster upgrades
+              image: registry.k8s.io/kubectl:v1.35.5
+              command:
+                - kubectl
+                - rollout
+                - restart
+                - deployment/demosrv
+                - -n
+                - traffic-sim
+              resources:
+                requests:
+                  cpu: "50m"
+                  memory: 64Mi
+                limits:
+                  cpu: "200m"
+                  memory: 128Mi
