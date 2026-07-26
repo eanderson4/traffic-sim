@@ -34,6 +34,7 @@ closed (2026-07-15..17).
 | [ADR-0017](../../decisions/ADR-0017-city-import-decisions.md) | City-scale OSM imports: no `--junctions.join` (stop override keys by OSM node id), `priority_stop` accepted as a whole-junction approximation, OSM relations (turn restrictions) not imported, directionless stops infer from oneway else forward with a reported count | The stop-sign pipeline (netconvert ignores `highway=stop`, eclipse-sumo #5244) forced each trade-off; recording them keeps the deviations from reading as oversights | ep-03 city imports (six metros); external-review rounds 2026-07-24 ([reviews](../../raw/reviews/)) |
 | [ADR-0018](../../decisions/ADR-0018-chunked-geojson.md) | City-scale network GeoJSON is served chunked over HTTP: manifest (`frame` + empty features + `parts`) at `/net/{id}.geojson`, hash-pinned part URLs that 404 a stale generation, sequential client fetch; small nets byte-identical | V8's ~537M-char string cap makes la-lean's ~860 MB single document unparseable; chunking keeps the existing endpoint and cache instead of a vector-tile migration | ADR-0015/0016 chunking precedent; la-lean browser verification 2026-07-24 |
 | [ADR-0019](../../decisions/ADR-0019-route-budget-determinism.md) | Route-budget determinism bound: per-replica admission timing (~0.3 sim-s worst case) and mid-queue failover lane re-freeze are accepted and bounded; strict fix is O(1) global exit-reachability, retiring the budget | City-scale cold-origin reachability scans stalled the obs path (measured sf-lean); the budget is the throttle, its edge cases are the recorded price | sf-lean stall diagnosis 2026-07-24; sol review rounds |
+| [ADR-0020](../../decisions/ADR-0020-demosrv-public-deployment.md) | demosrv public deployment: `-wspublic` advertises one verbatim client ws URL (TLS-LB case), `-admintoken` bearer-gates exactly the mutating POSTs (GETs stay public), `-autostart` starts a demo post-listen with keep-serving failure semantics, `-nobuild` execs prebuilt serve/replay; every flag defaults to the local-dev behavior | An always-on public instance (GKE pod behind a 443-only GCE Ingress) breaks four localhost assumptions: unreconstructable ws advertisement, open mutating API, nothing runs until a click, and the go-build pre-warm needs a toolchain the image lacks; ADR-0004 local-first stays the default | Podcast demo program deploy 2026-07-25 |
 
 ## Research Complete, ADR Pending
 
@@ -43,6 +44,7 @@ These areas have finished research (the gate) but no drafted ADR yet — see
 | Candidate ADR | Research basis | What it will pin |
 |---|---|---|
 | Network model | [Road Graph Model](../architecture/road-graph-model.md) | Lane-as-atom schema, compiled conflict sets, internal lanes, geometry-by-reference, file format duality |
+| Broker authentication (ADR-0006 amendment) | ADR-0020 deployment precondition (no research yet) | Observer subscribe-only account + engine/controller publish accounts on the embedded broker, viz credential plumbing — GATES the `-wspublic` public go-live; without it the advertised ws plane is publish-capable to anyone |
 | Project license | [Simulator Landscape](../business-domains/simulator-landscape.md) | Permissive license choice (deferred 2026-07-17, leaning MIT); ODbL layering per ADR-0009 stands regardless |
 
 ## Consequences That Reach Across ADRs
@@ -57,4 +59,4 @@ These areas have finished research (the gate) but no drafted ADR yet — see
   [VISION.md](../../../VISION.md).
 
 ---
-*Derived from: [decisions/](../../decisions/) ADR-0001..0019 and the raw research syntheses linked above*
+*Derived from: [decisions/](../../decisions/) ADR-0001..0020 and the raw research syntheses linked above*

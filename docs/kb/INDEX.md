@@ -50,7 +50,7 @@ back to it.
 - [Chicago Metro](articles/chicago-metro.md) — zoned Geofabrik→netconvert pipeline, portal-weighted napkin demand, driver exit-routing + serve attach barrier it required
 
 ### Decisions
-- [ADR Index](articles/decisions/adrs.md) — ADR-0001..0019 table with rationales, research basis, and pending-ADR queue
+- [ADR Index](articles/decisions/adrs.md) — ADR-0001..0020 table with rationales, research basis, and pending-ADR queue
 
 ## Raw Research
 
@@ -101,6 +101,8 @@ links its source synthesis for traceability.
 - [x] [ADR-0016](decisions/ADR-0016-tssg-chunking.md) — live-plane signal tables (TSSG) chunked like ADR-0015 (`sig_chunk: "i/n"` header, per-chunk-valid frames, no `sig_gen`), 20-tick rebroadcast + request-reply catch-up on `ts.{run}.state.sig.req`, max_payload 64MB→4MB as documented headroom
 - [x] [ADR-0017](decisions/ADR-0017-city-import-decisions.md) — city-scale OSM import decisions: no `--junctions.join` (stop override keys by OSM node id), `priority_stop` as whole-junction approximation, relations (turn restrictions) not imported, directionless stops infer from oneway else forward with a reported count
 - [x] [ADR-0018](decisions/ADR-0018-chunked-geojson.md) — city-scale network GeoJSON served chunked over HTTP: manifest (`frame` + empty features + `parts`), hash+schema-pinned part URLs that 404 a stale generation, sequential client fetch; small nets byte-identical
+- [x] [ADR-0019](decisions/ADR-0019-route-budget-determinism.md) — route-budget determinism bound: per-replica admission timing and mid-queue failover lane re-freeze accepted and bounded; strict fix retires the budget
+- [x] [ADR-0020](decisions/ADR-0020-demosrv-public-deployment.md) — demosrv public deployment: -wspublic verbatim ws advertisement, -admintoken bearer gate on the mutating POSTs (GETs public), -autostart with keep-serving failure semantics, -nobuild prebuilt engine binaries; all default to local-dev behavior
 
 ---
 *Last distilled: 2026-07-17 | 18 articles from 56 raw research files*
@@ -111,4 +113,6 @@ links its source synthesis for traceability.
 *ADR-0016 ratified 2026-07-24 (TSSG chunking + pull resync, after the LA busy-tab slow-consumer incident; Fable+Sol design round settled)*
 *ADR-0017 ratified 2026-07-24 (city import decisions, ep-03 six-metro imports)*
 *ADR-0018 ratified 2026-07-24 (chunked network GeoJSON, after la-lean hit the V8 string cap)*
+*ADR-0019 ratified 2026-07-24 (route-budget determinism bound, after the city-scale obs-path stall)*
+*ADR-0020 ratified 2026-07-25 (demosrv public deployment: GKE pod behind a 443-only TLS Ingress)*
 *Run `/update-kb` to check freshness*

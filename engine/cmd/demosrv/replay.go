@@ -122,10 +122,12 @@ func (s *server) handleReplayStart(w http.ResponseWriter, r *http.Request) {
 	verify := func() error { return checkRecordingHash(s.replayCtl, scenHash) }
 	if _, err := s.sup.start(spawnTarget{Kind: "replay", Rec: rec}, verify); err != nil {
 		// A verification failure has already killed the child (inside
-		// start): 409 for a binding problem with the recording itself,
-		// 502 for spawn/readiness/transport failures.
+		// start): 409 for a binding problem with the recording itself —
+		// and for the stopPending refusal (a stop in progress deliberately
+		// rejected the start, retry after it lands) — 502 for
+		// spawn/readiness/transport failures.
 		code := http.StatusBadGateway
-		if errors.Is(err, errRecordingMismatch) || errors.Is(err, errRecordingUnverifiable) {
+		if errors.Is(err, errRecordingMismatch) || errors.Is(err, errRecordingUnverifiable) || errors.Is(err, errStartAborted) {
 			code = http.StatusConflict
 		}
 		writeErr(w, code, err)

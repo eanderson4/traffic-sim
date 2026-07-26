@@ -18,6 +18,15 @@
 // first demo start is then a process exec, not a cold compile, and there
 // is no `go run` wrapper between demosrv and the engine to eat signals).
 // SIGINT/SIGTERM to demosrv kills the active child too.
+//
+// Public deployment (GKE behind a 443-only Ingress, ADR-0020) adds four
+// flags, all defaulting to the local-dev behavior above: -wspublic pins the
+// client-facing engine ws URL verbatim (the LB owns the public name and the
+// wss scheme — no rewrite of the listen address reconstructs it),
+// -admintoken bearer-gates the MUTATING routes (GETs stay public),
+// -autostart starts one demo once the listener is up (failure logs and
+// keeps serving), and -nobuild execs prebuilt serve/replay binaries from a
+// directory instead of the go-build pre-warm (the container-image case).
 package main
 
 import (
@@ -48,9 +57,47 @@ func main() {
 	netcacheDir := flag.String("netcache", "data/networks/.geojson-cache", "per-demo network GeoJSON cache")
 	overlayDir := flag.String("overlaydir", "data/networks/overlays", "static overlay GeoJSON directory (zones/boundaries, WGS84) — a missing dir just 404s /overlay/*")
 	wsAddr := flag.String("ws", "127.0.0.1:8443", "engine WebSocket listen address for spawned runs; override when another process holds 8443 (clients are told via /api/demos + start URLs)")
+	wsPublic := flag.String("wspublic", "", "verbatim client-facing engine WebSocket URL (e.g. wss://traffic-ws.example.com) for ALL advertised ws URLs — the TLS-terminating-LB case, where no rewrite of -ws reconstructs what browsers dial; empty = advertise the -ws listen address (legacy). Requires -admintoken/DEMOSRV_ADMIN_TOKEN (public shape must not serve the mutating POSTs open)")
+	adminToken := flag.String("admintoken", "", "bearer token required on the mutating endpoints (demo/replay start, demo stop, replay ctl verbs); GETs stay public either way, UNSET flag = DEMOSRV_ADMIN_TOKEN env fallback, unset everywhere = open (local dev); a supplied-but-empty token fatals (fail closed)")
+	autostartID := flag.String("autostart", "", "demo id to start once the HTTP listener is up (pod-style deploys); retries with backoff, then logs and KEEPS SERVING — unknown id likewise")
+	nobuildDir := flag.String("nobuild", "", "directory with PREBUILT serve+replay binaries: skip the go-build pre-warm and exec <dir>/serve + <dir>/replay (container images); stat-checked at startup, fatal when missing/non-executable")
 	flag.Parse()
 
 	wsListenAddr = *wsAddr
+	wsPublicURL = *wsPublic
+
+	// Flag validation FIRST — before the registry load and the go-build
+	// pre-warm, so a misconfiguration fatals in milliseconds, not after
+	// the expensive startup work (Fable, round 8).
+	if wsPublicURL != "" {
+		if err := validateWsPublic(wsPublicURL); err != nil {
+			// The value is NOT echoed: a userinfo-bearing typo would put
+			// its password in the startup log (Fable, round 29).
+			log.Fatalf("demosrv: -wspublic: %v — it would be advertised verbatim to every client", err)
+		}
+	}
+	// flag.Visit, not the flag VALUE: `-admintoken=` (or a manifest's
+	// "$TOK" expanding empty) is indistinguishable from an absent flag
+	// through *adminToken, and the fail-closed rule depends on the
+	// difference (Fable + sol, round 9).
+	adminTokenSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "admintoken" {
+			adminTokenSet = true
+		}
+	})
+	adminTok, err := resolveAdminToken(*adminToken, adminTokenSet)
+	if err != nil {
+		log.Fatalf("demosrv: %v", err)
+	}
+	if wsPublicURL != "" && adminTok == "" {
+		// -wspublic explicitly selects the PUBLIC deployment shape; with
+		// no token, every spawn/stop/replay-ctl POST is open to the
+		// internet — almost certainly a manifest that dropped the Secret,
+		// and fail-closed is the posture of everything else here (sol,
+		// round 13).
+		log.Fatalf("demosrv: -wspublic set but no admin token (-admintoken or %s) — refusing to serve the mutating POSTs OPEN on the public deployment shape", adminTokenEnv)
+	}
 
 	reg, err := LoadRegistry(*demosPath)
 	if err != nil {
@@ -60,29 +107,44 @@ func main() {
 	if err := os.MkdirAll(*netcacheDir, 0o755); err != nil {
 		log.Fatalf("demosrv: netcache: %v", err)
 	}
-	engineDir, err := findEngineDir()
-	if err != nil {
-		log.Fatalf("demosrv: %v", err)
-	}
 
-	// Pre-warm: build serve and replay once. Startup cost is ~1 s each on a
-	// warm build cache; every demo/replay start after that is an exec of
-	// THIS binary, so SIGTERM/SIGKILL reach the engine directly.
-	binDir, err := os.MkdirTemp("", "traffic-sim-demosrv-")
-	if err != nil {
-		log.Fatalf("demosrv: %v", err)
-	}
-	defer os.RemoveAll(binDir)
-	serveBin := filepath.Join(binDir, "serve")
-	replayBin := filepath.Join(binDir, "replay")
-	for _, b := range []struct{ bin, pkg string }{{serveBin, "./cmd/serve"}, {replayBin, "./cmd/replay"}} {
-		log.Printf("demosrv: building %s (go build %s in %s/)", filepath.Base(b.bin), b.pkg, engineDir)
-		build := exec.Command("go", "build", "-o", b.bin, b.pkg)
-		build.Dir = engineDir
-		build.Stdout = os.Stderr
-		build.Stderr = os.Stderr
-		if err := build.Run(); err != nil {
-			log.Fatalf("demosrv: go build %s: %v", b.pkg, err)
+	// Engine binaries, one of two sources. Default: build serve and replay
+	// ONCE here (pre-warm — the first demo start is then a process exec,
+	// not a cold compile, and there is no `go run` wrapper between demosrv
+	// and the engine to eat signals). -nobuild instead points at prebuilt
+	// binaries (the container image ships them; the pod may not even have
+	// a Go toolchain), stat-checked up front by prebuiltBins.
+	var serveBin, replayBin string
+	if *nobuildDir != "" {
+		serveBin, replayBin, err = prebuiltBins(*nobuildDir)
+		if err != nil {
+			log.Fatalf("demosrv: %v", err)
+		}
+		log.Printf("demosrv: -nobuild: using prebuilt engines %s, %s", serveBin, replayBin)
+	} else {
+		engineDir, err := findEngineDir()
+		if err != nil {
+			log.Fatalf("demosrv: %v", err)
+		}
+		binDir, err := os.MkdirTemp("", "traffic-sim-demosrv-")
+		if err != nil {
+			log.Fatalf("demosrv: %v", err)
+		}
+		defer os.RemoveAll(binDir)
+		serveBin = filepath.Join(binDir, "serve")
+		replayBin = filepath.Join(binDir, "replay")
+		for _, b := range []struct{ bin, pkg string }{{serveBin, "./cmd/serve"}, {replayBin, "./cmd/replay"}} {
+			log.Printf("demosrv: building %s (go build %s in %s/)", filepath.Base(b.bin), b.pkg, engineDir)
+			build := exec.Command("go", "build", "-o", b.bin, b.pkg)
+			build.Dir = engineDir
+			// Same stripEnv discipline as the engine children: the admin
+			// token is demosrv's own credential (Fable, round 11).
+			build.Env = stripEnv(os.Environ(), adminTokenEnv)
+			build.Stdout = os.Stderr
+			build.Stderr = os.Stderr
+			if err := build.Run(); err != nil {
+				log.Fatalf("demosrv: go build %s: %v", b.pkg, err)
+			}
 		}
 	}
 
@@ -91,24 +153,61 @@ func main() {
 	srv := &server{
 		reg: reg, sup: sup, viz: *vizDir, nets: &netCache{dir: *netcacheDir}, overlays: *overlayDir,
 		replayCtl: "http://" + replayCtlAddr, ctlTimeout: ctlTimeout, seekTimeout: seekTimeout,
+		adminToken: adminTok,
+		shutdown:   make(chan struct{}),
 	}
-	hs := &http.Server{Addr: *addr, Handler: srv.routes()}
+	if srv.adminToken != "" {
+		log.Printf("demosrv: admin gate ON — mutating POSTs require a bearer token (flag or %s)", adminTokenEnv)
+	}
+	if wsPublicURL != "" {
+		// The HTTP gate does NOT cover this: the advertised engine ws is
+		// the embedded broker's unauthenticated, publish-capable plane —
+		// ADR-0020's go-live precondition, true with or without the token
+		// (sol, round 11).
+		log.Printf("demosrv: warning: -wspublic advertises the engine's UNAUTHENTICATED ws plane (publish-capable) — broker auth is an ADR-0020 go-live precondition, not part of this build")
+	}
+	// ReadHeaderTimeout because -admintoken exists precisely for the
+	// PUBLIC deployment: slow-loris clients must not hold the menu's
+	// connections forever (sol review). The engine's ws server is a
+	// different listener (the child's); this covers only demosrv's HTTP.
+	hs := &http.Server{Handler: srv.routes(), ReadHeaderTimeout: 10 * time.Second}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		s := <-sig
 		log.Printf("demosrv: %v — killing the active run and exiting", s)
-		sup.stop()
+		srv.signalShutdown() // first: autostart's backoff sleep aborts now
+		sup.shutdownFinal()  // and the latch refuses any start from here on
 		hs.Close()
 	}()
 
 	if _, err := os.Stat(filepath.Join(*vizDir, "demos.html")); err != nil {
 		log.Printf("demosrv: warning: %s/demos.html not found — build the viz first (cd viz && pnpm build)", *vizDir)
 	}
+	// Bind BEFORE announcing and BEFORE autostart: with -autostart the demo
+	// spawn must follow the listener actually being up (a pod whose port
+	// never binds should fatal here, not autostart into the void).
+	ln, err := net.Listen("tcp", *addr)
+	if err != nil {
+		log.Fatalf("demosrv: %v", err)
+	}
 	log.Printf("demosrv: %d demo(s), %d recording(s) on http://%s/ — single active run, engine ws %s",
-		len(reg.Demos), len(reg.Recordings), *addr, wsListenAddr)
-	if err := hs.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		len(reg.Demos), len(reg.Recordings), ln.Addr(), wsListenAddr)
+	if *autostartID != "" {
+		// Direct supervisor start, bypassing the HTTP route (and with it the
+		// adminGate bearer check — the pod itself holds no token). The stop
+		// epoch is captured NOW, synchronously: an HTTP stop can only land
+		// after Serve begins, and the goroutine's own snapshot could be
+		// scheduled after such a stop completed (sol, round 19).
+		go srv.autostartDemo(*autostartID, sup.stopEpoch.Load())
+	}
+	if err := hs.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		// Kill the engine child BEFORE fataling: with -autostart a live
+		// run is the norm, and exiting here would orphan it on the ws
+		// port (Fable).
+		srv.signalShutdown()
+		sup.shutdownFinal()
 		log.Fatalf("demosrv: %v", err)
 	}
 }
@@ -141,6 +240,10 @@ func childSpawner(serveBin, replayBin string, lg *log.Logger) spawnFunc {
 			bin, args = serveBin, serveArgs(t.Demo)
 		}
 		cmd := exec.Command(bin, args...)
+		// The admin token is demosrv's own credential — strip it from the
+		// child's inherited environment (the engine exposes the
+		// unauthenticated ws plane; its env is one /proc read away).
+		cmd.Env = stripEnv(os.Environ(), adminTokenEnv)
 		w := &prefixWriter{lg: lg, prefix: "[" + t.id() + "] "}
 		cmd.Stdout = w
 		cmd.Stderr = w
@@ -159,6 +262,12 @@ func childSpawner(serveBin, replayBin string, lg *log.Logger) spawnFunc {
 // substituting the request host would advertise a listener that refuses
 // them, which is worse (sol review).
 func advertisedWsURL(r *http.Request) string {
+	// -wspublic wins outright, VERBATIM: the operator has named the URL
+	// browsers dial (TLS-terminating LB, 443 only) and any host/port
+	// substitution of the listen address would corrupt it.
+	if wsPublicURL != "" {
+		return wsPublicURL
+	}
 	host, port, err := net.SplitHostPort(wsListenAddr)
 	if err == nil && (host == "" || host == "0.0.0.0" || host == "::") {
 		reqHost, _, herr := net.SplitHostPort(r.Host)
@@ -255,6 +364,31 @@ type server struct {
 	replayCtl   string
 	ctlTimeout  time.Duration
 	seekTimeout time.Duration
+	// adminToken is -admintoken: when non-empty, the mutating routes (start/
+	// stop/replay-ctl) require it as a bearer token (adminGate). Empty = the
+	// open local-dev behavior. LOAD-BEARING: the gate binds at routes()
+	// construction — set this before calling routes() (main resolves the
+	// flag/env before building the server).
+	adminToken string
+	// shutdown, when non-nil, is closed by the signal handler BEFORE
+	// sup.shutdownFinal(): autostartDemo's retry loop selects on it so
+	// its backoff sleep aborts fast (the supervisor's closed latch then
+	// atomically refuses any later start — the child would be orphaned
+	// on the ws port — Fable, round 2/3). Nil in tests = never fires.
+	shutdown chan struct{}
+	// shutdownOnce guards close(shutdown): the signal handler AND the
+	// hs.Serve error path can both reach it (the same incident produces
+	// SIGTERM + an accept error on a public pod — Fable, round 17).
+	shutdownOnce sync.Once
+}
+
+// signalShutdown closes s.shutdown exactly once (nil-safe for tests).
+func (s *server) signalShutdown() {
+	s.shutdownOnce.Do(func() {
+		if s.shutdown != nil {
+			close(s.shutdown)
+		}
+	})
 }
 
 func (s *server) routes() *http.ServeMux {
@@ -266,19 +400,22 @@ func (s *server) routes() *http.ServeMux {
 	mux.HandleFunc("GET /app/", s.handleApp)
 	mux.HandleFunc("GET /api/demos", s.handleDemos)
 	mux.HandleFunc("GET /api/status", s.handleStatus)
-	mux.HandleFunc("POST /api/demo/{id}/start", s.handleStart)
+	// The POSTs are the MUTATING surface (spawn/kill the engine child or
+	// drive its replay) — adminGate bearer-checks them when -admintoken is
+	// set and is a pass-through otherwise. Everything GET stays public.
+	mux.HandleFunc("POST /api/demo/{id}/start", s.adminGate(s.handleStart))
 	mux.HandleFunc("GET /api/demo/{id}/params", s.handleParams)
-	mux.HandleFunc("POST /api/demo/stop", s.handleStop)
-	mux.HandleFunc("POST /api/replay/{id}/start", s.handleReplayStart)
+	mux.HandleFunc("POST /api/demo/stop", s.adminGate(s.handleStop))
+	mux.HandleFunc("POST /api/replay/{id}/start", s.adminGate(s.handleReplayStart))
 	mux.HandleFunc("GET /api/replay/status", s.handleReplayStatus)
 	// The four control verbs are registered explicitly (no {action}
 	// wildcard — it would conflict with /api/replay/{id}/start over paths
 	// like /api/replay/ctl/start): the proxy stays dumb, not open-ended,
 	// and unknown verbs 404 at the mux.
-	mux.HandleFunc("POST /api/replay/ctl/pause", s.ctlRoute("/pause", false))
-	mux.HandleFunc("POST /api/replay/ctl/resume", s.ctlRoute("/resume", false))
-	mux.HandleFunc("POST /api/replay/ctl/speed", s.ctlRoute("/speed", false))
-	mux.HandleFunc("POST /api/replay/ctl/seek", s.ctlRoute("/seek", true))
+	mux.HandleFunc("POST /api/replay/ctl/pause", s.adminGate(s.ctlRoute("/pause", false)))
+	mux.HandleFunc("POST /api/replay/ctl/resume", s.adminGate(s.ctlRoute("/resume", false)))
+	mux.HandleFunc("POST /api/replay/ctl/speed", s.adminGate(s.ctlRoute("/speed", false)))
+	mux.HandleFunc("POST /api/replay/ctl/seek", s.adminGate(s.ctlRoute("/seek", true)))
 	// Go's ServeMux wildcards are whole segments, so the .geojson suffix is
 	// parsed out of {file} in the handler.
 	mux.HandleFunc("GET /net/{file}", s.handleNet)
@@ -350,7 +487,14 @@ func (s *server) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 	run, err := s.sup.start(spawnTarget{Kind: "demo", Demo: d}, nil)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, err)
+		code := http.StatusBadGateway
+		if errors.Is(err, errStartAborted) {
+			// A stop is in progress (the stopPending refusal): the start
+			// was deliberately rejected, not broken — 409, "retry after
+			// the stop lands" (Fable, rounds 20-21).
+			code = http.StatusConflict
+		}
+		writeErr(w, code, err)
 		return
 	}
 	// A concurrent start can supersede ours between spawn and response:

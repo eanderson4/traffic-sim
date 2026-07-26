@@ -59,6 +59,14 @@ const (
 // handlers + /api/demos then tell the client where to connect instead.
 var wsListenAddr = "127.0.0.1:8443"
 
+// wsPublicURL, when set (-wspublic), is THE client-facing engine WebSocket
+// URL, used verbatim everywhere a browser is told where to dial (registry
+// WS, /api/demos, start deep links). It exists for the TLS-terminating-LB
+// deployment: the public name, scheme (wss), and port (443) belong to the
+// load balancer, and no host/port rewrite of wsListenAddr can reconstruct
+// them. Empty = derive from wsListenAddr (the legacy local behavior).
+var wsPublicURL string
+
 // wsDialURL normalizes a listen address into a dialable ws:// URL:
 // wildcard/empty hosts are not dialable and become loopback.
 func wsDialURL(addr string) string {
@@ -73,8 +81,14 @@ func wsDialURL(addr string) string {
 // links and the /api/demos payload. VERBATIM listen address — this is a
 // public URL: normalizing a wildcard listen to loopback (wsDialURL, the
 // probe-side helper) would point remote browsers at themselves; the
-// operator owning -ws owns what clients dial.
-func wsClientURL() string { return "ws://" + wsListenAddr }
+// operator owning -ws owns what clients dial. A -wspublic override wins
+// over all of this (see wsPublicURL).
+func wsClientURL() string {
+	if wsPublicURL != "" {
+		return wsPublicURL
+	}
+	return "ws://" + wsListenAddr
+}
 
 // spawnTarget identifies the child to exec: a live demo (Kind "demo",
 // serve) or a VCR recording (Kind "replay", engine/cmd/replay). Exactly
@@ -106,12 +120,29 @@ type activeRun struct {
 type supervisor struct {
 	mu     sync.Mutex
 	active *activeRun
-	// Per-generation start abort: stop() stamps the CURRENT generation
-	// before taking mu (a 660 s identity wait holds it); a queued LATER
-	// start has a different generation and is unaffected. No stale-flag
-	// abort of an unrelated spawn (sol review).
-	startGen atomic.Uint64
-	abortGen atomic.Uint64
+	// closed latches FINAL shutdown (shutdownFinal, the signal handler):
+	// once set, every start refuses (errSupervisorClosed) — a start
+	// beginning after the last stop would orphan its engine child as
+	// demosrv exits. ATOMIC, stored before shutdownFinal's stopEpoch
+	// bump and checked under mu both before AND after the start's epoch
+	// snapshot, so no start can slip the latch AND dodge the abort
+	// (sol, round 4). Distinct from stop(): the menu's stop/start cycle
+	// keeps working.
+	closed atomic.Bool
+	// stopEpoch is the abort mechanism: stop()/shutdownFinal() bump it
+	// BEFORE taking mu, and each start snapshots it under mu — the
+	// readiness probes abort on any later bump, so an in-flight start
+	// fails fast instead of holding mu through a 660 s identity wait
+	// with a stop queued behind it. No stamp/clear dance: nothing is
+	// ever cleared, so overlapping stops cannot erase each other's
+	// abort, and a start that begins after the bump simply snapshots
+	// the new epoch (Fable + sol, rounds 14-16).
+	stopEpoch atomic.Uint64
+	// stopPending counts stops between their epoch bump and their mu
+	// acquisition: a start that wins the lock race against a QUEUED stop
+	// refuses (errStartAborted) instead of spawning a child the stop
+	// will kill after a full readiness wait (sol, round 17).
+	stopPending atomic.Int64
 	// statusSnap is the lock-free status snapshot: /api/status polls every
 	// ~3 s and must not queue behind a long start's mu.
 	statusSnap atomic.Value // statusSnapshot
@@ -153,6 +184,22 @@ var runNonce = func() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
+// errAlreadyActive is startIfIdle's refusal: something went active before
+// autostart's retry took the lock (an operator's authed start) — the
+// active run is LEFT ALONE, never replaced.
+var errAlreadyActive = errors.New("a run is already active")
+
+// errSupervisorClosed is every start's refusal after shutdownFinal (the
+// signal handler): a start that began after the final stop would orphan
+// its engine child on the ws port as demosrv exits (Fable + sol, round 3).
+var errSupervisorClosed = errors.New("supervisor shut down")
+
+// errStartAborted marks a start aborted by a stop()/shutdownFinal()
+// generation stamp (waitPort/waitIdentity): an operator's DELIBERATE stop,
+// not a transient failure — autostart must treat it as terminal rather
+// than retry the demo the operator just stopped (Fable, round 12).
+var errStartAborted = errors.New("start aborted (stop requested)")
+
 // start replaces any active child with the target's engine and blocks
 // until the child is ready (see waitReady). Kill-before-spawn covers BOTH
 // kinds: a replay child must die before a serve starts and vice versa
@@ -169,12 +216,71 @@ var runNonce = func() (string, error) {
 // recording's stable id for replays) — the caller must thread exactly
 // this into the app URL, so no status re-read can mix generations.
 func (s *supervisor) start(t spawnTarget, verify func() error) (string, error) {
+	return s.startGuarded(t, verify, false, 0)
+}
+
+// startIfIdle is -autostart's start (deploy.go): the idle check rides the
+// SAME mu hold as the spawn, so an operator's start can never slip between
+// check and act (the check-then-act race Fable + sol flagged in round 2) —
+// whatever is active when the lock is taken wins, autostart backs off.
+// epoch0 is autostart's stop-epoch snapshot: a stop epoch that moved since
+// — even a stop that COMPLETED while this start was queued on mu — refuses
+// the start (errStartAborted), so autostart never un-stops what an
+// operator stopped (Fable, round 18).
+func (s *supervisor) startIfIdle(t spawnTarget, epoch0 uint64) (string, error) {
+	return s.startGuarded(t, nil, true, epoch0)
+}
+
+// startGuarded is start with the autostart guards. The ORDER of the first
+// three checks is load-bearing against stop()'s pending-then-bump order:
+// the epoch snapshot comes BEFORE the pending check, so a stop landing
+// mid-guard either trips pending (its mark preceded our check) or has its
+// epoch bump after our snapshot (the probes abort) — no interleaving
+// leaves a start both unrefused and unabortable (sol, round 18).
+// onlyIfIdle adds the epoch0 + s.active checks for autostart.
+func (s *supervisor) startGuarded(t spawnTarget, verify func() error, onlyIfIdle bool, epoch0 uint64) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Generation allocated UNDER mu: stop() stamps startGen to abort the
-	// in-flight start — it is always the LATEST generation, so the abort
-	// can never land on a queued (or already-cleared) one instead.
-	gen := s.startGen.Add(1)
+	if s.closed.Load() {
+		return "", errSupervisorClosed
+	}
+	// Epoch snapshotted UNDER mu, BEFORE the pending check: any stop()
+	// or shutdownFinal() bump after this point aborts the start at its
+	// next probe.
+	epoch := s.stopEpoch.Load()
+	if s.stopPending.Load() > 0 {
+		// A stop is QUEUED behind this lock acquisition: refuse fast
+		// rather than spawn a child the stop will kill after a full
+		// readiness wait (sol, round 17).
+		return "", errStartAborted
+	}
+	if onlyIfIdle && epoch != epoch0 {
+		// A stop landed since the caller's snapshot — possibly one that
+		// already COMPLETED while this start queued on mu (Fable, round
+		// 18). Terminal for autostart.
+		return "", errStartAborted
+	}
+	if onlyIfIdle && s.active != nil {
+		select {
+		case <-s.active.done:
+			// EXITED but not yet reaped: the reaper clears s.active
+			// asynchronously, and errAlreadyActive is TERMINAL for
+			// autostart — a corpse in this window must read as idle,
+			// not as "someone else won" (sol, round 6).
+			s.active = nil
+			s.mirrorStatus()
+		default:
+			return "", fmt.Errorf("%w: %s", errAlreadyActive, s.active.target.id())
+		}
+	}
+	// closed AGAIN (still under mu): shutdownFinal stores closed FIRST,
+	// so a shutdown landing between the first check and this one either
+	// trips this check, or has already bumped pending (caught above) or
+	// the epoch past our snapshot — a start can never slip the latch AND
+	// dodge the abort (sol, round 4).
+	if s.closed.Load() {
+		return "", errSupervisorClosed
+	}
 	s.stopLocked()
 	if t.Kind == "demo" {
 		// Unique run id per spawn: the run id IS the registry key and the
@@ -200,12 +306,15 @@ func (s *supervisor) start(t spawnTarget, verify func() error) (string, error) {
 		// way out) and the child's own log carries anything interesting.
 		cmd.Wait()
 		close(a.done)
-		// A child that dies on its own must not linger in the lock-free
-		// status mirror as "running". Only clear when THIS run is still
-		// the active one — a swap already replaced the mirror with the
-		// new run's status.
+		// A child that dies on its own must not linger as "running" — not
+		// in the lock-free status mirror (the menu badge must never claim
+		// a corpse is running) and not in s.active (startIfIdle's idle
+		// guard reads it under mu; a corpse there would block autostart
+		// forever — sol, round 3). Only clear when THIS run is still the
+		// active one — a swap already replaced both with the new run's.
 		s.mu.Lock()
 		if s.active == a {
+			s.active = nil
 			s.statusSnap.Store(statusSnapshot{})
 		}
 		s.mu.Unlock()
@@ -216,7 +325,7 @@ func (s *supervisor) start(t spawnTarget, verify func() error) (string, error) {
 	// loading overlay (with its watchdog) during a long world build,
 	// instead of showing idle and inviting a duplicate start.
 	s.mirrorStatus()
-	if err := s.waitReady(a, gen); err != nil {
+	if err := s.waitReady(a, epoch); err != nil {
 		s.stopLocked()
 		return "", fmt.Errorf("%s did not become ready: %w%s", t.id(), err, tailSuffix(cmd))
 	}
@@ -225,6 +334,22 @@ func (s *supervisor) start(t spawnTarget, verify func() error) (string, error) {
 			s.stopLocked()
 			return "", fmt.Errorf("%s failed post-start verification: %w%s", t.id(), err, tailSuffix(cmd))
 		}
+	}
+	// Final guard revalidation, STILL under mu, in the entry guard's
+	// pending-then-epoch order: a stop's mark PRECEDES its epoch bump,
+	// so a stop preempted between the two would slip an epoch-only check
+	// (sol, round 25). A stop (or shutdown) that marked itself during
+	// readiness/verify must not see this start return success for a
+	// child the stop then immediately kills (sol, round 24). The bumper
+	// cannot have completed (it needs mu, which we hold), so a hit
+	// always means a stop is queued behind us.
+	if s.closed.Load() {
+		s.stopLocked()
+		return "", errSupervisorClosed
+	}
+	if s.stopPending.Load() > 0 || s.stopEpoch.Load() != epoch {
+		s.stopLocked()
+		return "", errStartAborted
 	}
 	if t.Kind == "replay" {
 		return t.Rec.Run, nil
@@ -250,15 +375,36 @@ func tailSuffix(cmd *exec.Cmd) string {
 }
 
 func (s *supervisor) stop() {
-	// A start can hold s.mu through a ~660 s identity wait: abort THAT
-	// generation BEFORE taking the lock so its probes fail fast and
-	// release, instead of leaving demosrv + child running until the
-	// timeout (SIGINT path — sol review). stopLocked reaps the child
-	// after; the generation is cleared so a later start is unaffected.
-	s.abortGen.Store(s.startGen.Load())
+	// Bump the epoch BEFORE taking mu: a start can hold mu through a
+	// ~660 s identity wait, and its probes must fail fast and release
+	// instead of leaving demosrv + child running until the timeout
+	// (SIGINT path — sol review). No clear afterwards: overlapping stops
+	// can never erase each other's abort, and a start that begins after
+	// the bump snapshots the new epoch and is unaffected (Fable + sol,
+	// rounds 14-16).
+	s.stopPending.Add(1) // pending FIRST: a start between the two marks refuses
+	s.stopEpoch.Add(1)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.abortGen.Store(0)
+	s.stopPending.Add(-1)
+	s.stopLocked()
+}
+
+// shutdownFinal is the signal handler's stop: stop() PLUS the closed
+// latch, so no start can begin after the final stop (a plain stop leaves
+// the gap the shutdown channel only narrows — autostart could pass its
+// channel check, then spawn after stop returned; Fable + sol, round 3).
+// closed is stored FIRST, then pending, then the epoch bump: startGuarded
+// checks them in the same order under mu, so a start that saw the latch
+// open either trips pending or has its epoch snapshot covered by the bump
+// (sol, round 18 — the bump order is load-bearing).
+func (s *supervisor) shutdownFinal() {
+	s.closed.Store(true)
+	s.stopPending.Add(1)
+	s.stopEpoch.Add(1)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stopPending.Add(-1)
 	s.stopLocked()
 }
 
@@ -361,17 +507,17 @@ func (s *supervisor) withActiveReplay(fn func(run string) error) error {
 // early would race the replay panel's first probe. A live DEMO adds the
 // identity phase after the port probe (waitIdentity): the port accepting is
 // not enough to know the broker behind it is ours.
-func (s *supervisor) waitReady(a *activeRun, gen uint64) error {
+func (s *supervisor) waitReady(a *activeRun, epoch uint64) error {
 	if s.ready != nil {
 		return s.ready()
 	}
-	if err := waitPort(s.wsAddr, s.readyTimeout, a.done, &s.abortGen, gen); err != nil {
+	if err := s.waitPort(s.wsAddr, s.readyTimeout, a.done, epoch); err != nil {
 		return err
 	}
 	if a.target.Kind == "replay" {
-		return waitPort(s.ctlAddr, s.readyTimeout, a.done, &s.abortGen, gen)
+		return s.waitPort(s.ctlAddr, s.readyTimeout, a.done, epoch)
 	}
-	return s.waitIdentity(a.target.Demo.Run, a.startedAt, a.done, gen)
+	return s.waitIdentity(a.target.Demo.Run, a.startedAt, a.done, epoch)
 }
 
 // waitIdentity answers the question the raw port probe cannot: the listener
@@ -386,13 +532,15 @@ func (s *supervisor) waitReady(a *activeRun, gen uint64) error {
 // done aborts the wait immediately: when the port is held by a foreign
 // process our child dies on bind failure, and that error must surface in
 // seconds, not after the timeout.
-func (s *supervisor) waitIdentity(run string, spawnedAt time.Time, done <-chan struct{}, gen uint64) error {
+func (s *supervisor) waitIdentity(run string, spawnedAt time.Time, done <-chan struct{}, epoch uint64) error {
 	url := wsDialURL(s.wsAddr)
 	deadline := time.Now().Add(s.identityTimeout)
 	var lastErr error
 	for {
-		if g := s.abortGen.Load(); g != 0 && g == gen {
-			return fmt.Errorf("start aborted (stop requested)")
+		if s.stopEpoch.Load() != epoch {
+			// A stop (or shutdown) bumped the epoch after this start
+			// snapshotted it: the abort is DELIBERATE, fail fast.
+			return errStartAborted
 		}
 		select {
 		case <-done:
@@ -423,11 +571,12 @@ func (s *supervisor) waitIdentity(run string, spawnedAt time.Time, done <-chan s
 // scenario, engine panic) must not block start for the full timeout with
 // a generic dial error — and once the child is dead, a port that accepts
 // belongs to some STRAY process, never to us (report the death, not OK).
-func waitPort(addr string, timeout time.Duration, done <-chan struct{}, abortGen *atomic.Uint64, gen uint64) error {
+// The epoch check is the stop abort (see waitIdentity).
+func (s *supervisor) waitPort(addr string, timeout time.Duration, done <-chan struct{}, epoch uint64) error {
 	deadline := time.Now().Add(timeout)
 	for {
-		if g := abortGen.Load(); g != 0 && g == gen {
-			return fmt.Errorf("start aborted (stop requested)")
+		if s.stopEpoch.Load() != epoch {
+			return errStartAborted
 		}
 		select {
 		case <-done:
