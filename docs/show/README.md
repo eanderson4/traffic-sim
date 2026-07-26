@@ -56,13 +56,29 @@ replay is correct and was re-verified end to end after the fix landed. Any
 re-bake will land under a different hash directory, which is the content key
 doing its job. Re-bake before anything is published; not before the show.
 
-**Open on the wide shot, then zoom in — that is the first move, not a
-warm-up.** The map fits the whole extract at about z11.7, where lane lines
-are hairline and vehicles are hidden (they gate on at z13, and the frame
-chunks are not even fetched below it). It reads as a blank screen. Zoom to
-z13-15 over the Loop (`-87.63, 41.879`) and the grid, the congestion
-colouring and ~500 vehicles come up together. Every reload re-fits to the
-whole extract, so this repeats each time.
+**Give it a full minute to load before judging it.** The network is a 34 MB
+GeoJSON document; on a loaded machine it is ~40 s before a single lane
+paints, while the replay clock and the vehicle count are already running.
+A blank map with a ticking counter is loading, not broken.
+
+**Open zoomed in, not on the wide shot.** The default fit shows the whole
+extract at about z11.7, where lane lines are hairline and vehicles are
+hidden — they gate on at z13, and the frame chunks are not even fetched
+below it. It reads as a blank screen even after loading. Zoom to z13-15
+over the Loop (`-87.63, 41.879`) and the grid, the congestion colouring and
+~400 vehicles come up together.
+
+If the `?center=`/`?zoom=` camera work in `viz/src/config.ts` has landed,
+skip the zooming and deep-link the opening shot instead — verified against
+this recording:
+
+```
+.../?bake=<absolute index.json URL>&center=-87.6298,41.8790&zoom=14.5
+```
+
+That opens on the Loop grid and the Jane Byrne with traffic already
+running, which is the shot worth starting on. Every reload otherwise
+re-fits to the whole extract, so without it the zoom is a per-take action.
 
 ## The scenarios
 
