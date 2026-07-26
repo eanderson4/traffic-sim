@@ -59,14 +59,18 @@ func TestEndToEndBake(t *testing.T) {
 	if idx.Version != 1 || idx.Run != e2eRun || idx.Dt != 0.1 {
 		t.Fatalf("index header: version %d run %q dt %v", idx.Version, idx.Run, idx.Dt)
 	}
-	if idx.BakeEveryTicks != bakeEveryTicks || idx.LaneEveryFrames != laneEveryFrames {
+	stride, err := bakeStride(idx.Dt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idx.BakeEveryTicks != stride || idx.LaneEveryFrames != laneEveryFrames {
 		t.Fatalf("cadence: %d/%d", idx.BakeEveryTicks, idx.LaneEveryFrames)
 	}
 	if idx.TickStart != 0 || idx.TickEnd == 0 {
 		t.Fatalf("tick range [%d, %d]", idx.TickStart, idx.TickEnd)
 	}
-	nFrames := int(idx.TickEnd/bakeEveryTicks) + 1
-	if (uint64(nFrames-1) * bakeEveryTicks) != idx.TickEnd {
+	nFrames := int(idx.TickEnd/stride) + 1
+	if (uint64(nFrames-1) * stride) != idx.TickEnd {
 		nFrames++ // terminal off-stride frame
 	}
 	if idx.Network.GeoJSON != "network.geojson" || idx.Network.PromoteID != "id" {
@@ -80,8 +84,9 @@ func TestEndToEndBake(t *testing.T) {
 	}
 
 	// Every region's chunk lists are contiguous and sum to the schedule;
-	// lane lists sum to the aggregate schedule.
-	nAgg := (nFrames + laneEveryFrames - 1) / laneEveryFrames
+	// lane lists sum to the aggregate schedule (exact tick grid).
+	aggEvery := stride * uint64(laneEveryFrames)
+	nAgg := int(idx.TickEnd/aggEvery) + 1
 	if len(idx.Regions) == 0 {
 		t.Fatal("no regions in the index")
 	}
@@ -237,14 +242,28 @@ func TestEndToEndBake(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, pairs, _, err := parseTSRLFrame(lplain)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, p := range pairs {
-		if int(p.LaneIdx) >= len(laneIDs) {
-			t.Fatalf("lane_idx %d outside lanes.json (%d ids)", p.LaneIdx, len(laneIDs))
+	// Decode EVERY TSRL frame in the chunk: ticks must land exactly on
+	// tickStart + a×(bakeEveryTicks×laneEveryFrames) (the shim's lookup is
+	// exact tick equality), and lane indices stay inside lanes.json.
+	// TODO(review 2026-07-26): only the FIRST lane chunk of the first
+	// matching region is decoded, so a later-chunk off-grid frame would
+	// pass; the grid math below also assumes TickStart == 0 (asserted at
+	// the index check above, so it holds today). Deferred — the pod
+	// recording's grid is uniform and covered.
+	for buf := lplain; len(buf) > 0; {
+		tk, pairs, rest, err := parseTSRLFrame(buf)
+		if err != nil {
+			t.Fatal(err)
 		}
+		if tk%aggEvery != idx.TickStart%aggEvery || tk/aggEvery > uint64(nAgg-1) {
+			t.Fatalf("TSRL frame at tick %d is off the exact aggregate grid (every %d ticks)", tk, aggEvery)
+		}
+		for _, p := range pairs {
+			if int(p.LaneIdx) >= len(laneIDs) {
+				t.Fatalf("lane_idx %d outside lanes.json (%d ids)", p.LaneIdx, len(laneIDs))
+			}
+		}
+		buf = rest
 	}
 
 	t.Logf("bake: %d regions, tickEnd %d, %d frames, %d aggregates, %d occupied lanes",

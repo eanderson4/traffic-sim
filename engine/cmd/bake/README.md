@@ -16,7 +16,7 @@ bake -store DIR -run RUN -out OUTDIR [-overlays DIR] [-net-format auto|geojson|p
   (when `-overlays` is given), and `network.geojson` on the GeoJSON path.
 - Divergence policy is the audit path's: any CRC or verb mismatch ABORTS
   the bake and removes the staging dir; a completed bake is provably the
-  recorded run at 2 Hz decimation.
+  recorded run at the derived cadence (`bakeEveryTicks`, 1–2 Hz).
 
 Wire formats: `contracts/baked-replay-v1.md` (TSRB v1, TSRL v1,
 index.json).
@@ -26,7 +26,13 @@ index.json).
 City-scale networks (auto: > 100,000 lanes, or `-net-format pmtiles`)
 bake `network.pmtiles` with the pinned EXTERNAL binary:
 
-- **tippecanoe 2.78.0** (felt/tippecanoe). Install a release from
+- **tippecanoe — verified: 2.49.0, 2.78.0** (felt/tippecanoe). 2.78.0 is
+  the ADR-0023 spec pin; 2.49.0 from the OS package is verified working
+  (valid PMTiles v3, z8–z13, per-lane identity intact). The `--no-*`
+  identity flags below are the real requirement — any build that honors
+  them qualifies; the version banner rides the content key, so an
+  unverified build's tiles never share a URL with a verified one's.
+  Install a release from
   https://github.com/felt/tippecanoe (OS packages build it; do not run the
   install with sudo from bake — bake only *invokes* the binary). The
   binary's `--version` banner rides the per-city content key, so tiles

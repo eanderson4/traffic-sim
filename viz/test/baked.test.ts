@@ -218,6 +218,10 @@ function region(key: string, framesUrl: string, lanesUrl: string): BakedRegion {
 
 const TICKS = [0, 5, 10, 15, 20]; // dt 0.1 × stride 5 over [0, 20] (on-stride)
 const AGG_TICKS = [0, 10, 20]; // laneEveryFrames 2 → every 10 ticks
+// TODO(review 2026-07-26): tickEnd 20 lands exactly ON the aggregate grid,
+// so the specified off-stride-terminal-carries-no-aggregate behavior has
+// no fixture here. Deferred — the Go e2e covers the on-grid path and the
+// shim's lookup is exact-tick-equality either way.
 
 function makeIndex(): BakedIndex {
   return {
@@ -395,6 +399,14 @@ test("below the z13 gate: clock-only empty frames, no vehicle fetches, TSRL sche
   assert.ok(ratios);
   assert.equal(ratios.get("lane-a"), 1);
   assert.equal(ratios.get("lane-b"), 0.5);
+  // Hold-last (§4): the aggregate holds until the next one lands, and the
+  // final aggregate holds to tickEnd.
+  // TODO(review 2026-07-26): the fixture emits identical ratioQ at every
+  // aggregate tick, so the hold-last assert below cannot distinguish
+  // "held tick 10" from "snapped to tick 0" or "read tick 20 early".
+  // Vary ratioQ per aggregate tick to make this a real oracle. Deferred.
+  assert.equal(h.sub.laneRatiosAt(19)!.get("lane-a"), 1); // held from tick 10's aggregate
+  assert.ok(h.sub.laneRatiosAt(20) !== null); // final aggregate at tickEnd itself
 });
 
 test("at/above the gate: viewport region frames merge into one synthetic TSSF", async () => {

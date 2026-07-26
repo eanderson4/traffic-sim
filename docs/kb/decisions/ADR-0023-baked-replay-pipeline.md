@@ -112,7 +112,12 @@ none, matching the live path's 404 semantic.
   implementation; the flags must disable every behavior that destroys
   per-lane identity (no feature dropping at low zooms, no coalescing/
   merging of lines) — lane ids are the congestion feature-state key, a
-  dropped or merged lane is a lane that never colors.
+  dropped or merged lane is a lane that never colors. Qualification
+  criteria (review, 2026-07-26): a tippecanoe build is acceptable iff it
+  honors the recorded identity-flag set AND is listed as verified in the
+  bake README (today: 2.49.0, 2.78.0) — version-keying prevents cache
+  collisions but does not prove an unverified build preserves lane
+  identity or minzoom semantics.
 - **A node step for derived furniture** (`viz/scripts/bake-furniture.mjs`).
   Signal heads and stop signs are client-side derivations from lane
   geometry + the TSSG table today (signals.ts, stopsign.ts) — and with
@@ -500,6 +505,13 @@ memory):
   silently changes content. index.json is fetched `cache: "no-cache"`
   (netload.ts:61's rule); chunk/furniture/tile objects are immutable
   forever. The site pins the full index URL per replay page.
+  **MVP deferral (recorded 2026-07-26, external review):** (b) is NOT
+  yet implemented — hash12 covers (a) only, so a re-bake of the same
+  recording with different brotli/furniture/tile bytes can collide onto
+  one key. Accepted for the episode MVP because every bake to date is
+  produced by one tool build and uploaded once; (b) lands before any
+  re-bake-over-existing-key workflow. Greppable TODO(MVP-deferred)
+  markers in engine/cmd/bake/bake.go.
 - `network.pmtiles` is content-keyed per CITY and shared by all
   recordings of that network — la-lean's tiles bake once. Its key covers
   everything the tile bytes depend on: network bytes (ADR-0018's hash12

@@ -30,10 +30,14 @@ per vehicle (14 B): id u32 | x u32 | y u32 | angle u8 | class u8
 - `id` is the engine id narrowed to u32, `class` the scenario type index
   narrowed to u8. The bake ABORTS above MaxUint32 / 255 — the narrowing is
   guarded, never assumed.
-- Bake rate 2 Hz (`index.json.bakeEveryTicks` = 5 ticks at dt 0.1). Every
-  frame is a keyframe. Frames bake at `tickStart + k×stride`, plus a
-  TERMINAL frame at `tickEnd` when it is off-stride; `tickEnd` is
-  INCLUSIVE.
+- Bake rate `index.json.bakeEveryTicks` = max(1, round(0.5/dt)) ticks —
+  round is HALF-AWAY-FROM-ZERO (Go `math.Round`; dt 1.0 relies on
+  round(0.5)=1). Consumers read `bakeEveryTicks` from index.json rather
+  than recomputing it, so the tie rule pins the producer only.
+  (dt 0.1 → 5 → 2 Hz); the derived rate 1/(bakeEveryTicks×dt) must land in
+  [1,2] Hz or the bake rejects the dt. Every frame is a keyframe. Frames
+  bake at `tickStart + k×stride`, plus a TERMINAL frame at `tickEnd` when
+  it is off-stride; `tickEnd` is INCLUSIVE.
 
 ## TSRL v1 — baked lane-speed aggregate frame
 
@@ -51,16 +55,24 @@ per pair (5 B): lane_idx u32 | ratio_q u8
   instantaneous per-lane mean speed at the aggregate tick over the
   vehicles on the lane, divided by the lane's speedLimit. (Lanes with
   speedLimit ≤ 0 — none exist in compiled networks — are skipped.)
-- Aggregate cadence 0.2 Hz (`index.json.laneEveryFrames` = 10 baked
-  frames). Lane→region ownership is by the lane's home tile (its
-  midpoint's z11 tile), NOT by vehicle position.
+- Aggregate ticks land EXACTLY on `tickStart + a×(bakeEveryTicks ×
+  laneEveryFrames)` — consumers look frames up by exact tick equality, so
+  the off-stride terminal TSRB frame never carries an aggregate.
+  `index.json.laneEveryFrames` = 10 baked frames (0.2 Hz at 2 Hz bake).
+  Lane→region ownership is by the lane's home tile (its midpoint's z11
+  tile), NOT by vehicle position.
 
 ## Regions and chunk windows
 
-- Region key = web-mercator z11 tile, `"z11/{x}/{y}"`; object directories
-  replace slashes with dashes (`z11-352-819`). `bbox` in the manifest is
-  the tile's WGS84 bounds `[west, south, east, north]`.
-- Time window = 120 TSRB frames / 12 TSRL frames (60 s). Each (region,
+- Region key = web-mercator z11 tile, exactly the string `"z11/{x}/{y}"`;
+  object directories replace slashes with dashes (`z11-352-819`). `bbox`
+  in the manifest is the tile's WGS84 bounds `[west, south, east, north]`.
+  The manifest region set is the UNION of TSRB-occupied tiles and TSRL
+  owner (lane-midpoint home) tiles, so a boundary lane's aggregate is
+  never orphaned into a nonexistent region.
+- Time window = 120 TSRB frames / 12 TSRL frames per chunk — the counts
+  are fixed, the DURATION follows the derived cadence: 60 s at 2 Hz
+  (TSRL 0.2 Hz), 120 s at 1 Hz (TSRL 0.1 Hz). Each (region,
   window) is ONE object. A region's chunk list is CONTIGUOUS from window
   0: regions discovered mid-bake are backfilled with header-only chunks,
   and a window whose frames are all empty is still a chunk (header-only
@@ -91,10 +103,17 @@ reserved for it.
 
 - Bake prefix: `baked/{run}/{hash12}/` — sha256 (first 12 hex) over the
   recording stream name + run id + scenario hash + seed + tick horizon +
-  the record digest (sha256 over the log messages as consumed, in stream
-  order) + overlay bytes + the bake-config digest (cadences, chunk
-  lengths, quant step, brotli quality, minzoom policy, format versions,
-  bake-tool version).
+  the record digest + overlay bytes + the bake-config digest (cadences,
+  chunk lengths, quant step, brotli quality, minzoom policy, format
+  versions, bake-tool version).
+- Record digest: sha256 over the log messages as consumed, in stream
+  order, length-framed per message (all big-endian): u64 stream sequence |
+  u32 subject-len + subject | u32 header-block-len + header block | u32
+  payload-len + payload. The header block carries, where present and in
+  this fixed order, `schema_version`, `tick`, `kf_chunk`, `sig_chunk` —
+  each as u32 key-len + key, u32 value-len + value. Edge rules (matching
+  resim.go): a present-but-EMPTY value is treated as absent and omitted;
+  a multi-valued header contributes only its FIRST value.
 - `network.pmtiles`: `city/{hash12}/network.pmtiles` — sha256 over the
   network bytes + tippecanoe version + the exact flag set + the minzoom
   policy + the projection + the edgeB rule + the exporter version.
@@ -102,3 +121,6 @@ reserved for it.
   immutable forever. `.tsrb.br`/`.tsrl.br` objects serve with
   `Content-Encoding: br`; `network.pmtiles` serves IDENTITY with Range
   support (ADR-0023 §8's deployment contract).
+- MVP-deferred (deliberate, post-implementation triage): an
+  output-manifest digest in the bake key and a .pmtiles archive digest in
+  the city key. Both are TODO-marked at the key computations.
