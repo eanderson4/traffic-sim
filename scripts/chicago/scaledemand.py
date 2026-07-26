@@ -94,10 +94,21 @@ def main():
         if not selected(fl):
             continue
         n += 1
-        for sl in fl["slices"]:
-            before = sl["veh_per_h"]
-            sl["veh_per_h"] = round(before * args.scale, 3)
-            moved += before - sl["veh_per_h"]
+        # Two flow shapes in this repo: mkod.py emits time `slices`, while
+        # mkdemand.py emits one flat rate. Scale whichever is present rather
+        # than assuming, because assuming the wrong one silently produces an
+        # unchanged variant that reads as a no-op result.
+        if "slices" in fl:
+            for sl in fl["slices"]:
+                before = sl["veh_per_h"]
+                sl["veh_per_h"] = round(before * args.scale, 3)
+                moved += before - sl["veh_per_h"]
+        elif "veh_per_h" in fl:
+            before = fl["veh_per_h"]
+            fl["veh_per_h"] = round(before * args.scale, 3)
+            moved += before - fl["veh_per_h"]
+        else:
+            sys.exit(f"flow {fl['id']!r} has neither slices nor veh_per_h")
         if args.no_trucks and "vtypes" in fl:
             vt = fl["vtypes"]
             if vt.get("truck"):

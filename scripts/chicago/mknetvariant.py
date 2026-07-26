@@ -160,9 +160,13 @@ def main():
             drop.add(max(group, key=lambda L: L["edgeIndex"])["id"])
         net["lanes"] = lanes = [L for L in lanes if L["id"] not in drop]
         by_id = {L["id"]: L for L in lanes}
-        # A dropped lane must not linger as anybody's successor.
+        # A dropped lane must not linger as anybody's successor. Exit lanes
+        # carry no successors key at all (they are where vehicles leave the
+        # world), so this reads defensively rather than assuming the field.
         for L in lanes:
-            L["successors"] = [s for s in L["successors"] if s not in drop]
+            succ = L.get("successors")
+            if succ:
+                L["successors"] = [s for s in succ if s not in drop]
         log.append(f"drop-lane {keys}: removed {len(drop)} lanes "
                    f"over {len(by_edge)} edges")
 

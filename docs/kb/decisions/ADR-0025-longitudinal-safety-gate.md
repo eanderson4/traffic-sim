@@ -111,6 +111,29 @@ gate bounds the *damage* from staleness rather than removing it, which
 preserves the no-barrier property that keeps the engine from being held
 hostage by a slow client.
 
+## What it does not cover: crossing placements
+
+Measured after the gate was in: at freeway-scale 1.5 the gate binds 68 times
+in 77.6 M vehicle-ticks, yet 13,524 vehicle-ticks still see an overlapped
+pair. The gate is not failing — those overlaps are not created by closing
+speed at all.
+
+`boundaries()` moves a crosser by assigning `v.Lane = next` at a computed
+`v.S`. That is a **placement**, not a motion, and it happens after
+`computeAccels`. No acceleration guardrail can prevent it; only the follower
+stopping short of the boundary can. `CrossOverlaps` counts crossings that
+land on a vehicle already on the successor: **822** on that run, every one
+of the top sites a `j:` junction-internal lane, each overlap then persisting
+~16 ticks — which is essentially the whole 13,524.
+
+So the residual is a junction-entry conflict: a vehicle enters a junction
+interior that is already occupied. `injectionPlan` consults `junctionHold`
+before an injection; the crossing path has no equivalent occupancy check.
+That is a real model gap and it is recorded here rather than fixed, because
+it is now a 0.018% effect against a 20.2 M-observation one, and the repo's
+triage bar is blockers only. Fixing it means a blocked-box rule on the
+crossing path.
+
 ## Alternatives rejected
 
 - **Fall back to in-kernel IDM when hold-last expires.** Fixes case 1 only,
