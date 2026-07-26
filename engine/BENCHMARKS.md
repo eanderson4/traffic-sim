@@ -82,7 +82,100 @@ a subscriber problem, never the engine's. At 10 Hz × ~7 kB (I-80 scale) a
 single broker core is ~4 orders of magnitude below saturation; headroom
 for 10 Hz × 240 kB (10k vehicles) is still ~2 orders.
 
+## (d) Fleet-scale intent ingest (ADR-0026 M0 baseline)
+
+- **Date:** 2026-07-26
+- **Machine:** AMD Ryzen 7 9700X 8-Core, Linux 6.12 (x86_64), go1.26.5
+  linux/amd64
+- **Setup:** embedded nats-server in-process (`DontListen` +
+  `nats.InProcessServer`, net.Pipe — **no TCP, no TLS**), as in (a)–(c).
+
+`BenchmarkIntentIngest` (`engine/natsio/bench_intent_test.go`) fills the
+fleet-scale intent-ingest gap this file had (pubacks measured only to
+100 intents/tick; fan-out measured delivery, not many-publisher ingest).
+It is the **baseline the ADR-0026 batched-intents change (TSIB, M1–M3)
+is measured against**. K=4 controller connections each publish n/4
+per-vehicle v2 intents per tick (44 B, `EncodeIntent`, distinct vehicle
+ids) on their own `ts.{run}.ctl.intent.{ctl}` subjects against the REAL
+ingest path: broker route → `Bus.onIntent` (callback → lock → append) →
+per-tick `Contract.DrainIntents` (claim filter, seq/grant stamping,
+hold-last scan). Controllers attach over the wire (hello handshake, drive
+grant, claims at attach) so every drained intent passes the claim filter
+— asserted per tick (drained == published; no `Held` re-issues; claim
+violations == 0 or the benchmark fails). The measured path stops before
+kernel apply and record-plane logging. Scope note: the obs/AfterStep
+plane is deliberately out of scope — TSIB (M1–M3) does not touch it, so
+ingest+drain is the correct comparison scope for M3 (pinned by ADR-0026).
+3 warmup + 100 measured ticks per size, `b.N=1`; percentiles are
+nearest-rank over the 100 samples (p99 = 2nd-highest). Run:
+
+    go test -run '^$' -bench IntentIngest -benchtime=1x -timeout 20m ./natsio/   # from engine/
+    go test -run '^$' -bench OnIntentCPU -benchtime=3s ./natsio/                 # companion, per-callback CPU
+
+Two spans are recorded per tick: **publish start → engine buffer full**
+(the delivered-rate ceiling) and **publish start → `DrainIntents`
+return** — the **controller-publish→drained latency**, the like-for-like
+M0↔M3 comparison baseline ADR-0026 M0 asks for (its p50/p99 and the
+drain-complete intents/s below). Runs under a settling external load
+(load average ~5) agreed within ~10–15% on means; an earlier pass at
+load ~23 ran ~50% slower across the board, so treat absolute numbers as
+this-machine-this-load.
+
+| Vehicles (intents/tick) | Publish → buffer | Delivered rate (publish→buffer only) | DrainIntents / tick | Tick p50 (publish→drained) | Tick p99 (publish→drained) | Complete path (drain-complete) |
+|---|---|---|---|---|---|---|
+| 5,000 | ~2.2 ms | 2.28M msgs/s | 1.11 ms | 3.34 ms | 3.89 ms | 1.51M intents/s |
+| 15,000 | ~5.2 ms | 2.86M msgs/s | 3.89 ms | 9.02 ms | 11.58 ms | 1.64M intents/s |
+| 30,000 | ~9.6 ms | 3.13M msgs/s | 8.98 ms | 18.27 ms | 22.10 ms | 1.62M intents/s |
+
+**onIntent CPU** (`BenchmarkOnIntentCPU`, the M0 deliverable): the
+callback invoked directly — no broker, no delivery goroutine, no drain —
+costs **~61 ns/message** (subject tokenize + `DecodeIntent` + lock +
+append, 44 B payloads rotating across 4 controller subjects). That is
+~1.8 ms of pure callback CPU per 30k tick and a single-delivery-goroutine
+ceiling of ~16M msgs/s callback-side. The publish→buffer span in the
+table is an **end-to-end proxy**: it is this ~61 ns callback PLUS broker
+route and delivery-goroutine scheduling per message — the gap between
+~61 ns and the ~320 ns/message the 3.13M msgs/s row implies is broker +
+scheduling, not callback work.
+
+**Interpretation.** Two different rates, stated plainly: the
+**publish→buffer delivered rate** saturates around ~3.1M msgs/s
+in-process, but that number excludes the drain — the **complete
+controller-publish→drained path runs at ~1.5–1.6M intents/s at every
+size**, and *that* is the like-for-like baseline M3 compares against.
+What these spans are NOT: engine tick-budget consumption. The production
+run loop never waits for a full buffer — controllers publish
+asynchronously while the engine ticks, so the publish→drained latency
+lands off the run loop's critical path. The honest run-loop number is
+**`DrainIntents`: ~1.1 / 3.9 / 9.0 ms per tick at 5k/15k/30k (≈ 9 % of
+the 100 ms tick at 30k)**, plus the ~61 ns/message `onIntent` callback
+CPU (~1.8 ms at 30k) on the delivery goroutine. `DrainIntents` grows
+super-linearly (15k→30k more than doubles): past the linear
+claim-filter/seq-stamp work, the hold-last scan sorts the full
+tracked-vehicle id set every drain — O(n log n) at fleet scale. Note the
+1.36M msgs/s figure in §(c) is a *different shape* (8-subscriber fan-out
+delivery of 2.4 kB frames), exactly the distinction ADR-0026's context
+table draws; many-publisher 44 B ingest is its own ceiling, and this
+table is it. Caveats: net.Pipe transport is the best case — a
+socketed/TLS deployment lowers the delivered rate (the §(a) caveat
+applies here doubled, per-message on the ingest side); publish payloads
+are pre-encoded and reused, so encode cost is excluded (driver-side
+concern, not engine ingest); the buffer-full poll runs at 50 µs
+quantization, which inflates the smallest size's publish→buffer figure
+by up to ~2% (negligible at 15k/30k); run-to-run noise on this shared
+box is ±10–15% on means and worse on p99 (see the load note above).
+
 ## Consequence flags back to the KB
+
+- The fleet-scale intent-ingest gap is **filled** (§(d), ADR-0026 M0):
+  ~3.1M msgs/s in-process publish→buffer delivered rate; the complete
+  controller-publish→drained path is **~1.5–1.6M intents/s** — the
+  like-for-like M0↔M3 baseline (p50 ~18 ms / p99 ~22 ms per 30k tick).
+  These are latency/throughput baselines, NOT engine tick-budget: the
+  run loop never waits on delivery; what it pays is `DrainIntents`
+  (~9 ms ≈ 9 % of the 100 ms tick at 30k) plus ~61 ns/msg `onIntent`
+  callback CPU on the delivery goroutine. Revisit trigger for
+  socketed/TLS deployments as with §(a).
 
 - The `arch-nats-backbone` open question "puback latency vs the 100 ms
   tick at high batch multipliers" is **answered for R=1 local file**:
