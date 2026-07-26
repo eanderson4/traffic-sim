@@ -1,0 +1,2 @@
+ docs/kb/decisions/ADR-0026-batched-intents.md | 174 ++++++++++++++++++++++++++
+ 1 file changed, 174 insertions(+)

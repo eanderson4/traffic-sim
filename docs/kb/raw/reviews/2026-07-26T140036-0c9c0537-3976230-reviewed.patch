@@ -1,0 +1,180 @@
+diff --git a/docs/kb/decisions/ADR-0026-batched-intents.md b/docs/kb/decisions/ADR-0026-batched-intents.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..f1bcff87c060a5e913ca134da9f96b1c13deb3a2
+--- /dev/null
++++ b/docs/kb/decisions/ADR-0026-batched-intents.md
+@@ -0,0 +1,174 @@
++# ADR-0026: Batched intents on the live plane
++
++- Status: Proposed
++- Date: 2026-07-26
++- Amends: ADR-0006 §4 (live-plane message discipline), ADR-0008 (controller contract — wire encoding only, semantics unchanged)
++
++## Context
++
++The live plane is asymmetric today. Observations are already batched: the
++engine sends **one** TSOB frame per controller per tick on
++`ts.{run}.ctl.obs.{id}` (`engine/natsio/contract.go:923`), and one TSSF
++snapshot per tick on `ts.{run}.state.snap`. Intents are not: the default
++driver publishes **one 44 B message per claimed vehicle per cadence tick**
++on `ts.{run}.ctl.intent.{id}` (`engine/natsio/driver/driver.go:350`), and
++the engine ingests each via callback → lock → slice append
++(`engine/natsio/bus.go:239`).
++
++Per-message cost, not payload bytes, is the wall this hits:
++
++| live vehicles | intent msgs/s @10 Hz | notes |
++|---|---|---|
++| 14.5k (stress-dtla, largest run to date) | ~145k | works, but each msg is a publish+route+callback+lock round trip on both peers |
++| 40k (target fleet) | ~400k | per-message CPU dominates; marshal/alloc churn per vehicle |
++| 100k (metro ambition) | ~1M | at the edge of the 1.36M msgs/s aggregate fan-out measured in `engine/BENCHMARKS.md` — spent entirely on intents |
++
++Payload size is a non-issue by comparison: 44 B/vehicle means even 40k
++vehicles is 1.7 MB/tick of raw intent data, well inside the 1 MiB
++per-message discipline *when batched* (one TSIB caps at ~23.8k fixed
++records; beyond that the driver splits, still ≪ 40k messages).
++
++The controller-bus architecture is the project's differentiator
++(heterogeneous controllers, replay, external clients). Scaling it to
++metro fleets requires that message *count* per tick be O(controllers),
++not O(vehicles). Region decomposition (horizontal scaling across engine
++nodes) is a separate, later ADR; it does not fix per-vehicle intent
++traffic inside a region, and this change is a prerequisite for it
++(controller shards must already speak batches to align 1:1 with tiles).
++
++## Decision
++
++Add a batched intent message, **TSIB v1**, accepted alongside the existing
++per-vehicle intent v2 on the same subject. Batching happens at the wire
++boundary only; every internal semantic is preserved.
++
++### Wire format
++
++Subject: `ts.{run}.ctl.intent.{controller_id}` — unchanged. The engine's
++wildcard subscription (`...intent.>`) and per-publisher ordering are
++unchanged. One message may be either encoding; `onIntent` demuxes by
++magic bytes.
++
++```
++header (24 B):  magic "TSIB" | version u16 = 1 | flags u16 (reserved, 0)
++                | tick u64 | count u32 | reserved u32
++records:        count × 44 B, field-identical to the fixed section of
++                intent v2 (vehicle id, seq, axes)
++```
++
++- **Fixed-size records only.** The ≤48 B route suffix of intent v2 is not
++  carried in TSIB. Route updates are rare (set-once at spawn, deadlock
++  last resort); a controller sending one uses a standalone v2 message.
++  Mixed v2 and TSIB traffic from the same controller is legal; core NATS
++  per-publisher ordering applies across them.
++- **Whole-batch validity.** Structural validation is exact-length +
++  version, same posture as `ParseFrame` (`engine/natsio/frame.go:140`).
++  A malformed batch is dropped whole, counted (`intentBatchDropped`),
++  and logged — never partially applied. Per-record *semantic* filtering
++  (claim check, grant stamp, hold-last) is unchanged and happens after
++  expansion, in `DrainIntents`.
++
++### Expand at ingest; nothing downstream changes
++
++`onIntent` expands a valid TSIB into `count` `KeyedIntent`s, appended to
++the same locked buffer in record order. Everything past that point —
++claim filtering, seq stamping, hold-last re-issue, deterministic apply
++order (grant desc, vehicle asc, controller, seq, first-per-vehicle wins),
++per-applied-intent recording on `ts.{run}.log.intent`, replay, the bake
++pipeline — is **byte-identical to today**. The record plane never sees a
++batch.
++
++This is the load-bearing choice: batching is a wire codec, not a contract
++change. Replay determinism is preserved by construction, and the proof is
++that `LiveRecordReplayDeterminism` and the CRC identity of a re-run
++stress scenario pass unchanged with the driver in batch mode.
++
++### Driver aggregates per tick
++
++The default driver collects the intents it computes for a cadence tick
++and publishes one TSIB per tick (splitting at the ~23.8k-record payload
++cap). Per-vehicle seq counters, claim lifecycle, and the obs-driven loop
++are unchanged. Flag `-intent-batch=on|off`, default **on**; `off`
++restores exact current behavior for A/B measurement and debugging.
++
++No claim-protocol change. Sharding remains emergent via exclusive claims
++(driver.go:22-25); batching simply makes few-large-controllers the
++efficient configuration, which is the shape region decomposition will
++want. Explicit shard assignment is out of scope here.
++
++### No tick barrier
++
++The run loop stays fire-and-forget: intents apply whenever drained,
++hold-last heals gaps, `PaceFloor` keeps the engine from outrunning
++clients. Batching does not introduce a barrier or a deadline. (A barrier
++becomes interesting with region decomposition — deliberate then, not
++smuggled in now.)
++
++## Consequences
++
++- Intent message count per tick drops from O(vehicles) to
++  O(controllers × ⌈vehicles/23.8k⌉). At 40k vehicles on 4 controllers:
++  4 msgs/tick instead of 4,000.
++- `contracts/asyncapi.yaml` `ctlIntent` channel gains the TSIB schema —
++  a contract change, hence this ADR (ADR-0006 §9 gate).
++- One more wire codec to own. Mitigations: record layout reuses the v2
++  fixed section verbatim; v2 remains a first-class citizen (routes,
++  small fleets, debugging); codec table-tests shared between paths.
++- Debuggability: per-vehicle traffic is no longer 1:1 with NATS messages.
++  Counters (`intentBatches`, `intentRecords`, `intentBatchDropped`) are
++  the observability substitute; a `nats sub` still shows rates per
++  controller.
++
++## Non-goals
++
++- Region decomposition / multi-node horizontal scaling (later ADR;
++  depends on this one).
++- GPU controller workers. The SoA-friendly batch layout enables them;
++  nothing here requires them.
++- Grant policy / auth beyond the existing handshake.
++- Batching observations (already per-controller) or the record plane.
++
++## Implementation plan
++
++Sandbox: `~/sandbox/traffic-sim`, branch `batched-intents` (forked from
++main @ 081ea60; the `chicago-show` workstream is untouched in the grove
++clone). Per AGENTS.md: every code commit passes the staged-diff gate
++(Fable + sol, one round, blockers only); M4 gets the `--gemini` milestone
++round before any recording or content hash binds the new codec.
++
++- **M0 — Baseline measurement.** Extend the stress harness to measure
++  intent publish rate, `onIntent` CPU, and tick p50/p99 at 5k / 15k /
++  30k synthetic vehicles. Record in `engine/BENCHMARKS.md` — the gap was
++  noted there that nothing measures per-vehicle-intent rates at fleet
++  scale. Acceptance: baseline numbers committed.
++- **M1 — Codec + engine ingest.** TSIB encode/decode next to
++  `EncodeIntent` (`engine/natsio/bus.go:26-135`); magic demux in
++  `onIntent`; whole-batch validation; expansion into the existing
++  buffer. Tests: codec round-trip (shared cases with v2 fixed section),
++  malformed/truncated batch dropped whole, mixed v2+TSIB ordering, claim
++  filter and hold-last applied to expanded records, determinism suite
++  green with zero changes to its expectations. Acceptance: kernel +
++  natsio suites green; replay CRC identical to main for a seeded
++  scenario.
++- **M2 — Driver batching.** Per-tick aggregation, payload-cap split,
++  `-intent-batch` flag. Tests: one batch per cadence tick, seq
++  continuity across batches, route-update vehicle sends standalone v2,
++  on/off parity (same applied intents both modes).
++- **M3 — Stress rerun.** M0 scenarios in batch mode. Targets: intent
++  msgs/tick ≈ controller count; tick p99 ≤ baseline; applied-intent log
++  and run CRC **byte-identical** to M0 baseline for the same seed.
++  Document in `BENCHMARKS.md`.
++- **M4 — Contract + ratification.** `asyncapi.yaml` ctlIntent TSIB
++  schema; KB index + this ADR to Accepted; `--gemini` review round.
++
++## Risks / open questions
++
++- *44 B fixed-section reuse* — confirm during M1 that the v2 fixed
++  section is exactly 44 B and self-contained (bus.go:26-135); if not,
++  TSIB defines its own record layout and the codec table tests pin both.
++- *Emergent claims vs. large batches* — claim racing across few large
++  drivers could leave uneven splits; measure in M3 before inventing
++  assignment machinery.
++- *Late batches* — same semantics as late v2 intents (applied at drain
++  tick, hold-last heals); no new failure mode, but M3 watches tick p99
++  for controller-bunching effects.
