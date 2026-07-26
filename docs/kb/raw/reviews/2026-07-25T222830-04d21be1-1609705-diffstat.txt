@@ -1,0 +1,7 @@
+ contracts/baked-replay-v1.md     |  43 +++++++++-----
+ engine/cmd/bake/README.md        |   4 +-
+ engine/cmd/bake/bake_e2e_test.go |  38 +++++++++----
+ engine/cmd/bake/bake_test.go     |  50 +++++++++++++++++
+ viz/test/baked.test.ts           |   4 ++
+ viz/test/furniture.test.ts       | 117 +++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 229 insertions(+), 27 deletions(-)

@@ -1,0 +1,409 @@
+diff --git a/contracts/baked-replay-v1.md b/contracts/baked-replay-v1.md
+index 11da6ca63ee375e71e31c24688ceadde79a4dc7a..10b693c9b3dd46f5d41c37d66d96e41c51a0d7a2 100644
+--- a/contracts/baked-replay-v1.md
++++ b/contracts/baked-replay-v1.md
+@@ -30,10 +30,14 @@ per vehicle (14 B): id u32 | x u32 | y u32 | angle u8 | class u8
+ - `id` is the engine id narrowed to u32, `class` the scenario type index
+   narrowed to u8. The bake ABORTS above MaxUint32 / 255 — the narrowing is
+   guarded, never assumed.
+-- Bake rate 2 Hz (`index.json.bakeEveryTicks` = 5 ticks at dt 0.1). Every
+-  frame is a keyframe. Frames bake at `tickStart + k×stride`, plus a
+-  TERMINAL frame at `tickEnd` when it is off-stride; `tickEnd` is
+-  INCLUSIVE.
++- Bake rate `index.json.bakeEveryTicks` = max(1, round(0.5/dt)) ticks —
++  round is HALF-AWAY-FROM-ZERO (Go `math.Round`; dt 1.0 relies on
++  round(0.5)=1). Consumers read `bakeEveryTicks` from index.json rather
++  than recomputing it, so the tie rule pins the producer only.
++  (dt 0.1 → 5 → 2 Hz); the derived rate 1/(bakeEveryTicks×dt) must land in
++  [1,2] Hz or the bake rejects the dt. Every frame is a keyframe. Frames
++  bake at `tickStart + k×stride`, plus a TERMINAL frame at `tickEnd` when
++  it is off-stride; `tickEnd` is INCLUSIVE.
+ 
+ ## TSRL v1 — baked lane-speed aggregate frame
+ 
+@@ -51,15 +55,21 @@ per pair (5 B): lane_idx u32 | ratio_q u8
+   instantaneous per-lane mean speed at the aggregate tick over the
+   vehicles on the lane, divided by the lane's speedLimit. (Lanes with
+   speedLimit ≤ 0 — none exist in compiled networks — are skipped.)
+-- Aggregate cadence 0.2 Hz (`index.json.laneEveryFrames` = 10 baked
+-  frames). Lane→region ownership is by the lane's home tile (its
+-  midpoint's z11 tile), NOT by vehicle position.
++- Aggregate ticks land EXACTLY on `tickStart + a×(bakeEveryTicks ×
++  laneEveryFrames)` — consumers look frames up by exact tick equality, so
++  the off-stride terminal TSRB frame never carries an aggregate.
++  `index.json.laneEveryFrames` = 10 baked frames (0.2 Hz at 2 Hz bake).
++  Lane→region ownership is by the lane's home tile (its midpoint's z11
++  tile), NOT by vehicle position.
+ 
+ ## Regions and chunk windows
+ 
+-- Region key = web-mercator z11 tile, `"z11/{x}/{y}"`; object directories
+-  replace slashes with dashes (`z11-352-819`). `bbox` in the manifest is
+-  the tile's WGS84 bounds `[west, south, east, north]`.
++- Region key = web-mercator z11 tile, exactly the string `"z11/{x}/{y}"`;
++  object directories replace slashes with dashes (`z11-352-819`). `bbox`
++  in the manifest is the tile's WGS84 bounds `[west, south, east, north]`.
++  The manifest region set is the UNION of TSRB-occupied tiles and TSRL
++  owner (lane-midpoint home) tiles, so a boundary lane's aggregate is
++  never orphaned into a nonexistent region.
+ - Time window = 120 TSRB frames / 12 TSRL frames (60 s). Each (region,
+   window) is ONE object. A region's chunk list is CONTIGUOUS from window
+   0: regions discovered mid-bake are backfilled with header-only chunks,
+@@ -91,10 +101,17 @@ reserved for it.
+ 
+ - Bake prefix: `baked/{run}/{hash12}/` — sha256 (first 12 hex) over the
+   recording stream name + run id + scenario hash + seed + tick horizon +
+-  the record digest (sha256 over the log messages as consumed, in stream
+-  order) + overlay bytes + the bake-config digest (cadences, chunk
+-  lengths, quant step, brotli quality, minzoom policy, format versions,
+-  bake-tool version).
++  the record digest + overlay bytes + the bake-config digest (cadences,
++  chunk lengths, quant step, brotli quality, minzoom policy, format
++  versions, bake-tool version).
++- Record digest: sha256 over the log messages as consumed, in stream
++  order, length-framed per message (all big-endian): u64 stream sequence |
++  u32 subject-len + subject | u32 header-block-len + header block | u32
++  payload-len + payload. The header block carries, where present and in
++  this fixed order, `schema_version`, `tick`, `kf_chunk`, `sig_chunk` —
++  each as u32 key-len + key, u32 value-len + value. Edge rules (matching
++  resim.go): a present-but-EMPTY value is treated as absent and omitted;
++  a multi-valued header contributes only its FIRST value.
+ - `network.pmtiles`: `city/{hash12}/network.pmtiles` — sha256 over the
+   network bytes + tippecanoe version + the exact flag set + the minzoom
+   policy + the projection + the edgeB rule + the exporter version.
+@@ -102,3 +119,6 @@ reserved for it.
+   immutable forever. `.tsrb.br`/`.tsrl.br` objects serve with
+   `Content-Encoding: br`; `network.pmtiles` serves IDENTITY with Range
+   support (ADR-0023 §8's deployment contract).
++- MVP-deferred (deliberate, post-implementation triage): an
++  output-manifest digest in the bake key and a .pmtiles archive digest in
++  the city key. Both are TODO-marked at the key computations.
+diff --git a/docs/kb/decisions/ADR-0023-baked-replay-pipeline.md b/docs/kb/decisions/ADR-0023-baked-replay-pipeline.md
+index 0241eb6aaddc495834b73ad11e4cbb509a6d22a2..ba4e7e3427a28d53a5a2f524e3ff2ba80a93edc1 100644
+--- a/docs/kb/decisions/ADR-0023-baked-replay-pipeline.md
++++ b/docs/kb/decisions/ADR-0023-baked-replay-pipeline.md
+@@ -500,6 +500,12 @@ memory):
+   silently changes content. index.json is fetched `cache: "no-cache"`
+   (netload.ts:61's rule); chunk/furniture/tile objects are immutable
+   forever. The site pins the full index URL per replay page.
++  **MVP deferral (recorded 2026-07-26, external review):** (b) is NOT
++  yet implemented — hash12 covers (a) only, so a re-bake of the same
++  recording with different brotli/furniture/tile bytes can collide onto
++  one key. Accepted for the episode MVP because every bake to date is
++  produced by one tool build and uploaded once; (b) lands before any
++  re-bake-over-existing-key workflow. TODO at bake.go:357, bake.go:545.
+ - `network.pmtiles` is content-keyed per CITY and shared by all
+   recordings of that network — la-lean's tiles bake once. Its key covers
+   everything the tile bytes depend on: network bytes (ADR-0018's hash12
+diff --git a/engine/cmd/bake/README.md b/engine/cmd/bake/README.md
+index 14959ef64ec9fecf1d3a9f6e4259d490d1bdf076..3016475dcab54d6dfc19944a4c7a9fd1e6a5f543 100644
+--- a/engine/cmd/bake/README.md
++++ b/engine/cmd/bake/README.md
+@@ -16,7 +16,7 @@ bake -store DIR -run RUN -out OUTDIR [-overlays DIR] [-net-format auto|geojson|p
+   (when `-overlays` is given), and `network.geojson` on the GeoJSON path.
+ - Divergence policy is the audit path's: any CRC or verb mismatch ABORTS
+   the bake and removes the staging dir; a completed bake is provably the
+-  recorded run at 2 Hz decimation.
++  recorded run at the derived cadence (`bakeEveryTicks`, 1–2 Hz).
+ 
+ Wire formats: `contracts/baked-replay-v1.md` (TSRB v1, TSRL v1,
+ index.json).
+@@ -26,7 +26,13 @@ index.json).
+ City-scale networks (auto: > 100,000 lanes, or `-net-format pmtiles`)
+ bake `network.pmtiles` with the pinned EXTERNAL binary:
+ 
+-- **tippecanoe 2.78.0** (felt/tippecanoe). Install a release from
++- **tippecanoe — verified: 2.49.0, 2.78.0** (felt/tippecanoe). 2.78.0 is
++  the ADR-0023 spec pin; 2.49.0 from the OS package is verified working
++  (valid PMTiles v3, z8–z13, per-lane identity intact). The `--no-*`
++  identity flags below are the real requirement — any build that honors
++  them qualifies; the version banner rides the content key, so an
++  unverified build's tiles never share a URL with a verified one's.
++  Install a release from
+   https://github.com/felt/tippecanoe (OS packages build it; do not run the
+   install with sudo from bake — bake only *invokes* the binary). The
+   binary's `--version` banner rides the per-city content key, so tiles
+diff --git a/engine/cmd/bake/bake_e2e_test.go b/engine/cmd/bake/bake_e2e_test.go
+index 72647e159718aec53d00453d4681f8ba7ea50f23..2b25d1dd684c382ff36394382f6f77efce120c87 100644
+--- a/engine/cmd/bake/bake_e2e_test.go
++++ b/engine/cmd/bake/bake_e2e_test.go
+@@ -59,14 +59,18 @@ func TestEndToEndBake(t *testing.T) {
+ 	if idx.Version != 1 || idx.Run != e2eRun || idx.Dt != 0.1 {
+ 		t.Fatalf("index header: version %d run %q dt %v", idx.Version, idx.Run, idx.Dt)
+ 	}
+-	if idx.BakeEveryTicks != bakeEveryTicks || idx.LaneEveryFrames != laneEveryFrames {
++	stride, err := bakeStride(idx.Dt)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if idx.BakeEveryTicks != stride || idx.LaneEveryFrames != laneEveryFrames {
+ 		t.Fatalf("cadence: %d/%d", idx.BakeEveryTicks, idx.LaneEveryFrames)
+ 	}
+ 	if idx.TickStart != 0 || idx.TickEnd == 0 {
+ 		t.Fatalf("tick range [%d, %d]", idx.TickStart, idx.TickEnd)
+ 	}
+-	nFrames := int(idx.TickEnd/bakeEveryTicks) + 1
+-	if (uint64(nFrames-1) * bakeEveryTicks) != idx.TickEnd {
++	nFrames := int(idx.TickEnd/stride) + 1
++	if (uint64(nFrames-1) * stride) != idx.TickEnd {
+ 		nFrames++ // terminal off-stride frame
+ 	}
+ 	if idx.Network.GeoJSON != "network.geojson" || idx.Network.PromoteID != "id" {
+@@ -80,8 +84,9 @@ func TestEndToEndBake(t *testing.T) {
+ 	}
+ 
+ 	// Every region's chunk lists are contiguous and sum to the schedule;
+-	// lane lists sum to the aggregate schedule.
+-	nAgg := (nFrames + laneEveryFrames - 1) / laneEveryFrames
++	// lane lists sum to the aggregate schedule (exact tick grid).
++	aggEvery := stride * uint64(laneEveryFrames)
++	nAgg := int(idx.TickEnd/aggEvery) + 1
+ 	if len(idx.Regions) == 0 {
+ 		t.Fatal("no regions in the index")
+ 	}
+@@ -237,14 +242,28 @@ func TestEndToEndBake(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	_, pairs, _, err := parseTSRLFrame(lplain)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	for _, p := range pairs {
+-		if int(p.LaneIdx) >= len(laneIDs) {
+-			t.Fatalf("lane_idx %d outside lanes.json (%d ids)", p.LaneIdx, len(laneIDs))
++	// Decode EVERY TSRL frame in the chunk: ticks must land exactly on
++	// tickStart + a×(bakeEveryTicks×laneEveryFrames) (the shim's lookup is
++	// exact tick equality), and lane indices stay inside lanes.json.
++	// TODO(review 2026-07-26): only the FIRST lane chunk of the first
++	// matching region is decoded, so a later-chunk off-grid frame would
++	// pass; the grid math below also assumes TickStart == 0 (asserted at
++	// the index check above, so it holds today). Deferred — the pod
++	// recording's grid is uniform and covered.
++	for buf := lplain; len(buf) > 0; {
++		tk, pairs, rest, err := parseTSRLFrame(buf)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if tk%aggEvery != idx.TickStart%aggEvery || tk/aggEvery > uint64(nAgg-1) {
++			t.Fatalf("TSRL frame at tick %d is off the exact aggregate grid (every %d ticks)", tk, aggEvery)
++		}
++		for _, p := range pairs {
++			if int(p.LaneIdx) >= len(laneIDs) {
++				t.Fatalf("lane_idx %d outside lanes.json (%d ids)", p.LaneIdx, len(laneIDs))
++			}
+ 		}
++		buf = rest
+ 	}
+ 
+ 	t.Logf("bake: %d regions, tickEnd %d, %d frames, %d aggregates, %d occupied lanes",
+diff --git a/engine/cmd/bake/bake_test.go b/engine/cmd/bake/bake_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..66bb3e8bd791c5aaedcb17f6c4293ab7a7ad9447
+--- /dev/null
++++ b/engine/cmd/bake/bake_test.go
+@@ -0,0 +1,50 @@
++package main
++
++import (
++	"strings"
++	"testing"
++)
++
++// bake_test.go — the dt-derived cadence rule (ADR-0023 §2 clarification):
++// bakeEveryTicks = max(1, round(0.5/dt)); the derived rate must land in
++// [1,2] Hz.
++
++func TestBakeStride(t *testing.T) {
++	cases := []struct {
++		dt     float64
++		want   uint64
++		reject bool
++	}{
++		{0.1, 5, false},   // the recorded runs: 2.0 Hz
++		{0.05, 10, false}, // 2.0 Hz
++		{0.3, 2, false},   // 1.67 Hz
++		{0.5, 1, false},   // 2.0 Hz
++		{1.0, 1, false},   // 1.0 Hz (floor of the band)
++		{0.4, 0, true},    // stride 1 → 2.5 Hz, above the band
++		{2.5, 0, true},    // stride 1 → 0.4 Hz, below the band
++		{0, 0, true},
++		{-0.1, 0, true},
++	}
++	for _, c := range cases {
++		stride, err := bakeStride(c.dt)
++		if c.reject {
++			if err == nil {
++				t.Fatalf("dt %v: stride %d accepted, want rejection", c.dt, stride)
++			}
++			continue
++		}
++		if err != nil {
++			t.Fatalf("dt %v: %v", c.dt, err)
++		}
++		if stride != c.want {
++			t.Fatalf("dt %v: stride %d, want %d", c.dt, stride, c.want)
++		}
++		rate := 1 / (float64(stride) * c.dt)
++		if rate < 1 || rate > 2 {
++			t.Fatalf("dt %v: rate %v outside [1,2] Hz", c.dt, rate)
++		}
++	}
++	if _, err := bakeStride(0.4); err == nil || !strings.Contains(err.Error(), "[1,2] Hz") {
++		t.Fatalf("rejection message %v does not name the band", err)
++	}
++}
+diff --git a/viz/test/baked.test.ts b/viz/test/baked.test.ts
+index 0f6e3efa79d18cf2e9f10709401341d6d266aa44..53d30b2e2569b199a8f39e35217b6cb4003fd972 100644
+--- a/viz/test/baked.test.ts
++++ b/viz/test/baked.test.ts
+@@ -218,6 +218,10 @@ function region(key: string, framesUrl: string, lanesUrl: string): BakedRegion {
+ 
+ const TICKS = [0, 5, 10, 15, 20]; // dt 0.1 × stride 5 over [0, 20] (on-stride)
+ const AGG_TICKS = [0, 10, 20]; // laneEveryFrames 2 → every 10 ticks
++// TODO(review 2026-07-26): tickEnd 20 lands exactly ON the aggregate grid,
++// so the specified off-stride-terminal-carries-no-aggregate behavior has
++// no fixture here. Deferred — the Go e2e covers the on-grid path and the
++// shim's lookup is exact-tick-equality either way.
+ 
+ function makeIndex(): BakedIndex {
+   return {
+@@ -395,6 +399,10 @@ test("below the z13 gate: clock-only empty frames, no vehicle fetches, TSRL sche
+   assert.ok(ratios);
+   assert.equal(ratios.get("lane-a"), 1);
+   assert.equal(ratios.get("lane-b"), 0.5);
++  // Hold-last (§4): the aggregate holds until the next one lands, and the
++  // final aggregate holds to tickEnd.
++  assert.equal(h.sub.laneRatiosAt(19)!.get("lane-a"), 1); // held from tick 10's aggregate
++  assert.ok(h.sub.laneRatiosAt(20) !== null); // final aggregate at tickEnd itself
+ });
+ 
+ test("at/above the gate: viewport region frames merge into one synthetic TSSF", async () => {
+diff --git a/viz/test/furniture.test.ts b/viz/test/furniture.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..e30a4af5e72d20b29bf532a00aa0248175c40143
+--- /dev/null
++++ b/viz/test/furniture.test.ts
+@@ -0,0 +1,122 @@
++// furniture.test.ts — the baked furniture.geojson consumer (ADR-0023
++// §6.2): parseFurniture sorts heads/bars/signs and skips malformed
++// features; furnitureHeads joins heads to TSSG programs by the baked
++// binding (missing programs skip, mirroring the live path's
++// missing-geometry rule). Round-trips the schema bake-furniture.mjs emits.
++
++import { test } from "node:test";
++import assert from "node:assert/strict";
++
++import { furnitureHeads, parseFurniture } from "../src/furniture.ts";
++import type { FeatureCollection } from "geojson";
++import type { SignalTable } from "../src/tssg.ts";
++
++const TABLE: SignalTable = {
++  tick: 0,
++  programs: [
++    {
++      id: "j1",
++      junction: "j1",
++      offsetTicks: 0,
++      phases: [
++        { durationTicks: 90, state: "Gr" },
++        { durationTicks: 10, state: "yr" },
++      ],
++      links: [
++        { linkIdx: 0, laneId: "i1_0" },
++        { linkIdx: 1, laneId: "i2_0" },
++      ],
++    },
++  ],
++};
++
++// doc mirrors bake-furniture.mjs's output: head points with the program
++// binding, bar lines sharing the head id, sign points.
++const DOC: FeatureCollection = {
++  type: "FeatureCollection",
++  features: [
++    {
++      type: "Feature",
++      properties: { kind: "head", id: "j1:0", program: "j1", link: 0 },
++      geometry: { type: "Point", coordinates: [100, 200] },
++    },
++    {
++      type: "Feature",
++      properties: { kind: "bar", id: "j1:0" },
++      geometry: {
++        type: "LineString",
++        coordinates: [
++          [95, 198],
++          [105, 202],
++        ],
++      },
++    },
++    {
++      type: "Feature",
++      properties: { kind: "head", id: "j1:1", program: "j1", link: 1 },
++      geometry: { type: "Point", coordinates: [110, 190] },
++    },
++    {
++      type: "Feature",
++      properties: { kind: "sign", id: "j9#0" },
++      geometry: { type: "Point", coordinates: [50, 60] },
++    },
++  ],
++};
++
++test("parseFurniture sorts heads, bars, and signs; metric coords untouched", () => {
++  const f = parseFurniture(DOC);
++  assert.equal(f.heads.length, 2);
++  assert.deepEqual(f.heads[0], { id: "j1:0", programId: "j1", linkIdx: 0, x: 100, y: 200 });
++  assert.equal(f.bars.size, 1);
++  assert.deepEqual(f.bars.get("j1:0"), [95, 198, 105, 202]);
++  assert.deepEqual(f.signs, [{ id: "j9#0", x: 50, y: 60 }]);
++});
++
++test("furnitureHeads joins programs by the baked binding; bar attaches by shared id", () => {
++  const heads = furnitureHeads(parseFurniture(DOC), TABLE);
++  assert.equal(heads.length, 2);
++  const [h0, h1] = heads;
++  assert.equal(h0!.id, "j1:0");
++  assert.equal(h0!.program.id, "j1");
++  assert.equal(h0!.linkIdx, 0);
++  assert.deepEqual(h0!.bar, [95, 198, 105, 202]);
++  assert.equal(h1!.bar, null); // no bar feature for this head
++});
++
++test("a head whose program is missing from the table is skipped", () => {
++  const doc: FeatureCollection = {
++    type: "FeatureCollection",
++    features: [
++      {
++        type: "Feature",
++        properties: { kind: "head", id: "gone:0", program: "gone", link: 0 },
++        geometry: { type: "Point", coordinates: [0, 0] },
++      },
++    ],
++  };
++  assert.equal(furnitureHeads(parseFurniture(doc), TABLE).length, 0);
++});
++
++test("malformed features skip, never throw", () => {
++  // TODO(review 2026-07-26): geometry:null is legal GeoJSON and the
++  // committed parseFurniture would throw on it for a head/bar WITH an id
++  // — this test's "never throw" claim covers only the cases below. The
++  // producer is our own bake-furniture.mjs, which never emits null
++  // geometry, so this is deferred, not fixed.
++  const doc = {
++    type: "FeatureCollection",
++    features: [
++      { type: "Feature", properties: { kind: "head" }, geometry: { type: "Point", coordinates: [1, 2] } }, // no id
++      { type: "Feature", properties: { kind: "head", id: "x", program: "j1", link: 0 }, geometry: { type: "LineString", coordinates: [[1, 2], [3, 4]] } }, // not a point
++      { type: "Feature", properties: { kind: "bar", id: "b" }, geometry: { type: "Point", coordinates: [1, 2] } }, // not a line
++      { type: "Feature", properties: { kind: "mystery", id: "m" }, geometry: { type: "Point", coordinates: [1, 2] } }, // unknown kind
++      { type: "Feature", properties: null, geometry: { type: "Point", coordinates: [1, 2] } },
++    ],
++  } as unknown as FeatureCollection;
++  const f = parseFurniture(doc);
++  assert.equal(f.heads.length, 0);
++  assert.equal(f.bars.size, 0);
++  assert.equal(f.signs.length, 0);
++  assert.equal(parseFurniture({ type: "FeatureCollection" } as unknown as FeatureCollection).heads.length, 0);
++});
