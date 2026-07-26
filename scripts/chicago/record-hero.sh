@@ -22,6 +22,14 @@ OUT=${4:?output root}
 shift 4
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+# Binaries are build artifacts, not repo contents. Point at wherever they
+# were built; the defaults assume a scratch build rather than dropping
+# 25 MB executables into the working tree.
+SERVE_BIN=${SERVE_BIN:-$ROOT/engine/serve}
+BAKE_BIN=${BAKE_BIN:-$ROOT/engine/bake}
+for b in "$SERVE_BIN" "$BAKE_BIN"; do
+    [ -x "$b" ] || { echo "record-hero: no executable at $b — build it ""(go build -o \"$b\" ./cmd/...) or set SERVE_BIN/BAKE_BIN" >&2; exit 1; }
+done
 STORE="$OUT/store-$RUN"
 LOG="$OUT/$RUN.log"
 mkdir -p "$OUT"
@@ -33,7 +41,7 @@ if [ -e "$STORE" ]; then
 fi
 
 echo "[hero] recording $RUN ($TICKS ticks) -> $STORE" >&2
-"$ROOT/engine/serve" -scenario "$SC" -run "$RUN" -ticks "$TICKS" \
+"$SERVE_BIN" -scenario "$SC" -run "$RUN" -ticks "$TICKS" \
     -store "$STORE" -pace 0 -metrics-out "$OUT/$RUN.metrics.json" \
     "$@" 2>&1 | tee "$LOG"
 
@@ -52,5 +60,5 @@ check "nats-server not ready" "the broker never came up"
 [ "$fail" = 0 ] || exit 1
 
 echo "[hero] baking $RUN -> $OUT" >&2
-"$ROOT/engine/bake" -store "$STORE" -run "$RUN" -out "$OUT"
+"$BAKE_BIN" -store "$STORE" -run "$RUN" -out "$OUT"
 echo "[hero] done: $OUT/baked/$RUN/" >&2
