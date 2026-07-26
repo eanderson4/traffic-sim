@@ -45,9 +45,24 @@ const DirectorSpawnHoldTicks = 600
 // keyframe so pending state round-trips bit-exactly).
 type SpawnDirective struct {
 	RequestID    string // director-assigned idempotency key
-	Origin       string // origin lane ID (must be a network origin)
+	Origin       string // origin lane ID (a network origin, unless OffsetM > 0)
 	TypeName     string // scenario vehicle-type name
 	EarliestTick uint64 // not-before tick (sim ticks, ADR-0005)
+	// Destination is an optional route destination lane id (ADR-0021),
+	// applied as the vehicle's Route axis at injection. The kernel follows
+	// it (routing.go) and ENDS the trip there (boundaries()). Empty leaves
+	// the vehicle unrouted, exactly as before — controllers may still set
+	// the axis later over the intent plane.
+	Destination string
+	// OffsetM is the injection position along the origin lane, in meters
+	// from its start. Zero is the portal semantics (inject at the lane
+	// start) and is the only value a network ORIGIN lane accepts. A
+	// positive offset is the INTERIOR-origin opt-in (ADR-0021: a garage or
+	// driveway mid-block): it admits any lane, and the offset being
+	// explicit is what keeps a mistyped portal id from silently becoming a
+	// mid-network injection. Interior entries are clearance-checked behind
+	// as well as ahead.
+	OffsetM float64
 }
 
 // TickedSpawn is an accepted directive with its resolution and applied_tick
@@ -75,12 +90,46 @@ type TickedSpawn struct {
 // Like EnqueueIntent, it must be called only from the goroutine that owns
 // the engine, between Steps.
 func (e *Engine) EnqueueSpawn(d SpawnDirective) error {
-	lane := e.Net.OriginByID(d.Origin)
-	if lane == nil {
-		if e.Net.LaneByID(d.Origin) == nil {
+	var lane *Lane
+	switch {
+	case d.OffsetM < 0 || math.IsNaN(d.OffsetM):
+		return fmt.Errorf("bad injection offset %v (must be ≥ 0)", d.OffsetM)
+	case d.OffsetM > 0:
+		// Interior origin (ADR-0021): any lane, but the offset must leave
+		// the vehicle wholly on it — an injection point past the lane end
+		// would cross out on its first boundaries() pass, and one at the
+		// very end is the junction mouth the offset exists to avoid.
+		lane = e.Net.LaneByID(d.Origin)
+		if lane == nil {
 			return fmt.Errorf("unknown origin lane %q", d.Origin)
 		}
-		return fmt.Errorf("lane %q is not a spawn origin", d.Origin)
+		if d.OffsetM >= lane.Length {
+			return fmt.Errorf("injection offset %.2f m is past the end of lane %q (%.2f m)", d.OffsetM, d.Origin, lane.Length)
+		}
+	default:
+		lane = e.Net.OriginByID(d.Origin)
+		if lane == nil {
+			if e.Net.LaneByID(d.Origin) == nil {
+				return fmt.Errorf("unknown origin lane %q", d.Origin)
+			}
+			return fmt.Errorf("lane %q is not a spawn origin (interior injection needs an explicit offset_m)", d.Origin)
+		}
+	}
+	if d.Destination != "" {
+		dest := e.Net.LaneByID(d.Destination)
+		if dest == nil {
+			return fmt.Errorf("unknown destination lane %q", d.Destination)
+		}
+		// Arrival is detected in boundaries() by S > Lane.Length, but an
+		// EndWall lane brakes its traffic to a stop BEFORE that line, so a
+		// vehicle routed to one parks at the wall and never arrives — it
+		// stays in the world forever, inflating every occupancy metric.
+		// Reject it loudly rather than leak vehicles. No city import can hit
+		// this (netimport marks dead ends as exits, and chi-loop-urban has
+		// zero EndWall lanes); the synthetic fixtures are what have them.
+		if dest.EndWall {
+			return fmt.Errorf("destination lane %q ends in a wall: a vehicle routed there stops short of the lane end and can never arrive", d.Destination)
+		}
 	}
 	ti := -1
 	for i, t := range e.scen.Types {
@@ -109,10 +158,29 @@ func (e *Engine) EnqueueSpawn(d SpawnDirective) error {
 			Origin:       d.Origin,
 			TypeName:     d.TypeName,
 			EarliestTick: d.EarliestTick,
+			Destination:  d.Destination,
+			OffsetM:      d.OffsetM,
 		},
 	})
 	return nil
 }
+
+// InteriorInjection records one ADR-0021 mid-lane injection performed
+// during the last Step. The metric kernel needs it for two things a
+// first observation cannot otherwise distinguish: the vehicle did NOT
+// cross a boundary to reach a non-origin lane (so it must not be counted
+// as a dropped crossing), and its first tick of travel is v.S − S, not the
+// whole lane prefix v.S. Derived per-tick state — never serialized, not in
+// the CRC, reused by the next Step exactly like AppliedSpawns.
+type InteriorInjection struct {
+	ID uint64
+	S  float64 // injection position along the lane (meters)
+}
+
+// InteriorInjections returns the mid-lane injections performed during the
+// last Step. Portal injections (S = 0) are never listed — the first
+// observation of one is unambiguous already.
+func (e *Engine) InteriorInjections() []InteriorInjection { return e.interiorInj }
 
 // AppliedSpawns returns the directives accepted into the injection queue
 // during the last Step (stamped with their applied_tick) — the record plane
@@ -131,6 +199,7 @@ func (e *Engine) PendingSpawns() int { return len(e.dirQueue) }
 // Spawner's per-origin states).
 func (e *Engine) stepDirectorSpawns() {
 	e.appliedSpawns = e.appliedSpawns[:0]
+	e.interiorInj = e.interiorInj[:0]
 	if len(e.dirNew) > 0 {
 		for _, d := range e.dirNew {
 			d.Tick = e.Tick
@@ -163,7 +232,13 @@ func (e *Engine) stepDirectorSpawns() {
 		// The probe is a lightweight stand-in (not ID-streamed); its ID is
 		// the max uint64 so the mutual-yield tie-breaks (foe.ID < v.ID) read
 		// as "loses to every real vehicle" — conservative, and deterministic.
-		probe := &Vehicle{ID: ^uint64(0), Lane: lane, Type: e.scen.Types[d.TypeIdx]}
+		// Route must be on the probe: gateTarget walks successors via
+		// pickSuccessor, which follows the ROUTE where there is one, so a
+		// route-less probe checks the signal on the default branch while the
+		// vehicle injectDirective creates takes the routed one. On a city
+		// network those are different internal lanes — the probe would clear
+		// an injection against the wrong light.
+		probe := &Vehicle{ID: ^uint64(0), Lane: lane, S: d.OffsetM, Type: e.scen.Types[d.TypeIdx], Route: d.Destination}
 		speed, ok := e.injectionPlan(probe)
 		if !ok {
 			kept = append(kept, d)
@@ -189,9 +264,13 @@ func (e *Engine) injectDirective(d *TickedSpawn, lane *Lane, speed float64) {
 		v.F = 1.3
 	}
 	v.Lane = lane
-	v.S = 0
+	v.S = d.OffsetM
+	v.Route = d.Destination              // routing axis set at birth (ADR-0021)
 	v.V = math.Min(speed, v.v0eff(lane)) // the plan is F-free; apply the driver's own factor
 	v.Cooldown = e.Params.SpawnCooldown
 	e.register(v)
 	e.Stats.Spawned++
+	if d.OffsetM > 0 {
+		e.interiorInj = append(e.interiorInj, InteriorInjection{ID: v.ID, S: d.OffsetM})
+	}
 }

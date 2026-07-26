@@ -123,3 +123,18 @@ test("loadConfig resolves the theme (no Web Storage in node → navy)", () => {
   assert.equal(loadConfig("", "localhost").theme, "navy");
   assert.equal(loadConfig("?net=/net/x.geojson", "localhost").theme, "navy");
 });
+
+test("residential and workplace buildings are distinguishable in every theme", () => {
+  for (const [name, spec] of Object.entries(THEMES)) {
+    assert.notEqual(
+      spec.buildingResidential,
+      spec.buildingWorkplace,
+      `${name}: the two demand kinds must not share a color — the split is the layer`,
+    );
+    assert.notEqual(spec.buildingOther, spec.buildingResidential, name);
+    assert.notEqual(spec.buildingOther, spec.buildingWorkplace, name);
+    // Buildings sit under the roads: they must not be the water fill either.
+    assert.notEqual(spec.buildingResidential, spec.water, name);
+    assert.notEqual(spec.buildingWorkplace, spec.water, name);
+  }
+});

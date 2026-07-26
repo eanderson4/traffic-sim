@@ -50,7 +50,7 @@ back to it.
 - [Chicago Metro](articles/chicago-metro.md) — zoned Geofabrik→netconvert pipeline, portal-weighted napkin demand, driver exit-routing + serve attach barrier it required
 
 ### Decisions
-- [ADR Index](articles/decisions/adrs.md) — ADR-0001..0020 table with rationales, research basis, and pending-ADR queue
+- [ADR Index](articles/decisions/adrs.md) — ADR-0001..0022 table with rationales, research basis, and pending-ADR queue
 
 ## Raw Research
 
@@ -102,8 +102,10 @@ links its source synthesis for traceability.
 - [x] [ADR-0017](decisions/ADR-0017-city-import-decisions.md) — city-scale OSM import decisions: no `--junctions.join` (stop override keys by OSM node id), `priority_stop` as whole-junction approximation, relations (turn restrictions) not imported, directionless stops infer from oneway else forward with a reported count
 - [x] [ADR-0018](decisions/ADR-0018-chunked-geojson.md) — city-scale network GeoJSON served chunked over HTTP: manifest (`frame` + empty features + `parts`), hash+schema-pinned part URLs that 404 a stale generation, sequential client fetch; small nets byte-identical
 - [x] [ADR-0019](decisions/ADR-0019-route-budget-determinism.md) — route-budget determinism bound: per-replica admission timing and mid-queue failover lane re-freeze accepted and bounded; strict fix retires the budget
+- [ ] [ADR-0021](decisions/ADR-0021-od-demand-buildings.md) — PROPOSED: origin–destination demand — the route destination becomes a TRIP END (arrival despawn), `destination`/`offset_m` ride the spawn verb (omitempty, TSKF v4 only when used), interior injection is clearance-checked behind, and OD is anchored to OSM building floor area
 - [x] [ADR-0020](decisions/ADR-0020-demosrv-public-deployment.md) — demosrv public deployment: -wspublic verbatim ws advertisement, -admintoken bearer gate on the mutating POSTs (GETs public), -autostart with keep-serving failure semantics, -nobuild prebuilt engine binaries; all default to local-dev behavior
-- [ ] [ADR-0023](decisions/ADR-0023-baked-replay-pipeline.md) — PROPOSED: baked replay pipeline — offline re-sim of a recording into TSRB v1 binary frames (2 Hz, region-chunked by z11 tile) + TSRL v1 lane-speed aggregates (0.2 Hz), PMTiles network layer, content-addressed R2 layout, viz ?bake= shim re-encoding to synthetic TSSF
+- [ ] [ADR-0022](decisions/ADR-0022-us-urban-speed-typemap.md) — PROPOSED: US urban speed typemap — netconvert's German-derived OSM defaults gave unposted secondary/primary 100 km/h across all 25 US networks; an explicit speed-only typemap sets the 30 mph statutory urban default AND disables right-before-left (30 mph sits 0.2 m/s under netconvert's rbl threshold, which silently retyped 1,218 junctions to yield-to-the-right); joins the importer identity hash, region-scoped with the US map as the default
+- [ ] [ADR-0024](decisions/ADR-0024-bounded-memory-replay-reader.md) — ACCEPTED (pending review): bounded-memory replay reading — the Player materialized the WHOLE record (`fetchFrom` from seq 1 plus a full per-tick index, both live at once), which is why a 30-minute chi-loop cut could not be opened; measured 9,973,269 intents vs 9,000 CRCs and 91 keyframes in a 15-minute recording, so intents are 99.9% of the record at ~1 per vehicle per tick. Replaced by a forward-only `logCursor` holding one tick at a time; the RECORD FORMAT is untouched, so every existing recording still replays. Also adds `Engine.DropIntentLog` / `serve -intent-log=false` (the flag earlier planning assumed existed, and did not)
 
 ---
 *Last distilled: 2026-07-17 | 18 articles from 56 raw research files*
@@ -116,5 +118,6 @@ links its source synthesis for traceability.
 *ADR-0018 ratified 2026-07-24 (chunked network GeoJSON, after la-lean hit the V8 string cap)*
 *ADR-0019 ratified 2026-07-24 (route-budget determinism bound, after the city-scale obs-path stall)*
 *ADR-0020 ratified 2026-07-25 (demosrv public deployment: GKE pod behind a 443-only TLS Ingress)*
-*ADR-0023 PROPOSED 2026-07-25 (baked replay pipeline for phantomjam.com MVP; three design rounds — Kimi K3 brief, Claude Fable + GPT-5.6-sol)*
+*ADR-0021 PROPOSED 2026-07-25 (building-anchored OD demand for chi-loop; awaiting the external-review round)*
+*ADR-0022 PROPOSED 2026-07-25 (US urban speed typemap; found while chasing chi-loop's collision hotspot — 79.7% of its lanes were ≥80 km/h. Review round: Kimi K3 + GPT-5.6-sol, which caught the right-before-left retyping the first draft missed)*
 *Run `/update-kb` to check freshness*

@@ -4,14 +4,19 @@
 // engine timestep in seconds (engine DefaultParams Dt = 0.1) — needed to
 // derive vehicle speed from SIM time, not wall-clock frame spans.
 // `?theme=` picks the palette (theme.ts THEMES; unknown names → navy).
+// `?bake=<index.json URL>` selects the baked-replay shim (ADR-0023): the
+// recording replays from static artifacts, `?ws=` is inert, and `?run=`
+// is display-only (the shim echoes the index's run id).
 
 export interface VizConfig {
   run: string;
   ws: string;
+  bake: string | null; // ?bake= index.json URL — baked mode when set (ADR-0023)
   networkUrl: string;
   zonesUrl: string;
   boundariesUrl: string;
   waterUrl: string;
+  buildingsUrl: string;
   bufferMs: number;
   dt: number; // engine timestep, s — sim seconds per tick
   theme: string; // theme.ts THEMES key (navy default, resolved by getTheme)
@@ -47,12 +52,14 @@ export function loadConfig(search: string, hostname: string): VizConfig {
   return {
     run: p.get("run") ?? "demo",
     ws: p.get("ws") ?? `ws://${hostname}:8443`,
+    bake: p.get("bake"),
     networkUrl: p.get("net") ?? "/network.geojson",
     // Static WGS84 overlays (demosrv /overlay/); optional — a 404 just
     // means "no overlay on this demo", the fetch tolerates it.
     zonesUrl: p.get("zones") ?? "/overlay/zones.geojson",
     boundariesUrl: p.get("boundaries") ?? "/overlay/boundaries.geojson",
     waterUrl: p.get("water") ?? "/overlay/water.geojson",
+    buildingsUrl: p.get("buildings") ?? "/overlay/buildings.geojson",
     bufferMs: Number.isFinite(buffer) && buffer >= 0 ? buffer : 250,
     dt: Number.isFinite(dt) && dt > 0 ? dt : 0.1,
     theme: resolveThemeName(p.get("theme"), stored),

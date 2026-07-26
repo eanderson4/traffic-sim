@@ -331,6 +331,128 @@ Directive expiry + yield conservatism; ADR-level. Fixture: `engine/fixture_round
 ### WQ-7: stopDone keyframe persistence (v4)
 Deferred until recordings exist. Not podcast-blocking.
 
+### WQ-17: chi-loop origin–destination demand (ADR-0021) — DONE 2026-07-25, review pending
+Replaces chi-loop's portal-inflow-with-random-egress demand with a
+building-anchored OD program. Scenarios: `data/scenarios/chi-loop-od`
+(3 h AM profile, the metrics run) and `chi-loop-od-peak` (flat peak rate,
+the recordable cut — a store always starts at tick 0, so recording the
+ramped scenario would only ever capture 06:00–06:15). Pipeline:
+`scripts/chicago/buildings.py` (OSM footprints → floor area → snapped
+access lane) → `mkod.py` (OD demand YAML) → `congestion.py` (delay ranked
+by STREET NAME, not lane id). Engine: arrival despawn, verb
+`destination`/`offset_m`, rear-clearance-checked interior injection, and
+the LATERAL route guardrail — see ADR-0021.
+
+> **Status 2026-07-25 (2nd pass).** The corrected import shipped
+> (`--junctions.right-before-left.speed-threshold 0`, ADR-0022 §6) and the
+> engine bugs are fixed. Everything below was re-measured on it. The old
+> collision A/B and delay-share comparison are WITHDRAWN, not re-run — see
+> ADR-0022; the decision they justified is settled.
+
+Closed since first writing:
+- **Route recovery now crosses any number of lanes.** The reachability
+  predicate became a lateral-depth gradient (`routeLatDepth`: layered 0-1
+  BFS from the destination over the reversed lane graph, successor edges
+  cost 0, `Left`/`Right` links cost 1). The veto denies any hop that
+  increases depth; recovery descends it. `TestRouteRecoveryCrossesTwoLanes`
+  pins the case the predicate could not solve. Full Go suite green,
+  including the CRC-pinned fixtures — unrouted vehicles are untouched.
+- **The network no longer gridlocks.** On the corrected import a 10k–20k
+  demand bracket all flows. At the shipped 16,000 veh/h target: 26.0 km/h
+  mean network speed, 53% delay share, 96% of despawns are arrivals, 4,996
+  collision observations over 18,000 ticks — against **975,673** (774,172 in
+  one junction) on the defective rbl import.
+- **Demand re-tuned to a 16,000 veh/h target / 12,960 injected**, shipped as
+  `data/scenarios/chi-loop-od-30m` (18,000 ticks = 30 sim min, flat peak).
+  Chosen over 20,000 because collision observations grow superlinearly past
+  it (+25% demand → +71% collisions) for 1.7 km/h of extra congestion.
+- **Corridor attribution exists now.** `scripts/chicago/corridors.py` builds
+  a lane → named-corridor map (`corridors.json`) for the Kennedy, Dan Ryan,
+  Eisenhower, Stevenson, Lake Shore Drive and the Jane Byrne Interchange —
+  by OSM name substring, with the Byrne matched geometrically since it has
+  no name. `congestion.py --corridors` ranks them by delay per lane-km.
+- **`congestion.py` reports delay PER PERSON** and person-hours per street
+  behind an explicit `--occupancy car=1.2,truck=1.0` flag that is printed
+  with every report (VISION.md use case 4).
+- **The recording is watchable again.** The 30-minute cut was 9.1 GB, and
+  `replay` materializes the whole store before it serves (~7× RSS ≈ 60 GB),
+  so nobody could open it. Re-recorded as a 15-minute cut at the retuned
+  rate: **2.3 GB store, 17.0 GB replay RSS**, loads in ~2 min, `/status`
+  and `/seek` verified, 0 CRC errors, 0 verb errors. The horizon is now
+  documented in `chi-loop-od-peak/scenario.yaml` as a storage budget.
+  General lesson for any future city recording: budget ~150 MB per
+  simulated minute per 1,000 live vehicles, and remember replay RSS is ~7×
+  the store.
+
+Still open on this thread:
+- **THE VALIDATION GAP: the expressways do not congest.** Six of the ten
+  corridors in the Chicago hotspot research report
+  (`~/grove/research-bot/.research/chicago-traffic-hotspots/REPORT.md`) are
+  inside the chi-loop extract, and at the shipped rate all six run free —
+  Kennedy 72.1 km/h, Eisenhower 79.4, Dan Ryan 78.6, Stevenson 78.3, Lake
+  Shore Drive 53.4, Jane Byrne 48.5 — carrying 3.3% of network delay
+  between them while the arterial grid takes 94.7%. The report singles the
+  Kennedy out as having the **lowest peak truck speed of any Chicago entry
+  (19.1 mph / 31 km/h)**; we have it at 72.
+  **This is structural, not a tuning knob.** `mkod.py` sets portal rates as
+  `class_rate × (total × portal_share / portal_raw)`, so the per-class table
+  is only a shape and `--total` sets the level. At `--total 16000` the scale
+  factor is ≈0.24 and the Kennedy's two boundary origin lanes inject
+  337 veh/h/lane — about a sixth of a freeway lane's capacity, and a sixth
+  of the corridor's real ~275,000 veh/day. Per-corridor injection at 16,000:
+  Kennedy 674 veh/h (2 origin lanes), Stevenson 674 (2), Dan Ryan 1,348 (4),
+  Eisenhower 1,348 (4), LSD 2,092 (8), everything else 10,063 over 216
+  lanes. Reaching the motorway class rate needs `--total ≈ 67,000`, which
+  buries the arterial grid. **One scalar cannot congest both.**
+  **The fix is measured and works.** Multiplying only the `-motorway`/
+  `-trunk` portal flows by 4.15 (337 → ~1,400 veh/h/lane, the class rate),
+  arterial and residential demand untouched, over matched 6,000-tick runs:
+  the expressways go from **4.7% to 52.9% of network delay**, Eisenhower
+  82.5 → 37.4 km/h (its real ATRI peak truck speed is 36), Dan Ryan
+  74.5 → 27.2, Stevenson 82.6 → 33.1, LSD 60.1 → 30.4 — and the network
+  still flows (mean 36.4 → 29.5 km/h, collisions 216 → 1,043, no gridlock).
+  Two stay too free: the Kennedy (50.1 vs a real 31) has 681 lanes in the
+  crop but only 2 boundary origin lanes, so its inflow spreads thin; and the
+  Jane Byrne barely moved because its lanes are `motorway_link` and the
+  experiment's filter only matched `-motorway`/`-trunk`.
+  Implementation: a `--freeway-scale F` flag on `mkod.py` injecting
+  motorway/trunk/`*_link` portals at `F × class_rate` directly, bypassing
+  the zone scalar. NOT implemented — it changes what the demand grammar
+  means and belongs with the ADR-0021 generator work, not a tuning pass.
+- **A batch metrics run is memory-bounded by `Engine.IntentLog`, and the
+  3-hour chi-loop AM run does not fit in 123 GB.** `IntentLog` accumulates
+  every applied intent for the whole run and is never drained, so RSS grows
+  as fleet × ticks. Measured on `chi-loop-od` at 9,000 veh/h with
+  `-metrics-out`: **~1 GB per 1,000 ticks at a 3–4k fleet**, and a marginal
+  rate of ~2.4 GB/1,000 ticks once the fleet passed 3,900 — 45.8 GB at tick
+  47,200, projecting past 120 GB before the 108,000-tick horizon. The run
+  was killed and re-run at 54,000 ticks (06:00–07:30: the ramp plus the
+  first plateau half-hour), which is what
+  `data/scenarios/chi-loop-od/am-peak-build.congestion.txt` reports.
+  This is unrecoverable rather than degrading: **metrics are written only at
+  run end, and SIGINT abandons the run** ("demo mode does no graceful
+  finish"), so an OOM at tick 90,000 loses the whole run. Fix directions, in
+  order of cheapness: (1) a `-intent-log=false` flag for batch runs that do
+  not need replay-from-log, (2) write metrics incrementally or on SIGINT,
+  (3) cap/ring-buffer `IntentLog`. Until then, the 3-hour AM profile in
+  `chi-loop-od/scenario.yaml` is a horizon no box here can measure — treat
+  `ticks: 108000` as an aspiration, not a runnable default.
+- **`dropped_crossings` is one counter mixing ≥4 causes** and is dominated
+  on dense grids by the multi-successor overshoot refund, not by anything
+  routing-related. Split it per reason before anyone tries to act on it
+  (this also answers WQ-4's "correlate with `_d2` fragments").
+- **chi-loop has no residential street grid** (107 residential + 108 service
+  lanes of 23,833 — the `motorway…tertiary` import filter), so residents
+  inject onto arterials they do not front. Re-import decision.
+- **Residential mass is under-counted**: 71% of footprints are
+  `building=yes` with nothing to disambiguate, so Chicago's 2- and 3-flats
+  produce no trips.
+- **Every other US network still has autobahn speed limits** (ADR-0022's
+  table is the queue): la, sf, miami, atlanta, houston, dallas,
+  boston-core, phoenix-arterial, manhattan-grid, stress-dtla, chi-kennedy,
+  chi-north-lakefront. Any level-of-service number from those is wrong in
+  the same direction.
+
 ## Program items (bigger, parallelizable, post-podcast unless cheap)
 
 ### WQ-8: GIS network analysis (LA vs NY) — DONE (2026-07-24)

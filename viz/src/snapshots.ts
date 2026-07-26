@@ -45,7 +45,7 @@ function lerpAngle(a: number, b: number, t: number): number {
 
 export class SnapshotBuffer {
   private frames: TimedFrame[] = [];
-  readonly bufferMs: number;
+  private bufferMs: number;
   simDt: number; // engine timestep, s — sim seconds per tick (see setSimDt)
   private readonly maxFrames: number;
 
@@ -54,6 +54,16 @@ export class SnapshotBuffer {
     this.bufferMs = bufferMs;
     this.simDt = simDt;
     this.maxFrames = maxFrames;
+  }
+
+  // setBufferMs re-sizes the interpolation buffer WITHOUT a rebuild
+  // (buffered frames are interpolation history — dropping them mid-play
+  // would smear). Baked replay (ADR-0023 §2) needs this: at the 2 Hz bake
+  // cadence the frame interval (500 ms) exceeds the 250 ms default, so the
+  // buffer tracks 1.25 × frameInterval / playback speed instead — field
+  // assignment only, never a reset.
+  setBufferMs(ms: number): void {
+    this.bufferMs = ms;
   }
 
   // setSimDt re-targets the sim seconds-per-tick behind speed derivation.

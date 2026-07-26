@@ -74,6 +74,7 @@ type Director struct {
 type pendingArrival struct {
 	at    float64
 	vtype string
+	dest  string // route destination drawn for this arrival ("" = unrouted)
 }
 
 var discard = log.New(io.Discard, "", 0)
@@ -146,12 +147,12 @@ func Attach(nc *nats.Conn, js nats.JetStreamContext, cfg Config, dfs []*scenario
 		d.samplers = append(d.samplers, newFlowSampler(f, cfg.Seed, i))
 		d.pending = append(d.pending, pendingArrival{})
 		d.exhausted = append(d.exhausted, false)
-		at, vtype, ok := d.samplers[i].next(d.dt)
+		at, vtype, dest, ok := d.samplers[i].next(d.dt)
 		if !ok {
 			d.exhausted[i] = true
 			continue
 		}
-		d.pending[i] = pendingArrival{at: at, vtype: vtype}
+		d.pending[i] = pendingArrival{at: at, vtype: vtype, dest: dest}
 	}
 	lg.Printf("demand director: attached as %s (director grant) to run %q (dt=%.3fs, %d ticks, %d flows)",
 		ctlID, cfg.Run, d.dt, meta.Spec.Ticks, len(flows))
@@ -229,6 +230,8 @@ func (d *Director) send(flowIdx int) {
 		Origin:       fs.flow.Origin,
 		VType:        d.pending[flowIdx].vtype,
 		EarliestTick: atTick,
+		Destination:  d.pending[flowIdx].dest,
+		OffsetM:      fs.flow.OffsetM,
 	})
 	d.Sent++
 	msg, err := d.nc.Request(natsio.SubjectCtlVerb(d.cfg.Run, d.ctlID), req, 2*time.Second)
@@ -247,12 +250,12 @@ func (d *Director) send(flowIdx int) {
 		d.Rejected++
 		d.log.Printf("  verb f%d-%06d REJECTED: %s", flowIdx, fs.ordinal-1, msg.Data)
 	}
-	at, vtype, ok := fs.next(d.dt)
+	at, vtype, dest, ok := fs.next(d.dt)
 	if !ok {
 		d.exhausted[flowIdx] = true
 		return
 	}
-	d.pending[flowIdx] = pendingArrival{at: at, vtype: vtype}
+	d.pending[flowIdx] = pendingArrival{at: at, vtype: vtype, dest: dest}
 }
 
 // flowSampler walks one flow's arrival program. All draws come from the
@@ -301,17 +304,23 @@ func rateAt(f *scenario.Flow, tS float64) float64 {
 	return 0
 }
 
-// next returns the next (arrival sim-seconds, vtype) and advances. ok=false
-// when the program is exhausted (past until_s, or a zero rate with slices).
-func (fs *flowSampler) next(dt float64) (atS float64, vtype string, ok bool) {
+// next returns the next (arrival sim-seconds, vtype, destination) and
+// advances. ok=false when the program is exhausted (past until_s, or a zero
+// rate with slices).
+//
+// Draw ORDER on the per-vehicle stream is gap → vtype → destination
+// (ADR-0021): appending the destination draw LAST means a flow that
+// declares no destinations consumes exactly the draws it always did, so
+// every pinned pre-ADR-0021 realization is unchanged.
+func (fs *flowSampler) next(dt float64) (atS float64, vtype, dest string, ok bool) {
 	f := fs.flow
 	if f.UntilS > 0 && fs.nextS >= f.UntilS {
-		return 0, "", false
+		return 0, "", "", false
 	}
 	rate := rateAt(&f, fs.nextS)
 	if rate <= 0 {
 		if len(f.Slices) == 0 {
-			return 0, "", false
+			return 0, "", "", false
 		}
 		// Jump to the next slice window.
 		best := math.Inf(1)
@@ -321,12 +330,12 @@ func (fs *flowSampler) next(dt float64) (atS float64, vtype string, ok bool) {
 			}
 		}
 		if math.IsInf(best, 1) {
-			return 0, "", false
+			return 0, "", "", false
 		}
 		fs.nextS = best
 		rate = rateAt(&f, fs.nextS)
 		if rate <= 0 {
-			return 0, "", false
+			return 0, "", "", false
 		}
 	}
 	st := fs.stream()
@@ -336,10 +345,11 @@ func (fs *flowSampler) next(dt float64) (atS float64, vtype string, ok bool) {
 		gapS = -math.Log(1-st.Float64()) * gapS
 	}
 	vtype = pickType(st, f.VTypes)
+	dest = pickWeighted(st, f.Destinations)
 	at := fs.nextS
 	fs.ordinal++
 	fs.nextS = at + gapS
-	return at, vtype, true
+	return at, vtype, dest, true
 }
 
 // pickType draws the vehicle type from the per-vehicle stream, weights
@@ -351,6 +361,25 @@ func pickType(st *engine.Stream, weights map[string]float64) string {
 	if len(weights) == 0 {
 		return "car"
 	}
+	return weightedDraw(st, weights)
+}
+
+// pickWeighted draws a destination lane from the flow's weighted
+// distribution, "" when the flow declares none (unrouted — and, crucially,
+// NO draw is consumed in that case, so pre-ADR-0021 flows keep their exact
+// stream sequence).
+func pickWeighted(st *engine.Stream, weights map[string]float64) string {
+	if len(weights) == 0 {
+		return ""
+	}
+	return weightedDraw(st, weights)
+}
+
+// weightedDraw remaps one uniform draw onto a weighted key set. BOTH the
+// total and the cumulative walk accumulate over the SORTED key list — float
+// addition is non-associative, so Go map order is forbidden anywhere near a
+// sampled path (ADR-0005; a director restart must be invisible).
+func weightedDraw(st *engine.Stream, weights map[string]float64) string {
 	names := make([]string, 0, len(weights))
 	for n := range weights {
 		names = append(names, n)

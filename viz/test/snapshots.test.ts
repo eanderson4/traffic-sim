@@ -269,3 +269,18 @@ test("SeekGate.setSimDt re-derives the threshold when the recorded dt is adopted
   assert.equal(g.observe(1610), false); // another +800 — still progression
   assert.equal(g.observe(25611), true); // +24001 — a real scrub ahead
 });
+
+test("setBufferMs re-sizes without dropping interpolation history (ADR-0023 baked cadence)", () => {
+  // The 2 Hz bake delivers frames 500 ms apart; sizing the buffer to the
+  // cadence (625 ms at 1×) keeps renderAt trailing the newest frame by
+  // more than one interval — and the already-buffered frames survive the
+  // resize (a rebuild would drop them mid-play).
+  const b = new SnapshotBuffer(250, 0.1);
+  b.push(frame(0, [[1, 0, 0]]), 1000);
+  b.push(frame(5, [[1, 10, 0]]), 1500);
+  // 250 ms buffer: renderAt 1250 lerps midway between the two frames.
+  assert.ok(Math.abs(b.sample(1500)!.vehicles[0]!.x - 5) < 1e-9);
+  b.setBufferMs(625); // baked mode's 1.25 × 500 ms
+  // renderAt 875 — behind the oldest frame, which CLAMPS to it (no drop).
+  assert.equal(b.sample(1500)!.vehicles[0]!.x, 0);
+});

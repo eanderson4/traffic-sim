@@ -20,7 +20,7 @@ asyncapi: 3.0.0
 
 info:
   title: traffic-sim engine contract
-  version: 2.3.0
+  version: 2.4.0
   description: |
     The engine's NATS surface per ADR-0006 (planes, taxonomy, pipelines) and
     ADR-0008 (the engine↔controller contract — M4, schema_version 2):
@@ -276,16 +276,18 @@ channels:
     description: |
       Director verbs (ADR-0008 §5; ADR-0006 2026-07-20 M10 addendum),
       request/reply, JSON. The sender must hold the director grant. v1
-      implements verb "spawn": origin lane id (must be a network origin),
-      vehicle-type name (resolved against the scenario type list), and
-      earliest_tick (not-before, sim ticks). Every verb carries a
+      implements verb "spawn": origin lane id (a network origin, or any
+      lane when offset_m > 0), vehicle-type name (resolved against the
+      scenario type list), earliest_tick (not-before, sim ticks), and the
+      optional ADR-0021 pair destination + offset_m. Every verb carries a
       director-assigned request_id — the engine remembers the reply per id
       for the run's lifetime, so a retried verb (reconnect, publish retry,
       director failover) gets the same answer with duplicate: true and
       NEVER double-spawns. Request/reply (not fire-and-forget like raw
       intents) because the director paces its schedule on accept/reject.
       Validation rejections (unknown origin, lane not a spawn origin,
-      unknown type, unsupported verb) carry a reason; accepted verbs take
+      unknown type, unknown destination, offset past the lane end,
+      unsupported verb) carry a reason; accepted verbs take
       effect at the next tick boundary and are logged on
       ts.{run}.log.verb. Blocked origins hold-and-retry (bounded, 600
       ticks past earliest_tick) with the Spawner's own clearance and
@@ -1110,9 +1112,11 @@ components:
           type: string
           minLength: 1
           description: 'Director-assigned idempotency key: unique per intended spawn for the run. The engine remembers the reply per id; a retry answers duplicate: true and never double-spawns. Deterministic ids (e.g. f{flow}-{ordinal}) make director failover invisible.'
-        origin: { type: string, description: 'Origin lane id; must be a network origin lane (rejected otherwise).' }
+        origin: { type: string, description: 'Origin lane id. Must be a network ORIGIN lane unless offset_m > 0, which admits any lane (ADR-0021 interior injection).' }
         vtype: { type: string, description: 'Vehicle-type name, resolved against the scenario type list (rejected if unknown).' }
         earliest_tick: { type: integer, minimum: 0, description: 'Not-before sim tick (ADR-0005 tick clock; 0 = as soon as applied). A blocked origin holds-and-retries from this tick, bounded at 600 ticks.' }
+        destination: { type: string, description: 'OPTIONAL (ADR-0021). Route destination lane id, applied as the vehicle Route axis at injection: the kernel routes toward it and ENDS the trip at its end (arrival despawn). Rejected if it is not a lane of the network. Omitted = unrouted, the pre-ADR-0021 shape.' }
+        offset_m: { type: number, minimum: 0, description: 'OPTIONAL (ADR-0021). Injection position along the origin lane in meters. Omitted/0 = portal semantics and the origin must be a network origin. Positive = interior injection (a mid-block garage): admits any lane, must be < the lane length, and is additionally clearance-checked BEHIND — an entry that would be rear-ended is denied and held as demand.' }
 
     VerbReplyView:
       title: Director verb reply
@@ -1123,7 +1127,7 @@ components:
         verb: { type: string }
         request_id: { type: string, description: 'Echoed even on parse-level and not-attached rejections.' }
         duplicate: { type: boolean, description: 'true = this request_id was seen before; the ORIGINAL reply is replayed and nothing re-queued.' }
-        reason: { type: string, description: '"not attached" | "verb requires the director grant" | "unsupported verb" | "missing request_id" | validation message (unknown origin lane / not a spawn origin / unknown vehicle type).' }
+        reason: { type: string, description: '"not attached" | "verb requires the director grant" | "unsupported verb" | "missing request_id" | validation message (unknown origin lane / not a spawn origin / unknown vehicle type / unknown destination lane / offset past the end of lane).' }
 
     LoggedVerbView:
       title: Recorded director verb (ts.{run}.log.verb payload)
@@ -1132,6 +1136,8 @@ components:
       properties:
         tick: { type: integer, minimum: 0, description: 'applied_tick — the tick the verb entered the injection queue; replay re-enqueues here.' }
         request_id: { type: string }
+        destination: { type: string, description: 'OPTIONAL (ADR-0021), omitted when unrouted — so a recording of portal-only demand is byte-identical to a pre-ADR-0021 one.' }
+        offset_m: { type: number, minimum: 0, description: 'OPTIONAL (ADR-0021), omitted when zero (see destination).' }
         origin: { type: string, description: 'Origin lane id; replay re-resolves it against the run spec (deterministic).' }
         vtype: { type: string }
         type_idx: { type: integer, minimum: 0, description: 'Resolved scenario type index (auditability).' }

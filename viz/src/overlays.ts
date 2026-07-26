@@ -1,5 +1,6 @@
 // overlays.ts — pure, DOM-free helpers for the static WGS84 overlays
-// (zones + administrative boundaries, served by demosrv under /overlay/).
+// (zones, administrative boundaries, water, building footprints — served by
+// demosrv under /overlay/).
 // Unlike the network channel these arrive ALREADY in lon/lat, so there is
 // no projection here — only doc validation and the per-feature style
 // classification main.ts stamps onto the zone source (MapLibre's
@@ -57,6 +58,43 @@ export function prepareZones(fc: FeatureCollection): FeatureCollection {
           zrun: zoneRunnable(props) ? 1 : 0,
           label: typeof props["label"] === "string" ? props["label"] : String(props["name"] ?? ""),
         },
+      };
+    }),
+  };
+}
+
+export type BuildingKind = "residential" | "workplace" | "other";
+
+// buildingKind classifies a building feature's `kind` property
+// (scripts/chicago/buildings.py). Only the two demand-relevant kinds are
+// recognised; anything else — including a missing or misspelled kind —
+// degrades to "other" (the quiet fill), so an unexpected value paints as
+// context rather than masquerading as a tower.
+export function buildingKind(props: Record<string, unknown> | null | undefined): BuildingKind {
+  const k = props?.["kind"];
+  return k === "residential" || k === "workplace" ? k : "other";
+}
+
+// buildingLevels coerces the `levels` property to a storey count >= 1.
+// The fill-opacity ramp interpolates on it, and MapLibre's ["interpolate"]
+// throws on a non-number input, so a string/missing/garbage value must be
+// resolved HERE rather than trusted at render time.
+export function buildingLevels(props: Record<string, unknown> | null | undefined): number {
+  const n = Number(props?.["levels"]);
+  return Number.isFinite(n) && n >= 1 ? Math.round(n) : 1;
+}
+
+// prepareBuildings stamps the resolved classification onto every feature as
+// plain properties (bkind, blevels) for the style layers — same contract as
+// prepareZones: the layers read only the stamped values, never the raw ones.
+export function prepareBuildings(fc: FeatureCollection): FeatureCollection {
+  return {
+    type: "FeatureCollection",
+    features: fc.features.map((f) => {
+      const props = (f.properties ?? {}) as Record<string, unknown>;
+      return {
+        ...f,
+        properties: { ...props, bkind: buildingKind(props), blevels: buildingLevels(props) },
       };
     }),
   };

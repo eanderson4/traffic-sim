@@ -54,7 +54,12 @@ type Stats struct {
 	LaneChanges         int
 	Spawned             int
 	Despawned           int
-	WallHits            int // vehicles clamped at a dead-lane wall (should stay 0)
+	// Arrived counts vehicles that despawned by REACHING their route
+	// destination rather than by leaving the network at an exit lane
+	// (ADR-0021). Arrivals are included in Despawned — this is the
+	// breakdown, not a second total.
+	Arrived  int
+	WallHits int // vehicles clamped at a dead-lane wall (should stay 0)
 }
 
 // Engine is the single-threaded simulation kernel. No goroutines, no wall
@@ -77,15 +82,32 @@ type Engine struct {
 	intentQ   []KeyedIntent  // buffered, applied at the next tick boundary
 	applied   []TickedIntent // applied during the last Step (reused each Step)
 	IntentLog []TickedIntent // arbitrated log in application order (ADR-0005)
+	// DropIntentLog stops IntentLog from being retained. The zero value
+	// keeps it, so this changes nothing unless a caller asks.
+	//
+	// IntentLog is the whole run's arbitrated intents held in memory for the
+	// in-memory RunLog paths (RunLive's returned log, ReplayRunLog). The
+	// JetStream recorder does NOT read it — it reads AppliedIntents(), the
+	// per-tick slice — so dropping it leaves the durable record identical
+	// and replay unaffected. What it costs is the in-memory RunLog, which a
+	// headless metrics run never looks at.
+	//
+	// It matters because retention is unbounded and city-scale runs publish
+	// roughly one intent per vehicle per tick: a long chi-loop horizon grew
+	// ~1 GB per 1,000 ticks and made the 3-hour scenario unrunnable long
+	// before it could write its metrics (ADR-0024).
+	DropIntentLog bool
 
-	dirNew        []TickedSpawn // buffered director directives, applied next boundary
-	dirQueue      []TickedSpawn // accepted directives awaiting injection (FIFO)
-	appliedSpawns []TickedSpawn // entered the queue during the last Step (reused)
-	SpawnLog      []TickedSpawn // every accepted directive, in application order
+	dirNew        []TickedSpawn       // buffered director directives, applied next boundary
+	dirQueue      []TickedSpawn       // accepted directives awaiting injection (FIFO)
+	appliedSpawns []TickedSpawn       // entered the queue during the last Step (reused)
+	interiorInj   []InteriorInjection // ADR-0021 mid-lane injections of the last Step (derived, per-tick)
+	SpawnLog      []TickedSpawn       // every accepted directive, in application order
 
 	// Route-following caches (routing.go): derived from the immutable
 	// network, never serialized, never folded into the CRC.
 	routeTabs map[int][]int32 // dest lane index → next-hop table
+	latTabs   map[int][]int32 // dest lane index → lateral-depth table
 	preds     [][]int32       // predecessor adjacency, built once
 
 	Stats Stats
@@ -431,9 +453,15 @@ func (e *Engine) integrate() {
 // had:
 //
 //	Exit lane:        despawn (left the network)
+//	route destination: despawn (ARRIVED — reached the lane it was routed
+//	                  to; ADR-0021, the "parked at the building" case)
 //	lane w/ successor: cross over, s -= lane.Length — a held turn intent
 //	                  (ADR-0008 §2) chooses the successor and is consumed
 //	EndWall lane:     clamp at the wall (pathology guard; counted)
+//
+// The exit case is tested FIRST, so a destination that is itself an exit
+// lane (the ExitRouting default) despawns exactly as it always did and
+// every pre-ADR-0021 recording stays bit-identical.
 //
 // Vehicles past their lane end are bucketed by lane in one O(vehicles)
 // pass — the previous lanes×vehicles sweep cost ~2/3 of the tick at city
@@ -470,6 +498,17 @@ func (e *Engine) boundaries() {
 				v.Lane = nil
 				despawned = true
 				e.Stats.Despawned++
+			case v.Route != "" && v.Route == lane.ID:
+				// Arrived: the route destination is where the trip ENDS, so
+				// the vehicle leaves the world at this lane's end instead of
+				// crossing on. Without this a non-exit destination is
+				// unreachable as a trip end — the vehicle would roll past it
+				// and the route would re-steer it back (the cyclic-network
+				// loop-back recorded in ADR-0019's deferrals).
+				v.Lane = nil
+				despawned = true
+				e.Stats.Despawned++
+				e.Stats.Arrived++
 			case len(lane.Successors) > 0:
 				v.S -= lane.Length
 				next := e.pickSuccessor(lane, v)

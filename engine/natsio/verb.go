@@ -34,9 +34,18 @@ import (
 type VerbRequest struct {
 	Verb         string `json:"verb"` // spawn
 	RequestID    string `json:"request_id"`
-	Origin       string `json:"origin"`        // origin lane id (must be a network origin)
+	Origin       string `json:"origin"`        // origin lane id (a network origin, unless offset_m > 0)
 	VType        string `json:"vtype"`         // scenario vehicle-type name
 	EarliestTick uint64 `json:"earliest_tick"` // not-before sim tick
+	// Destination is an optional route destination lane id (ADR-0021): the
+	// engine applies it as the vehicle's Route axis at injection and ends
+	// the trip there. Omitted (the pre-ADR-0021 shape) leaves the vehicle
+	// unrouted — every extant recording decodes unchanged.
+	Destination string `json:"destination,omitempty"`
+	// OffsetM is the injection position along the origin lane in meters.
+	// Omitted/zero is portal semantics; positive is the interior-origin
+	// opt-in (ADR-0021).
+	OffsetM float64 `json:"offset_m,omitempty"`
 }
 
 // VerbReply is the engine's answer. A duplicate request_id replays the
@@ -61,6 +70,11 @@ type loggedVerb struct {
 	VType        string `json:"vtype"`
 	TypeIdx      int    `json:"type_idx"`
 	EarliestTick uint64 `json:"earliest_tick"`
+	// ADR-0021, both omitempty: a recording of portal-only demand is
+	// byte-identical to a pre-ADR-0021 one, so replay of every existing
+	// recording is unaffected.
+	Destination string  `json:"destination,omitempty"`
+	OffsetM     float64 `json:"offset_m,omitempty"`
 }
 
 func encodeLoggedVerb(s engine.TickedSpawn) ([]byte, error) {
@@ -71,6 +85,8 @@ func encodeLoggedVerb(s engine.TickedSpawn) ([]byte, error) {
 		VType:        s.TypeName,
 		TypeIdx:      s.TypeIdx,
 		EarliestTick: s.EarliestTick,
+		Destination:  s.Destination,
+		OffsetM:      s.OffsetM,
 	})
 }
 
@@ -87,6 +103,8 @@ func decodeLoggedVerb(data []byte) (engine.TickedSpawn, error) {
 			Origin:       lv.Origin,
 			TypeName:     lv.VType,
 			EarliestTick: lv.EarliestTick,
+			Destination:  lv.Destination,
+			OffsetM:      lv.OffsetM,
 		},
 	}, nil
 }

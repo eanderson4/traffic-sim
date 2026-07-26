@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- osm-urban-us.typ.xml — netconvert type overrides for US URBAN imports.
+     See ADR-0022 (docs/kb/decisions/ADR-0022-us-urban-speed-typemap.md).
+
+     netconvert's built-in OSM typemap is German-derived: highway.secondary,
+     primary and trunk all default to 27.78 m/s (100 km/h). Only 16.5% of
+     chi-loop's secondary ways carry a maxspeed tag, so 12,945 of its 15,975
+     secondary lanes compiled at 62 mph — Michigan Avenue, Wells, Wabash and
+     State Street all simulated as autobahn. Measured across the tree, 25 US
+     networks were affected; worst was houston-lean at 51.8% of lanes sitting
+     at exactly 100 km/h.
+
+     The unposted defaults here are the STATUTORY urban-district limit —
+     30 mph in Illinois, Texas, Georgia and Florida — not fitted values.
+     Known approximation: California's business/residence default is 25 mph
+     (CVC 22352), so SF/LA imports run 5 mph fast on unposted streets. Fork
+     a per-state map if that ever needs to be exact.
+
+     ONLY the speed attribute differs from the stock typemap: numLanes,
+     priority, oneway, width, allow/disallow and discard are copied
+     verbatim, and no type id is added or dropped. That keeps the diff
+     auditable — it does NOT mean the import is speed-only. netconvert
+     derives right-of-way and signal timing FROM speed:
+
+       * This file MUST be paired with netconvert's
+         "junctions.right-before-left.speed-threshold" option set to 0.
+         (Spelled without its leading dashes here because an XML comment
+         may not contain a double hyphen.) 30 mph = 13.41 m/s is 0.2 m/s
+         below netconvert's default rbl threshold of 13.6111, so without
+         that flag 1,218 chi-loop junctions silently retype from priority
+         to yield-to-the-right. import-city.sh passes both together; do
+         not use this file without it.
+       * Signal phase durations shift (1,936 of chi-loop's 2,217 programs).
+         Yellow tracks approach speed — 3 s at 30 mph instead of 6 s at
+         100 km/h — which is correct, but it means A/B recordings are not
+         comparable at signal-timing level.
+
+     What the chi-loop A/B shows preserved is the external lane ID SET
+     (identical, not merely equal in count), origins, exits and the
+     signal-program count. The junction INTERIOR is not: connections and
+     internal lanes move, because 275 junctions change right-of-way class.
+     Do not upgrade this to "lane-level topology is preserved" — that is
+     the same shape of claim ADR-0022 §1 had to retract.
+     An OSM maxspeed tag still wins over the default.
+
+     This map is the DEFAULT for import-city.sh, and a non-US import must
+     OPT OUT: run with TYPEMAP= (empty) to get netconvert's stock German
+     map, which is what de-roundabouts wants. Defaulting to US is
+     deliberate — nearly every network in this repo is US, so forgetting
+     the flag should fail in the rare case, not the common one.
+
+     Generated from the stock osmNetconvert.typ.xml — regenerate rather
+     than hand-edit if SUMO's typemap changes.
+-->
+<types xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/types_file.xsd">
+    <type id="highway.motorway"       numLanes="2" speed="24.59" priority="14" oneway="true"  disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship pedestrian bicycle moped"/>
+    <type id="highway.trunk"          numLanes="2" speed="20.12" priority="13" oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship pedestrian bicycle"/>
+    <type id="highway.primary"        numLanes="2" speed="13.41" priority="12" oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
+    <type id="highway.secondary"      numLanes="1" speed="13.41" priority="11" oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
+    <type id="highway.tertiary"       numLanes="1" speed="13.41" priority="10" oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
+    <type id="highway.motorway_link"  numLanes="1" speed="17.88" priority="9"  oneway="true"  disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship pedestrian bicycle moped"/>
+    <type id="highway.trunk_link"     numLanes="1" speed="15.65" priority="8"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship pedestrian bicycle"/>
+    <type id="highway.primary_link"   numLanes="1" speed="11.18" priority="7"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
+    <type id="highway.secondary_link" numLanes="1" speed="11.18" priority="6"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
+    <type id="highway.tertiary_link"  numLanes="1" speed="11.18" priority="5"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
+    <type id="highway.unclassified"   numLanes="1" speed="11.18" priority="4"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
+    <type id="highway.residential"    numLanes="1" speed="11.18" priority="3"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
+    <type id="highway.living_street"  numLanes="1" speed="4.47"  priority="2"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
+    <type id="highway.unsurfaced"     numLanes="1" speed="8.33"  priority="1"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram drone aircraft scooter container wheelchair subway cable_car ship"/>
+    <type id="highway.service"        numLanes="1" speed="6.71"  priority="1"  oneway="false" allow="delivery pedestrian bicycle"/>
+    <type id="highway.service|psv"    numLanes="1" speed="13.89" priority="1"  oneway="false" allow="delivery pedestrian bicycle bus"/>
+    <type id="highway.service|bus"    numLanes="1" speed="13.89" priority="1"  oneway="false" allow="delivery pedestrian bicycle bus"/>
+
+    <!-- everything which serves mainly pedestrians is oneway because all current pedestrian models do not care about direction -->
+    <type id="highway.track"          numLanes="1" speed="5.56"  priority="1"  oneway="false"           allow="motorcycle moped pedestrian bicycle"/>
+    <type id="highway.footway"        numLanes="1" speed="2.78"  priority="1"  oneway="true"  width="2" allow="pedestrian"/>
+    <type id="highway.pedestrian"     numLanes="1" speed="2.78"  priority="1"  oneway="true"  width="2" allow="pedestrian"/>
+    <type id="highway.path"           numLanes="1" speed="5.56"  priority="1"  oneway="false" width="2" allow="pedestrian bicycle"/>
+    <type id="highway.bridleway"      numLanes="1" speed="2.78"  priority="1"  oneway="true"  width="2" allow="pedestrian"/>
+    <type id="highway.cycleway"       numLanes="1" speed="5.56"  priority="1"  oneway="false" width="2" allow="bicycle"/>
+    <type id="highway.step"           numLanes="1" speed="1.39"  priority="1"  oneway="true"  width="2" allow="pedestrian"/>
+    <type id="highway.steps"          numLanes="1" speed="1.39"  priority="1"  oneway="true"  width="2" allow="pedestrian"/>
+    <type id="highway.stairs"         numLanes="1" speed="1.39"  priority="1"  oneway="true"  width="2" allow="pedestrian"/>
+
+    <type id="highway.bus_guideway"   numLanes="1" speed="27.78" priority="1"  oneway="true"  allow="bus"/>
+    <type id="highway.busway"         numLanes="1" speed="27.78" priority="1"  oneway="true"  allow="bus"/>
+    <type id="highway.raceway"        numLanes="2" speed="83.33" priority="15" oneway="false" allow="vip"/>
+    <type id="highway.ford"           numLanes="1" speed="2.78"  priority="1"  oneway="false" allow="army"/>
+
+    <type id="railway.preserved"      numLanes="1" speed="27.78" priority="16" oneway="true"  allow="rail"/>
+    <type id="railway.tram"           numLanes="1" speed="13.89" priority="17" oneway="true"  allow="tram"/>
+    <type id="railway.subway"         numLanes="1" speed="27.78" priority="18" oneway="true"  allow="subway"/>
+    <type id="railway.light_rail"     numLanes="1" speed="27.78" priority="19" oneway="true"  allow="rail_urban"/>
+    <type id="railway.rail"           numLanes="1" speed="44.44" priority="20" oneway="true"  allow="rail"/>
+    <type id="railway.highspeed"      numLanes="1" speed="69.44" priority="21" oneway="true"  allow="rail_fast rail rail_electric"/>
+
+    <type id="highway.construction"   numLanes="1" speed="13.89" priority="4"  oneway="false" disallow="rail rail_urban rail_electric rail_fast tram tram drone aircraft scooter container wheelchair subway cable_car ship" discard="true"/>
+    <type id="railway.construction"   numLanes="1" speed="13.89" priority="20"  oneway="true" allow="rail" discard="true"/>
+</types>

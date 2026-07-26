@@ -49,6 +49,98 @@ func (e *Engine) routeNextHop(lane *Lane, destID string) *Lane {
 	return nil
 }
 
+// routeLatDist returns the LATERAL DEPTH of lane toward destID: the minimum
+// number of lane changes a vehicle on lane must still make before it sits on
+// a lane whose successors reach the destination. 0 means the destination is
+// reachable from here by driving alone; −1 means it is unreachable at ANY
+// depth.
+//
+// This is the LATERAL half of route following (ADR-0021). routeNextHop only
+// chooses among a lane's successors, so a vehicle that changes into a lane
+// the destination is unreachable from has silently abandoned its route —
+// measured on chi-loop, 28% of multi-lane positions that can reach a given
+// destination have a lateral neighbour that cannot, and route-blind MOBIL
+// walked 92% of routed vehicles off their route before they arrived.
+//
+// The first cut of that fix used the boolean predicate "depth == 0". A
+// GRADIENT is what makes recovery work more than one lane out: a vehicle in
+// the left lane of a 3-lane arterial whose exit is on the right has NO
+// route-reachable neighbour at all, so a predicate leaves it stranded, while
+// a gradient walks it across one lane per hop.
+//
+// An unknown destination reads as depth 0 everywhere, so the lateral
+// guardrail degrades to pre-ADR-0021 behavior rather than pinning vehicles in
+// lane — the same convention routeNextHop uses.
+func (e *Engine) routeLatDist(lane *Lane, destID string) int32 {
+	dest := e.Net.LaneByID(destID)
+	if dest == nil {
+		return 0
+	}
+	return e.routeLatDepth(dest.Index)[lane.Index]
+}
+
+// routeLatDepth returns — computing and memoizing on first use — the lateral
+// depth table toward the destination lane at destIdx. One int32 array per
+// destination, alongside the next-hop table, on the same never-invalidates
+// grounds (the network is immutable for the run).
+//
+// It is a 0-1 BFS from the destination over the REVERSED lane graph:
+// a successor edge p→u costs 0 lane changes (the vehicle just drives it) and
+// a lateral link costs 1 (it has to hop). Written in the LAYERED form rather
+// than with a deque — expand the 0-cost closure of the current layer, then
+// take one lateral step to seed the next — which is the same algorithm and
+// the same O(V+E), needs no container/list, and makes the two edge costs
+// legible as two loops.
+//
+// Determinism (ADR-0005): predecessor lists are in fixed lane-then-successor
+// order, laterals are visited Left then Right, first assignment wins, and no
+// map iteration feeds the result.
+func (e *Engine) routeLatDepth(destIdx int) []int32 {
+	if t, ok := e.latTabs[destIdx]; ok {
+		return t
+	}
+	n := len(e.Net.Lanes)
+	preds := e.routePreds()
+	depth := make([]int32, n)
+	for i := range depth {
+		depth[i] = -1
+	}
+	depth[destIdx] = 0
+	frontier := []int32{int32(destIdx)}
+	for d := int32(0); len(frontier) > 0; d++ {
+		// 0-cost closure: everything that can DRIVE to this layer is in it.
+		layer := frontier
+		for i := 0; i < len(layer); i++ {
+			for _, p := range preds[layer[i]] {
+				if depth[p] < 0 {
+					depth[p] = d
+					layer = append(layer, p)
+				}
+			}
+		}
+		// 1-cost step: the lateral neighbours of the whole layer seed d+1.
+		// Lateral links are mutual at every construction site (network.go,
+		// netfile.go, scenario_i80.go), so the lanes that can hop INTO u are
+		// exactly u.Left and u.Right.
+		var next []int32
+		for _, u := range layer {
+			l := e.Net.Lanes[u]
+			for _, nb := range [2]*Lane{l.Left, l.Right} {
+				if nb != nil && depth[nb.Index] < 0 {
+					depth[nb.Index] = d + 1
+					next = append(next, int32(nb.Index))
+				}
+			}
+		}
+		frontier = next
+	}
+	if e.latTabs == nil {
+		e.latTabs = map[int][]int32{}
+	}
+	e.latTabs[destIdx] = depth
+	return depth
+}
+
 // routeTable returns — computing and memoizing on first use — the next-hop
 // table toward the destination lane at destIdx: tab[i] is the index of the
 // successor of lane i on the shortest path to the destination, −1 when

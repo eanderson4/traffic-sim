@@ -81,6 +81,19 @@ export class Legend {
       `<div class="legend-ramp-labels"><span>stopped</span><span>free flow</span></div>` +
       `<div class="legend-caption">lane mean speed / limit</div></div>` +
       `<div class="legend-sep"></div>` +
+      // Building footprints (buildings.geojson overlay): one toggle, two
+      // swatches — the residential/workplace split IS the layer, and the
+      // caption states the zoom gate so an empty city-zoom map reads as
+      // "not yet" rather than "broken".
+      `<div class="legend-toggle" data-toggle="buildings">` +
+      `<div class="legend-row">` +
+      `<span class="legend-bld" style="background:${theme.buildingResidential}"></span>` +
+      `<span>residential</span></div>` +
+      `<div class="legend-row">` +
+      `<span class="legend-bld" style="background:${theme.buildingWorkplace}"></span>` +
+      `<span>workplace</span></div>` +
+      `<div class="legend-caption">buildings, zoom 14+; shade = storeys</div></div>` +
+      `<div class="legend-sep"></div>` +
       `<div class="legend-row"><span>sim time</span><span class="legend-clock">00:00:00</span></div>`;
 
     const clock = el.querySelector(".legend-clock");

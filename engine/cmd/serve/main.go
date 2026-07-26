@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -60,6 +61,7 @@ func main() {
 	capacity := flag.Int("capacity", 1000, "driver claim capacity")
 	exitRouting := flag.Bool("exit-routing", true, "driver assigns each claimed vehicle a seeded exit-lane destination (per-vehicle routing; without it vehicles take the kernel's leftmost-successor default)")
 	attachTimeout := flag.Duration("attach-timeout", 30*time.Second, "bound on the client-attach barrier: serve fails if an embedded client (driver, demand director) has not reported attached within this")
+	intentLog := flag.Bool("intent-log", true, "retain the engine's whole-run in-memory intent log; -intent-log=false drops it for long headless runs (the durable JetStream record and replay are unaffected — only the in-memory RunLog is lost)")
 	flag.Parse()
 
 	if *scenarioDir != "" && *netfile != "" {
@@ -305,6 +307,10 @@ func main() {
 	// directions pinned in natsio's startgate test).
 	startGate := make(chan struct{})
 	runErr := make(chan error, 1)
+	// finalStats is published by the run goroutine before it sends on
+	// runErr, so the channel receive below is the happens-before edge that
+	// makes the read race-free.
+	var finalStats engine.Stats
 	go func() {
 		// PaceFloor = one tick of wall time at -pace 1 (1× realtime); -pace N
 		// divides it by N, -pace 0 disables pacing entirely (batch mode).
@@ -312,9 +318,14 @@ func main() {
 		if mobs != nil {
 			cc.Observer = mobs
 		}
-		lr, err := natsio.RunLive(nc, js, *run, spec, natsio.RecorderConfig{}, cc)
+		lr, err := natsio.RunLive(nc, js, *run, spec, natsio.RecorderConfig{
+			DropEngineIntentLog: !*intentLog,
+		}, cc)
 		if err == nil && mobs != nil {
 			err = mobs.finish(lr.Engine, *metricsOut, spec.Ticks)
+		}
+		if lr != nil && lr.Engine != nil {
+			finalStats = lr.Engine.Stats
 		}
 		runErr <- err
 	}()
@@ -371,6 +382,36 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println("serve: run complete")
+		// Arrivals vs exits (ADR-0021): the ONLY direct readout of whether
+		// routed demand is reaching its destinations. A run whose arrivals
+		// are a small fraction of despawns has vehicles drifting off-route
+		// and leaving via the map edge instead.
+		if st := finalStats; st.Despawned > 0 {
+			fmt.Printf("serve: spawned=%d despawned=%d (arrived=%d, %.0f%% of despawns) lanechanges=%d collisions=%d\n",
+				st.Spawned, st.Despawned, st.Arrived, 100*float64(st.Arrived)/float64(st.Despawned),
+				st.LaneChanges, st.Collisions)
+			// Collisions are a model-pathology indicator (ADR-0007): localize
+			// them, because a network-wide count says nothing about whether
+			// the cause is one bad junction or the whole import.
+			if len(st.CollisionsBySection) > 0 {
+				secs := make([]string, 0, len(st.CollisionsBySection))
+				for k := range st.CollisionsBySection {
+					secs = append(secs, k)
+				}
+				sort.Slice(secs, func(i, j int) bool {
+					a, b := st.CollisionsBySection[secs[i]], st.CollisionsBySection[secs[j]]
+					if a != b {
+						return a > b
+					}
+					return secs[i] < secs[j]
+				})
+				top := min(len(secs), 8)
+				fmt.Printf("serve: collision observations over %d sections; worst:\n", len(secs))
+				for _, sec := range secs[:top] {
+					fmt.Printf("serve:   %-40s %d\n", sec, st.CollisionsBySection[sec])
+				}
+			}
+		}
 		if mobs != nil {
 			fmt.Printf("serve: wrote metrics to %s\n", *metricsOut)
 		}

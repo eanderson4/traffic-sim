@@ -51,6 +51,25 @@ Tag sparsity (taginfo, 2026-07-17, against ~177.9 M motor-road ways) is the foun
 - **No default lane width is codified anywhere** in OSM: osm2streets hard-codes sidewalk 1.5 m / shoulder 0.5 m / service road 2.0 m; SUMO's lane-width default is 3.2 m. Our table must own this explicitly.
 - Cross-validation is a pass, not an assumption: real data carries `lanes=4` next to a 5-value `turn:lanes` pipe list (OsmAnd#5221). Conflicts degrade to **warnings + default fallback, never import failures**.
 
+> **This prediction came true, and we shipped 25 networks before catching it**
+> (2026-07-25, [ADR-0022](../../decisions/ADR-0022-us-urban-speed-typemap.md)).
+> The "not trusting them" and "per-region parameters" warnings above were
+> written, then not acted on: every US network in `data/networks/` was
+> imported on the stock German typemap, where unposted
+> `secondary`/`primary`/`trunk` default to 27.78 m/s (100 km/h). With
+> `maxspeed` present on only 19% of chi-loop's secondary ways, 12,945 of its
+> 15,975 secondary lanes compiled at 62 mph — 79.7% of the whole network at
+> ≥80 km/h, mean 85.9 km/h. Worst case measured was `houston-lean`: 51.8% of
+> lanes at exactly 100 km/h.
+>
+> The lesson is about *where* the defaults table bites. Sparsity was known
+> and quantified here at ~12% `maxspeed` coverage; what was missed is that
+> free-flow speed is the **denominator of every congestion number** the
+> metric kernel produces, so an unverified default does not degrade results
+> gracefully — it silently rescales them. Defaults whose errors compound
+> into headline metrics need verification before first use, not "our table
+> must own this explicitly" as future work.
+
 ### 4. Turn fabric: generate from geometry, filter by relations, never orphan a lane
 
 - Generate candidate lane-to-lane connections from geometry + junction topology using A/B Street's lane-type pairing (straight = Cartesian product of driving lanes; side-lane-originated turns), guided by `turn:lanes` where present — treating partial markings as *unknown*, not through-lanes (netconvert's documented trap; `--osm.turn-lanes` defaults off for this reason).
@@ -94,7 +113,7 @@ Nobody publishes the middle artifact — a typed lane list + restriction-resolve
 - **Counts say how many, never which**: `lanes:bus=1` carries no position; only the `bus:lanes=` pipe-list form does.
 - **Indicated ≠ legal**: `turn:lanes` records road markings; restriction relations record law. Both must be imported and reconciled — they disagree in real data.
 - **Hard-failing on bad tags is an anti-pattern**: a wrong restriction or pipe-count mismatch degrades to warning + fallback. The invariant "every lane leads somewhere" outranks any single tag.
-- **No global rules where OSM diverges regionally**: three maxspeed zone notations, US-vs-international `motorway_link` extent, two signal conventions — these need per-region parameters.
+- **No global rules where OSM diverges regionally**: three maxspeed zone notations, US-vs-international `motorway_link` extent, two signal conventions — these need per-region parameters. **Confirmed the expensive way**: netconvert's typemap is German, and applying it to 25 US networks put unposted arterials at 100 km/h ([ADR-0022](../../decisions/ADR-0022-us-urban-speed-typemap.md)). The region parameter is not a refinement — it is load-bearing from the first import.
 
 ## Open Questions
 

@@ -122,6 +122,86 @@
 
 ## Freshness Notes
 
+- 2026-07-25 (i): **chi-loop origin–destination demand (ADR-0021, PROPOSED).**
+  The chi-loop demand model was portal inflow with random egress — all 112
+  flows on boundary portals, destinations drawn as random exit lanes by
+  speed limit, and despawn only at `lane.Exit`. Nobody was born inside the
+  zone and nobody arrived anywhere, which is why its tuning log records
+  "delay SPREAD across many lanes (no single defect lane)". Shipped:
+  arrival despawn at a non-exit route destination (`Stats.Arrived`, exit
+  case tested first so pre-0021 recordings stay bit-identical);
+  `destination` + `offset_m` on the spawn verb (omitempty; TSKF v4 written
+  only when a queued directive uses them; asyncapi 2.4.0); interior
+  injection clearance-checked BEHIND (`rearClear` — an unsafe follower
+  DENIES the entry where an unsafe leader only caps the speed); weighted
+  `destinations` and `offset_m` in the scenario demand grammar; and
+  `scripts/chicago/{buildings,mkod,congestion}.py`. **The finding that
+  mattered**: route following was longitudinal-only — `routeNextHop`
+  chooses among successors, and the external driver's MOBIL is route-blind,
+  so a lane change onto a lane the destination is unreachable from silently
+  abandoned the route. 28% of multi-lane positions on chi-loop have such a
+  neighbour, and only 8 of 102 completed trips reached their destination.
+  A lateral guardrail (veto hops that leave the reachable set, recover
+  toward it when stranded) took that to 100%, and a real OD run to 96% of
+  despawns being arrivals. Also fixed: the metric kernel booked an interior
+  injection's whole lane prefix as travelled distance and counted it as a
+  dropped crossing (`InteriorInjections()`).
+
+  **Closed since**: recovery now crosses ANY number of lanes. The
+  reachability predicate became a **lateral-depth gradient**
+  (`routeLatDepth`, a layered 0-1 BFS from the destination over the reversed
+  lane graph — successor edges cost 0, `Left`/`Right` links cost 1); the veto
+  denies any hop that increases depth, recovery descends it. The old rule
+  pinned a vehicle two lanes out against a wall it could not leave, because
+  its only neighbour was itself off-route.
+
+  **The bigger finding was in the IMPORT, not the demand.** Building the
+  first OD scenario surfaced that netconvert's built-in OSM typemap is
+  German-derived and only ~16% of chi-loop's `secondary` ways carry a
+  `maxspeed` tag, so 12,945 of 15,975 secondary lanes — Michigan, Wells,
+  Wabash, State — compiled at 100 km/h, and all 648 primary lanes likewise.
+  Mean lane speed limit over the zone was 53.3 mph. That is **ADR-0022**, and
+  it affects every US network in `data/networks/` (la, sf, miami, atlanta,
+  houston, dallas, boston-core, phoenix, manhattan-grid, stress-dtla and the
+  three chi zones): they all used the stock typemap. chi-loop was re-imported
+  as `chi-loop-urban` (mean 31.4 mph, lane set bit-identical); the rest are
+  the ADR-0022 work queue.
+
+  **The re-import needed a second pass, and the lesson generalizes.** The
+  first `chi-loop-urban` was defective: the statutory 30 mph limit
+  (13.41 m/s) sits 0.2 m/s under netconvert's
+  `--junctions.right-before-left.speed-threshold` default (13.6111 m/s), so
+  the speed typemap silently retyped 1,218 Chicago intersections
+  `priority` → `right_before_left`. **A speed-only typemap is not a
+  speed-only import** — netconvert derives right-of-way AND signal yellow
+  times from speed. The damage was severe and visible: a 54,000-tick
+  `chi-loop-od` run logged 975,673 collision observations, 774,172 inside
+  one junction, the classic mutual-blocking gridlock. Shipped fix is
+  `--junctions.right-before-left.speed-threshold 0` (ADR-0022 §6); on that
+  import the junction-interior counts move **+17** instead of −118, which
+  is the signature of a genuinely speed-only change.
+
+  Re-measured on the shipped import with the fixed engine: a 10k–20k demand
+  bracket all flows, and `chi-loop-od-30m` ships at a 16,000 veh/h target
+  (12,960 injected) giving 26.0 km/h mean network speed, 53% delay share and
+  4,996 collision observations over 30 sim minutes. The old collision A/B
+  and delay-share comparison against `chi-loop` are WITHDRAWN rather than
+  re-run — they justified a decision that is already made.
+
+  **The open validation gap** is that the demand does not congest the
+  expressways. Six of the ten corridors in the Chicago hotspot research
+  report are inside the extract and all six run free (Kennedy 72.1 km/h
+  against a real 19.1 mph peak), carrying 3.3% of network delay while the
+  arterial grid takes 94.7%. `mkod.py` scales its per-class portal table to
+  hit `--total`, so the class table is only a shape: the Kennedy's two
+  origin lanes get 337 veh/h/lane, a sixth of freeway capacity, and
+  reaching the class rate would need `--total ≈ 67,000` — which buries the
+  grid. One scalar cannot congest both; freeway portals need their own knob.
+
+  Still open: `dropped_crossings` is one counter mixing ≥4 causes and is
+  dominated on dense grids by the multi-successor overshoot refund, not by
+  routing; chi-loop has no residential street grid; residential mass is
+  under-counted (71% of footprints are bare `building=yes`).
 - 2026-07-24 (h): **chicago-metro milestone external review round (Fable + GPT-5.6-sol; archive `raw/reviews/2026-07-24-chicago-metro-*`).** Three blockers found and fixed in the hardening pass: (1) exit routing only steered the FIRST fork — the driver's once-sent turn is consumed at the next crossing and middle successors of 3+-way forks were inexpressible through the ±1 turn axis; fixed ENGINE-SIDE: the kernel now follows the persistent Route intent at every multi-successor lane via memoized reverse-Dijkstra next-hop tables (`engine/routing.go`), held turn still wins, unknown/unreachable dests degrade to default. (2) the driver's router was O(V²) Dijkstra run TWICE per assignment (~55k lanes on chi-loop → seconds per claim, a likely major contributor to the documented batch-mode claim lag) — deleted with the move to engine-side following; pickExit's O(network) candidate+reachability rebuilds are memoized (`exitCache`). (3) `pickExit` drew destinations from the vehicle MAIN stream domain — route choice was numerically identical to the first policy draws fleet-wide (Fable) — now under `traffic-sim/driver/exit-destination` via the new exported `engine.DeriveStreamDomain`. Should-fixes landed: portals dual-flag lanes now emit one record per role (kind agrees with array); scorecard.py reads the authoritative metrics `totals` (was summing intervals — double-counts multi-set, KeyError on omitted groups); zones.geojson statuses corrected to runnable for loop/kennedy/north-lakefront + the overlay-population step is now documented; asyncapi records the batch-mode liveness exception and the Route-axis semantics (ADR-0006 addendum). Deferred (recorded): demo-scoped overlays (see Deferred Decisions), wall-clock liveness budget for batch mode (rejected while pace is unrecorded), routeTabs memo growth is client-controlled server memory (~224 KB/destination on a 56k-lane zone; bounded in practice by exit-candidate cardinality — revisit with multiplayer, ADR-0006 §9). Gate rounds 2–3 added: right-of-way lookahead now consumes the held turn VIRTUALLY after the first predicted crossing (turn-intent runs may change trajectory; runs with neither route nor turn intents are bit-identical), failover re-claim ADOPTS the orphan's obs-echoed route instead of re-deriving mid-trip, and the driver re-sends the Route intent until the obs frame echoes it (a dropped one-shot publish would have left the vehicle default-routed for life). The contract-versioning objection (Sol, rounds 1–2) is answered with an explicit supersession note in the ADR-0006 addendum: contract versions version the WIRE, not the world model; every extant recording predates Route intents and replays bit-identically. Full Go suite green. Round-3 deferrals (Sol, no blockers): a NON-EXIT destination reactivates routing after the vehicle leaves it (cyclic networks could loop back) — unreachable today (destinations are exit lanes, arrival = despawn) and a naive engine-side clear would fight the driver's echo-confirm retry, so deferred until a non-exit-destination consumer exists; routeTabs memory deferral stands.
 - 2026-07-23 (g): **"Extra lights" observation + stress-test program entry.** Live viewing at junction zoom (screenshot 15-24-54) shows signal heads that look spurious: heads sit at lane ends AROUND the junction box on what appear to be exit-side stubs / netconvert fragment ends, not only at true stop-line entries — plus the known mid-zoom clustering (note f issue 2). Open issue, needs investigation: classify each rendered head as true stop-line entry vs fragment artifact, then either suppress artifact heads or gate them differently. STRESS-TEST PROGRAM (owner request: "stress test big simulation to make sure our architecture is fine"): existing evidence = stress-dtla (14.9k lanes, 1202 signals) at 1200 veh/h/lane gridlocked with 7989 peak vehicles (the "~7 ms/tick kernel cost" quoted here from note b was wrong — corrected there). To do: a scripted elevated-demand run of stress-dtla (or manhattan-grid) via demosrv quantifying kernel tick cost curve vs vehicle count, NATS/ws pipeline health, viz updateData behavior at 5-10k vehicles, and the known ADR-0008 §6 pause-gate deadlock on overload runs (workaround: raised -capacity; needs an escape or loud log/metric). Work-queue for agent dispatch: docs/kb/articles/podcast-demo-workqueue.md.
 - 2026-07-23 (f): **Viz zoom-legibility + open issues from live viewing.** DONE: signal heads are zoom-gated (minzoom 13 on housing + lens layers — at city zoom they blobbed into clutter that hid the network); road casing/centerline widths bumped at z≤12 (3.2/1.8) so the network reads zoomed out. OPEN ISSUES (log for followup): **(1) Trailer physics** (viz/src/artic.ts) — screenshots show trailers perpendicular to their tractors and apparently detached across lanes. Mechanism: the single-track angle law θ_tr += (v·dt/L)·sin(θ_front − θ_tr) has TWO stable equilibria per direction — aligned and JACKKNIFED (θ_front ± π); a >90° upset (lane-hop lateral teleport of the hitch, spawn on a curved fragment, U-shaped lane chains) pushes θ_tr onto the jackknife branch and it never recovers. Fix directions: clamp |Δθ_tr| per frame, re-anchor θ_tr to θ_front when the wrap exceeds ~60° (the engine has no jackknife crashes to honor), and smooth/re-anchor the hitch on lane hops. **(2) Signal-head clustering** — at mid zooms (13–15) the per-movement heads blob at dense junctions (adjacent approaches' heads overlap); consider per-junction decluttering (offset or count-badged single head). **(3) Zoomed-out road detail** — junction-interior lanes still draw at city zoom (the squiggles at every intersection); consider zoom-gating `internal` lanes to ≥13 as well.

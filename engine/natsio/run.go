@@ -96,6 +96,10 @@ func RunLive(nc *nats.Conn, js nats.JetStreamContext, run string, spec engine.Ru
 	if err != nil {
 		return nil, err
 	}
+	// Retention opt-out before the first Step, so nothing is accumulated.
+	// LiveRun.Log's Intents are empty when set — the durable JetStream
+	// record is the log for these runs (ADR-0024).
+	e.DropIntentLog = recCfg.DropEngineIntentLog
 	if contractCfg.Observer != nil {
 		if err := contractCfg.Observer.Attach(e); err != nil {
 			return nil, err

@@ -1,6 +1,9 @@
 package engine
 
-import "math"
+import (
+	"math"
+	"sort"
+)
 
 // Scenario describes everything a run consumes beyond the network: spawn
 // demand, density cap, initial population, and the vehicle-type mix. It is
@@ -93,11 +96,11 @@ func (sp *Spawner) init(e *Engine) {
 	}
 }
 
-// injectionPlan decides whether the pending vehicle v (Lane and Type set,
-// S = 0, not yet registered) may enter this tick, and the physical entry
-// cap. ok=false holds the spawn — unmet demand carries over. The entry is
-// safe when v can brake COMFORTABLY (its Type.B) to whichever constraint
-// is nearer:
+// injectionPlan decides whether the pending vehicle v (Lane, Type and the
+// injection position S set, not yet registered) may enter this tick, and
+// the physical entry cap. ok=false holds the spawn — unmet demand carries
+// over. The entry is safe when v can brake COMFORTABLY (its Type.B) to
+// whichever constraint is nearer:
 //
 //   - the nearest leader measured THROUGH the connection (leaderAt from
 //     the lane start) — the old rule (8+0.8·v buffer against vehicles ON
@@ -111,23 +114,32 @@ func (sp *Spawner) init(e *Engine) {
 //     is where the fixtures' mass red crossings came from.
 //
 // The entry speed caps at what can still stop short of the constraint:
-// v² ≤ v_leader² + 2·B·(gap − s0). There is no speed floor: origin lanes
-// have no predecessors, so nothing can rear-end a slow entry, and joining
-// a queue tail at crawl speed is how real queues grow (the prototype's
-// 8 m/s floor only starved congested origins). F-free by design — the
-// plan may be probed for a vehicle whose desired-speed factor has not
-// been drawn (the director probe); callers apply their own F via
+// v² ≤ v_leader² + 2·B·(gap − s0). There is no speed floor at a PORTAL:
+// origin lanes have no predecessors, so nothing can rear-end a slow entry,
+// and joining a queue tail at crawl speed is how real queues grow (the
+// prototype's 8 m/s floor only starved congested origins). F-free by
+// design — the plan may be probed for a vehicle whose desired-speed factor
+// has not been drawn (the director probe); callers apply their own F via
 // min(cap, v0eff) at injection.
+//
+// INTERIOR injection (v.S > 0, ADR-0021) has traffic behind it, so the
+// portal reasoning above does not hold: the entry additionally requires
+// that the nearest follower can brake comfortably to the injected rear
+// bumper. Without it a garage exit materializes in front of moving traffic
+// and is rear-ended — the one failure mode a portal can't have.
 func (e *Engine) injectionPlan(v *Vehicle) (float64, bool) {
 	lane := v.Lane
 	gap := math.Inf(1)
 	vl := 0.0
-	// leaderAt from a hair BEFORE the lane start: its strict S > s search
-	// would miss a vehicle injected at exactly S = 0 earlier in the same
-	// events phase (the director queue's same-tick backlog stack).
-	if li := e.leaderAt(lane, -1e-9, nil); li.OK {
+	// leaderAt from a hair BEFORE the injection point: its strict S > s
+	// search would miss a vehicle injected at exactly this S earlier in the
+	// same events phase (the director queue's same-tick backlog stack).
+	if li := e.leaderAt(lane, v.S-1e-9, nil); li.OK {
 		gap = li.Gap
 		vl = li.V
+	}
+	if v.S > 0 && !e.rearClear(v) {
+		return 0, false
 	}
 	if next, dist := e.gateTarget(v); next != nil && dist < gap && e.junctionHold(v, next) {
 		gap = dist
@@ -141,6 +153,63 @@ func (e *Engine) injectionPlan(v *Vehicle) (float64, bool) {
 		return 0, false
 	}
 	return math.Sqrt(vl*vl + 2*v.Type.B*room), true
+}
+
+// rearClear reports whether an interior injection of v (Lane and S set,
+// not yet registered) leaves its nearest follower able to brake COMFORTABLY
+// — the mirror of the leader rule, with the same Type.B/S0 comfort
+// criterion applied to the follower's own type. The follower is searched on
+// the injection lane first, then through predecessors (prevFollower, same
+// sight bounds as the leader walk) so a vehicle about to cross in from
+// upstream is not missed.
+//
+// Note the asymmetry with the leader rule: an unsafe leader gap only CAPS
+// the entry speed, but an unsafe follower gap denies the entry outright.
+// There is no entry speed that fixes being materialized on top of someone —
+// the vehicle simply waits for a gap, which is what a car nosing out of a
+// garage actually does. Denials carry over as demand exactly like a blocked
+// portal (director.go's hold-and-retry).
+func (e *Engine) rearClear(v *Vehicle) bool {
+	rear := v.S - v.Type.Length
+	// Footprint guard, and it must come FIRST. The two gap searches start
+	// from opposite bumpers — leaderAt from v.S, followerAt from rear — so a
+	// vehicle whose FRONT bumper lies inside (rear, v.S] is behind the leader
+	// search and ahead of the follower search, invisible to both. That window
+	// is one injected-vehicle length wide (12 m for a truck) and it is
+	// precisely the space the injection is about to occupy, so it is a
+	// denial, not a gap to be measured: no entry speed fixes materializing on
+	// top of someone. Portals cannot hit this (v.S = 0 puts the window at
+	// negative S), which is why the rule lives here and not in injectionPlan.
+	if a := v.Lane.vehs; len(a) > 0 {
+		if i := sort.Search(len(a), func(i int) bool { return a[i].S > rear }); i < len(a) && a[i].S <= v.S {
+			return false
+		}
+	}
+	f, _, gap, ok := e.followerAt(v.Lane, rear)
+	if !ok {
+		return true // nobody behind within sight
+	}
+	room := gap - f.Type.S0
+	if room <= 0 {
+		return false
+	}
+	// The follower must be able to shed its speed over the room available:
+	// v_f² ≤ 2·B_f·room, the leader rule read from the other side.
+	return f.V*f.V <= 2*f.Type.B*room
+}
+
+// followerAt resolves the nearest follower behind a hypothetical rear
+// bumper at `rear` on lane: the last vehicle strictly behind it ON the lane,
+// else prevFollower's cross-boundary walk. Gap is the clear distance from
+// the follower's front bumper to `rear`.
+func (e *Engine) followerAt(lane *Lane, rear float64) (f *Vehicle, fLane *Lane, gap float64, ok bool) {
+	a := lane.vehs
+	i := sort.Search(len(a), func(i int) bool { return a[i].S > rear })
+	if i > 0 {
+		b := a[i-1]
+		return b, lane, rear - b.S, true
+	}
+	return e.prevFollower(lane, rear)
 }
 
 // step attempts the scheduled spawn on each origin lane, in fixed lane
