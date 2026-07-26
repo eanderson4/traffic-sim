@@ -47,9 +47,10 @@ import (
 
 // benchIngestEngine builds a ring-net engine with n live vehicles (the
 // benchEngine pattern of engine/bench_test.go, kept local so this file is
-// self-contained in the natsio test package).
-func benchIngestEngine(b *testing.B, n int) *engine.Engine {
-	b.Helper()
+// self-contained in the natsio test package). testing.TB: the ADR-0026 M1
+// tests (tsib_test.go) reuse the same Bus/Contract wiring.
+func benchIngestEngine(tb testing.TB, n int) *engine.Engine {
+	tb.Helper()
 	spec := engine.RunSpec{
 		Net:    engine.NetSpec{Kind: "ring", Length: 8 * float64(n), SpeedLimit: 33.3},
 		Scen:   engine.Scenario{InitialVehicles: n},
@@ -58,7 +59,7 @@ func benchIngestEngine(b *testing.B, n int) *engine.Engine {
 	}
 	e, err := engine.NewEngine(spec)
 	if err != nil {
-		b.Fatal(err)
+		tb.Fatal(err)
 	}
 	e.Step() // one tick so state is representative
 	return e
@@ -77,9 +78,9 @@ func benchBufferedIntents(bus *Bus) int {
 // handshake: hello with the drive grant and its claims at attach, buffered
 // by the wire callback and answered when ProcessControl runs (the run-loop
 // drain point). Returns the engine-assigned controller id after verifying
-// every claim was granted.
-func benchAttachController(b *testing.B, c *Contract, e *engine.Engine, conn *nats.Conn, run string, claims []uint64) string {
-	b.Helper()
+// every claim was granted. testing.TB: reused by the M1 tests (tsib_test.go).
+func benchAttachController(tb testing.TB, c *Contract, e *engine.Engine, conn *nats.Conn, run string, claims []uint64) string {
+	tb.Helper()
 	req, err := json.Marshal(HelloRequest{
 		ContractVersion: SchemaVersion,
 		ControllerType:  "bench",
@@ -89,7 +90,7 @@ func benchAttachController(b *testing.B, c *Contract, e *engine.Engine, conn *na
 		Claims:          claims,
 	})
 	if err != nil {
-		b.Fatal(err)
+		tb.Fatal(err)
 	}
 	type result struct {
 		reply HelloReply
@@ -116,22 +117,22 @@ func benchAttachController(b *testing.B, c *Contract, e *engine.Engine, conn *na
 			break
 		}
 		if time.Now().After(deadline) {
-			b.Fatal("hello never reached the contract request buffer")
+			tb.Fatal("hello never reached the contract request buffer")
 		}
 		time.Sleep(time.Millisecond)
 	}
 	if err := c.ProcessControl(e); err != nil {
-		b.Fatalf("ProcessControl: %v", err)
+		tb.Fatalf("ProcessControl: %v", err)
 	}
 	res := <-resCh
 	if res.err != nil {
-		b.Fatalf("hello: %v", res.err)
+		tb.Fatalf("hello: %v", res.err)
 	}
 	if !res.reply.Accepted {
-		b.Fatalf("hello rejected: %s", res.reply.Reason)
+		tb.Fatalf("hello rejected: %s", res.reply.Reason)
 	}
 	if len(res.reply.Claims) != len(claims) {
-		b.Fatalf("granted %d/%d claims", len(res.reply.Claims), len(claims))
+		tb.Fatalf("granted %d/%d claims", len(res.reply.Claims), len(claims))
 	}
 	return res.reply.ControllerID
 }

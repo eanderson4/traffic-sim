@@ -46,16 +46,17 @@ const (
 	intentFlagTurnSet   = 1 << 3
 	intentFlagRouteSet  = 1 << 4
 
-	headerTick          = "tick"
-	headerSchemaVersion = "schema_version"
-	headerAppliedTick   = "applied_tick"
-	headerSigChunk      = "sig_chunk" // "i/n" 1-based, ADR-0016 (absent = whole table)
-	intentSubjectTokens = 5           // ts.{run}.ctl.intent.{controller_id}
+	headerTick           = "tick"
+	headerSchemaVersion  = "schema_version"
+	headerAppliedTick    = "applied_tick"
+	headerSigChunk       = "sig_chunk"       // "i/n" 1-based, ADR-0016 (absent = whole table)
+	headerIntentEncoding = "intent_encoding" // ADR-0026 demux: absent = v2, "tsib" = TSIB, else drop+count
+	intentEncodingTSIB   = "tsib"
+	intentSubjectTokens  = 5 // ts.{run}.ctl.intent.{controller_id}
 )
 
-// EncodeIntent serializes one intent for ts.{run}.ctl.intent.{controller_id}.
-// Exported so controllers (and tests) share the codec.
-func EncodeIntent(in engine.Intent) []byte {
+// intentFixedFlags computes the v2 flag bits for the non-route axes.
+func intentFixedFlags(in engine.Intent) uint32 {
 	var flags uint32
 	if in.AccelSet {
 		flags |= intentFlagAccelSet
@@ -69,6 +70,70 @@ func EncodeIntent(in engine.Intent) []byte {
 	if in.TurnSet {
 		flags |= intentFlagTurnSet
 	}
+	return flags
+}
+
+// putIntentFixed writes the 44-byte fixed section (the layout above) into
+// buf with the given flags and route_len. Shared by v2 EncodeIntent (which
+// derives both from the route) and TSIB EncodeTSIB (which pins route_len 0)
+// so the layout arithmetic lives in exactly one place.
+func putIntentFixed(buf []byte, in engine.Intent, flags uint32, routeLen uint16) {
+	binary.LittleEndian.PutUint64(buf[0:], in.VehicleID)
+	binary.LittleEndian.PutUint32(buf[8:], flags)
+	binary.LittleEndian.PutUint32(buf[12:], uint32(int32(in.LaneDelta)))
+	binary.LittleEndian.PutUint64(buf[16:], math.Float64bits(in.Accel))
+	binary.LittleEndian.PutUint64(buf[24:], math.Float64bits(in.SpeedSetpoint))
+	binary.LittleEndian.PutUint32(buf[32:], uint32(int32(in.Signals)))
+	binary.LittleEndian.PutUint32(buf[36:], uint32(int32(in.Turn)))
+	binary.LittleEndian.PutUint16(buf[40:], routeLen)
+}
+
+// getIntentFixed parses the 44-byte fixed section into *in (axis fields),
+// returning the raw flags and route_len. Presence bits and semantic checks
+// are the caller's — DecodeIntent and DecodeTSIB apply them differently
+// (v2 honors the route, TSIB structurally rejects one). Pointer out-param:
+// returning the ~80-byte Intent by value doubled DecodeIntent's cost.
+func getIntentFixed(buf []byte, in *engine.Intent) (flags uint32, routeLen int) {
+	in.VehicleID = binary.LittleEndian.Uint64(buf[0:])
+	flags = binary.LittleEndian.Uint32(buf[8:])
+	in.LaneDelta = int(int32(binary.LittleEndian.Uint32(buf[12:])))
+	in.Accel = math.Float64frombits(binary.LittleEndian.Uint64(buf[16:]))
+	in.SpeedSetpoint = math.Float64frombits(binary.LittleEndian.Uint64(buf[24:]))
+	in.Signals = int(int32(binary.LittleEndian.Uint32(buf[32:])))
+	in.Turn = int(int32(binary.LittleEndian.Uint32(buf[36:])))
+	routeLen = int(binary.LittleEndian.Uint16(buf[40:]))
+	return flags, routeLen
+}
+
+// applyIntentFlags sets in's presence bits from flags, rejecting (false) a
+// NaN/Inf accel or setpoint — the boundary rule both v2 messages and TSIB
+// records enforce per intent.
+func applyIntentFlags(in *engine.Intent, flags uint32) bool {
+	if flags&intentFlagAccelSet != 0 {
+		if math.IsNaN(in.Accel) || math.IsInf(in.Accel, 0) {
+			return false
+		}
+		in.AccelSet = true
+	}
+	if flags&intentFlagSpeedSet != 0 {
+		if math.IsNaN(in.SpeedSetpoint) || math.IsInf(in.SpeedSetpoint, 0) {
+			return false
+		}
+		in.SpeedSet = true
+	}
+	if flags&intentFlagSignalSet != 0 {
+		in.SignalSet = true
+	}
+	if flags&intentFlagTurnSet != 0 {
+		in.TurnSet = true
+	}
+	return true
+}
+
+// EncodeIntent serializes one intent for ts.{run}.ctl.intent.{controller_id}.
+// Exported so controllers (and tests) share the codec.
+func EncodeIntent(in engine.Intent) []byte {
+	flags := intentFixedFlags(in)
 	route := in.Route
 	if in.RouteSet && route != "" {
 		flags |= intentFlagRouteSet
@@ -79,14 +144,7 @@ func EncodeIntent(in engine.Intent) []byte {
 		route = ""
 	}
 	buf := make([]byte, intentFixedBytes+len(route))
-	binary.LittleEndian.PutUint64(buf[0:], in.VehicleID)
-	binary.LittleEndian.PutUint32(buf[8:], flags)
-	binary.LittleEndian.PutUint32(buf[12:], uint32(int32(in.LaneDelta)))
-	binary.LittleEndian.PutUint64(buf[16:], math.Float64bits(in.Accel))
-	binary.LittleEndian.PutUint64(buf[24:], math.Float64bits(in.SpeedSetpoint))
-	binary.LittleEndian.PutUint32(buf[32:], uint32(int32(in.Signals)))
-	binary.LittleEndian.PutUint32(buf[36:], uint32(int32(in.Turn)))
-	binary.LittleEndian.PutUint16(buf[40:], uint16(len(route)))
+	putIntentFixed(buf, in, flags, uint16(len(route)))
 	copy(buf[intentFixedBytes:], route)
 	return buf
 }
@@ -98,34 +156,12 @@ func DecodeIntent(buf []byte) (engine.Intent, bool) {
 		return engine.Intent{}, false
 	}
 	var in engine.Intent
-	in.VehicleID = binary.LittleEndian.Uint64(buf[0:])
-	flags := binary.LittleEndian.Uint32(buf[8:])
-	in.LaneDelta = int(int32(binary.LittleEndian.Uint32(buf[12:])))
-	in.Accel = math.Float64frombits(binary.LittleEndian.Uint64(buf[16:]))
-	in.SpeedSetpoint = math.Float64frombits(binary.LittleEndian.Uint64(buf[24:]))
-	in.Signals = int(int32(binary.LittleEndian.Uint32(buf[32:])))
-	in.Turn = int(int32(binary.LittleEndian.Uint32(buf[36:])))
-	routeLen := int(binary.LittleEndian.Uint16(buf[40:]))
+	flags, routeLen := getIntentFixed(buf, &in)
 	if routeLen > intentMaxRoute || len(buf) != intentFixedBytes+routeLen {
 		return engine.Intent{}, false
 	}
-	if flags&intentFlagAccelSet != 0 {
-		if math.IsNaN(in.Accel) || math.IsInf(in.Accel, 0) {
-			return engine.Intent{}, false
-		}
-		in.AccelSet = true
-	}
-	if flags&intentFlagSpeedSet != 0 {
-		if math.IsNaN(in.SpeedSetpoint) || math.IsInf(in.SpeedSetpoint, 0) {
-			return engine.Intent{}, false
-		}
-		in.SpeedSet = true
-	}
-	if flags&intentFlagSignalSet != 0 {
-		in.SignalSet = true
-	}
-	if flags&intentFlagTurnSet != 0 {
-		in.TurnSet = true
+	if !applyIntentFlags(&in, flags) {
+		return engine.Intent{}, false
 	}
 	if flags&intentFlagRouteSet != 0 {
 		in.RouteSet = true
@@ -170,6 +206,14 @@ type Bus struct {
 	snapErrs atomic.Uint64 // snapshot publish failures (separate loud-budget from sigErrs, ADR-0016 §6)
 	sigErrs  atomic.Uint64 // signal table publish/reply failures
 	snapsOut atomic.Uint64
+
+	// TSIB counters (ADR-0026): the observability substitute for 1:1
+	// per-vehicle messages, which batching ends.
+	intentBatches         atomic.Uint64 // structurally valid TSIB batches accepted
+	intentRecords         atomic.Uint64 // records expanded from accepted batches (post NaN-drop)
+	intentBatchDropped    atomic.Uint64 // structurally invalid batches dropped WHOLE
+	intentRecordDropped   atomic.Uint64 // NaN/Inf records dropped singly (the batch-level parity of dropped)
+	intentEncodingUnknown atomic.Uint64 // unknown (or present-but-empty) intent_encoding header values dropped
 }
 
 // NewBus attaches the live plane for a run: subscribes the intent wildcard
@@ -234,21 +278,79 @@ func NewPublishBus(nc *nats.Conn, run string, e *engine.Engine) (*Bus, error) {
 	return b, nil
 }
 
-// onIntent buffers a raw intent with its controller identity. Called on a
-// nats.go delivery goroutine; never touches the engine.
+// onIntent buffers raw intents with their controller identity. Called on a
+// nats.go delivery goroutine; never touches the engine. Demuxes on the
+// intent_encoding header (ADR-0026): ABSENT = per-vehicle v2 (every existing
+// producer, byte-identical path), "tsib" = a TSIB batch expanded into one
+// ArrivedIntent per surviving record IN RECORD ORDER (engine-assigned seqs
+// stay monotonic per controller exactly as for a v2 stream), anything else —
+// including a present-but-EMPTY value — = drop + count, LOUD: never a
+// fall-through to v2 parsing, so a future encoding against an old engine
+// fails loudly instead of misparsing.
 func (b *Bus) onIntent(msg *nats.Msg) {
 	tokens := strings.Split(msg.Subject, ".")
 	if len(tokens) != intentSubjectTokens {
 		b.dropped.Add(1)
 		return
 	}
-	in, ok := DecodeIntent(msg.Data)
+	// Headerless (every existing v2 producer) is the hot path: gate the
+	// demux on header presence — a MIMEHeader lookup canonicalizes
+	// (allocates), which is per-message cost the v2 stream never had.
+	if len(msg.Header) == 0 {
+		b.bufferV2Intent(tokens[4], msg.Data)
+		return
+	}
+	// Key EXISTENCE, not Get: Get cannot distinguish an absent key (v2)
+	// from a present-but-empty one (unknown encoding — ADR-0026). Keys are
+	// stored verbatim (nats.Header is case-sensitive, no canonicalization),
+	// so the exact contract key is the lookup.
+	vals, present := msg.Header[headerIntentEncoding]
+	if !present {
+		// Headers present but none named intent_encoding: v2.
+		b.bufferV2Intent(tokens[4], msg.Data)
+		return
+	}
+	var enc string
+	if len(vals) > 0 {
+		enc = vals[0]
+	}
+	switch enc {
+	case intentEncodingTSIB:
+		intents, recordDrops, ok := DecodeTSIB(msg.Data)
+		if !ok {
+			// Structurally invalid batch: dropped WHOLE, never partially
+			// applied (ADR-0026) — loud, first 3 per run.
+			if n := b.intentBatchDropped.Add(1); n <= 3 {
+				log.Printf("run %s: TSIB batch from %s dropped (%d bytes): structurally invalid", b.run, tokens[4], len(msg.Data))
+			}
+			return
+		}
+		b.intentBatches.Add(1)
+		b.intentRecords.Add(uint64(len(intents)))
+		b.intentRecordDropped.Add(uint64(recordDrops))
+		b.mu.Lock()
+		for _, in := range intents {
+			b.buf = append(b.buf, ArrivedIntent{Controller: tokens[4], Intent: in})
+		}
+		b.mu.Unlock()
+	default:
+		if n := b.intentEncodingUnknown.Add(1); n <= 3 {
+			log.Printf("run %s: intent message from %s with unknown intent_encoding %q dropped", b.run, tokens[4], enc)
+		}
+	}
+}
+
+// bufferV2Intent decodes one per-vehicle v2 message and appends it — the
+// pre-TSIB callback body, factored out for the two demux exits that mean
+// "v2" (headerless; headered without an intent_encoding key).
+func (b *Bus) bufferV2Intent(controller string, data []byte) {
+	in, ok := DecodeIntent(data)
 	if !ok {
 		b.dropped.Add(1)
 		return
 	}
 	b.mu.Lock()
-	b.buf = append(b.buf, ArrivedIntent{Controller: tokens[4], Intent: in})
+	b.buf = append(b.buf, ArrivedIntent{Controller: controller, Intent: in})
 	b.mu.Unlock()
 }
 
@@ -445,6 +547,15 @@ func (b *Bus) PublishAcks(applied []engine.TickedIntent, tick uint64) {
 // Stats reports bus counters (observability, not world state).
 func (b *Bus) Stats() (droppedIntents, pubErrs, snapshots uint64) {
 	return b.dropped.Load(), b.pubErrs.Load(), b.snapsOut.Load()
+}
+
+// IntentBatchStats reports the TSIB counters (ADR-0026): accepted batches,
+// expanded records, structurally rejected batches, per-record NaN/Inf drops,
+// and unknown/present-empty encoding drops. Kept separate from Stats so the
+// v2-plane signature is untouched.
+func (b *Bus) IntentBatchStats() (batches, records, batchDropped, recordDropped, encodingUnknown uint64) {
+	return b.intentBatches.Load(), b.intentRecords.Load(),
+		b.intentBatchDropped.Load(), b.intentRecordDropped.Load(), b.intentEncodingUnknown.Load()
 }
 
 // Close detaches the intent subscription.
