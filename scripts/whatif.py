@@ -39,6 +39,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 
 # ---------------------------------------------------------------- statistics
@@ -185,18 +186,37 @@ def load_metrics(path, warmup, corridors=None):
 
 # --------------------------------------------------------------------- runs
 
-def run_one(serve_bin, scenario, seed, ticks, port, workdir, capacity, extra):
+# Transient startup failures, retried on a fresh port. Each run embeds its
+# own NATS server, and past a handful of concurrent runs some lose the race
+# to bind or to report ready. Retrying matters more than it looks: a dropped
+# run silently shrinks n for ONE arm, which biases a paired comparison
+# rather than just weakening it.
+TRANSIENT = ("nats-server not ready", "address already in use",
+             "bind: ", "connection refused")
+
+
+def run_one(serve_bin, scenario, seed, ticks, port, workdir, capacity, extra,
+            attempts=3):
     """One serve invocation -> parsed metrics path. Returns (ok, path, log)."""
     tag = f"{os.path.basename(scenario)}-s{seed}"
     mpath = os.path.join(workdir, f"{tag}.json")
     logp = os.path.join(workdir, f"{tag}.log")
-    cmd = [serve_bin, "-scenario", scenario, "-run", f"wf{port}",
-           "-seed", str(seed), "-ticks", str(ticks), "-pace", "0",
-           "-capacity", str(capacity), "-intent-log=false",
-           "-metrics-out", mpath, "-ws", f"127.0.0.1:{port}"] + extra
-    with open(logp, "w") as lf:
-        rc = subprocess.call(cmd, stdout=lf, stderr=subprocess.STDOUT)
-    return rc == 0 and os.path.exists(mpath), mpath, logp
+    for attempt in range(attempts):
+        p = port + attempt * 997  # a stride well clear of the pod's own block
+        cmd = [serve_bin, "-scenario", scenario, "-run", f"wf{p}",
+               "-seed", str(seed), "-ticks", str(ticks), "-pace", "0",
+               "-capacity", str(capacity), "-intent-log=false",
+               "-metrics-out", mpath, "-ws", f"127.0.0.1:{p}"] + extra
+        with open(logp, "w") as lf:
+            rc = subprocess.call(cmd, stdout=lf, stderr=subprocess.STDOUT)
+        if rc == 0 and os.path.exists(mpath):
+            return True, mpath, logp
+        with open(logp) as lf:
+            tail = lf.read()[-4000:]
+        if not any(t in tail for t in TRANSIENT) or attempt == attempts - 1:
+            return False, mpath, logp
+        time.sleep(5 + 5 * attempt)
+    return False, mpath, logp
 
 
 def main():
