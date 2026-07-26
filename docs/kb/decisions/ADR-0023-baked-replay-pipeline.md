@@ -105,14 +105,19 @@ none, matching the live path's 404 semantic.
   `"tippecanoe": {"minzoom": N}` member (tippecanoe's documented GeoJSON
   extension), then runs tippecanoe to one `.pmtiles` per city. Choosing
   an external binary over Go libraries (go-pmtiles + an MVT encoder)
-  keeps AGENTS.md's stdlib-first rule: no new Go module dependency, and
+  keeps AGENTS.md's stdlib-first rule for the *tiling* step, and
   zoom-tiering is tippecanoe's core competence. SUMO (tools/sumo-venv)
   is the precedent for heavy external tooling. The tippecanoe VERSION is
   pinned in the bake README and the exact flag set recorded at
   implementation; the flags must disable every behavior that destroys
   per-lane identity (no feature dropping at low zooms, no coalescing/
   merging of lines) — lane ids are the congestion feature-state key, a
-  dropped or merged lane is a lane that never colors.
+  dropped or merged lane is a lane that never colors. Qualification
+  criteria (review, 2026-07-26): a tippecanoe build is acceptable iff it
+  honors the recorded identity-flag set AND is listed as verified in the
+  bake README (today: 2.49.0, 2.78.0) — version-keying prevents cache
+  collisions but does not prove an unverified build preserves lane
+  identity or minzoom semantics.
 - **A node step for derived furniture** (`viz/scripts/bake-furniture.mjs`).
   Signal heads and stop signs are client-side derivations from lane
   geometry + the TSSG table today (signals.ts, stopsign.ts) — and with
@@ -500,6 +505,13 @@ memory):
   silently changes content. index.json is fetched `cache: "no-cache"`
   (netload.ts:61's rule); chunk/furniture/tile objects are immutable
   forever. The site pins the full index URL per replay page.
+  **MVP deferral (recorded 2026-07-26, external review):** (b) is NOT
+  yet implemented — hash12 covers (a) only, so a re-bake of the same
+  recording with different brotli/furniture/tile bytes can collide onto
+  one key. Accepted for the episode MVP because every bake to date is
+  produced by one tool build and uploaded once; (b) lands before any
+  re-bake-over-existing-key workflow. Greppable TODO(MVP-deferred)
+  markers in engine/cmd/bake/bake.go.
 - `network.pmtiles` is content-keyed per CITY and shared by all
   recordings of that network — la-lean's tiles bake once. Its key covers
   everything the tile bytes depend on: network bytes (ADR-0018's hash12
@@ -601,3 +613,41 @@ alone is 5×).
   ReplayFromStream's audit and the Player's demo plane); the shared
   re-sim core is extracted in natsio, keeping nats.go confinement and
   giving all three one CRC/verb/code path.
+
+## Addendum (2026-07-26): the brotli dependency
+
+Flagged in external review — the text above claims the tippecanoe choice
+means "no new Go module dependency", and the implementation nonetheless
+added one: `github.com/andybalholm/brotli v1.2.0`. The claim was about the
+tiling step and has been narrowed accordingly; this records the dependency
+that did land, per AGENTS.md's rule that dependencies are justified rather
+than assumed.
+
+**What it is for.** The chunk objects ship pre-compressed and are served
+with `Content-Encoding: br` (see §"Content-Encoding" above). Brotli is not
+in the Go standard library — `compress/flate` and `compress/gzip` are — so
+producing them in-process needs either this module or a subprocess.
+
+**Why not the tippecanoe treatment (an external `brotli` binary).** Tiling
+is one invocation per city over one file; compression is thousands of
+invocations over small buffers in the bake's inner loop, where per-call
+process spawn dominates. It is also on the correctness path in a way tiling
+is not: the compressed bytes are covered by the content key, so a
+brotli-CLI version difference between machines would silently change the
+published key. A pinned module makes that a `go.mod` diff.
+
+**Why not gzip instead.** The artifacts are written once and served
+indefinitely to every viewer; brotli's ~15–20% edge over gzip on these
+chunks is paid for once and recovered on every fetch. Cloudflare serves
+`br` natively.
+
+**Confinement**, matching the ADR-0006 and ADR-0012 exceptions: the import
+is confined to `engine/cmd/bake` (`chunks.go` and its tests). The kernel
+package stays stdlib-only, and `engine/natsio` keeps its own confinement.
+The bake CLI is an offline authoring tool — nothing on the live NATS path
+links it.
+
+**Consequence to accept.** Anything that reads these chunks needs a brotli
+decoder. In the browser that is free (the platform decodes
+`Content-Encoding: br`); a non-browser verifier needs its own, which is why
+`scripts/serve-baked.py` exists to set the header rather than decompress.

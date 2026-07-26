@@ -69,8 +69,22 @@ test("congestion off: both congestion line layers hide; the casings are never to
   assert.ok(!v.has("network-internal-casing"), "internal casing is road geometry too");
 });
 
+test("buildings off: both footprint layers hide; nothing else moves", () => {
+  const v = vis(layerOpsFor({ ...DEFAULT_TOGGLES, buildings: false }));
+  assert.equal(v.get("buildings-fill"), false);
+  assert.equal(v.get("buildings-outline"), false);
+  assert.equal(v.get("network-line"), true, "roads are a different toggle");
+});
+
 test("every toggle key off still names only real layers, exactly once", () => {
-  const ops = layerOpsFor({ car: false, truck: false, signals: false, stops: false, congestion: false });
+  const ops = layerOpsFor({
+    car: false,
+    truck: false,
+    signals: false,
+    stops: false,
+    congestion: false,
+    buildings: false,
+  });
   const ids = ops.visibility.map(([id]) => id);
   assert.equal(new Set(ids).size, ids.length);
   for (const [, on] of ops.visibility) assert.equal(on, false);

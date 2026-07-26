@@ -1,0 +1,73 @@
+{
+  "title": "Chicago Loop CBD",
+  "baseline": "base",
+  "metric": "speed_kmh",
+  "seeds": 12,
+  "ticks": 12000,
+  "winner": "retime-truckban",
+  "options": [
+    {
+      "name": "retime-truckban",
+      "label": "Shorter cycles AND a peak-hour freight ban together",
+      "delta_pct": 6.743485633550377,
+      "p": 0.0028331792801206943,
+      "cohen_d": 1.1033248961442619,
+      "verdict": "UPGRADE",
+      "carries_traffic": true
+    },
+    {
+      "name": "calm-secondary",
+      "label": "Slow Streets \u2014 25 km/h limit across the Loop grid",
+      "delta_pct": -8.750667170951472,
+      "p": 1.915079996673572e-05,
+      "cohen_d": -2.0585329408069724,
+      "verdict": "WORSE",
+      "carries_traffic": false
+    },
+    {
+      "name": "transit-5",
+      "label": "Free CTA transfers \u2014 shift 5% of Loop trips to transit",
+      "delta_pct": 4.0242175559934745,
+      "p": 0.07037579677053339,
+      "cohen_d": 0.5783720353026579,
+      "verdict": "no-op (n.s.)",
+      "carries_traffic": true
+    },
+    {
+      "name": "truck-ban",
+      "label": "Peak-hour freight ban \u2014 no trucks in the Loop",
+      "delta_pct": -0.0689788360930554,
+      "p": 0.9742916612462755,
+      "cohen_d": -0.009516691751168484,
+      "verdict": "no-op (n.s.)",
+      "carries_traffic": true
+    }
+  ],
+  "all_tested": {
+    "calm-secondary": {
+      "delta_pct": -8.750667170951472,
+      "p": 1.915079996673572e-05,
+      "verdict": "WORSE"
+    },
+    "retime-short": {
+      "delta_pct": 3.6471235371365123,
+      "p": 0.05779998840340379,
+      "verdict": "no-op (n.s.)"
+    },
+    "retime-truckban": {
+      "delta_pct": 6.743485633550377,
+      "p": 0.0028331792801206943,
+      "verdict": "UPGRADE"
+    },
+    "transit-5": {
+      "delta_pct": 4.0242175559934745,
+      "p": 0.07037579677053339,
+      "verdict": "no-op (n.s.)"
+    },
+    "truck-ban": {
+      "delta_pct": -0.0689788360930554,
+      "p": 0.9742916612462755,
+      "verdict": "no-op (n.s.)"
+    }
+  }
+}

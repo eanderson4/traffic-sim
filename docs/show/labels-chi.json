@@ -1,0 +1,10 @@
+{
+  "base": "Do nothing",
+  "lsd-widen": "Widen Lake Shore Drive — one lane each way",
+  "kennedy-widen": "Widen the Kennedy — one lane each way",
+  "ramp-meter": "Ramp metering — hold back 20% of expressway on-ramp entries",
+  "retime-short": "Shorter signal cycles — 34% shorter, same green share",
+  "retime-long": "Longer greens — 40% longer cycles citywide",
+  "truck-ban": "Peak-hour freight ban — no trucks downtown",
+  "transit-5": "Free CTA transfers — shift 5% of trips to transit"
+}

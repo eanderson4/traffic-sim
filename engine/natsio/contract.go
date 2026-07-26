@@ -674,6 +674,8 @@ func (c *Contract) handleVerb(e *engine.Engine, r ctlReq) {
 		Origin:       req.Origin,
 		TypeName:     req.VType,
 		EarliestTick: req.EarliestTick,
+		Destination:  req.Destination,
+		OffsetM:      req.OffsetM,
 	})
 	if err != nil {
 		reply.Reason = err.Error()

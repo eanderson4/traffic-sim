@@ -1,0 +1,83 @@
+{
+  "title": "Chicago \u2014 the Loop and the expressways",
+  "baseline": "base",
+  "metric": "speed_kmh",
+  "seeds": 6,
+  "ticks": 12000,
+  "winner": "retime-short",
+  "options": [
+    {
+      "name": "retime-short",
+      "label": "Shorter signal cycles \u2014 34% shorter, same green share",
+      "delta_pct": 2.0927558524928123,
+      "p": 0.0020853383846941203,
+      "cohen_d": 2.3835163346445105,
+      "verdict": "UPGRADE",
+      "carries_traffic": true
+    },
+    {
+      "name": "retime-long",
+      "label": "Longer greens \u2014 40% longer cycles citywide",
+      "delta_pct": -3.820972293739502,
+      "p": 1.82864119723316e-05,
+      "cohen_d": -6.463717612295601,
+      "verdict": "WORSE",
+      "carries_traffic": false
+    },
+    {
+      "name": "lsd-widen",
+      "label": "Widen Lake Shore Drive \u2014 one lane each way",
+      "delta_pct": 0.5083458759006373,
+      "p": 0.032080669191343184,
+      "cohen_d": 1.2021785747964269,
+      "verdict": "no-op (under practical floor)",
+      "carries_traffic": true
+    },
+    {
+      "name": "kennedy-widen",
+      "label": "Widen the Kennedy \u2014 one lane each way",
+      "delta_pct": 0.19026538992320918,
+      "p": 0.38624022991532503,
+      "cohen_d": 0.38739137317733674,
+      "verdict": "no-op (n.s.)",
+      "carries_traffic": true
+    }
+  ],
+  "all_tested": {
+    "kennedy-widen": {
+      "delta_pct": 0.19026538992320918,
+      "p": 0.38624022991532503,
+      "verdict": "no-op (n.s.)"
+    },
+    "lsd-widen": {
+      "delta_pct": 0.5083458759006373,
+      "p": 0.032080669191343184,
+      "verdict": "UPGRADE"
+    },
+    "ramp-meter": {
+      "delta_pct": 1.315580357755076,
+      "p": 0.0009173661188976653,
+      "verdict": "UPGRADE"
+    },
+    "retime-long": {
+      "delta_pct": -3.820972293739502,
+      "p": 1.82864119723316e-05,
+      "verdict": "WORSE"
+    },
+    "retime-short": {
+      "delta_pct": 2.0927558524928123,
+      "p": 0.0020853383846941203,
+      "verdict": "UPGRADE"
+    },
+    "transit-5": {
+      "delta_pct": 2.0911115962175937,
+      "p": 3.837665033571652e-05,
+      "verdict": "UPGRADE"
+    },
+    "truck-ban": {
+      "delta_pct": 2.2779207300195186,
+      "p": 0.00018393107818180453,
+      "verdict": "UPGRADE"
+    }
+  }
+}

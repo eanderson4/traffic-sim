@@ -25,8 +25,21 @@ test("overlay URLs default to the demosrv /overlay/ route, overridable", () => {
   assert.equal(def.zonesUrl, "/overlay/zones.geojson");
   assert.equal(def.boundariesUrl, "/overlay/boundaries.geojson");
   assert.equal(def.waterUrl, "/overlay/water.geojson");
-  const custom = loadConfig("?zones=/o/z.geojson&boundaries=/o/b.geojson&water=/o/w.geojson", "localhost");
+  assert.equal(def.buildingsUrl, "/overlay/buildings.geojson");
+  const custom = loadConfig(
+    "?zones=/o/z.geojson&boundaries=/o/b.geojson&water=/o/w.geojson&buildings=/o/bl.geojson",
+    "localhost",
+  );
   assert.equal(custom.zonesUrl, "/o/z.geojson");
   assert.equal(custom.boundariesUrl, "/o/b.geojson");
   assert.equal(custom.waterUrl, "/o/w.geojson");
+  assert.equal(custom.buildingsUrl, "/o/bl.geojson");
+});
+
+test("?bake= selects the baked-replay shim (ADR-0023); default is live", () => {
+  assert.equal(loadConfig("", "localhost").bake, null);
+  assert.equal(
+    loadConfig("?bake=https://data.example.com/baked/run/abc123/index.json", "localhost").bake,
+    "https://data.example.com/baked/run/abc123/index.json",
+  );
 });

@@ -28,6 +28,13 @@ export interface ThemeSpec {
   district: string; // zone district outline/fill
   corridor: string; // zone corridor outline
   water: string; // water fill, UNDER the road lines
+  // Building footprints (buildings.geojson overlay, UNDER the road lines,
+  // zoom-gated): the demand-relevant kinds are split by hue — residential
+  // violet / workplace warm ochre — because that distinction IS the layer.
+  // Hues deliberately avoid the water blue and the congestion ramp.
+  buildingResidential: string;
+  buildingWorkplace: string;
+  buildingOther: string; // non-demand structures: barely above the canvas
   // Stop sign (stopsign.ts): semantic red in every theme, like the lenses.
   stopFace: string;
   stopRim: string;
@@ -63,6 +70,9 @@ export const THEMES = {
     // Water fill (Lake Michigan, rivers) — a shade off the math-900 canvas
     // so the shoreline reads without competing with congestion.
     water: "#122a70",
+    buildingResidential: "#6a5bb0", // muted violet — homes
+    buildingWorkplace: "#a97a45", // muted ochre — offices/retail
+    buildingOther: "#1e2c68", // garages/sheds/roofs: canvas + a hair
     stopFace: "#e5484d", // semantic stop red, both themes
     stopRim: "#ffffff",
     hudBg: "rgba(14, 29, 92, 0.82)",
@@ -90,6 +100,9 @@ export const THEMES = {
     district: "#2563eb", // the paper accent blue
     corridor: "#d97706", // amber, darkened to read on paper
     water: "#d7e6f5", // pale blue-gray fill under the road hairlines
+    buildingResidential: "#8d7cc4", // violet, darkened to read on paper
+    buildingWorkplace: "#c08a4e", // ochre, darkened to read on paper
+    buildingOther: "#c9c9d0", // ink-300: quiet paper gray
     stopFace: "#e5484d", // semantic stop red, both themes
     stopRim: "#ffffff",
     hudBg: "#ffffff",

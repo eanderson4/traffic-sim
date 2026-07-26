@@ -48,7 +48,16 @@ const (
 	//	nDirectives u32 | per directive:
 	//	  tick u64 | laneIdx u32 | typeIdx u32 | earliestTick u64 |
 	//	  reqIDLen u16 | reqID bytes
-	keyframeVersion = 3
+	//
+	// Version 4 (ADR-0021, written only while some QUEUED directive carries
+	// a destination or a non-zero injection offset — a queue of plain
+	// portal spawns still marshals byte-identical v3) appends per directive:
+	//
+	//	destLen u16 | dest bytes | offsetM f64
+	keyframeVersion = 4
+	// keyframeQueueVersion is the version a non-empty director queue needs
+	// when none of its entries use the ADR-0021 fields.
+	keyframeQueueVersion = 3
 	// keyframeMinVersion is the oldest readable version (v2 recordings
 	// predate the director path; their queue is empty by definition).
 	keyframeMinVersion = 2
@@ -61,7 +70,13 @@ func (e *Engine) MarshalState() ([]byte, error) {
 	w.u32(keyframeMagic)
 	version := uint16(keyframeMinVersion)
 	if len(e.dirQueue) > 0 {
-		version = keyframeVersion
+		version = keyframeQueueVersion
+		for _, d := range e.dirQueue {
+			if d.Destination != "" || d.OffsetM != 0 {
+				version = keyframeVersion
+				break
+			}
+		}
 	}
 	w.u16(version)
 	w.u16(0)
@@ -134,6 +149,11 @@ func (e *Engine) MarshalState() ([]byte, error) {
 			w.u64(d.EarliestTick)
 			w.u16(uint16(len(d.RequestID)))
 			w.bytes([]byte(d.RequestID))
+			if version >= keyframeVersion {
+				w.u16(uint16(len(d.Destination)))
+				w.bytes([]byte(d.Destination))
+				w.f64(d.OffsetM)
+			}
 		}
 	}
 	return w.buf, nil
@@ -264,6 +284,10 @@ func RestoreState(spec RunSpec, data []byte) (*Engine, error) {
 			}
 			d.EarliestTick = r.u64()
 			d.RequestID = string(r.bytesN(int(r.u16())))
+			if ver >= keyframeVersion {
+				d.Destination = string(r.bytesN(int(r.u16())))
+				d.OffsetM = r.f64()
+			}
 			if r.err != nil {
 				return nil, fmt.Errorf("keyframe: directive %d: %w", i, r.err)
 			}

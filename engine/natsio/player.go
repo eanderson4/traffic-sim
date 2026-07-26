@@ -101,8 +101,8 @@ type Player struct {
 	stream    string
 	log       *log.Logger
 
-	idx     *logIndex
-	endTick uint64 // min(spec.Ticks, last logged tick)
+	cur     *logCursor // forward reader over the log stream (ADR-0024)
+	endTick uint64     // min(spec.Ticks, last logged tick)
 
 	bus *Bus
 	e   *engine.Engine // owned by the Run goroutine
@@ -151,10 +151,16 @@ type ctrlAck struct {
 
 // NewPlayer prepares a replay of the recorded run cfg.Run: it reads the run
 // registry meta (fail loud if the run is unknown to this store), restores
-// the tick-0 keyframe, and materializes the whole log — the recording is
-// immutable once the serving broker has exited, so per-tick re-enqueue
-// reads the index, never the stream (seek keyframes are re-fetched on
-// demand). Nothing is published and nothing steps until Run.
+// the tick-0 keyframe, and opens a forward cursor over the log stream.
+//
+// The cursor replaced a full materialization of the record (ADR-0024). The
+// recording is immutable once the serving broker has exited and playback is
+// monotonic in tick, so per-tick re-enqueue only ever needs the tick it is
+// about to step — holding the whole log in memory made a 30-minute city cut
+// unopenable (~10M intent messages per 15 sim-minutes). Seek keyframes are
+// still re-fetched on demand from the sparse keyframe subject.
+//
+// Nothing is published and nothing steps until Run.
 func NewPlayer(nc *nats.Conn, js nats.JetStreamContext, cfg PlayerConfig) (*Player, error) {
 	// Namespace hygiene: the replay plane of "foo" lives under
 	// "foo"+replayRunSuffix, so a source run id already ending in the
@@ -201,20 +207,24 @@ func NewPlayer(nc *nats.Conn, js nats.JetStreamContext, cfg PlayerConfig) (*Play
 	if err != nil {
 		return nil, fmt.Errorf("run %q: restore tick-0 keyframe: %w", cfg.Run, err)
 	}
-	msgs, err := fetchFrom(js, stream, cfg.Run, 1)
-	if err != nil {
-		return nil, err
-	}
-	idx, err := indexLogMsgs(msgs, cfg.Run)
-	if err != nil {
-		return nil, err
-	}
 	// A dirty store (a run id recorded twice into the same stream) can
 	// yield two keyframes at the same tick — refuse the corrupt record
 	// loud and early rather than seeking into an ambiguous log.
-	if len(idx.keyframes) >= 2 && idx.keyframes[1] == idx.keyframes[0] {
+	kfTicks, err := firstKeyframeTicks(js, stream, cfg.Run)
+	if err != nil {
+		return nil, err
+	}
+	if len(kfTicks) >= 2 && kfTicks[1] == kfTicks[0] {
 		return nil, fmt.Errorf("run %q: corrupt record: duplicate keyframes at tick %d — was this run id recorded twice into the same store?",
-			cfg.Run, idx.keyframes[0])
+			cfg.Run, kfTicks[0])
+	}
+	lastTick, _, err := lastLoggedTick(js, stream, cfg.Run)
+	if err != nil {
+		return nil, err
+	}
+	cur, err := newLogCursor(js, stream, cfg.Run, 1)
+	if err != nil {
+		return nil, err
 	}
 	// The horizon the record actually covers. The registry completion
 	// status is the proof: a run marked "done" RAN to spec.Ticks — the max
@@ -224,20 +234,21 @@ func NewPlayer(nc *nats.Conn, js nats.JetStreamContext, cfg PlayerConfig) (*Play
 	// last logged tick, because re-simming past the log would invent an
 	// under-controlled tail — the post-log controller input never existed.
 	end := spec.Ticks
-	if meta.Status != StatusDone && idx.lastTick < end {
-		end = idx.lastTick
+	if meta.Status != StatusDone && lastTick < end {
+		end = lastTick
 	}
 
 	// The live plane under the fresh replay run id, publish-only: the
 	// player has no contract plane, so no intent subscription.
 	bus, err := NewPublishBus(nc, replayRun, e)
 	if err != nil {
+		cur.close() // else the ephemeral consumer outlives the failed player
 		return nil, err
 	}
 
 	p := &Player{
 		js: js, src: cfg.Run, replayRun: replayRun, spec: spec, stream: stream, log: lg,
-		idx: idx, endTick: end,
+		cur: cur, endTick: end,
 		bus: bus, e: e, speed: speed,
 		ctrlCh: make(chan ctrlRequest), runDone: make(chan struct{}),
 	}
@@ -266,6 +277,9 @@ func (p *Player) Run() error {
 	// on exit: a stopped player must not keep answering — or sharing —
 	// signal-table requests against a replacement.
 	defer p.bus.Close()
+	// Drop the log cursor's ephemeral consumer with it: replay is a
+	// read-only path and must leave no broker state behind.
+	defer p.cur.close()
 	// Opening frames: the signal table once (republished at the
 	// signalCatchUpEvery cadence from here on, mirroring run.go) and the
 	// tick-0 snapshot so a browser attaching before the first tick already
@@ -309,7 +323,10 @@ func (p *Player) Run() error {
 		}
 
 		tickStart := time.Now()
-		p.stepTick(true)
+		if err := p.stepTick(true); err != nil {
+			p.log.Printf("replay: %v — stopping playback", err)
+			return err
+		}
 		if p.e.Tick%decimation(speed, p.spec.Params.Dt) == 0 {
 			p.bus.PublishSnapshot(p.e)
 		}
@@ -420,23 +437,32 @@ func (p *Player) republishPaused() {
 // the /status counters mean "divergences during forward playback") from
 // seek re-sim (verified and logged, but NOT counted: scrubbing back and
 // forth across a divergent span must not inflate them). Run-goroutine only.
-func (p *Player) stepTick(countErrs bool) {
+func (p *Player) stepTick(countErrs bool) error {
 	next := p.e.Tick + 1
-	for _, k := range p.idx.intents[next] {
+	rec, err := p.cur.records(next)
+	if err != nil {
+		// A read fault is not a divergence and must not be swallowed: the
+		// record is unreadable from here, so stepping anyway would invent an
+		// uncontrolled tick, and retrying in place would spin (seek's re-sim
+		// loop advances only on a successful step). Fail the caller.
+		return fmt.Errorf("read log at tick %d: %w", next, err)
+	}
+	for _, k := range rec.intents {
 		p.e.EnqueueIntent(k)
 	}
-	for _, d := range p.idx.verbs[next] {
+	for _, d := range rec.verbs {
 		if err := p.e.EnqueueSpawn(d); err != nil {
 			p.reportDivergence(countErrs, &p.verbErrs,
 				fmt.Sprintf("verb %q at tick %d rejected (%v) — record and spec disagree", d.RequestID, next, err))
 		}
 	}
 	p.e.Step()
-	if want, ok := p.idx.crcs[next]; ok && p.e.CRC() != want {
+	if rec.hasCRC && p.e.CRC() != rec.crc {
 		p.reportDivergence(countErrs, &p.crcErrs,
-			fmt.Sprintf("CRC divergence at tick %d: crc %016x, logged %016x", next, p.e.CRC(), want))
+			fmt.Sprintf("CRC divergence at tick %d: crc %016x, logged %016x", next, p.e.CRC(), rec.crc))
 	}
 	p.curTick.Store(p.e.Tick)
+	return nil
 }
 
 // reportDivergence logs loudly (rate-limited when counting: first 3
@@ -470,10 +496,21 @@ func (p *Player) seek(target uint64) error {
 	if err != nil {
 		return fmt.Errorf("restore keyframe tick %d: %w", kf.tick, err)
 	}
+	// Re-anchor the forward cursor behind the landing keyframe. kf.seq is the
+	// keyframe's LAST message, so the re-sim starts at seq+1 — after the
+	// complete keyframe, exactly where ReplayFromStream resumes. Seeking is
+	// the only way the playhead moves backwards, so this is the only place
+	// the cursor is ever repositioned.
+	if err := p.cur.reset(kf.seq + 1); err != nil {
+		return err
+	}
 	p.e = e
 	p.curTick.Store(e.Tick)
 	for p.e.Tick < target {
-		p.stepTick(false) // verify + log, but the counters are forward-playback only
+		// Verify + log, but the counters are forward-playback only.
+		if err := p.stepTick(false); err != nil {
+			return err
+		}
 	}
 	p.done.Store(false)
 	if target >= p.endTick {

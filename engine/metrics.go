@@ -252,6 +252,11 @@ type mLastObs struct {
 	stopped bool         // v < metricStopSpeed at that observation
 	dtShare float64      // time booked to lane at that observation (s)
 	tlShare float64      // time-loss booked to lane at that observation (s)
+	// route is the vehicle's destination lane id at that observation
+	// (ADR-0021), "" when unrouted. The despawn-tick attribution resolves
+	// toward THIS lane when set: a routed vehicle's last hop is known
+	// exactly, where exitResolve can only guess among reachable exits.
+	route string
 }
 
 // tripState is the open per-vehicle trip accumulation.
@@ -371,7 +376,7 @@ func NewKernel(e *Engine, cfg KernelConfig) (*Kernel, error) {
 	for _, v := range e.Vehicles() {
 		// dtShare is seeded at a full tick (approximation: no booking was
 		// observed — it only matters if the vehicle is parked overshoot).
-		k.last[v.ID] = mLastObs{lane: v.Lane, s: v.S, v: v.V, vt: v.Type, f: v.F, stopped: v.V < metricStopSpeed, dtShare: e.Params.Dt}
+		k.last[v.ID] = mLastObs{lane: v.Lane, s: v.S, v: v.V, vt: v.Type, f: v.F, stopped: v.V < metricStopSpeed, dtShare: e.Params.Dt, route: v.Route}
 		k.seenIDs[v.ID] = true
 		if v.ID > k.maxFirstSeenID {
 			k.maxFirstSeenID = v.ID // pre-placed IDs seed the gap baseline
@@ -403,6 +408,17 @@ func (k *Kernel) Observe(e *Engine) {
 	k.observed, k.lastTick = true, e.Tick
 	dt := k.dt
 	tick := e.Tick
+	// ADR-0021 mid-lane injections of THIS tick: a vehicle first observed
+	// off an origin lane is otherwise indistinguishable from one that
+	// crossed a boundary within its spawn tick, and the two book travel
+	// completely differently. Lookup only, never iterated (ADR-0005).
+	var injectedAt map[uint64]float64
+	if inj := e.InteriorInjections(); len(inj) > 0 {
+		injectedAt = make(map[uint64]float64, len(inj))
+		for _, in := range inj {
+			injectedAt[in.ID] = in.S
+		}
+	}
 	cur := make(map[uint64]mLastObs, len(k.last)+4)
 	for _, v := range e.Vehicles() {
 		lane := v.Lane
@@ -425,7 +441,15 @@ func (k *Kernel) Observe(e *Engine) {
 			// wholly to the seen lane and DroppedCrossings makes it loud.
 			// Current networks can't reach this: the shortest origin lane
 			// (I-280: 13.02 m) far exceeds one tick's travel (≤ ~4.3 m).
-			if e.Net.OriginByID(lane.ID) == nil {
+			//
+			// An ADR-0021 interior injection is the one legitimate way to
+			// be first observed off an origin lane. entryS is where it
+			// entered, so its first tick of travel is v.S − entryS rather
+			// than the whole lane prefix — booking v.S would credit the
+			// vehicle with the entire block it never drove, on every one of
+			// a scenario's residential flows.
+			entryS, interior := injectedAt[v.ID]
+			if !interior && e.Net.OriginByID(lane.ID) == nil {
 				k.droppedCrossings++
 			}
 			// Invisible-vehicle detection: vehicle IDs are sequential with
@@ -446,11 +470,15 @@ func (k *Kernel) Observe(e *Engine) {
 			if v.ID > k.maxFirstSeenID {
 				k.maxFirstSeenID = v.ID
 			}
-			k.addSegment(lane, v.S, dt, tick)
-			tickLoss = k.addTimeLoss(lane, dt-v.S/v.v0eff(lane), tick)
+			firstD := v.S - entryS
+			if firstD < 0 {
+				firstD = 0
+			}
+			k.addSegment(lane, firstD, dt, tick)
+			tickLoss = k.addTimeLoss(lane, dt-firstD/v.v0eff(lane), tick)
 			k.addOccupancy(lane, dt*v.Type.Length, tick)
 			if ts != nil {
-				ts.dist += v.S
+				ts.dist += firstD
 			}
 		case prev.lane == lane:
 			d := v.S - prev.s
@@ -534,7 +562,7 @@ func (k *Kernel) Observe(e *Engine) {
 				}
 			}
 		}
-		cur[v.ID] = mLastObs{lane: lane, s: v.S, v: v.V, vt: v.Type, f: v.F, stopped: stopped, dtShare: shareT, tlShare: shareTL}
+		cur[v.ID] = mLastObs{lane: lane, s: v.S, v: v.V, vt: v.Type, f: v.F, stopped: stopped, dtShare: shareT, tlShare: shareTL, route: v.Route}
 		if ts != nil {
 			ts.dest = lane.ID
 		}
@@ -1229,6 +1257,30 @@ func exitShares(prev mLastObs) (shares []laneShare, exitLane *Lane, ok, ambiguou
 	if prev.lane.Exit {
 		return shares, prev.lane, true, false
 	}
+	// A ROUTED vehicle's last hop is known exactly: it despawned at its
+	// destination lane's end, whether that lane is an exit (ADR-0019 exit
+	// routing) or an interior arrival (ADR-0021). Resolving toward the
+	// destination is therefore exact where exitResolve is a guess — it
+	// fails outright when several exits are reachable within the depth
+	// bound, which on a dense grid is most of them (chi-loop booked 16.9k
+	// dropped crossings in 15 sim-minutes). Falls through to the exit
+	// search when the destination is not reachable from here — a vehicle
+	// that left the network without ever reaching its destination.
+	if prev.route != "" {
+		if prev.lane.ID == prev.route {
+			return shares, prev.lane, true, false
+		}
+		want := prev.route
+		if chain, dest, amb := chainResolve(prev.lane, func(l *Lane) bool { return l.ID == want }); dest != nil {
+			if amb {
+				return shares, nil, false, true
+			}
+			for _, l := range chain[1:] {
+				shares = append(shares, laneShare{lane: l, d: l.Length})
+			}
+			return shares, dest, true, false
+		}
+	}
 	chain, exit, amb := exitResolve(prev.lane)
 	if exit == nil {
 		return shares, nil, false, false
@@ -1248,12 +1300,20 @@ func exitShares(prev mLastObs) (shares []laneShare, exitLane *Lane, ok, ambiguou
 // chains reach the one exit with different booked length sums (parallel
 // internals), ambiguous = true — the shortest books, the caller counts.
 func exitResolve(from *Lane) (chain []*Lane, exit *Lane, ambiguous bool) {
-	chains, truncated := findChains(from, func(l *Lane) bool { return l.Exit }, 3)
-	exits := map[*Lane]bool{}
+	return chainResolve(from, func(l *Lane) bool { return l.Exit })
+}
+
+// chainResolve is exitResolve's general form: THE lane matching want that is
+// reachable from `from` within maxCrossDepth when exactly one exists, with
+// the shortest chain to it. With an id predicate at most one lane can match,
+// so the "several targets" rejection only ever fires for the exit search.
+func chainResolve(from *Lane, want func(*Lane) bool) (chain []*Lane, target *Lane, ambiguous bool) {
+	chains, truncated := findChains(from, want, 3)
+	targets := map[*Lane]bool{}
 	for _, c := range chains {
-		exits[c[len(c)-1]] = true
+		targets[c[len(c)-1]] = true
 	}
-	if len(exits) != 1 {
+	if len(targets) != 1 {
 		return nil, nil, false
 	}
 	// ANY second chain to the one exit (or a truncated enumeration) makes

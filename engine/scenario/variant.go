@@ -171,7 +171,7 @@ func loadVariant(dir string) (*Scenario, error) {
 	// list — a replacement that invalidates base demand fails HERE, at
 	// variant load, not at spawn time.
 	netPath, netRel := base.NetPath, base.Manifest.Network
-	origins := base.origins
+	lanes := base.lanes
 	rawNet := baseParts[base.Manifest.Network] // already canonical JSON
 	effNet := (*engine.Network)(nil)           // the effective network (resolved below)
 	if v.Network != "" {
@@ -200,10 +200,7 @@ func loadVariant(dir string) (*Scenario, error) {
 			return nil, fmt.Errorf("variant network %s: %w", v.Network, err)
 		}
 		effNet = net
-		origins = make(map[string]bool, len(net.Origins))
-		for _, l := range net.Origins {
-			origins[l.ID] = true
-		}
+		lanes = newNetLanes(net)
 		netPath, netRel, rawNet = p, v.Network, canonicalJSON(raw, v.Network)
 	}
 	typeSet := make(map[string]bool, len(eff.Types))
@@ -211,7 +208,7 @@ func loadVariant(dir string) (*Scenario, error) {
 		typeSet[t] = true
 	}
 
-	s := &Scenario{Dir: dir, Manifest: eff, NetPath: netPath, origins: origins}
+	s := &Scenario{Dir: dir, Manifest: eff, NetPath: netPath, lanes: lanes}
 	hm := eff
 	hm.Seed, hm.Ticks = 0, 0 // run coordinates stripped (see Load)
 	s.parts = append(s.parts, hashPart{rel: ManifestFile, data: canonicalYAML(&hm)})
@@ -229,7 +226,7 @@ func loadVariant(dir string) (*Scenario, error) {
 				return nil, err
 			}
 			delete(patchesByPart, ref)
-			df, canonical, err := parseDemand(patched, origins, typeSet)
+			df, canonical, err := parseDemand(patched, lanes, typeSet)
 			if err != nil {
 				return nil, fmt.Errorf("variant demand %s (after patching — line numbers cite the patched document, not the base file): %w", ref, err)
 			}
@@ -240,7 +237,7 @@ func loadVariant(dir string) (*Scenario, error) {
 		// Unpatched: reuse the base's loaded model and captured canonical
 		// bytes, re-validated against the EFFECTIVE origins and types.
 		df := base.Demands[i]
-		if err := validateDemand(df, origins, typeSet); err != nil {
+		if err := validateDemand(df, lanes, typeSet); err != nil {
 			return nil, fmt.Errorf("variant demand %s: %w", ref, err)
 		}
 		s.Demands = append(s.Demands, df)
@@ -259,7 +256,7 @@ func loadVariant(dir string) (*Scenario, error) {
 		if err != nil {
 			return nil, fmt.Errorf("variant demand: %w", err)
 		}
-		df, canonical, err := loadDemandFile(pth, origins, typeSet)
+		df, canonical, err := loadDemandFile(pth, lanes, typeSet)
 		if err != nil {
 			return nil, fmt.Errorf("variant demand %s: %w", ref, err)
 		}

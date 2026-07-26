@@ -30,6 +30,15 @@ type RecorderConfig struct {
 	AckWait time.Duration
 	// MaxAge bounds stream retention; 0 keeps everything (tests, local runs).
 	MaxAge time.Duration
+	// DropEngineIntentLog stops the engine retaining its whole-run
+	// IntentLog (engine.Engine.DropIntentLog). It rides here because this
+	// is the run-tuning struct RunLive already threads and — unlike
+	// RunSpec — nothing in it is recorded, so the option cannot leak into
+	// the record or the ADR-0012 content hash. The durable log is
+	// unaffected either way: the recorder reads AppliedIntents(), the
+	// per-tick slice, never IntentLog. What it costs is the in-memory
+	// RunLog a headless metrics run never reads (ADR-0024).
+	DropEngineIntentLog bool
 	// KeyframeChunkMax bounds one keyframe log message's payload in bytes
 	// (default 768 KiB — safely under the broker's 1 MiB max_payload with
 	// headers). A larger keyframe is split into chunk messages reassembled

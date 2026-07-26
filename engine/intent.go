@@ -139,7 +139,11 @@ func (e *Engine) applyIntents() {
 		}
 		entry := TickedIntent{Tick: e.Tick, Superseded: superseded, KeyedIntent: k}
 		e.applied = append(e.applied, entry)
-		e.IntentLog = append(e.IntentLog, entry)
+		if !e.DropIntentLog {
+			// applied (the per-tick slice the recorder reads) is always
+			// built; only the unbounded whole-run retention is optional.
+			e.IntentLog = append(e.IntentLog, entry)
+		}
 	}
 	e.intentQ = e.intentQ[:0]
 }
@@ -229,8 +233,10 @@ func (v *Vehicle) intentAccel() float64 {
 // hard lateral gaps, the kinematic collision-freedom floor, the changer's
 // own b_safe, and the new follower's b_safe. An infeasible command expires
 // (one-shot semantics, ADR-0008 §2).
+// The route guardrail (ADR-0021) applies here too: a commanded hop that
+// would abandon the vehicle's route is denied like an infeasible one.
 func (e *Engine) tryForcedLaneChange(v *Vehicle) {
-	if e.PolicyContext(v).ForcedFeasible(e.Params, v.reqLane) {
+	if e.routeHopOK(v, v.reqLane) && e.PolicyContext(v).ForcedFeasible(e.Params, v.reqLane) {
 		e.execLaneChange(v, v.reqLane)
 	}
 }

@@ -4,7 +4,7 @@
 // applied by main.ts) so node --test can pin the mapping; legend.ts deals
 // only in ToggleKeys, main.ts only in the ops returned here.
 
-export type ToggleKey = "car" | "truck" | "signals" | "stops" | "congestion";
+export type ToggleKey = "car" | "truck" | "signals" | "stops" | "congestion" | "buildings";
 
 export type ToggleState = Record<ToggleKey, boolean>;
 
@@ -15,6 +15,7 @@ export const DEFAULT_TOGGLES: ToggleState = {
   signals: true,
   stops: true,
   congestion: true,
+  buildings: true,
 };
 
 export interface LayerOps {
@@ -38,7 +39,9 @@ export interface LayerOps {
 //   - "network-line" + "network-internal-line" are the congestion overlay
 //     (external lanes / zoom-gated junction interiors, WQ-3);
 //     "network-casing" + "network-internal-casing" (the road geometry
-//     itself) are NEVER toggled.
+//     itself) are NEVER toggled;
+//   - "buildings-fill" + "buildings-outline" are the footprint overlay
+//     (zoom-gated context UNDER the roads; both move as one group).
 export function layerOpsFor(state: ToggleState): LayerOps {
   const cls: number[] = [];
   if (state.car) cls.push(0);
@@ -57,6 +60,8 @@ export function layerOpsFor(state: ToggleState): LayerOps {
       ["stop-signs", state.stops],
       ["network-line", state.congestion],
       ["network-internal-line", state.congestion],
+      ["buildings-fill", state.buildings],
+      ["buildings-outline", state.buildings],
     ],
   };
 }

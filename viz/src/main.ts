@@ -26,12 +26,12 @@ import "maplibre-gl/dist/maplibre-gl.css";
 import type { Feature, FeatureCollection, LineString, Point } from "geojson";
 
 import { loadConfig, THEME_STORAGE_KEY } from "./config.ts";
-import { parseOverlay, prepareZones } from "./overlays.ts";
+import { parseOverlay, prepareBuildings, prepareZones } from "./overlays.ts";
 import { decodeFrame } from "./tssf.ts";
 import { decodeSignalFrame, parseSigChunkHeader, SignalTableAccumulator, type SigColor, type SignalTable } from "./tssg.ts";
 import { headStatesAtTick, signalHeads, type SignalHead } from "./signals.ts";
 import { SIGNAL_HEAD, SIGNAL_HEAD_IMAGE_ID, signalHeadImage } from "./signalhead.ts";
-import { STOP_SIGN_IMAGE_ID, stopSignImage, stopSigns } from "./stopsign.ts";
+import { STOP_SIGN_IMAGE_ID, stopSignImage, stopSigns, type StopSign } from "./stopsign.ts";
 import { makeProjector } from "./proj.ts";
 import { SnapshotBuffer, SeekGate } from "./snapshots.ts";
 import {
@@ -44,6 +44,17 @@ import {
 import { LaneIndex, laneSpeedRatios } from "./congestion.ts";
 import { edgeBoundaries } from "./edges.ts";
 import { subscribeSnapshots, requestSignalTable } from "./nats-client.ts";
+import {
+  BAKED_VEHICLE_GATE_ZOOM,
+  classifyOverlay,
+  loadBakedIndex,
+  resolveBakedUrl,
+  subscribeBaked,
+  type BakedIndex,
+  type BakedSubscription,
+} from "./baked.ts";
+import { furnitureHeads, parseFurniture, type BakedFurniture } from "./furniture.ts";
+import { Protocol as PMTilesProtocol } from "pmtiles";
 import type { MsgHdrs, NatsConnection } from "nats.ws";
 import { Hud } from "./status.ts";
 import { Legend } from "./legend.ts";
@@ -186,27 +197,67 @@ async function main(): Promise<void> {
     loadingHidden = true;
     loadingEl.style.display = "none";
   };
-  loadingMsg.textContent = `loading network ${cfg.networkUrl} …`;
+  loadingMsg.textContent =
+    cfg.bake !== null ? "loading baked replay index …" : `loading network ${cfg.networkUrl} …`;
 
   // ?bare=1: clean-canvas mode for screenshots — CSS hides the HUD chrome
   // and the loading overlay (which otherwise waits on a live engine).
   if (cfg.bare) document.body.classList.add("bare");
 
+  // Baked replay (ADR-0023): ?bake= selects the shim. Startup reads the
+  // index manifest (§5/§6.5) — projector from its frame descriptor, map
+  // fit from its bounds (replacing the geometry walk), network from its
+  // pmtiles/geojson entry, overlays from its overlay list; the chunked
+  // netload.ts path is skipped entirely on the PMTiles path.
+  const bakedIndex: BakedIndex | null = cfg.bake !== null ? await loadBakedIndex(cfg.bake) : null;
+  const bakedPmtiles = bakedIndex?.network.pmtiles !== undefined;
+  const netSourceLayer = bakedPmtiles ? (bakedIndex?.network.layer ?? "lanes") : null;
+
   // Network GeoJSON — chunked manifests (netload.ts) are reassembled
-  // here, so everything downstream sees one plain collection.
-  const net = await fetchNetwork(cfg.networkUrl);
-  if (net.type !== "FeatureCollection" || !Array.isArray(net.features)) {
-    throw new Error(`${cfg.networkUrl}: not a FeatureCollection`);
+  // here, so everything downstream sees one plain collection. Baked mode
+  // loads it only for a small-network GeoJSON bake (ADR-0023 §7: e.g.
+  // i280's 375 lanes need no tiles) — the PMTiles path ships no lane
+  // geometry to the browser at all.
+  const netUrl =
+    bakedIndex === null
+      ? cfg.networkUrl
+      : bakedIndex.network.geojson !== undefined
+        ? resolveBakedUrl(cfg.bake!, bakedIndex.network.geojson)
+        : null;
+  const net = netUrl !== null ? await fetchNetwork(netUrl) : null;
+  if (net !== null) {
+    if (net.type !== "FeatureCollection" || !Array.isArray(net.features)) {
+      throw new Error(`${netUrl}: not a FeatureCollection`);
+    }
+    if (!net.frame) throw new Error(`${netUrl}: missing "frame" descriptor`);
   }
-  if (!net.frame) throw new Error(`${cfg.networkUrl}: missing "frame" descriptor`);
-  const project = makeProjector(net.frame);
+  const frameDesc = net?.frame ?? bakedIndex?.frame;
+  if (frameDesc === undefined) throw new Error("no frame descriptor (network GeoJSON or baked index)");
+  const project = makeProjector(frameDesc);
 
   // Optional static overlays (zones + admin boundaries): already WGS84
   // lon/lat, so unlike the network they go to MapLibre unprojected. A 404
   // (demos without overlays) or a garbage doc just means "no overlay" —
   // parseOverlay/prepareZones (overlays.ts) also stamp the style
-  // classification (zkind/zrun) that the zone layers filter on.
-  const fetchOverlay = async (url: string): Promise<FeatureCollection | null> => {
+  // classification (zkind/zrun) that the zone layers filter on. Baked mode
+  // reads the manifest's overlay list (§5: bake copies the demo's
+  // /overlay/* set; absent = no overlays, exactly the live 404 semantic).
+  const overlayUrl = (kind: "zones" | "boundaries" | "water" | "buildings"): string | null => {
+    if (bakedIndex === null) {
+      return {
+        zones: cfg.zonesUrl,
+        boundaries: cfg.boundariesUrl,
+        water: cfg.waterUrl,
+        buildings: cfg.buildingsUrl,
+      }[kind];
+    }
+    for (const u of bakedIndex.overlays ?? []) {
+      if (classifyOverlay(u) === kind) return resolveBakedUrl(cfg.bake!, u);
+    }
+    return null;
+  };
+  const fetchOverlay = async (url: string | null): Promise<FeatureCollection | null> => {
+    if (url === null) return null;
     try {
       const res = await fetch(url);
       if (!res.ok) return null;
@@ -215,74 +266,124 @@ async function main(): Promise<void> {
       return null;
     }
   };
-  const [zonesFC, boundariesFC, waterFC] = await Promise.all([
-    fetchOverlay(cfg.zonesUrl).then((fc) => (fc === null ? null : prepareZones(fc))),
-    fetchOverlay(cfg.boundariesUrl),
-    fetchOverlay(cfg.waterUrl),
+  const [zonesFC, boundariesFC, waterFC, buildingsFC] = await Promise.all([
+    fetchOverlay(overlayUrl("zones")).then((fc) => (fc === null ? null : prepareZones(fc))),
+    fetchOverlay(overlayUrl("boundaries")),
+    fetchOverlay(overlayUrl("water")),
+    fetchOverlay(overlayUrl("buildings")).then((fc) => (fc === null ? null : prepareBuildings(fc))),
   ]);
 
   // Static channel: project lane polylines once (local metric → WGS84).
   // Engine export guarantees [x, y] pairs (engine/geojson.go) — validated.
-  const pair = (c: number[]): [number, number] => {
-    if (c.length < 2 || c[0] === undefined || c[1] === undefined) {
-      throw new Error(`${cfg.networkUrl}: malformed coordinate ${JSON.stringify(c)}`);
-    }
-    return [c[0], c[1]];
-  };
-  // Edge-group boundaries (edges.ts): lanes sharing the engine's lateral
-  // group are "the same road" — the casing layer reads the edgeB flag to
-  // draw the group's outer shell only, so a multi-lane road renders as one
-  // band with colored interior stripes instead of N independent roads.
-  const edgeBounds = edgeBoundaries(
-    net.features.map((f) => ({
-      id: String(f.id ?? f.properties?.["id"]),
-      edge: f.properties?.["edge"] as string | undefined,
-      edgeIndex: f.properties?.["edgeIndex"] as number | undefined,
-    })),
-  );
-  const lanes: Feature<LineString>[] = net.features.map((f) => ({
-    ...f,
-    properties: {
-      ...f.properties,
-      edgeB: edgeBounds.has(String(f.id ?? f.properties?.["id"])),
-    },
-    geometry: {
-      type: "LineString",
-      coordinates: f.geometry.coordinates.map((c) => project(...pair(c))),
-    },
-  }));
-  const networkFC: FeatureCollection = { type: "FeatureCollection", features: lanes };
-  const bounds = new maplibregl.LngLatBounds();
-  for (const f of lanes) for (const c of f.geometry.coordinates) bounds.extend(pair(c));
-
-  // Congestion inputs stay in the metric frame (vehicle positions arrive
-  // metric; nearest-lane matching happens there).
-  const laneIndex = new LaneIndex(
-    net.features.map((f) => ({
-      id: String(f.id ?? f.properties?.["id"]),
-      shape: f.geometry.coordinates as Array<[number, number]>,
-    })),
-  );
+  // Skipped on the PMTiles path (no lane geometry in the browser); in
+  // baked GeoJSON mode edgeB is still derived client-side (§7's single
+  // rendering contract), but the congestion/signal geometry indexes are
+  // LIVE-mode only (§6.1/§6.2: TSRL + furniture replace them).
+  let networkFC: FeatureCollection | null = null;
+  let laneIndex: LaneIndex | null = null;
   const speedLimitByLane = new Map<string, number>();
-  for (const f of net.features) {
-    speedLimitByLane.set(String(f.id ?? f.properties?.["id"]), Number(f.properties?.["speedLimit"]));
-  }
-  // Signal stop-lines resolve against the static geometry (local frame).
   const shapeByLane = new Map<string, Array<[number, number]>>();
-  for (const f of net.features) {
-    shapeByLane.set(String(f.id ?? f.properties?.["id"]), f.geometry.coordinates as Array<[number, number]>);
+  let stopSignPts: StopSign[] = [];
+  if (net !== null) {
+    const pair = (c: number[]): [number, number] => {
+      if (c.length < 2 || c[0] === undefined || c[1] === undefined) {
+        throw new Error(`${netUrl}: malformed coordinate ${JSON.stringify(c)}`);
+      }
+      return [c[0], c[1]];
+    };
+    // Edge-group boundaries (edges.ts): lanes sharing the engine's lateral
+    // group are "the same road" — the casing layer reads the edgeB flag to
+    // draw the group's outer shell only, so a multi-lane road renders as one
+    // band with colored interior stripes instead of N independent roads.
+    const edgeBounds = edgeBoundaries(
+      net.features.map((f) => ({
+        id: String(f.id ?? f.properties?.["id"]),
+        edge: f.properties?.["edge"] as string | undefined,
+        edgeIndex: f.properties?.["edgeIndex"] as number | undefined,
+      })),
+    );
+    const lanes: Feature<LineString>[] = net.features.map((f) => ({
+      ...f,
+      properties: {
+        ...f.properties,
+        edgeB: edgeBounds.has(String(f.id ?? f.properties?.["id"])),
+      },
+      geometry: {
+        type: "LineString",
+        coordinates: f.geometry.coordinates.map((c) => project(...pair(c))),
+      },
+    }));
+    networkFC = { type: "FeatureCollection", features: lanes };
+    if (bakedIndex === null) {
+      // Congestion inputs stay in the metric frame (vehicle positions arrive
+      // metric; nearest-lane matching happens there).
+      laneIndex = new LaneIndex(
+        net.features.map((f) => ({
+          id: String(f.id ?? f.properties?.["id"]),
+          shape: f.geometry.coordinates as Array<[number, number]>,
+        })),
+      );
+      for (const f of net.features) {
+        speedLimitByLane.set(String(f.id ?? f.properties?.["id"]), Number(f.properties?.["speedLimit"]));
+      }
+      // Signal stop-lines resolve against the static geometry (local frame).
+      for (const f of net.features) {
+        shapeByLane.set(String(f.id ?? f.properties?.["id"]), f.geometry.coordinates as Array<[number, number]>);
+      }
+      // Stop signs (stopsign.ts, ADR-0010 row/junction lane properties): one
+      // sign per stop-controlled approach cluster, resolved ONCE from the
+      // static geometry — no feature-state channel, no per-tick update.
+      stopSignPts = stopSigns(
+        net.features.map((f) => ({
+          id: String(f.id ?? f.properties?.["id"]),
+          row: String(f.properties?.["row"] ?? ""),
+          junction: String(f.properties?.["junction"] ?? ""),
+          shape: f.geometry.coordinates as Array<[number, number]>,
+        })),
+      );
+    }
   }
-  // Stop signs (stopsign.ts, ADR-0010 row/junction lane properties): one
-  // sign per stop-controlled approach cluster, resolved ONCE from the
-  // static geometry — no feature-state channel, no per-tick update.
-  const stopSignPts = stopSigns(
-    net.features.map((f) => ({
-      id: String(f.id ?? f.properties?.["id"]),
-      row: String(f.properties?.["row"] ?? ""),
-      junction: String(f.properties?.["junction"] ?? ""),
-      shape: f.geometry.coordinates as Array<[number, number]>,
-    })),
-  );
+
+  // Map fit: the index's bounds in baked mode (§5 — replaces the geometry
+  // walk, which needs lane geometry the PMTiles path never fetches).
+  let bounds = new maplibregl.LngLatBounds();
+  if (bakedIndex !== null) {
+    bounds = new maplibregl.LngLatBounds(
+      [bakedIndex.bounds[0], bakedIndex.bounds[1]],
+      [bakedIndex.bounds[2], bakedIndex.bounds[3]],
+    );
+  } else if (networkFC !== null) {
+    for (const f of networkFC.features) {
+      for (const c of (f.geometry as LineString).coordinates) bounds.extend(c as [number, number]);
+    }
+  }
+
+  // Baked furniture (§6.2): signal heads, stop bars, and stop signs arrive
+  // pre-derived in furniture.geojson (metric coords — the browser holds no
+  // lane geometry to derive them from on the PMTiles path). Heads join to
+  // TSSG programs by the baked binding when the table lands
+  // (ensureSignalSource); stop signs are static like the live path's.
+  let furniture: BakedFurniture | null = null;
+  if (bakedIndex !== null && bakedIndex.furniture !== undefined) {
+    try {
+      const res = await fetch(resolveBakedUrl(cfg.bake!, bakedIndex.furniture));
+      if (res.ok) {
+        furniture = parseFurniture((await res.json()) as FeatureCollection);
+        stopSignPts = furniture.signs;
+      }
+    } catch {
+      furniture = null; // a bake without furniture renders without heads/signs
+    }
+  }
+
+  // PMTiles network source (§7): MapLibre 5.24 bundles no pmtiles
+  // protocol — register the official companion package. The archive is
+  // served IDENTITY (§8's deployment contract: the client reads it by
+  // Range-requested byte offsets, so no Content-Encoding on the object).
+  if (bakedPmtiles) {
+    const protocol = new PMTilesProtocol();
+    maplibregl.addProtocol("pmtiles", protocol.tile);
+  }
 
   const map = new maplibregl.Map({
     container: "map",
@@ -298,8 +399,16 @@ async function main(): Promise<void> {
   // the ?dt= URL hint and is REPLACED by the recorded run's authoritative
   // dt on the replay panel's first status probe (the onStatus hook below)
   // — a direct/stale deep link must not leave any consumer on the hint.
-  let currentDt = cfg.dt;
+  // Baked mode starts on the index's dt directly (§6: same authority).
+  let currentDt = bakedIndex?.dt ?? cfg.dt;
   const buffer = new SnapshotBuffer(cfg.bufferMs, currentDt);
+  // Baked mode sizes the interpolation buffer to the delivery cadence
+  // (ADR-0023 §2: at 2 Hz the 500 ms frame interval exceeds the 250 ms
+  // default, so the buffer tracks 1.25 × frameInterval / speed — 625 ms
+  // at 1×). The panel's onStatus hook re-sizes on speed changes.
+  if (bakedIndex !== null) {
+    buffer.setBufferMs(Math.max(250, 1.25 * bakedIndex.bakeEveryTicks * bakedIndex.dt * 1000));
+  }
   const seekGate = new SeekGate(currentDt);
   const applied = new Map<number, RenderedVehicle>();
   const appliedTrailers = new Map<number, RenderedTrailer>();
@@ -403,7 +512,10 @@ async function main(): Promise<void> {
   // changes ride feature-state below.
   function ensureSignalSource(): void {
     if (!mapReady || sigTable === null) return;
-    const heads = signalHeads(sigTable, shapeByLane);
+    // Baked mode joins pre-derived furniture heads to the table's programs
+    // by the baked binding (§6.2); the live path derives heads from the
+    // static lane geometry (signals.ts).
+    const heads = furniture !== null ? furnitureHeads(furniture, sigTable) : signalHeads(sigTable, shapeByLane);
     sigDebug.pts = heads.length;
     const key = heads.map((h) => h.id).join(",");
     // Always take the LATEST table's program objects: a republished table
@@ -470,7 +582,82 @@ async function main(): Promise<void> {
         paint: { "fill-color": theme.water },
       });
     }
-    map.addSource("network", { type: "geojson", data: networkFC, promoteId: "id" });
+    // Buildings SECOND: on top of the water fill (they stand on land) but
+    // still under every road layer — footprints are context, they must
+    // never hide the network. Source is added even when the overlay 404'd
+    // (EMPTY_FC) so the layer ids layertoggles.ts names always exist.
+    //
+    // Zoom-gated to >=14 like the signal heads / junction interiors (WQ-1,
+    // WQ-3): chi-loop alone is 42k polygons and at city zoom they are a
+    // solid smear over the roads. A fill (not fill-extrusion) because the
+    // camera is top-down — extrusion draws in a separate 3D pass that
+    // cannot be ordered under line layers, which is exactly the property
+    // this layer needs.
+    map.addSource("buildings", {
+      type: "geojson",
+      data: buildingsFC ?? EMPTY_FC,
+    });
+    // Kind → hue (residential vs workplace is the point of the layer);
+    // both fill and outline read the same expression so they can't drift.
+    const buildingColor: maplibregl.ExpressionSpecification = [
+      "match",
+      ["get", "bkind"],
+      "residential", theme.buildingResidential,
+      "workplace", theme.buildingWorkplace,
+      theme.buildingOther,
+    ];
+    // Storeys drive opacity, so a 60-storey tower reads as a tower on a
+    // flat map: 1 storey barely tints, 40+ is a solid block. Scaled down at
+    // the minzoom boundary so the layer fades in instead of popping — and
+    // written as ONE top-level zoom interpolate whose stop outputs are the
+    // storey ramp, because MapLibre rejects ["zoom"] anywhere but as the
+    // direct input of a top-level step/interpolate (so the obvious
+    // ["*", zoomRamp, storeyRamp] does not validate).
+    const storeyOpacity = (scale: number): maplibregl.ExpressionSpecification =>
+      [
+        "interpolate", ["linear"], ["to-number", ["get", "blevels"], 1],
+        1, 0.16 * scale,
+        4, 0.28 * scale,
+        20, 0.55 * scale,
+        40, 0.72 * scale,
+      ] as maplibregl.ExpressionSpecification;
+    const buildingWeight: maplibregl.ExpressionSpecification = [
+      "interpolate", ["linear"], ["zoom"],
+      14, storeyOpacity(0.35),
+      15.5, storeyOpacity(1),
+    ];
+    map.addLayer({
+      id: "buildings-fill",
+      type: "fill",
+      source: "buildings",
+      minzoom: 14,
+      paint: { "fill-color": buildingColor, "fill-opacity": buildingWeight },
+    });
+    // Outline only once individual footprints are worth resolving —
+    // at z14 it would just thicken the smear.
+    map.addLayer({
+      id: "buildings-outline",
+      type: "line",
+      source: "buildings",
+      minzoom: 16,
+      paint: {
+        "line-color": buildingColor,
+        "line-opacity": ["interpolate", ["linear"], ["zoom"], 16, 0, 17, 0.5],
+        "line-width": 0.8,
+      },
+    });
+    // The network source: PMTiles vector tiles in baked city-scale mode
+    // (§7 — promoteId "id" makes tile-split pieces of one lane share its
+    // feature-state), GeoJSON otherwise (live, and small-network bakes).
+    if (netSourceLayer !== null && bakedIndex?.network.pmtiles !== undefined) {
+      map.addSource("network", {
+        type: "vector",
+        url: `pmtiles://${bakedIndex.network.pmtiles}`,
+        promoteId: bakedIndex.network.promoteId,
+      });
+    } else {
+      map.addSource("network", { type: "geojson", data: networkFC ?? EMPTY_FC, promoteId: "id" });
+    }
     map.addSource("vehicles", { type: "geojson", data: EMPTY_FC, promoteId: "id" });
     // Lane paint shared by the external and internal layer pairs below so
     // the two can't drift (WQ-3). Junction interiors (internal:true) are
@@ -510,6 +697,9 @@ async function main(): Promise<void> {
     };
     const externalOnly: maplibregl.FilterSpecification = ["!=", ["get", "internal"], true];
     const internalOnly: maplibregl.FilterSpecification = ["==", ["get", "internal"], true];
+    // Vector (PMTiles) layers MUST name their source-layer (§6.3); GeoJSON
+    // sources must not carry one. One spread keeps the two paths in lockstep.
+    const srcLayer = netSourceLayer !== null ? { "source-layer": netSourceLayer } : {};
     // Order matters: BOTH casings below BOTH congestion lines (review
     // round 1) — an internal casing's round end-cap is wider than the
     // line and would overpaint the external lane's congestion color at
@@ -518,6 +708,7 @@ async function main(): Promise<void> {
       id: "network-casing",
       type: "line",
       source: "network",
+      ...srcLayer,
       filter: externalOnly,
       layout: laneLayout,
       paint: casingPaint,
@@ -526,6 +717,7 @@ async function main(): Promise<void> {
       id: "network-internal-casing",
       type: "line",
       source: "network",
+      ...srcLayer,
       minzoom: 13,
       filter: internalOnly,
       layout: laneLayout,
@@ -535,6 +727,7 @@ async function main(): Promise<void> {
       id: "network-line",
       type: "line",
       source: "network",
+      ...srcLayer,
       filter: externalOnly,
       layout: laneLayout,
       paint: linePaint,
@@ -543,6 +736,7 @@ async function main(): Promise<void> {
       id: "network-internal-line",
       type: "line",
       source: "network",
+      ...srcLayer,
       minzoom: 13,
       filter: internalOnly,
       layout: laneLayout,
@@ -658,12 +852,17 @@ async function main(): Promise<void> {
       map.addImage(b.id, b.image, { sdf: true });
     }
     // Trailers UNDER vehicles: the tractor overlaps the trailer nose at
-    // the hitch, which reads as the pivot joint.
+    // the hitch, which reads as the pivot joint. Baked mode gates both
+    // vehicle layers to z13 (§6.4 — the zoom at which the last road class
+    // appears, so dots never float over invisible streets); below the gate
+    // the shim schedules no region fetches and emits clock-only frames.
+    const vehicleGate = bakedIndex !== null ? { minzoom: BAKED_VEHICLE_GATE_ZOOM } : {};
     map.addSource("trailers", { type: "geojson", data: EMPTY_FC, promoteId: "id" });
     map.addLayer({
       id: "trailers",
       type: "symbol",
       source: "trailers",
+      ...vehicleGate,
       layout: {
         "icon-image": TRAILER_IMAGE_ID,
         "icon-rotation-alignment": "map",
@@ -689,6 +888,7 @@ async function main(): Promise<void> {
       id: "vehicles",
       type: "symbol",
       source: "vehicles",
+      ...vehicleGate,
       layout: {
         "icon-image": ["match", ["get", "cls"], 0, glyphImageId(glyphByCls(0)), TRACTOR_IMAGE_ID],
         "icon-rotation-alignment": "map",
@@ -867,49 +1067,85 @@ async function main(): Promise<void> {
     applyLayerToggles(); // a legend click may have beaten the style load
   });
 
-  hud.setConnection(false, `connecting to ${cfg.ws} …`);
-  loadingMsg.textContent = `connecting to ${cfg.ws} …`;
-  const snapSub = await subscribeSnapshots(
-    cfg.ws,
-    cfg.run,
-    (data) => {
-      try {
-        const frame = decodeFrame(data);
-        // Replay seek (replaypanel.ts): the stream jumps — BACKWARD to a
-        // lower tick, or FORWARD past SeekGate's maxJump on a scrub-ahead.
-        // Everything the pre-seek stream painted belongs to states the
-        // seek abandoned; resetForSeek drops it (a lerp across the jump
-        // would smear vehicles and derive bogus speeds, lanes keep stale
-        // colors otherwise) and the new frame lands fresh. Duplicate ticks
-        // (paused republication) are not seeks; push's own drop handles
-        // them.
-        if (seekGate.observe(frame.tick)) resetForSeek();
-        buffer.push(frame, performance.now());
-      } catch (err) {
-        hud.setConnection(false, String(err));
-      }
-    },
-    handleSigMessage,
-    (connected, detail) => {
-      hud.setConnection(connected, `${detail}  ·  run ${cfg.run}`);
-      // The overlay covers the HUD until the first sample — mirror the
-      // connection state into it or a pre-snapshot drop reads as a hang.
-      if (!loadingHidden) {
-        loadingMsg.textContent = connected
-          ? "connected — waiting for the engine's first snapshot (world build) …"
-          : `connection lost before the first snapshot — ${detail}`;
-      }
-      if (connected && wasConnected === false) {
-        // Reconnect: the pull budget may have burned out while down, and
-        // paused replay never rebroadcasts — re-arm and pull (sol review).
-        sigReqRetries = 0;
-        requestSig();
-      }
-      wasConnected = connected;
-    },
-  );
+  // Baked mode viewport → shim (§6.4/§4): at/above the z13 gate the shim
+  // subscribes the viewport's region set and refetches on pan (debounced);
+  // below it, no vehicle fetches at all. Crossing BELOW the gate also
+  // CLEARS the applied vehicle diff state — today nothing ever hides the
+  // layer, so without this the last fetched frame would freeze on screen.
+  let bakedSub: BakedSubscription | null = null;
+  let aboveVehicleGate = false;
+  const reportViewport = (): void => {
+    if (bakedSub === null) return;
+    const b = map.getBounds();
+    bakedSub.setViewport([b.getWest(), b.getSouth(), b.getEast(), b.getNorth()], map.getZoom());
+    const above = map.getZoom() >= BAKED_VEHICLE_GATE_ZOOM;
+    if (above === aboveVehicleGate) return;
+    aboveVehicleGate = above;
+    if (!above && mapReady) {
+      (map.getSource("vehicles") as maplibregl.GeoJSONSource).updateData({ removeAll: true });
+      (map.getSource("trailers") as maplibregl.GeoJSONSource).updateData({ removeAll: true });
+      applied.clear();
+      appliedTrailers.clear();
+      artic.reset();
+      prevSampleTick = null; // the post-gate frame must not kick the trailer
+    }
+  };
+  let viewportTimer: number | null = null;
+  map.on("moveend", () => {
+    if (viewportTimer !== null) window.clearTimeout(viewportTimer);
+    viewportTimer = window.setTimeout(() => {
+      viewportTimer = null;
+      reportViewport();
+    }, 200);
+  });
+
+  hud.setConnection(false, cfg.bake !== null ? "loading baked replay …" : `connecting to ${cfg.ws} …`);
+  loadingMsg.textContent = cfg.bake !== null ? "loading baked replay …" : `connecting to ${cfg.ws} …`;
+  const onSnapFrame = (data: Uint8Array): void => {
+    try {
+      const frame = decodeFrame(data);
+      // Replay seek (replaypanel.ts): the stream jumps — BACKWARD to a
+      // lower tick, or FORWARD past SeekGate's maxJump on a scrub-ahead.
+      // Everything the pre-seek stream painted belongs to states the
+      // seek abandoned; resetForSeek drops it (a lerp across the jump
+      // would smear vehicles and derive bogus speeds, lanes keep stale
+      // colors otherwise) and the new frame lands fresh. Duplicate ticks
+      // (paused republication) are not seeks; push's own drop handles
+      // them.
+      if (seekGate.observe(frame.tick)) resetForSeek();
+      buffer.push(frame, performance.now());
+    } catch (err) {
+      hud.setConnection(false, String(err));
+    }
+  };
+  const onSnapStatus = (connected: boolean, detail: string): void => {
+    hud.setConnection(connected, `${detail}  ·  run ${cfg.run}`);
+    // The overlay covers the HUD until the first sample — mirror the
+    // connection state into it or a pre-snapshot drop reads as a hang.
+    if (!loadingHidden) {
+      loadingMsg.textContent = connected
+        ? "connected — waiting for the engine's first snapshot (world build) …"
+        : `connection lost before the first snapshot — ${detail}`;
+    }
+    if (connected && wasConnected === false) {
+      // Reconnect: the pull budget may have burned out while down, and
+      // paused replay never rebroadcasts — re-arm and pull (sol review).
+      sigReqRetries = 0;
+      requestSig();
+    }
+    wasConnected = connected;
+  };
+  // Baked mode (ADR-0023 §6): the shim replaces the NATS transport —
+  // synthetic TSSF/TSSG from static artifacts, nc null (the ADR-0016 pull
+  // below no-ops on its guard), the control plane served by its FetchLike
+  // stub (injected into the ReplayPanel below).
+  const snapSub =
+    cfg.bake !== null
+      ? (bakedSub = await subscribeBaked(cfg.bake, onSnapFrame, handleSigMessage, onSnapStatus))
+      : await subscribeSnapshots(cfg.ws, cfg.run, onSnapFrame, handleSigMessage, onSnapStatus);
   natsConn = snapSub.nc;
   requestSig(); // attach-time pull (ADR-0016 §3): don't wait out a catch-up round
+  reportViewport(); // the shim's first region set + vehicle-gate state
 
   // Startup watchdog: 20 s connected with no first sample usually means the
   // broker on the ws port isn't streaming THIS run (foreign engine, dead
@@ -934,7 +1170,7 @@ async function main(): Promise<void> {
   function clearCongestion(): void {
     if (mapReady) {
       for (const laneId of prevRatios.keys()) {
-        map.removeFeatureState({ source: "network", id: laneId });
+        map.removeFeatureState(netTarget(laneId));
       }
     }
     prevRatios = new Map();
@@ -951,11 +1187,37 @@ async function main(): Promise<void> {
     artic.reset();
     prevSampleTick = null; // the landing tick must not kick the trailer
   }
+  // netTarget builds a lane's feature-state identifier: PMTiles (vector)
+  // sources REQUIRE sourceLayer (§6.3 — omitting it is fine for GeoJSON,
+  // mandatory for vector); GeoJSON sources must not carry one.
+  const netTarget = (laneId: string): maplibregl.FeatureIdentifier =>
+    netSourceLayer !== null
+      ? { source: "network", sourceLayer: netSourceLayer, id: laneId }
+      : { source: "network", id: laneId };
   function updateCongestion(nowMs: number): void {
     if (!mapReady || nowMs - lastCongestionMs < 1000) return;
     lastCongestionMs = nowMs;
     const sample = buffer.sample(nowMs);
     if (!sample) return;
+    if (bakedSub !== null) {
+      // Baked mode (§6.1): the TSRL aggregate stream REPLACES the client
+      // derivation (§4: instantaneous per-lane mean speed/limit read from
+      // engine state at bake time — authoritative, and available at every
+      // zoom; lane coloring ALWAYS reads TSRL). Diffed like the live path.
+      const ratios = bakedSub.laneRatiosAt(sample.tick);
+      if (ratios === null) return; // lanes.json/chunks not landed — keep the previous paint
+      for (const [laneId, ratio] of ratios) {
+        if (prevRatios.get(laneId) !== ratio) {
+          map.setFeatureState(netTarget(laneId), { ratio });
+        }
+      }
+      for (const laneId of prevRatios.keys()) {
+        if (!ratios.has(laneId)) map.removeFeatureState(netTarget(laneId));
+      }
+      prevRatios = ratios;
+      return;
+    }
+    if (laneIndex === null) return; // unreachable live (index built above), keeps TS honest
     const speedsByLane = new Map<string, number[]>();
     for (const v of sample.vehicles) {
       const laneId = laneIndex.nearestLane(v.x, v.y, 6);
@@ -967,11 +1229,11 @@ async function main(): Promise<void> {
     const ratios = laneSpeedRatios(speedsByLane, speedLimitByLane);
     for (const [laneId, ratio] of ratios) {
       if (prevRatios.get(laneId) !== ratio) {
-        map.setFeatureState({ source: "network", id: laneId }, { ratio });
+        map.setFeatureState(netTarget(laneId), { ratio });
       }
     }
     for (const laneId of prevRatios.keys()) {
-      if (!ratios.has(laneId)) map.removeFeatureState({ source: "network", id: laneId });
+      if (!ratios.has(laneId)) map.removeFeatureState(netTarget(laneId));
     }
     prevRatios = ratios;
   }
@@ -999,8 +1261,18 @@ async function main(): Promise<void> {
     // probe/ctl binds cfg.run, so a stale deep link for another recording
     // 409s into the mismatch hint instead of adopting the active replay.
     expectedRun: cfg.run,
+    // Baked mode (§6): the shim's FetchLike stub answers the panel's exact
+    // /api/replay/* routes — the panel code is unchanged, real fetch is
+    // never consulted.
+    ...(bakedSub !== null ? { fetchFn: bakedSub.fetchFn } : {}),
     onSeeking: resetForSeek,
     onStatus: (s) => {
+      // Baked mode (§2): the interpolation buffer tracks the delivery
+      // cadence × playback speed — max(250, 1.25 × frameInterval/speed),
+      // 625 ms at the 2 Hz bake at 1×.
+      if (bakedIndex !== null && s.dt > 0 && s.speed > 0) {
+        buffer.setBufferMs(Math.max(250, (1.25 * bakedIndex.bakeEveryTicks * s.dt * 1000) / s.speed));
+      }
       if (s.dt <= 0 || s.dt === currentDt) return; // dt is constant per run
       console.warn(
         `replay status dt ${s.dt} ≠ config dt ${currentDt} — ` +

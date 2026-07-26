@@ -7,7 +7,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { parseOverlay, prepareZones, zoneKind, zoneRunnable } from "../src/overlays.ts";
+import {
+  buildingKind,
+  buildingLevels,
+  parseOverlay,
+  prepareBuildings,
+  prepareZones,
+  zoneKind,
+  zoneRunnable,
+} from "../src/overlays.ts";
 
 test("parseOverlay accepts a FeatureCollection and keeps it verbatim", () => {
   const fc = {
@@ -86,4 +94,49 @@ test("prepareZones stamps zkind/zrun and falls back from label to name", () => {
   assert.equal(c?.properties?.["zkind"], "corridor");
   assert.equal(c?.properties?.["zrun"], 1);
   assert.equal(c?.properties?.["label"], "i90"); // label fell back to name
+});
+
+test("buildingKind: only the two demand kinds are recognised, all else is other", () => {
+  assert.equal(buildingKind({ kind: "residential" }), "residential");
+  assert.equal(buildingKind({ kind: "workplace" }), "workplace");
+  assert.equal(buildingKind({ kind: "other" }), "other");
+  assert.equal(buildingKind({ kind: "Residential" }), "other"); // case-sensitive
+  assert.equal(buildingKind({ kind: 7 }), "other");
+  assert.equal(buildingKind({}), "other");
+  assert.equal(buildingKind(null), "other");
+});
+
+test("buildingLevels clamps to a storey count >= 1 the opacity ramp can interpolate", () => {
+  assert.equal(buildingLevels({ levels: 83 }), 83);
+  assert.equal(buildingLevels({ levels: "12" }), 12); // JSON string coerces
+  assert.equal(buildingLevels({ levels: 2.6 }), 3); // rounded
+  assert.equal(buildingLevels({ levels: 0 }), 1);
+  assert.equal(buildingLevels({ levels: -4 }), 1);
+  assert.equal(buildingLevels({ levels: "tall" }), 1);
+  assert.equal(buildingLevels({}), 1);
+  assert.equal(buildingLevels(null), 1);
+});
+
+test("prepareBuildings stamps bkind/blevels and keeps the original properties", () => {
+  const fc = prepareBuildings({
+    type: "FeatureCollection",
+    features: [
+      {
+        type: "Feature",
+        properties: { osm_id: "w64388609", kind: "workplace", levels: 83, name: "Aon Center" },
+        geometry: { type: "Polygon", coordinates: [[[0, 0], [1, 0], [1, 1], [0, 0]]] },
+      },
+      {
+        type: "Feature",
+        properties: { osm_id: "w1", kind: "garage" },
+        geometry: { type: "Polygon", coordinates: [[[0, 0], [1, 0], [1, 1], [0, 0]]] },
+      },
+    ],
+  });
+  const [tower, junk] = fc.features;
+  assert.equal(tower?.properties?.["bkind"], "workplace");
+  assert.equal(tower?.properties?.["blevels"], 83);
+  assert.equal(tower?.properties?.["name"], "Aon Center");
+  assert.equal(junk?.properties?.["bkind"], "other"); // unknown kind → context fill
+  assert.equal(junk?.properties?.["blevels"], 1); // missing levels → floor of the ramp
 });

@@ -63,6 +63,19 @@ type laneDeniedJSON struct {
 	Served  int     `json:"served"`
 }
 
+// demandJSON reports how much of the scenario's demand became vehicles.
+// It rides in the metrics document because delivery is a VALIDITY flag on
+// every other number here: a run that injected 16% of what its scenario
+// asked for is not that scenario, and nothing else in this document would
+// say so — expiry is not a denial, so denied_* reads clean through it.
+type demandJSON struct {
+	Injected       int     `json:"injected"`
+	Expired        int     `json:"expired"`
+	DeadOnArrival  int     `json:"dead_on_arrival"`
+	DeliveredFrac  float64 `json:"delivered_frac"`
+	LastInjectTick uint64  `json:"last_inject_tick"`
+}
+
 type totalsJSON struct {
 	CompletedTrips   int              `json:"completed_trips"`
 	ActiveAtHorizon  int              `json:"active_at_horizon"`
@@ -75,6 +88,16 @@ type totalsJSON struct {
 	DeniedServed     int              `json:"denied_served"`
 	DroppedCrossings int              `json:"dropped_crossings"`
 	DeniedByLane     []laneDeniedJSON `json:"denied_by_lane"`
+	Demand           *demandJSON      `json:"demand,omitempty"`
+}
+
+// DemandDelivery carries the kernel's director spawn tallies into the
+// metrics document. Optional: runs with no director demand omit it.
+type DemandDelivery struct {
+	Injected       int
+	Expired        int
+	DeadOnArrival  int
+	LastInjectTick uint64
 }
 
 // WriteMetricsJSON drains k's remaining interval and trip records, reads its
@@ -82,7 +105,7 @@ type totalsJSON struct {
 // to w. ticks is the run horizon. Drain order is already the canonical sort;
 // the denied-by-lane array is sorted by lane ID (the Totals.DeniedByLane
 // emission contract — never a bare map).
-func WriteMetricsJSON(w io.Writer, k *Kernel, ticks uint64) error {
+func WriteMetricsJSON(w io.Writer, k *Kernel, ticks uint64, dd ...DemandDelivery) error {
 	intervals := k.DrainIntervals()
 	trips := k.DrainTrips()
 	tot := k.Totals()
@@ -145,6 +168,18 @@ func WriteMetricsJSON(w io.Writer, k *Kernel, ticks uint64) error {
 		DeniedServed:     tot.DeniedServed,
 		DroppedCrossings: tot.DroppedCrossings,
 		DeniedByLane:     make([]laneDeniedJSON, 0, len(lanes)),
+	}
+	for _, d := range dd {
+		if d.Injected+d.Expired == 0 {
+			continue
+		}
+		doc.Totals.Demand = &demandJSON{
+			Injected:       d.Injected,
+			Expired:        d.Expired,
+			DeadOnArrival:  d.DeadOnArrival,
+			DeliveredFrac:  float64(d.Injected) / float64(d.Injected+d.Expired),
+			LastInjectTick: d.LastInjectTick,
+		}
 	}
 	for _, id := range lanes {
 		ld := tot.DeniedByLane[id]

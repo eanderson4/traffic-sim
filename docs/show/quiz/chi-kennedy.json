@@ -1,0 +1,83 @@
+{
+  "title": "Kennedy corridor",
+  "baseline": "base",
+  "metric": "speed_kmh",
+  "seeds": 8,
+  "ticks": 12000,
+  "winner": "truck-ban",
+  "options": [
+    {
+      "name": "truck-ban",
+      "label": "Peak-hour freight ban \u2014 no trucks on the corridor",
+      "delta_pct": 3.9479800721247553,
+      "p": 4.98504658528982e-07,
+      "cohen_d": 6.171209349615678,
+      "verdict": "UPGRADE",
+      "carries_traffic": true
+    },
+    {
+      "name": "speed-harmonise",
+      "label": "Speed harmonisation \u2014 80 km/h posted on the mainline",
+      "delta_pct": -3.067106226136665,
+      "p": 1.5611520060239858e-05,
+      "cohen_d": -3.7081595386810537,
+      "verdict": "WORSE",
+      "carries_traffic": false
+    },
+    {
+      "name": "mainline-widen",
+      "label": "Widen the mainline \u2014 one extra lane each way",
+      "delta_pct": 0.6715901805169189,
+      "p": 0.08895512200374124,
+      "cohen_d": 0.6979414563559267,
+      "verdict": "no-op (n.s.)",
+      "carries_traffic": true
+    },
+    {
+      "name": "ramp-widen",
+      "label": "Widen the on-ramps \u2014 longer, wider merge lanes",
+      "delta_pct": -0.263383049731266,
+      "p": 0.34564641489708325,
+      "cohen_d": -0.3574683628364642,
+      "verdict": "no-op (n.s.)",
+      "carries_traffic": true
+    }
+  ],
+  "all_tested": {
+    "mainline-widen": {
+      "delta_pct": 0.6715901805169189,
+      "p": 0.08895512200374124,
+      "verdict": "no-op (n.s.)"
+    },
+    "ramp-meter": {
+      "delta_pct": 1.0979736466039598,
+      "p": 0.002175754786789456,
+      "verdict": "UPGRADE"
+    },
+    "ramp-widen": {
+      "delta_pct": -0.263383049731266,
+      "p": 0.34564641489708325,
+      "verdict": "no-op (n.s.)"
+    },
+    "retime": {
+      "delta_pct": 0.03292996661854998,
+      "p": 0.8931677246493671,
+      "verdict": "no-op (n.s.)"
+    },
+    "speed-harmonise": {
+      "delta_pct": -3.067106226136665,
+      "p": 1.5611520060239858e-05,
+      "verdict": "WORSE"
+    },
+    "transit-5": {
+      "delta_pct": 2.7582080861679583,
+      "p": 5.5567955348242046e-06,
+      "verdict": "UPGRADE"
+    },
+    "truck-ban": {
+      "delta_pct": 3.9479800721247553,
+      "p": 4.98504658528982e-07,
+      "verdict": "UPGRADE"
+    }
+  }
+}

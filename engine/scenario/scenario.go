@@ -111,6 +111,20 @@ type Flow struct {
 	VTypes  map[string]float64 `yaml:"vtypes,omitempty"`
 	Slices  []Slice            `yaml:"slices,omitempty"`
 	UntilS  float64            `yaml:"until_s,omitempty"`
+	// Destinations is an optional weighted destination-lane distribution
+	// (ADR-0021): the director draws one per vehicle and the engine ends
+	// the trip there. Weights are relative, drawn over the SORTED key list
+	// exactly like VTypes — Go map order can never reach a sampled path
+	// (ADR-0005). Empty leaves the vehicle unrouted, so the driver's own
+	// exit routing (ADR-0019) still applies.
+	Destinations map[string]float64 `yaml:"destinations,omitempty"`
+	// OffsetM is the injection position along the origin lane in meters.
+	// Zero (omitted) means a boundary PORTAL and the origin must be one.
+	// A positive value is the interior-origin opt-in (ADR-0021): a
+	// mid-block garage or driveway. The explicitness is the safety
+	// property — a mistyped portal id cannot silently become a
+	// mid-network injection.
+	OffsetM float64 `yaml:"offset_m,omitempty"`
 }
 
 // Slice is one piecewise-constant demand window [StartS, EndS) in sim
@@ -128,7 +142,7 @@ type Scenario struct {
 	Demands  []*DemandFile  // aligned with Manifest.Demand
 	Metrics  []*MetricsFile // aligned with Manifest.Metrics
 	NetPath  string         // resolved network path (absolute)
-	origins  map[string]bool
+	lanes    *netLanes
 	parts    []hashPart // everything the content hash covers
 }
 
@@ -210,10 +224,7 @@ func Load(dir string) (*Scenario, error) {
 		return nil, fmt.Errorf("scenario network %s: %w", m.Network, err)
 	}
 	s.NetPath = netPath
-	s.origins = make(map[string]bool, len(net.Origins))
-	for _, l := range net.Origins {
-		s.origins[l.ID] = true
-	}
+	s.lanes = newNetLanes(net)
 	s.parts = append(s.parts, hashPart{rel: m.Network, data: canonicalJSON(rawNet, m.Network)})
 
 	typeSet := make(map[string]bool, len(m.Types))
@@ -225,7 +236,7 @@ func Load(dir string) (*Scenario, error) {
 		if err != nil {
 			return nil, fmt.Errorf("scenario demand: %w", err)
 		}
-		df, canonical, err := loadDemandFile(p, s.origins, typeSet)
+		df, canonical, err := loadDemandFile(p, s.lanes, typeSet)
 		if err != nil {
 			return nil, fmt.Errorf("scenario demand %s: %w", ref, err)
 		}
@@ -282,22 +293,90 @@ func LoadDemandFile(path string) (*DemandFile, error) {
 	return df, err
 }
 
-func loadDemandFile(path string, origins, typeSet map[string]bool) (*DemandFile, []byte, error) {
+// netLanes is the network view demand validation needs: which lanes are
+// boundary portals, and the length of EVERY lane — interior injection
+// offsets and destination ids are checked against the whole lane set, not
+// just the portals. A nil *netLanes disables the network-dependent checks
+// (the network-free load path used by `scenario fmt`).
+type netLanes struct {
+	origin  map[string]bool
+	length  map[string]float64
+	endWall map[string]bool
+}
+
+// validateDestinations checks a flow's weighted destination distribution
+// (ADR-0021): every key must name a lane of the network and every weight
+// must be a positive finite number. An empty map is valid and means
+// "unrouted" — a zero-weight or negative entry is not, because it would be
+// dead config that silently never draws.
+func validateDestinations(where string, dests map[string]float64, lanes *netLanes) error {
+	if len(dests) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(dests))
+	for n := range dests {
+		names = append(names, n)
+	}
+	sort.Strings(names) // errors must not depend on map order
+	for _, n := range names {
+		w := dests[n]
+		if err := finite(fmt.Sprintf("%s destination %q weight", where, n), w); err != nil {
+			return err
+		}
+		if w <= 0 {
+			return fmt.Errorf("%s: destination %q weight must be > 0", where, n)
+		}
+		if lanes != nil {
+			if _, ok := lanes.length[n]; !ok {
+				return fmt.Errorf("%s: destination %q is not a lane of the network", where, n)
+			}
+			// Arrival is S > Lane.Length, but an EndWall lane stops its
+			// traffic short of that line, so a vehicle routed to one never
+			// arrives and never despawns. Reject the config instead of
+			// leaking vehicles for the whole run (director.go applies the
+			// same rule to the spawn verb).
+			if lanes.endWall[n] {
+				return fmt.Errorf("%s: destination %q ends in a wall — a vehicle routed there stops short of the lane end and can never arrive", where, n)
+			}
+		}
+	}
+	return nil
+}
+
+func newNetLanes(net *engine.Network) *netLanes {
+	nl := &netLanes{
+		origin:  make(map[string]bool, len(net.Origins)),
+		length:  make(map[string]float64, len(net.Lanes)),
+		endWall: map[string]bool{},
+	}
+	for _, l := range net.Origins {
+		nl.origin[l.ID] = true
+	}
+	for _, l := range net.Lanes {
+		nl.length[l.ID] = l.Length
+		if l.EndWall {
+			nl.endWall[l.ID] = true
+		}
+	}
+	return nl
+}
+
+func loadDemandFile(path string, lanes *netLanes, typeSet map[string]bool) (*DemandFile, []byte, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, nil, err
 	}
-	return parseDemand(data, origins, typeSet)
+	return parseDemand(data, lanes, typeSet)
 }
 
 // parseDemand is the byte-level core of loadDemandFile — variant loading
 // feeds it patched documents without touching the base's files on disk.
-func parseDemand(data []byte, origins, typeSet map[string]bool) (*DemandFile, []byte, error) {
+func parseDemand(data []byte, lanes *netLanes, typeSet map[string]bool) (*DemandFile, []byte, error) {
 	var df DemandFile
 	if err := strictDecode(data, &df); err != nil {
 		return nil, nil, err
 	}
-	if err := validateDemand(&df, origins, typeSet); err != nil {
+	if err := validateDemand(&df, lanes, typeSet); err != nil {
 		return nil, nil, err
 	}
 	return &df, canonicalYAML(&df), nil
@@ -552,7 +631,7 @@ func validateManifest(m *Manifest) error {
 	return nil
 }
 
-func validateDemand(df *DemandFile, origins, typeSet map[string]bool) error {
+func validateDemand(df *DemandFile, lanes *netLanes, typeSet map[string]bool) error {
 	if df.FormatVersion != FormatVersion {
 		return fmt.Errorf("unsupported format_version %d (loader supports %d)", df.FormatVersion, FormatVersion)
 	}
@@ -571,8 +650,31 @@ func validateDemand(df *DemandFile, origins, typeSet map[string]bool) error {
 		if f.Origin == "" {
 			return fmt.Errorf("flow %d: missing origin", i)
 		}
-		if origins != nil && !origins[f.Origin] {
-			return fmt.Errorf("%s: not a spawn origin lane of the network", where)
+		if err := finite(where+" offset_m", f.OffsetM); err != nil {
+			return err
+		}
+		switch {
+		case f.OffsetM < 0:
+			return fmt.Errorf("%s: offset_m must be ≥ 0", where)
+		case f.OffsetM > 0:
+			// Interior origin (ADR-0021): any lane, but the offset must
+			// leave the vehicle wholly on it.
+			if lanes != nil {
+				ln, ok := lanes.length[f.Origin]
+				if !ok {
+					return fmt.Errorf("%s: not a lane of the network", where)
+				}
+				if f.OffsetM >= ln {
+					return fmt.Errorf("%s: offset_m %.2f is past the end of the %.2f m lane", where, f.OffsetM, ln)
+				}
+			}
+		default:
+			if lanes != nil && !lanes.origin[f.Origin] {
+				return fmt.Errorf("%s: not a spawn origin lane of the network (interior injection needs an explicit offset_m)", where)
+			}
+		}
+		if err := validateDestinations(where, f.Destinations, lanes); err != nil {
+			return err
 		}
 		if f.Spacing != "constant" && f.Spacing != "poisson" {
 			return fmt.Errorf("%s: spacing %q (want constant|poisson)", where, f.Spacing)

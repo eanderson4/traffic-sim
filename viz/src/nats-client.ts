@@ -11,7 +11,10 @@
 import { connect, Empty, RequestStrategy, type MsgHdrs, type NatsConnection } from "nats.ws";
 
 export interface SnapSubscription {
-  nc: NatsConnection;
+  // Null in baked mode (ADR-0023: subscribeBaked has no connection — the
+  // ADR-0016 request/reply pull no-ops on the caller's null guard, which
+  // is safe because the baked TSSG set is delivered complete at attach).
+  nc: NatsConnection | null;
   close: () => Promise<void>;
 }
 

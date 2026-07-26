@@ -198,8 +198,10 @@ func indexLogMsgs(msgs []*nats.Msg, run string) (*logIndex, error) {
 			// Mid-stream keyframes are for later seeks; the CRC chain
 			// already verifies the state they capture. A chunked keyframe
 			// (ADR-0015) counts once — at its final chunk — so the ticks
-			// list holds one entry per keyframe (cadence derivation and
-			// the player's duplicate-tick corruption check depend on it).
+			// list holds one entry per keyframe. The player's duplicate-tick
+			// corruption check used to read this; it now uses
+			// firstKeyframeTicks, which scans only the sparse keyframe
+			// subject (ADR-0024).
 			hdr := m.Header.Get(headerKeyframeChunk)
 			if hdr == "" {
 				idx.keyframes = append(idx.keyframes, tick)
