@@ -1,0 +1,875 @@
+diff --git a/engine/natsio/bench_intent_test.go b/engine/natsio/bench_intent_test.go
+index 562cc8cd94a97ee38c2fb35f2e7fcac1e5f9a2c9..14d069efb8d1f9c6b5808e54c8641c3eeb3b4b9d 100644
+--- a/engine/natsio/bench_intent_test.go
++++ b/engine/natsio/bench_intent_test.go
+@@ -47,9 +47,10 @@ import (
+ 
+ // benchIngestEngine builds a ring-net engine with n live vehicles (the
+ // benchEngine pattern of engine/bench_test.go, kept local so this file is
+-// self-contained in the natsio test package).
+-func benchIngestEngine(b *testing.B, n int) *engine.Engine {
+-	b.Helper()
++// self-contained in the natsio test package). testing.TB: the ADR-0026 M1
++// tests (tsib_test.go) reuse the same Bus/Contract wiring.
++func benchIngestEngine(tb testing.TB, n int) *engine.Engine {
++	tb.Helper()
+ 	spec := engine.RunSpec{
+ 		Net:    engine.NetSpec{Kind: "ring", Length: 8 * float64(n), SpeedLimit: 33.3},
+ 		Scen:   engine.Scenario{InitialVehicles: n},
+@@ -58,7 +59,7 @@ func benchIngestEngine(b *testing.B, n int) *engine.Engine {
+ 	}
+ 	e, err := engine.NewEngine(spec)
+ 	if err != nil {
+-		b.Fatal(err)
++		tb.Fatal(err)
+ 	}
+ 	e.Step() // one tick so state is representative
+ 	return e
+@@ -77,9 +78,9 @@ func benchBufferedIntents(bus *Bus) int {
+ // handshake: hello with the drive grant and its claims at attach, buffered
+ // by the wire callback and answered when ProcessControl runs (the run-loop
+ // drain point). Returns the engine-assigned controller id after verifying
+-// every claim was granted.
+-func benchAttachController(b *testing.B, c *Contract, e *engine.Engine, conn *nats.Conn, run string, claims []uint64) string {
+-	b.Helper()
++// every claim was granted. testing.TB: reused by the M1 tests (tsib_test.go).
++func benchAttachController(tb testing.TB, c *Contract, e *engine.Engine, conn *nats.Conn, run string, claims []uint64) string {
++	tb.Helper()
+ 	req, err := json.Marshal(HelloRequest{
+ 		ContractVersion: SchemaVersion,
+ 		ControllerType:  "bench",
+@@ -89,7 +90,7 @@ func benchAttachController(b *testing.B, c *Contract, e *engine.Engine, conn *na
+ 		Claims:          claims,
+ 	})
+ 	if err != nil {
+-		b.Fatal(err)
++		tb.Fatal(err)
+ 	}
+ 	type result struct {
+ 		reply HelloReply
+@@ -116,22 +117,22 @@ func benchAttachController(b *testing.B, c *Contract, e *engine.Engine, conn *na
+ 			break
+ 		}
+ 		if time.Now().After(deadline) {
+-			b.Fatal("hello never reached the contract request buffer")
++			tb.Fatal("hello never reached the contract request buffer")
+ 		}
+ 		time.Sleep(time.Millisecond)
+ 	}
+ 	if err := c.ProcessControl(e); err != nil {
+-		b.Fatalf("ProcessControl: %v", err)
++		tb.Fatalf("ProcessControl: %v", err)
+ 	}
+ 	res := <-resCh
+ 	if res.err != nil {
+-		b.Fatalf("hello: %v", res.err)
++		tb.Fatalf("hello: %v", res.err)
+ 	}
+ 	if !res.reply.Accepted {
+-		b.Fatalf("hello rejected: %s", res.reply.Reason)
++		tb.Fatalf("hello rejected: %s", res.reply.Reason)
+ 	}
+ 	if len(res.reply.Claims) != len(claims) {
+-		b.Fatalf("granted %d/%d claims", len(res.reply.Claims), len(claims))
++		tb.Fatalf("granted %d/%d claims", len(res.reply.Claims), len(claims))
+ 	}
+ 	return res.reply.ControllerID
+ }
+diff --git a/engine/natsio/bus.go b/engine/natsio/bus.go
+index 9ced19fd4651666c68ade6fad5e22b354f9579df..d6455fcf00fb591a0e90e540fbbbbe5054931eaf 100644
+--- a/engine/natsio/bus.go
++++ b/engine/natsio/bus.go
+@@ -46,16 +46,17 @@ const (
+ 	intentFlagTurnSet   = 1 << 3
+ 	intentFlagRouteSet  = 1 << 4
+ 
+-	headerTick          = "tick"
+-	headerSchemaVersion = "schema_version"
+-	headerAppliedTick   = "applied_tick"
+-	headerSigChunk      = "sig_chunk" // "i/n" 1-based, ADR-0016 (absent = whole table)
+-	intentSubjectTokens = 5           // ts.{run}.ctl.intent.{controller_id}
++	headerTick           = "tick"
++	headerSchemaVersion  = "schema_version"
++	headerAppliedTick    = "applied_tick"
++	headerSigChunk       = "sig_chunk"       // "i/n" 1-based, ADR-0016 (absent = whole table)
++	headerIntentEncoding = "intent_encoding" // ADR-0026 demux: absent = v2, "tsib" = TSIB, else drop+count
++	intentEncodingTSIB   = "tsib"
++	intentSubjectTokens  = 5 // ts.{run}.ctl.intent.{controller_id}
+ )
+ 
+-// EncodeIntent serializes one intent for ts.{run}.ctl.intent.{controller_id}.
+-// Exported so controllers (and tests) share the codec.
+-func EncodeIntent(in engine.Intent) []byte {
++// intentFixedFlags computes the v2 flag bits for the non-route axes.
++func intentFixedFlags(in engine.Intent) uint32 {
+ 	var flags uint32
+ 	if in.AccelSet {
+ 		flags |= intentFlagAccelSet
+@@ -69,16 +70,14 @@ func EncodeIntent(in engine.Intent) []byte {
+ 	if in.TurnSet {
+ 		flags |= intentFlagTurnSet
+ 	}
+-	route := in.Route
+-	if in.RouteSet && route != "" {
+-		flags |= intentFlagRouteSet
+-		if len(route) > intentMaxRoute {
+-			route = route[:intentMaxRoute]
+-		}
+-	} else {
+-		route = ""
+-	}
+-	buf := make([]byte, intentFixedBytes+len(route))
++	return flags
++}
++
++// putIntentFixed writes the 44-byte fixed section (the layout above) into
++// buf with the given flags and route_len. Shared by v2 EncodeIntent (which
++// derives both from the route) and TSIB EncodeTSIB (which pins route_len 0)
++// so the layout arithmetic lives in exactly one place.
++func putIntentFixed(buf []byte, in engine.Intent, flags uint32, routeLen uint16) {
+ 	binary.LittleEndian.PutUint64(buf[0:], in.VehicleID)
+ 	binary.LittleEndian.PutUint32(buf[8:], flags)
+ 	binary.LittleEndian.PutUint32(buf[12:], uint32(int32(in.LaneDelta)))
+@@ -86,38 +85,39 @@ func EncodeIntent(in engine.Intent) []byte {
+ 	binary.LittleEndian.PutUint64(buf[24:], math.Float64bits(in.SpeedSetpoint))
+ 	binary.LittleEndian.PutUint32(buf[32:], uint32(int32(in.Signals)))
+ 	binary.LittleEndian.PutUint32(buf[36:], uint32(int32(in.Turn)))
+-	binary.LittleEndian.PutUint16(buf[40:], uint16(len(route)))
+-	copy(buf[intentFixedBytes:], route)
+-	return buf
++	binary.LittleEndian.PutUint16(buf[40:], routeLen)
+ }
+ 
+-// DecodeIntent parses one intent message; ok=false means the message is
+-// malformed and must be dropped (counted), never applied.
+-func DecodeIntent(buf []byte) (engine.Intent, bool) {
+-	if len(buf) < intentFixedBytes {
+-		return engine.Intent{}, false
+-	}
+-	var in engine.Intent
++// getIntentFixed parses the 44-byte fixed section into *in (axis fields),
++// returning the raw flags and route_len. Presence bits and semantic checks
++// are the caller's — DecodeIntent and DecodeTSIB apply them differently
++// (v2 honors the route, TSIB structurally rejects one). Pointer out-param:
++// returning the ~80-byte Intent by value doubled DecodeIntent's cost.
++func getIntentFixed(buf []byte, in *engine.Intent) (flags uint32, routeLen int) {
+ 	in.VehicleID = binary.LittleEndian.Uint64(buf[0:])
+-	flags := binary.LittleEndian.Uint32(buf[8:])
++	flags = binary.LittleEndian.Uint32(buf[8:])
+ 	in.LaneDelta = int(int32(binary.LittleEndian.Uint32(buf[12:])))
+ 	in.Accel = math.Float64frombits(binary.LittleEndian.Uint64(buf[16:]))
+ 	in.SpeedSetpoint = math.Float64frombits(binary.LittleEndian.Uint64(buf[24:]))
+ 	in.Signals = int(int32(binary.LittleEndian.Uint32(buf[32:])))
+ 	in.Turn = int(int32(binary.LittleEndian.Uint32(buf[36:])))
+-	routeLen := int(binary.LittleEndian.Uint16(buf[40:]))
+-	if routeLen > intentMaxRoute || len(buf) != intentFixedBytes+routeLen {
+-		return engine.Intent{}, false
+-	}
++	routeLen = int(binary.LittleEndian.Uint16(buf[40:]))
++	return flags, routeLen
++}
++
++// applyIntentFlags sets in's presence bits from flags, rejecting (false) a
++// NaN/Inf accel or setpoint — the boundary rule both v2 messages and TSIB
++// records enforce per intent.
++func applyIntentFlags(in *engine.Intent, flags uint32) bool {
+ 	if flags&intentFlagAccelSet != 0 {
+ 		if math.IsNaN(in.Accel) || math.IsInf(in.Accel, 0) {
+-			return engine.Intent{}, false
++			return false
+ 		}
+ 		in.AccelSet = true
+ 	}
+ 	if flags&intentFlagSpeedSet != 0 {
+ 		if math.IsNaN(in.SpeedSetpoint) || math.IsInf(in.SpeedSetpoint, 0) {
+-			return engine.Intent{}, false
++			return false
+ 		}
+ 		in.SpeedSet = true
+ 	}
+@@ -127,6 +127,42 @@ func DecodeIntent(buf []byte) (engine.Intent, bool) {
+ 	if flags&intentFlagTurnSet != 0 {
+ 		in.TurnSet = true
+ 	}
++	return true
++}
++
++// EncodeIntent serializes one intent for ts.{run}.ctl.intent.{controller_id}.
++// Exported so controllers (and tests) share the codec.
++func EncodeIntent(in engine.Intent) []byte {
++	flags := intentFixedFlags(in)
++	route := in.Route
++	if in.RouteSet && route != "" {
++		flags |= intentFlagRouteSet
++		if len(route) > intentMaxRoute {
++			route = route[:intentMaxRoute]
++		}
++	} else {
++		route = ""
++	}
++	buf := make([]byte, intentFixedBytes+len(route))
++	putIntentFixed(buf, in, flags, uint16(len(route)))
++	copy(buf[intentFixedBytes:], route)
++	return buf
++}
++
++// DecodeIntent parses one intent message; ok=false means the message is
++// malformed and must be dropped (counted), never applied.
++func DecodeIntent(buf []byte) (engine.Intent, bool) {
++	if len(buf) < intentFixedBytes {
++		return engine.Intent{}, false
++	}
++	var in engine.Intent
++	flags, routeLen := getIntentFixed(buf, &in)
++	if routeLen > intentMaxRoute || len(buf) != intentFixedBytes+routeLen {
++		return engine.Intent{}, false
++	}
++	if !applyIntentFlags(&in, flags) {
++		return engine.Intent{}, false
++	}
+ 	if flags&intentFlagRouteSet != 0 {
+ 		in.RouteSet = true
+ 		in.Route = string(buf[intentFixedBytes:])
+@@ -170,6 +206,13 @@ type Bus struct {
+ 	snapErrs atomic.Uint64 // snapshot publish failures (separate loud-budget from sigErrs, ADR-0016 §6)
+ 	sigErrs  atomic.Uint64 // signal table publish/reply failures
+ 	snapsOut atomic.Uint64
++
++	// TSIB counters (ADR-0026): the observability substitute for 1:1
++	// per-vehicle messages, which batching ends.
++	intentBatches         atomic.Uint64 // structurally valid TSIB batches accepted
++	intentRecords         atomic.Uint64 // records expanded from accepted batches (post NaN-drop)
++	intentBatchDropped    atomic.Uint64 // structurally invalid batches dropped WHOLE
++	intentEncodingUnknown atomic.Uint64 // unknown intent_encoding header values dropped
+ }
+ 
+ // NewBus attaches the live plane for a run: subscribes the intent wildcard
+@@ -234,22 +277,69 @@ func NewPublishBus(nc *nats.Conn, run string, e *engine.Engine) (*Bus, error) {
+ 	return b, nil
+ }
+ 
+-// onIntent buffers a raw intent with its controller identity. Called on a
+-// nats.go delivery goroutine; never touches the engine.
++// onIntent buffers raw intents with their controller identity. Called on a
++// nats.go delivery goroutine; never touches the engine. Demuxes on the
++// intent_encoding header (ADR-0026): absent = per-vehicle v2 (every existing
++// producer, byte-identical path), "tsib" = a TSIB batch expanded into one
++// ArrivedIntent per surviving record IN RECORD ORDER (engine-assigned seqs
++// stay monotonic per controller exactly as for a v2 stream), anything else =
++// drop + count, LOUD — never a fall-through to v2 parsing, so a future
++// encoding against an old engine fails loudly instead of misparsing.
+ func (b *Bus) onIntent(msg *nats.Msg) {
+ 	tokens := strings.Split(msg.Subject, ".")
+ 	if len(tokens) != intentSubjectTokens {
+ 		b.dropped.Add(1)
+ 		return
+ 	}
+-	in, ok := DecodeIntent(msg.Data)
+-	if !ok {
+-		b.dropped.Add(1)
++	// Headerless (every existing v2 producer) is the hot path and stays
++	// byte-identical to the pre-TSIB callback: gate the demux on header
++	// presence — MIMEHeader.Get canonicalizes (allocates) even on a miss,
++	// which is per-message cost the v2 stream never had.
++	if len(msg.Header) == 0 {
++		in, ok := DecodeIntent(msg.Data)
++		if !ok {
++			b.dropped.Add(1)
++			return
++		}
++		b.mu.Lock()
++		b.buf = append(b.buf, ArrivedIntent{Controller: tokens[4], Intent: in})
++		b.mu.Unlock()
+ 		return
+ 	}
+-	b.mu.Lock()
+-	b.buf = append(b.buf, ArrivedIntent{Controller: tokens[4], Intent: in})
+-	b.mu.Unlock()
++	switch enc := msg.Header.Get(headerIntentEncoding); enc {
++	case "":
++		// Headers present but none named intent_encoding: v2 — the demux
++		// is on the header VALUE, absent = v2 (ADR-0026).
++		in, ok := DecodeIntent(msg.Data)
++		if !ok {
++			b.dropped.Add(1)
++			return
++		}
++		b.mu.Lock()
++		b.buf = append(b.buf, ArrivedIntent{Controller: tokens[4], Intent: in})
++		b.mu.Unlock()
++	case intentEncodingTSIB:
++		intents, ok := DecodeTSIB(msg.Data)
++		if !ok {
++			// Structurally invalid batch: dropped WHOLE, never partially
++			// applied (ADR-0026) — loud, first 3 per run.
++			if n := b.intentBatchDropped.Add(1); n <= 3 {
++				log.Printf("run %s: TSIB batch from %s dropped (%d bytes): structurally invalid", b.run, tokens[4], len(msg.Data))
++			}
++			return
++		}
++		b.intentBatches.Add(1)
++		b.intentRecords.Add(uint64(len(intents)))
++		b.mu.Lock()
++		for _, in := range intents {
++			b.buf = append(b.buf, ArrivedIntent{Controller: tokens[4], Intent: in})
++		}
++		b.mu.Unlock()
++	default:
++		if n := b.intentEncodingUnknown.Add(1); n <= 3 {
++			log.Printf("run %s: intent message from %s with unknown intent_encoding %q dropped", b.run, tokens[4], enc)
++		}
++	}
+ }
+ 
+ // DrainIntents returns the intents buffered since the last drain (arrival
+@@ -447,6 +537,14 @@ func (b *Bus) Stats() (droppedIntents, pubErrs, snapshots uint64) {
+ 	return b.dropped.Load(), b.pubErrs.Load(), b.snapsOut.Load()
+ }
+ 
++// IntentBatchStats reports the TSIB counters (ADR-0026): accepted batches,
++// expanded records, structurally rejected batches, and unknown-encoding
++// drops. Kept separate from Stats so the v2-plane signature is untouched.
++func (b *Bus) IntentBatchStats() (batches, records, batchDropped, encodingUnknown uint64) {
++	return b.intentBatches.Load(), b.intentRecords.Load(),
++		b.intentBatchDropped.Load(), b.intentEncodingUnknown.Load()
++}
++
+ // Close detaches the intent subscription.
+ func (b *Bus) Close() {
+ 	if b.sub != nil {
+diff --git a/engine/natsio/tsib.go b/engine/natsio/tsib.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..88c9228b892af913dff0a189c54684f06d666c6b
+--- /dev/null
++++ b/engine/natsio/tsib.go
+@@ -0,0 +1,103 @@
++package natsio
++
++// tsib.go — TSIB v1, the batched intent message (ADR-0026): one message per
++// controller per tick on the SAME subject as per-vehicle v2 intents, demuxed
++// by the intent_encoding NATS header in onIntent. Batching is a wire
++// boundary change only: a valid batch expands into ArrivedIntent entries in
++// record order and everything downstream (claim filter, seq/grant stamping,
++// hold-last, the record plane) is identical to the v2 path.
++//
++// Wire format (little-endian):
++//
++//	header (24 B):  magic "TSIB" | version u16 = 1 | flags u16 (reserved, 0)
++//	                | tick u64 | count u32 | reserved u32
++//	records:        count × 44 B, byte-identical layout to the fixed section
++//	                of intent v2 (shared helpers in bus.go — no duplicated
++//	                layout arithmetic)
++//
++// tick is informational only (diagnostics, the M3 applied-lag metric): never
++// validated, never gating acceptance — ingest is arrival-based exactly as
++// for v2. Whole-batch structural validity: exact length (24 + 44·count),
++// version 1, count ≤ TSIBMaxRecords, and the route-field rule — ANY record
++// with route_len ≠ 0 or flag bit4 set makes the WHOLE batch invalid (route
++// updates go as one complete standalone v2 intent, and the vehicle is
++// omitted from that tick's batch). A structurally invalid batch is dropped
++// whole, never partially applied. Per-record SEMANTIC checks are unchanged:
++// a NaN/Inf accel/setpoint drops ONLY that record, in parity with a bad v2
++// message dropping alone.
++
++import (
++	"encoding/binary"
++
++	"traffic-sim/engine"
++)
++
++const (
++	tsibHeaderBytes = 24
++
++	// TSIBMaxRecords caps one batch (20,000 records = 880,024 B with the
++	// header): under the 1 MiB per-message discipline with ~32 B of headroom
++	// past the theoretical ceiling, pinned by a boundary publish test. A
++	// controller with more claimed vehicles splits into multiple batches
++	// per tick.
++	TSIBMaxRecords = 20000
++)
++
++// EncodeTSIB serializes one batch for ts.{run}.ctl.intent.{controller_id}
++// (published with the intent_encoding: tsib header). Route-bearing intents
++// (RouteSet) are SKIPPED — a batch never carries a route field; the driver
++// diverts those vehicles to standalone v2 intents for the tick (ADR-0026;
++// the diversion itself is M2 driver work).
++func EncodeTSIB(tick uint64, intents []engine.Intent) []byte {
++	buf := make([]byte, tsibHeaderBytes+intentFixedBytes*len(intents))
++	copy(buf[0:], "TSIB")
++	binary.LittleEndian.PutUint16(buf[4:], 1) // version; flags u16 reserved 0
++	binary.LittleEndian.PutUint64(buf[8:], tick)
++	off := tsibHeaderBytes
++	var count uint32
++	for _, in := range intents {
++		if in.RouteSet {
++			continue
++		}
++		putIntentFixed(buf[off:], in, intentFixedFlags(in), 0)
++		off += intentFixedBytes
++		count++
++	}
++	binary.LittleEndian.PutUint32(buf[16:], count)
++	return buf[:off]
++}
++
++// DecodeTSIB parses one batch into its surviving records, in record order.
++// ok=false means the batch is structurally invalid and must be dropped WHOLE
++// (counted intentBatchDropped), never partially applied. ok=true may return
++// fewer than count records: a NaN/Inf accel/setpoint drops only its own
++// record (v2 parity). An empty batch (count 0) is valid and returns nothing.
++func DecodeTSIB(buf []byte) ([]engine.Intent, bool) {
++	if len(buf) < tsibHeaderBytes {
++		return nil, false
++	}
++	if string(buf[0:4]) != "TSIB" || binary.LittleEndian.Uint16(buf[4:]) != 1 {
++		return nil, false
++	}
++	count := binary.LittleEndian.Uint32(buf[16:])
++	if count > TSIBMaxRecords || len(buf) != tsibHeaderBytes+intentFixedBytes*int(count) {
++		return nil, false
++	}
++	out := make([]engine.Intent, 0, count)
++	off := tsibHeaderBytes
++	for i := uint32(0); i < count; i++ {
++		var in engine.Intent
++		flags, routeLen := getIntentFixed(buf[off:], &in)
++		off += intentFixedBytes
++		if routeLen != 0 || flags&intentFlagRouteSet != 0 {
++			// Routes are forbidden in batch records: structural rejection
++			// of the WHOLE batch (ADR-0026 — never partially applied).
++			return nil, false
++		}
++		if !applyIntentFlags(&in, flags) {
++			continue // NaN/Inf axis: this record alone drops (v2 parity)
++		}
++		out = append(out, in)
++	}
++	return out, true
++}
+diff --git a/engine/natsio/tsib_test.go b/engine/natsio/tsib_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..10ad37382cde07e9c3198a0971db7a3f3bfd2548
+--- /dev/null
++++ b/engine/natsio/tsib_test.go
+@@ -0,0 +1,421 @@
++package natsio
++
++// tsib_test.go — ADR-0026 M1: the TSIB codec, the intent_encoding header
++// demux, expand-at-ingest ordering, and the downstream-unchanged guarantees
++// (claim filter, hold-last) applied to expanded records. The Bus/Contract
++// wiring reuses the M0 benchmark harness (bench_intent_test.go).
++
++import (
++	"encoding/binary"
++	"math"
++	"testing"
++	"time"
++
++	"github.com/nats-io/nats.go"
++	"traffic-sim/engine"
++)
++
++// tsibCodecCases are shared between the v2 fixed section and TSIB records:
++// the layouts are byte-identical by contract (ADR-0026 wire format).
++var tsibCodecCases = []engine.Intent{
++	{VehicleID: 42, Accel: -2.5, AccelSet: true, SpeedSetpoint: 22.5, SpeedSet: true,
++		LaneDelta: -1, Turn: 1, TurnSet: true, Signals: 3, SignalSet: true}, // all axes
++	{VehicleID: 1}, // no axes — no change
++	{VehicleID: 1<<63 + 7, Accel: 0.5, AccelSet: true},
++	{VehicleID: 9, SpeedSetpoint: -1, SpeedSet: true}, // negative clears the cruise setpoint
++	{VehicleID: 77, LaneDelta: 1, Turn: -1, TurnSet: true, Signals: 2, SignalSet: true},
++}
++
++func tsibMsg(subj string, data []byte) *nats.Msg {
++	m := nats.NewMsg(subj)
++	m.Data = data
++	m.Header.Set(headerIntentEncoding, intentEncodingTSIB)
++	return m
++}
++
++func TestTSIBCodecRoundTrip(t *testing.T) {
++	buf := EncodeTSIB(1234, tsibCodecCases)
++	if len(buf) != tsibHeaderBytes+intentFixedBytes*len(tsibCodecCases) {
++		t.Fatalf("encoded %d bytes, want %d", len(buf), tsibHeaderBytes+intentFixedBytes*len(tsibCodecCases))
++	}
++	if string(buf[0:4]) != "TSIB" || binary.LittleEndian.Uint16(buf[4:]) != 1 {
++		t.Fatalf("bad header: % x", buf[:tsibHeaderBytes])
++	}
++	if got := binary.LittleEndian.Uint64(buf[8:]); got != 1234 {
++		t.Fatalf("tick = %d, want 1234", got)
++	}
++	if got := binary.LittleEndian.Uint32(buf[16:]); got != uint32(len(tsibCodecCases)) {
++		t.Fatalf("count = %d, want %d", got, len(tsibCodecCases))
++	}
++	// Records are byte-identical to each intent's v2 fixed section — the
++	// shared-table case with the v2 codec the ADR pins.
++	for i, in := range tsibCodecCases {
++		rec := buf[tsibHeaderBytes+i*intentFixedBytes : tsibHeaderBytes+(i+1)*intentFixedBytes]
++		if v2 := EncodeIntent(in); string(rec) != string(v2) {
++			t.Fatalf("record %d differs from v2 fixed section:\n tsib % x\n v2   % x", i, rec, v2)
++		}
++	}
++	got, ok := DecodeTSIB(buf)
++	if !ok || len(got) != len(tsibCodecCases) {
++		t.Fatalf("round trip = %d records (ok %v), want %d", len(got), ok, len(tsibCodecCases))
++	}
++	for i := range got {
++		if got[i] != tsibCodecCases[i] {
++			t.Fatalf("record %d = %+v, want %+v", i, got[i], tsibCodecCases[i])
++		}
++	}
++
++	// Route-bearing intents never enter a batch: EncodeTSIB skips them (the
++	// driver diverts them to a standalone v2 intent — M2).
++	route := engine.Intent{VehicleID: 5, Route: "B0", RouteSet: true}
++	mixed := []engine.Intent{tsibCodecCases[0], route, tsibCodecCases[1]}
++	got, ok = DecodeTSIB(EncodeTSIB(7, mixed))
++	if !ok || len(got) != 2 || got[0] != tsibCodecCases[0] || got[1] != tsibCodecCases[1] {
++		t.Fatalf("route-bearing skip: %d records (ok %v): %+v", len(got), ok, got)
++	}
++
++	// An empty batch (count 0) is valid and expands to nothing.
++	if got, ok = DecodeTSIB(EncodeTSIB(7, nil)); !ok || len(got) != 0 {
++		t.Fatalf("empty batch: %d records (ok %v)", len(got), ok)
++	}
++}
++
++// Structurally invalid batches — bad magic, wrong version, truncated, length
++// mismatch, count over the cap, route-bearing record (route_len ≠ 0 or flag
++// bit4) — are rejected WHOLE (ok=false) and counted intentBatchDropped.
++func TestTSIBMalformed(t *testing.T) {
++	good := EncodeTSIB(1, tsibCodecCases)
++	patch := func(mut func(b []byte)) []byte {
++		b := make([]byte, len(good))
++		copy(b, good)
++		mut(b)
++		return b
++	}
++	overCap := make([]byte, tsibHeaderBytes+intentFixedBytes*(TSIBMaxRecords+1))
++	copy(overCap, "TSIB")
++	binary.LittleEndian.PutUint16(overCap[4:], 1)
++	binary.LittleEndian.PutUint32(overCap[16:], TSIBMaxRecords+1)
++
++	cases := map[string][]byte{
++		"bad magic":       patch(func(b []byte) { b[0] = 'X' }),
++		"wrong version":   patch(func(b []byte) { binary.LittleEndian.PutUint16(b[4:], 2) }),
++		"truncated hdr":   good[:tsibHeaderBytes-4],
++		"truncated rec":   good[:len(good)-10],
++		"length mismatch": append(patch(func(b []byte) {}), 0),
++		"count over cap":  overCap,
++		"route_len rec":   patch(func(b []byte) { binary.LittleEndian.PutUint16(b[tsibHeaderBytes+40:], 1) }),
++		"bit4 rec":        patch(func(b []byte) { binary.LittleEndian.PutUint32(b[tsibHeaderBytes+8:], intentFlagRouteSet) }),
++	}
++	bus := &Bus{} // onIntent touches only counters + the buffer; no broker needed
++	for name, payload := range cases {
++		if _, ok := DecodeTSIB(payload); ok {
++			t.Errorf("%s: structurally invalid batch accepted", name)
++		}
++		bus.onIntent(tsibMsg("ts.r.ctl.intent.alpha", payload))
++		if len(bus.buf) != 0 {
++			t.Errorf("%s: invalid batch expanded into the buffer", name)
++		}
++	}
++	if _, _, dropped, _ := bus.IntentBatchStats(); dropped != uint64(len(cases)) {
++		t.Fatalf("intentBatchDropped = %d, want %d", dropped, len(cases))
++	}
++	if d, _, _ := bus.Stats(); d != 0 {
++		t.Fatalf("v2 dropped counter = %d, want 0 (batch rejects count separately)", d)
++	}
++
++	// Boundary: exactly TSIBMaxRecords records is a valid batch (the +1
++	// over-cap case above pins the other side).
++	boundary := make([]engine.Intent, TSIBMaxRecords)
++	for i := range boundary {
++		boundary[i] = engine.Intent{VehicleID: uint64(i + 1), Accel: 0.5, AccelSet: true}
++	}
++	got, ok := DecodeTSIB(EncodeTSIB(1, boundary))
++	if !ok || len(got) != TSIBMaxRecords {
++		t.Fatalf("boundary batch: %d records (ok %v), want %d", len(got), ok, TSIBMaxRecords)
++	}
++}
++
++// A NaN/Inf record among valid records drops ALONE (v2 parity); the rest of
++// the batch still decodes and expands in record order.
++func TestTSIBMixedNaNDropsOnlyBadRecord(t *testing.T) {
++	intents := []engine.Intent{
++		{VehicleID: 1, Accel: 0.5, AccelSet: true},
++		{VehicleID: 2, Accel: math.NaN(), AccelSet: true},
++		{VehicleID: 3, SpeedSetpoint: math.Inf(1), SpeedSet: true},
++		{VehicleID: 4, Accel: -1, AccelSet: true},
++	}
++	got, ok := DecodeTSIB(EncodeTSIB(1, intents))
++	if !ok || len(got) != 2 || got[0] != intents[0] || got[1] != intents[3] {
++		t.Fatalf("mixed NaN batch: %d records (ok %v): %+v", len(got), ok, got)
++	}
++
++	bus := &Bus{}
++	bus.onIntent(tsibMsg("ts.r.ctl.intent.alpha", EncodeTSIB(1, intents)))
++	if len(bus.buf) != 2 || bus.buf[0].Intent.VehicleID != 1 || bus.buf[1].Intent.VehicleID != 4 {
++		t.Fatalf("expansion: %+v", bus.buf)
++	}
++	for _, a := range bus.buf {
++		if a.Controller != "alpha" {
++			t.Fatalf("controller = %q, want alpha (from the subject)", a.Controller)
++		}
++	}
++	batches, records, _, _ := bus.IntentBatchStats()
++	if batches != 1 || records != 2 {
++		t.Fatalf("counters: batches %d records %d, want 1/2", batches, records)
++	}
++}
++
++// Header discipline (ADR-0026 consequences): a TSIB payload published
++// WITHOUT the header is read as v2. Multi-record: always rejected by v2
++// structural validation (loud, never silent). Pathological single-record:
++// the 68 B payload's bytes 40–41 (the record's accel low bytes) decode as
++// route_len 24, the v2 length check passes, and the garbage-vehicle_id
++// intent dies at CLAIM FILTERING — the named backstop.
++func TestTSIBHeaderlessReadAsV2(t *testing.T) {
++	// Multi-record: structurally rejected as v2, counted as a dropped v2 msg.
++	bus := &Bus{}
++	multi := EncodeTSIB(1, []engine.Intent{tsibCodecCases[0], tsibCodecCases[1]})
++	bus.onIntent(&nats.Msg{Subject: "ts.r.ctl.intent.alpha", Data: multi})
++	if len(bus.buf) != 0 {
++		t.Fatalf("header-less multi-record TSIB decoded as v2: %+v", bus.buf)
++	}
++	if d, _, _ := bus.Stats(); d != 1 {
++		t.Fatalf("dropped = %d, want 1 (v2 structural rejection)", d)
++	}
++
++	// Pathological single-record: accel bits with low u16 = 24 make the v2
++	// length check pass (68 = 44 + 24). The decoded intent is garbage but
++	// well-formed v2 — it must die at claim filtering, not at decode.
++	pather := EncodeTSIB(1, []engine.Intent{{VehicleID: 1, Accel: math.Float64frombits(24), AccelSet: true}})
++	if len(pather) != 68 {
++		t.Fatalf("pathological payload = %d bytes, want 68", len(pather))
++	}
++	in, ok := DecodeIntent(pather)
++	if !ok {
++		t.Fatal("premise broken: pathological payload no longer passes v2 decode")
++	}
++
++	srv := NewTestServer(t)
++	nc := srv.Connect(t)
++	e := benchIngestEngine(t, 4)
++	claimed := e.Vehicles()[0].ID
++	if in.VehicleID == claimed {
++		t.Fatal("premise broken: garbage vehicle_id collides with the claimed vehicle")
++	}
++	bus2, err := NewBus(nc, "hl1", e)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer bus2.Close()
++	contract, err := NewContract(nc, "hl1", ContractConfig{}, bus2, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer contract.Close()
++	if err := nc.Flush(); err != nil { // SUBs registered before the hello races them
++		t.Fatal(err)
++	}
++	ctl := benchAttachController(t, contract, e, srv.Connect(t), "hl1", []uint64{claimed})
++
++	bus2.onIntent(&nats.Msg{Subject: SubjectCtlIntent("hl1", ctl), Data: pather})
++	keyed := contract.DrainIntents(e)
++	if len(keyed) != 0 {
++		t.Fatalf("garbage-vehicle intent applied: %+v", keyed)
++	}
++	violations, _, _ := contract.Stats()
++	if violations != 1 {
++		t.Fatalf("claimViolations = %d, want 1 (claim filter is the backstop)", violations)
++	}
++}
++
++// An unknown intent_encoding value is dropped + counted, LOUD — never a
++// fall-through to v2 parsing, even when the payload is valid v2. Headers
++// present but none named intent_encoding is still v2 (the demux is on the
++// header VALUE; absent = v2).
++func TestTSIBUnknownEncodingDropped(t *testing.T) {
++	bus := &Bus{}
++	m := nats.NewMsg("ts.r.ctl.intent.alpha")
++	m.Data = EncodeIntent(tsibCodecCases[0]) // valid v2 payload
++	m.Header.Set(headerIntentEncoding, "v9")
++	bus.onIntent(m)
++	if len(bus.buf) != 0 {
++		t.Fatalf("unknown encoding fell through to v2 parsing: %+v", bus.buf)
++	}
++	if _, _, _, unknown := bus.IntentBatchStats(); unknown != 1 {
++		t.Fatalf("intentEncodingUnknown = %d, want 1", unknown)
++	}
++
++	m2 := nats.NewMsg("ts.r.ctl.intent.alpha")
++	m2.Data = EncodeIntent(tsibCodecCases[0])
++	m2.Header.Set(headerSchemaVersion, "2") // unrelated header, no intent_encoding
++	bus.onIntent(m2)
++	if len(bus.buf) != 1 || bus.buf[0].Intent != tsibCodecCases[0] {
++		t.Fatalf("headered v2 message without intent_encoding not read as v2: %+v", bus.buf)
++	}
++}
++
++// tsibSetup wires a real Bus+Contract over the embedded server with one
++// attached drive controller holding claims (the M0 harness at test scale).
++func tsibSetup(t *testing.T, run string, nVehicles int, claims []uint64) (*Bus, *Contract, *engine.Engine, string) {
++	t.Helper()
++	srv := NewTestServer(t)
++	nc := srv.Connect(t)
++	e := benchIngestEngine(t, nVehicles)
++	bus, err := NewBus(nc, run, e)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(bus.Close)
++	contract, err := NewContract(nc, run, ContractConfig{}, bus, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(contract.Close)
++	// NewBus/NewContract subscribe without flushing: push the SUBs to the
++	// server before another connection's hello/publish can race past them.
++	if err := nc.Flush(); err != nil {
++		t.Fatal(err)
++	}
++	ctl := benchAttachController(t, contract, e, srv.Connect(t), run, claims)
++	return bus, contract, e, ctl
++}
++
++// Mixed v2 + TSIB from the same controller across a tick: drain order is
++// arrival order and engine-assigned seqs are monotonic, exactly as for a
++// pure v2 stream (expansion appends records in record order).
++func TestTSIBMixedV2Ordering(t *testing.T) {
++	bus, contract, e, ctl := tsibSetup(t, "mix1", 4, []uint64{1, 2, 3, 4})
++	subj := SubjectCtlIntent("mix1", ctl)
++
++	mk := func(vid uint64, accel float64) engine.Intent {
++		return engine.Intent{VehicleID: vid, Accel: accel, AccelSet: true}
++	}
++	bus.onIntent(&nats.Msg{Subject: subj, Data: EncodeIntent(mk(1, 0.1))})
++	bus.onIntent(tsibMsg(subj, EncodeTSIB(e.Tick, []engine.Intent{mk(2, 0.2), mk(3, 0.3)})))
++	bus.onIntent(&nats.Msg{Subject: subj, Data: EncodeIntent(mk(4, 0.4))})
++
++	keyed := contract.DrainIntents(e)
++	if len(keyed) != 4 {
++		t.Fatalf("drained %d intents, want 4", len(keyed))
++	}
++	for i, k := range keyed {
++		if k.Intent.VehicleID != uint64(i+1) {
++			t.Fatalf("keyed[%d] vehicle = %d, want %d (arrival order)", i, k.Intent.VehicleID, i+1)
++		}
++		if k.Seq != uint64(i+1) {
++			t.Fatalf("keyed[%d] seq = %d, want %d (monotonic)", i, k.Seq, i+1)
++		}
++		if k.Held {
++			t.Fatalf("keyed[%d] held: a fresh intent was filtered", i)
++		}
++	}
++}
++
++// Claim filtering and hold-last apply to expanded records exactly as to v2
++// messages: a batch record for an unclaimed vehicle is filtered; a claimed
++// vehicle absent from the next batch gets a hold-last re-issue.
++func TestTSIBClaimFilterAndHoldLast(t *testing.T) {
++	ids := []uint64{1, 3}
++	bus, contract, e, ctl := tsibSetup(t, "cf1", 4, ids)
++	subj := SubjectCtlIntent("cf1", ctl)
++	mk := func(vid uint64) engine.Intent {
++		return engine.Intent{VehicleID: vid, Accel: 0.3, AccelSet: true}
++	}
++
++	// Tick 1 batch: records for claimed 1 and 3 plus UNCLAIMED 2.
++	bus.onIntent(tsibMsg(subj, EncodeTSIB(e.Tick, []engine.Intent{mk(1), mk(2), mk(3)})))
++	keyed := contract.DrainIntents(e)
++	if len(keyed) != 2 || keyed[0].Intent.VehicleID != 1 || keyed[1].Intent.VehicleID != 3 {
++		t.Fatalf("tick 1 drain: %+v (want vehicles 1,3 — 2 filtered)", keyed)
++	}
++	violations, _, _ := contract.Stats()
++	if violations != 1 {
++		t.Fatalf("claimViolations = %d, want 1 (unclaimed vehicle 2 filtered)", violations)
++	}
++
++	// Tick 2 batch: vehicle 1 absent → hold-last re-issues its last intent.
++	e.Step()
++	bus.onIntent(tsibMsg(subj, EncodeTSIB(e.Tick, []engine.Intent{mk(3)})))
++	keyed = contract.DrainIntents(e)
++	var fresh, held int
++	for _, k := range keyed {
++		switch {
++		case k.Held && k.Intent.VehicleID == 1:
++			held++
++			if k.Intent != mk(1) {
++				t.Fatalf("held intent = %+v, want re-issue of %+v", k.Intent, mk(1))
++			}
++		case !k.Held && k.Intent.VehicleID == 3:
++			fresh++
++		default:
++			t.Fatalf("unexpected keyed intent: %+v", k)
++		}
++	}
++	if fresh != 1 || held != 1 {
++		t.Fatalf("tick 2 drain: fresh %d held %d, want 1/1", fresh, held)
++	}
++}
++
++// Boundary publish (ADR-0026): exactly TSIBMaxRecords records — 880,024 B
++// with the header — crosses the real broker and expands whole.
++func TestTSIBBoundaryPublishMaxRecords(t *testing.T) {
++	srv := NewTestServer(t)
++	nc := srv.Connect(t)
++	run := "cap1"
++	e := benchIngestEngine(t, TSIBMaxRecords)
++	bus, err := NewBus(nc, run, e)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer bus.Close()
++	contract, err := NewContract(nc, run, ContractConfig{}, bus, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer contract.Close()
++
++	// NewBus/NewContract subscribe without flushing: push the SUBs to the
++	// server before another connection's hello/publish can race past them.
++	if err := nc.Flush(); err != nil {
++		t.Fatal(err)
++	}
++	ids := make([]uint64, 0, TSIBMaxRecords)
++	intents := make([]engine.Intent, 0, TSIBMaxRecords)
++	for _, v := range e.Vehicles() {
++		ids = append(ids, v.ID)
++		intents = append(intents, engine.Intent{VehicleID: v.ID, Accel: 0.5, AccelSet: true})
++	}
++	ctl := benchAttachController(t, contract, e, srv.Connect(t), run, ids)
++
++	payload := EncodeTSIB(e.Tick, intents)
++	if len(payload) != tsibHeaderBytes+intentFixedBytes*TSIBMaxRecords {
++		t.Fatalf("boundary payload = %d bytes, want %d", len(payload), tsibHeaderBytes+intentFixedBytes*TSIBMaxRecords)
++	}
++	if err := nc.PublishMsg(tsibMsg(SubjectCtlIntent(run, ctl), payload)); err != nil {
++		t.Fatalf("publish: %v", err)
++	}
++	if err := nc.Flush(); err != nil {
++		t.Fatalf("flush: %v", err)
++	}
++	waitFor(t, "boundary batch delivery", 30*time.Second, func() bool {
++		return benchBufferedIntents(bus) == TSIBMaxRecords
++	})
++
++	keyed := contract.DrainIntents(e)
++	if len(keyed) != TSIBMaxRecords {
++		t.Fatalf("drained %d intents, want %d", len(keyed), TSIBMaxRecords)
++	}
++	for i, k := range keyed {
++		if k.Held {
++			t.Fatalf("keyed[%d] held: a fresh intent was filtered", i)
++		}
++		if k.Intent.VehicleID != ids[i] {
++			t.Fatalf("keyed[%d] vehicle = %d, want %d (record order)", i, k.Intent.VehicleID, ids[i])
++		}
++	}
++	batches, records, dropped, unknown := bus.IntentBatchStats()
++	if batches != 1 || records != TSIBMaxRecords || dropped != 0 || unknown != 0 {
++		t.Fatalf("counters: batches %d records %d dropped %d unknown %d, want 1/%d/0/0",
++			batches, records, dropped, unknown, TSIBMaxRecords)
++	}
++}
