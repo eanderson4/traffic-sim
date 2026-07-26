@@ -47,6 +47,15 @@ shows a vehicle.
 `Failed to construct 'URL': Invalid base URL` — the manifest URL is used as
 the base for resolving every chunk.
 
+**The shipped artifacts predate a digest fix.** External review found that
+the bake's record digest folded every tick-group boundary message twice, so
+the `baked/{run}/{hash12}/` content key of the artifacts in `data/baked/` is
+not the one the fixed code computes. The frames themselves are unaffected —
+the bake still CRC-verified every tick against the recording — so the
+replay is correct and was re-verified end to end after the fix landed. Any
+re-bake will land under a different hash directory, which is the content key
+doing its job. Re-bake before anything is published; not before the show.
+
 **Open on the wide shot, then zoom in — that is the first move, not a
 warm-up.** The map fits the whole extract at about z11.7, where lane lines
 are hairline and vehicles are hidden (they gate on at z13, and the frame
