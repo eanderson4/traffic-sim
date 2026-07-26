@@ -189,6 +189,25 @@ That the trap held (`calm-secondary`, −8.75%) is the control on this: the
 run can still detect a large effect, so the near-misses are power limits,
 not a broken measurement.
 
+### Kennedy outcome: confirmed, and barely moved
+
+Six held-out seeds:
+
+| option | speed | p | VMT | p | outcome |
+|---|---:|---:|---:|---:|---|
+| **truck-ban** | **+3.68%** | **0.0000** | **+1.95%** | 0.0007 | **CONFIRMED** |
+| mainline-widen | +0.81% | 0.0125 | +0.98% | 0.0002 | not confirmed — under the floor |
+| speed-harmonise | −3.22% | 0.0001 | −0.38% | 0.081 | trap, holds |
+
+The winner shifted from +3.95% to +3.68% — regression to the mean of about
+a quarter of a point, on seeds that had nothing to do with selecting it.
+This is the strongest result in the three scenarios.
+
+`mainline-widen` is the sharpest illustration of why the practical floor
+exists separately from the p-value: +0.81% at p=0.0125 is a *statistically
+solid* result that is also too small to matter and barely above the 0.32%
+noise floor. It stays a no-op on the menu.
+
 ## What held up
 
 - Hero fidelity, from the run log: 0.03% uncontrolled coasting (24,264 of
