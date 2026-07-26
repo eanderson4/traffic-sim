@@ -1,0 +1,7 @@
+ docs/show/cbd-options.md         |  6 ++++--
+ docs/show/chi-loop-options.md    |  2 ++
+ docs/show/kennedy-options.md     |  2 ++
+ docs/show/quiz/chi-loop-cbd.json |  2 +-
+ scripts/chicago/curate.py        | 45 +++++++++++++++++++++++++++++++++-------
+ viz/public/quiz.html             |  2 +-
+ 6 files changed, 47 insertions(+), 12 deletions(-)
