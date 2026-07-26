@@ -189,6 +189,29 @@ That the trap held (`calm-secondary`, −8.75%) is the control on this: the
 run can still detect a large effect, so the near-misses are power limits,
 not a broken measurement.
 
+### Loop outcome: confirmed, and the two-winner problem resolved itself
+
+Six held-out seeds:
+
+| option | speed | p | VMT | p | outcome |
+|---|---:|---:|---:|---:|---|
+| **retime-short** | **+2.42%** | **0.0000** | **+1.93%** | 0.0001 | **CONFIRMED** |
+| truck-ban | +1.75% | 0.0010 | +1.59% | 0.0009 | confirmed, but smaller |
+| retime-long | −3.69% | 0.0000 | −2.70% | 0.0000 | trap, holds |
+
+**The ordering flipped.** On the discovery seeds the freight ban was the
+stronger result (+2.28% against +2.09%), which is what §1 flags as the
+awkward two-winner problem. On seeds that played no part in selecting
+either, the shortlisted winner is the stronger one (+2.42% against +1.75%)
+and the gap runs the other way.
+
+That does not retract §1 — both options are real upgrades on both seed sets,
+so the menu still contains two genuine winners and the curation still chose
+between them. What it does show is that the *ranking* between two options
+0.2 points apart was never stable enough to carry an argument. The honest
+reading is "shorter cycles and a freight ban both work on the Loop, and this
+study cannot rank them", not "the freight ban was better and we hid it".
+
 ### Kennedy outcome: confirmed, and barely moved
 
 Six held-out seeds:

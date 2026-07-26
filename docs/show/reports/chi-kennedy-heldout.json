@@ -1,0 +1,316 @@
+{
+  "pod": "/tmp/claude-1000/-home-eric-grove-traffic-sim/b6b10bf9-859d-4b15-a06e-43c7fde235bb/scratchpad/ho-ken",
+  "baseline": "base",
+  "seeds": [
+    2000,
+    2001,
+    2002,
+    2003,
+    2004,
+    2005
+  ],
+  "ticks": 12000,
+  "warmup": 4000,
+  "variants": {
+    "base": {
+      "n": 6,
+      "metric": "speed_kmh",
+      "mean": 48.09432061982218,
+      "delta": 0.0,
+      "delta_pct": 0.0,
+      "p": 1.0,
+      "cohen_d": 0.0,
+      "verdict": "\u2014 baseline \u2014",
+      "per_seed": {
+        "2000": {
+          "speed_kmh": 47.386548533383,
+          "completed": 4201,
+          "mean_time_loss_s": 29.87433887066521,
+          "mean_trip_s": 137.16277076886456,
+          "vmt_km": 34931.19063232398,
+          "active_at_horizon": 4274,
+          "delivered_frac": 0.9945633991301439
+        },
+        "2001": {
+          "speed_kmh": 48.22208988887942,
+          "completed": 4277,
+          "mean_time_loss_s": 29.107508368000165,
+          "mean_trip_s": 135.840589198036,
+          "vmt_km": 35531.87315921804,
+          "active_at_horizon": 4208,
+          "delivered_frac": 0.9959503923057453
+        },
+        "2002": {
+          "speed_kmh": 47.01791470344219,
+          "completed": 4280,
+          "mean_time_loss_s": 30.643238148830626,
+          "mean_trip_s": 136.42404205607477,
+          "vmt_km": 35309.89829747793,
+          "active_at_horizon": 4239,
+          "delivered_frac": 0.9989962358845671
+        },
+        "2003": {
+          "speed_kmh": 48.54864804898293,
+          "completed": 4148,
+          "mean_time_loss_s": 26.891117466032515,
+          "mean_trip_s": 132.48616200578593,
+          "vmt_km": 34893.02377466858,
+          "active_at_horizon": 4117,
+          "delivered_frac": 0.9954081632653061
+        },
+        "2004": {
+          "speed_kmh": 48.88797379145258,
+          "completed": 4325,
+          "mean_time_loss_s": 29.150863879856207,
+          "mean_trip_s": 138.70945664739884,
+          "vmt_km": 35504.68321282053,
+          "active_at_horizon": 4084,
+          "delivered_frac": 0.9970240625797127
+        },
+        "2005": {
+          "speed_kmh": 48.502748752792925,
+          "completed": 4319,
+          "mean_time_loss_s": 28.141715972300826,
+          "mean_trip_s": 136.39798564482518,
+          "vmt_km": 34952.36358287298,
+          "active_at_horizon": 4054,
+          "delivered_frac": 0.9969056214543579
+        }
+      },
+      "all_metrics": {
+        "active_at_horizon": 4162.666666666667,
+        "completed": 4258.333333333333,
+        "delivered_frac": 0.9964746457699721,
+        "mean_time_loss_s": 28.968130450947594,
+        "mean_trip_s": 136.17016772016422,
+        "speed_kmh": 48.09432061982218,
+        "vmt_km": 35187.17210989701
+      }
+    },
+    "mainline-widen": {
+      "n": 6,
+      "metric": "speed_kmh",
+      "mean": 48.48497696133532,
+      "delta": 0.39065634151314893,
+      "delta_pct": 0.8122712546481822,
+      "p": 0.012514570117763354,
+      "cohen_d": 1.55496231398201,
+      "verdict": "UPGRADE",
+      "per_seed": {
+        "2000": {
+          "speed_kmh": 47.4770911343091,
+          "completed": 4203,
+          "mean_time_loss_s": 29.70631043032232,
+          "mean_trip_s": 136.11232453009754,
+          "vmt_km": 35285.19068323699,
+          "active_at_horizon": 4354,
+          "delivered_frac": 0.9995825331886115
+        },
+        "2001": {
+          "speed_kmh": 48.97535315859989,
+          "completed": 4305,
+          "mean_time_loss_s": 28.09448687535171,
+          "mean_trip_s": 135.4163763066202,
+          "vmt_km": 35995.25952417122,
+          "active_at_horizon": 4212,
+          "delivered_frac": 0.998819462011974
+        },
+        "2002": {
+          "speed_kmh": 47.64705852875704,
+          "completed": 4277,
+          "mean_time_loss_s": 27.14961824662068,
+          "mean_trip_s": 133.03140051437924,
+          "vmt_km": 35624.34687795869,
+          "active_at_horizon": 4254,
+          "delivered_frac": 1
+        },
+        "2003": {
+          "speed_kmh": 48.77185747140091,
+          "completed": 4169,
+          "mean_time_loss_s": 26.77687460761267,
+          "mean_trip_s": 133.2116814583833,
+          "vmt_km": 35135.482830712295,
+          "active_at_horizon": 4171,
+          "delivered_frac": 0.9994900560938297
+        },
+        "2004": {
+          "speed_kmh": 49.20173297577656,
+          "completed": 4331,
+          "mean_time_loss_s": 28.583930413082328,
+          "mean_trip_s": 136.92927730316325,
+          "vmt_km": 35775.74190122592,
+          "active_at_horizon": 4096,
+          "delivered_frac": 1
+        },
+        "2005": {
+          "speed_kmh": 48.83676849916844,
+          "completed": 4238,
+          "mean_time_loss_s": 29.458976140795706,
+          "mean_trip_s": 138.58022652194433,
+          "vmt_km": 35369.854070698726,
+          "active_at_horizon": 4152,
+          "delivered_frac": 1
+        }
+      },
+      "all_metrics": {
+        "active_at_horizon": 4206.5,
+        "completed": 4253.833333333333,
+        "delivered_frac": 0.9996486752157359,
+        "mean_time_loss_s": 28.295032785630905,
+        "mean_trip_s": 135.54688110576464,
+        "speed_kmh": 48.48497696133532,
+        "vmt_km": 35530.97931466731
+      }
+    },
+    "speed-harmonise": {
+      "n": 6,
+      "metric": "speed_kmh",
+      "mean": 46.546698539804375,
+      "delta": -1.5476220800177956,
+      "delta_pct": -3.2178894723381117,
+      "p": 5.8375965080176834e-05,
+      "cohen_d": -5.09873890084441,
+      "verdict": "WORSE",
+      "per_seed": {
+        "2000": {
+          "speed_kmh": 45.95720695989587,
+          "completed": 4151,
+          "mean_time_loss_s": 25.444050207930623,
+          "mean_trip_s": 134.04131534569984,
+          "vmt_km": 34850.49859516082,
+          "active_at_horizon": 4349,
+          "delivered_frac": 0.9952333166081284
+        },
+        "2001": {
+          "speed_kmh": 46.87871709782421,
+          "completed": 4210,
+          "mean_time_loss_s": 24.078867369292215,
+          "mean_trip_s": 131.99311163895487,
+          "vmt_km": 35413.97066227163,
+          "active_at_horizon": 4296,
+          "delivered_frac": 0.9956980177140448
+        },
+        "2002": {
+          "speed_kmh": 45.72908317399952,
+          "completed": 4171,
+          "mean_time_loss_s": 24.862472088113993,
+          "mean_trip_s": 130.91285063533925,
+          "vmt_km": 35296.68284994658,
+          "active_at_horizon": 4363,
+          "delivered_frac": 0.9992474287147755
+        },
+        "2003": {
+          "speed_kmh": 47.07365372717865,
+          "completed": 4064,
+          "mean_time_loss_s": 24.2746239574499,
+          "mean_trip_s": 130.57062007874015,
+          "vmt_km": 34877.83040223677,
+          "active_at_horizon": 4235,
+          "delivered_frac": 0.996852403232667
+        },
+        "2004": {
+          "speed_kmh": 46.769580653075316,
+          "completed": 4203,
+          "mean_time_loss_s": 26.41769384124068,
+          "mean_trip_s": 133.7139186295503,
+          "vmt_km": 35086.912554888906,
+          "active_at_horizon": 4206,
+          "delivered_frac": 0.9964282677098393
+        },
+        "2005": {
+          "speed_kmh": 46.871949626852704,
+          "completed": 4197,
+          "mean_time_loss_s": 22.410796625481904,
+          "mean_trip_s": 129.32847271860854,
+          "vmt_km": 34793.46867958576,
+          "active_at_horizon": 4183,
+          "delivered_frac": 0.9975934679845294
+        }
+      },
+      "all_metrics": {
+        "active_at_horizon": 4272.0,
+        "completed": 4166.0,
+        "delivered_frac": 0.9968421503273307,
+        "mean_time_loss_s": 24.581417348251552,
+        "mean_trip_s": 131.76004817448216,
+        "speed_kmh": 46.546698539804375,
+        "vmt_km": 35053.227290681745
+      }
+    },
+    "truck-ban": {
+      "n": 6,
+      "metric": "speed_kmh",
+      "mean": 49.86413681662742,
+      "delta": 1.7698161968052482,
+      "delta_pct": 3.6798860530650987,
+      "p": 2.9955911727981093e-05,
+      "cohen_d": 5.845231870276623,
+      "verdict": "UPGRADE",
+      "per_seed": {
+        "2000": {
+          "speed_kmh": 49.7256251944595,
+          "completed": 4354,
+          "mean_time_loss_s": 28.39921100273289,
+          "mean_trip_s": 140.47677997243915,
+          "vmt_km": 36043.19575101478,
+          "active_at_horizon": 4140,
+          "delivered_frac": 0.996824600986045
+        },
+        "2001": {
+          "speed_kmh": 49.74556985302486,
+          "completed": 4393,
+          "mean_time_loss_s": 24.891562377722696,
+          "mean_trip_s": 135.9119508308673,
+          "vmt_km": 35966.20659803247,
+          "active_at_horizon": 4115,
+          "delivered_frac": 0.9971320118093632
+        },
+        "2002": {
+          "speed_kmh": 48.88198342566321,
+          "completed": 4413,
+          "mean_time_loss_s": 26.800294190360983,
+          "mean_trip_s": 137.81008384319057,
+          "vmt_km": 35985.65298662513,
+          "active_at_horizon": 4138,
+          "delivered_frac": 0.9999163739755812
+        },
+        "2003": {
+          "speed_kmh": 50.12813159712125,
+          "completed": 4220,
+          "mean_time_loss_s": 25.974499058477548,
+          "mean_trip_s": 134.63663507109004,
+          "vmt_km": 35510.027288284255,
+          "active_at_horizon": 4074,
+          "delivered_frac": 0.9975335941486647
+        },
+        "2004": {
+          "speed_kmh": 50.50695914185555,
+          "completed": 4459,
+          "mean_time_loss_s": 27.667169055856757,
+          "mean_trip_s": 141.62621664050238,
+          "vmt_km": 36126.80689705426,
+          "active_at_horizon": 3963,
+          "delivered_frac": 0.9975356900067981
+        },
+        "2005": {
+          "speed_kmh": 50.19655168764016,
+          "completed": 4348,
+          "mean_time_loss_s": 23.00621336369288,
+          "mean_trip_s": 132.30625574977,
+          "vmt_km": 35603.32971731176,
+          "active_at_horizon": 3990,
+          "delivered_frac": 0.9979370809695719
+        }
+      },
+      "all_metrics": {
+        "active_at_horizon": 4070.0,
+        "completed": 4364.5,
+        "delivered_frac": 0.997813225316004,
+        "mean_time_loss_s": 26.12315817480729,
+        "mean_trip_s": 137.12798701797658,
+        "speed_kmh": 49.86413681662742,
+        "vmt_km": 35872.53653972044
+      }
+    }
+  }
+}

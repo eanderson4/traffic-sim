@@ -84,9 +84,12 @@ the label, which is the point.
 | Loop CBD | **Shorter cycles + freight ban together** +6.7% (p=0.0028, VMT **+7.6%**) | Slow Streets −8.8% | Freight ban alone (−0.1%), free CTA transfers (+4.0%, p=0.070 — a near-miss, not a proven no-op) |
 | Kennedy corridor | **Peak-hour freight ban** +3.9% (p<0.0001, VMT **+1.8%**) | Speed harmonisation −3.1% | Widen the mainline, widen the on-ramps (both n.s.) |
 
-Each winner carries at least as much traffic as its baseline, so none of
-them is winning by moving less. Two carry measurably more; the CBD winner's
-throughput is statistically flat with a −1.6% point estimate.
+**All three winners were confirmed on held-out seeds** (2000+, used for
+nothing else — see [audit.md](audit.md) for the rule, written before the
+numbers). Each carries measurably MORE traffic than its baseline, so none
+of them wins by moving less: +1.9%, +7.6% and +2.0% respectively. One
+earlier winner did not survive — the CBD's free-transfers option, replaced
+by the combined retiming + freight ban above.
 
 **"Exactly one winner" is a property of the menu, not of Chicago.** The
 shortlist is built to contain one answer, so where the measurements found
