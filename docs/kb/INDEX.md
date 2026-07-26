@@ -43,6 +43,7 @@ back to it.
 ### Concepts
 - [Vehicle & Controller Interface](articles/concepts/vehicle-controller-interface.md) — one 4-axis intent, declared observation windows, exclusive claims, always-on clamping, external default-driver fleet (ADR-0008)
 - [Scenario Format](articles/concepts/scenario-format.md) — strict-YAML manifest-of-parts directory, kustomize-style overlay variants, (content-hash, seed) run identity
+- [Silent Fidelity Failures](articles/concepts/silent-fidelity-failures.md) — four ways a city-scale run reports a clean measurement of a scenario it never simulated, and the counter that catches each (ADR-0025)
 
 ### Integrations
 - [OSM Extraction](articles/integrations/osm-extraction.md) — seven-pass Go importer bootstrapped and oracle-checked by netconvert, defaults-first lane inference, provenance flags (ADR-0009)
