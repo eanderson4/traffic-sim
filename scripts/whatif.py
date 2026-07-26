@@ -311,9 +311,18 @@ def main():
           f"{len(variants) * len(seeds)} runs, {args.jobs} at a time -> {workdir}",
           file=sys.stderr)
 
+    # SEED-MAJOR, not variant-major. A run's result is not purely a function
+    # of its seed: the driver is a separate service, so under CPU contention
+    # it falls behind differently and the numbers move. Two runs of a
+    # byte-identical scenario on the same 8 seeds differ with a per-seed sd of
+    # 0.32% on network speed. That is tolerable as noise, but submitting
+    # variant-major makes it BIAS: each arm's runs then occupy a different
+    # stretch of a multi-hour schedule, so any drift in machine load maps onto
+    # arm identity. Blocking by seed puts every arm's run for a given seed in
+    # the same stretch, which is what the paired test already assumes.
     jobs, port = [], args.port_base
-    for v in variants:
-        for s in seeds:
+    for s in seeds:
+        for v in variants:
             jobs.append((v, s, port))
             port += 1
 

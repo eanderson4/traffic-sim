@@ -177,13 +177,24 @@ def main():
         shortlist = [win] + [o for o in others
                              if id(o) != id(win)][:args.pick - 1]
 
+    def shown_verdict(v):
+        """The menu's verdict, demoted by the practical floor.
+
+        The raw verdict is significance only. Printing "UPGRADE" beside a
+        0.5% effect in the guest-facing table contradicts the answer key
+        three lines below it, which calls the same option a no-op.
+        """
+        if v["verdict"] == "UPGRADE" and abs(v.get("delta_pct") or 0) < args.min_effect:
+            return "no-op (under practical floor)"
+        return v["verdict"]
+
     lines.append("| option | Δ vs base | Δ% | p | Cohen's d | verdict |")
     lines.append("|---|---:|---:|---:|---:|---|")
     for v in shortlist:
         n = name_of[id(v)]
         lines.append(f"| {labels.get(n, n)} | {fmt(v['delta'])} | "
                      f"{fmt(v['delta_pct'], 1)}% | {fmt(v['p'], 4)} | "
-                     f"{fmt(v['cohen_d'])} | {v['verdict']} |")
+                     f"{fmt(v['cohen_d'])} | {shown_verdict(v)} |")
 
     lines.append("\n## Answer key\n")
     for v in shortlist:
@@ -203,8 +214,14 @@ def main():
                     f"work, not doing it better")
         verdict = v["verdict"]
         if verdict == "UPGRADE" and abs(v.get("delta_pct") or 0) < args.min_effect:
-            verdict = (f"statistically real but below the {args.min_effect:g}% "
-                       f"practical floor")
+            # Deliberately NOT "statistically real but small". Two runs of a
+            # byte-identical scenario on the same seeds differ with a per-seed
+            # sd of ~0.3% on network speed (scripts/nulltest.py), so a
+            # sub-floor effect is not merely too small to feel — its p-value
+            # is measuring drift the paired test cannot see past.
+            verdict = (f"no-op (effect under the {args.min_effect:g}% "
+                       f"practical floor; p-values below ~0.3% effect are "
+                       f"not separable from run-to-run drift)")
         lines.append(f"- **{labels.get(n, n)}** (`{n}`): {verdict}, "
                      f"{fmt(v['delta_pct'], 1)}% on {metric}, p={fmt(v['p'], 4)}"
                      f"{note}")
