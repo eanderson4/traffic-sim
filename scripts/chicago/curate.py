@@ -56,7 +56,11 @@ why cordon-20's "win" is annotated rather than celebrated.
 """
 import argparse
 import json
+import os
 import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from whatif import paired_t  # noqa: E402  (the paired test, not a second copy)
 
 
 def fmt(x, nd=2):
@@ -75,9 +79,13 @@ def main():
                          "demoted to fillers rather than presented as wins.")
     ap.add_argument("--title", default=None)
     ap.add_argument("--out", default=None)
-    ap.add_argument("--vmt-guard", type=float, default=0.03,
-                    help="flag any option whose vehicle-distance falls more "
-                         "than this fraction below baseline")
+    ap.add_argument("--exclude", action="append", default=[],
+                    help="variant to leave out of the SHORTLIST (it still "
+                         "appears in the full results table). For choosing "
+                         "among several valid winners — three scenarios whose "
+                         "answer is the same intervention is a worse show than "
+                         "three different ones, and the full table keeps the "
+                         "choice honest.")
     ap.add_argument("--labels", default=None,
                     help="JSON file mapping variant name -> guest-facing label")
     args = ap.parse_args()
@@ -94,16 +102,35 @@ def main():
     # whatif.py records the direction in the verdict it already computed, so
     # "helpful" here is read from that rather than re-derived and risking
     # disagreement with the table the numbers came from.
-    cands = {k: v for k, v in rep["variants"].items() if k != base}
+    allv = {k: v for k, v in rep["variants"].items() if k != base}
+    cands = {k: v for k, v in allv.items() if k not in set(args.exclude)}
 
     base_vmt = rep["variants"][base].get("all_metrics", {}).get("vmt_km")
+    base_seeds = rep["variants"][base].get("per_seed", {})
+
+    def vmt_test(v):
+        """Paired test of this option's vehicle-distance against baseline.
+
+        Computed from the per-seed records rather than compared against a
+        fixed percentage: whether an option moves less traffic is a question
+        the data answers, and a hand-picked threshold either forgives a real
+        reduction or condemns noise.
+        """
+        pairs = [(m.get("vmt_km"), base_seeds.get(sd, {}).get("vmt_km"))
+                 for sd, m in v.get("per_seed", {}).items()]
+        diffs = [a - b for a, b in pairs if a and b]
+        if len(diffs) < 2:
+            return None
+        _, p, _ = paired_t(diffs)
+        return (sum(diffs) / len(diffs), p)
 
     def carries_its_traffic(v):
-        """True unless the option moves materially less vehicle-distance."""
-        ct = v.get("all_metrics", {}).get("vmt_km")
-        if not base_vmt or not ct:
+        """True unless the option moves SIGNIFICANTLY less vehicle-distance."""
+        t = vmt_test(v)
+        if t is None:
             return True
-        return ct >= base_vmt * (1 - args.vmt_guard)
+        delta, p = t
+        return not (delta < 0 and p <= args.alpha)
 
     # Winners are ranked by whether they carry the traffic FIRST and by p
     # second. An option that raises speed while moving 11% less
@@ -168,11 +195,10 @@ def main():
         # because completions are themselves subject to the survivorship
         # effect described above: vehicle-distance covered in the window is
         # measured over every vehicle, finished or not.
-        bt = rep["variants"][base].get("all_metrics", {}).get("vmt_km")
-        ct = am.get("vmt_km")
-        if bt and ct and ct < bt * (1 - args.vmt_guard):
-            note = (f" — CAUTION: moves {100 * (1 - ct / bt):.0f}% less "
-                    f"vehicle-distance than baseline, so this is not a "
+        if not carries_its_traffic(v):
+            d, pv = vmt_test(v)
+            note = (f" — CAUTION: moves {100 * d / base_vmt:.1f}% less "
+                    f"vehicle-distance (p={fmt(pv, 4)}), so this is not a "
                     f"like-for-like comparison: the network is doing less "
                     f"work, not doing it better")
         verdict = v["verdict"]
@@ -186,7 +212,7 @@ def main():
     lines.append("\n## Everything tested\n")
     lines.append("| option | Δ% | p | d | verdict |")
     lines.append("|---|---:|---:|---:|---|")
-    for n, v in sorted(cands.items(), key=lambda kv: kv[1]["p"]):
+    for n, v in sorted(allv.items(), key=lambda kv: kv[1]["p"]):
         lines.append(f"| {n} | {fmt(v['delta_pct'], 1)}% | {fmt(v['p'], 4)} | "
                      f"{fmt(v['cohen_d'])} | {v['verdict']} |")
 

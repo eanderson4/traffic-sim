@@ -28,9 +28,12 @@ the label, which is the point.
 
 | scenario | the winner | the trap | the no-ops |
 |---|---|---|---|
-| the Loop and the expressways | **Peak-hour freight ban** +2.3% (p=0.0002, VMT **+2.2%**) | Longer greens −3.8% | Widen LSD (+0.5%, below the practical floor), Widen the Kennedy (n.s.) |
+| the Loop and the expressways | **Shorter signal cycles** +2.1% (p=0.0021, VMT **+1.5%**) | Longer greens −3.8% | Widen LSD (+0.5%, below the practical floor), Widen the Kennedy (n.s.) |
 | Loop CBD | **Free CTA transfers** +5.0% (p=0.042, VMT flat) | Slow Streets −9.5% | Longer greens, freight ban (both n.s.) |
-| Kennedy corridor | **Ramp metering** +1.1% (p=0.0022) | Speed harmonisation −3.1% | Widen the mainline, widen the on-ramps (both n.s.) |
+| Kennedy corridor | **Peak-hour freight ban** +3.9% (p<0.0001, VMT **+1.8%**) | Speed harmonisation −3.1% | Widen the mainline, widen the on-ramps (both n.s.) |
+
+Each winner carries at least as much traffic as its baseline, so none of
+them is winning by moving less. Two carry measurably more.
 
 Three things worth saying out loud when the reveal comes:
 
@@ -39,12 +42,17 @@ Three things worth saying out loud when the reveal comes:
   significant. That said, read the model caveat below before making the
   strong version of that claim — for widening specifically, this simulation
   cannot fully back it.
-- **The two winners on the small grids are not construction.** They are a
-  freight ban and a 5% mode shift. On the Kennedy the winner is metering —
-  admitting traffic more slowly. Nothing was built in any of them.
-- **Ramp metering carries 1.9% less traffic** while raising speed 1.1%.
-  It passes the 3% VMT guard, but it is the weakest of the three winners and
-  part of its gain is holding cars back rather than moving them better.
+- **Nothing was built in any of the three winners.** They are a signal
+  retiming, a 5% mode shift, and a freight ban. Every option that laid
+  concrete came back flat.
+- **The same signal change helps and hurts depending on direction.** Shorter
+  cycles are the Loop's winner at +2.1%; longer cycles are its trap at
+  −3.8%. Cycle length is the single largest lever found anywhere in this
+  work, in both directions.
+- **The freight ban wins on the Kennedy and does nothing in the CBD**
+  (+3.9% against +1.0%, n.s.). Trucks cost you where vehicles are fast and
+  merging; in a grid where nothing exceeds 13 km/h, a truck is just another
+  vehicle waiting at a light.
 
 ## How to read a result
 
@@ -61,8 +69,13 @@ same ten paired seeds:
 
 **Every result is guarded by VMT** (total vehicle-distance in the window).
 An option that raises average speed while moving less traffic has not made
-the network better at its job. The tool ranks options that carry their
-traffic ahead of those that do not, and annotates the rest.
+the network better at its job. The guard is itself a paired test over the
+per-seed records rather than a hand-picked percentage — whether an option
+moves less traffic is a question the data answers. Options that do not
+significantly reduce vehicle-distance are ranked ahead of those that do,
+and the rest are annotated. On the Loop this is what separates the two
++2.1% results: shorter signal cycles carry 1.5% MORE traffic, while a 5%
+mode shift carries 3.1% less.
 
 **Statistical significance is not practical significance.** Six paired seeds
 of a low-variance simulation put the seed-to-seed spread on chi-loop-urban

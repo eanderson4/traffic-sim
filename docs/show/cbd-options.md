@@ -12,7 +12,7 @@ Baseline `base`, 10 paired seeds, 12000 ticks, warmup 4000. Primary metric: `spe
 ## Answer key
 
 - **Free CTA transfers — shift 5% of Loop trips to transit** (`transit-5`): UPGRADE, 5.0% on speed_kmh, p=0.0419
-- **Slow Streets — 25 km/h limit across the Loop grid** (`calm-secondary`): WORSE, -9.5% on speed_kmh, p=0.0027 — CAUTION: moves 6% less vehicle-distance than baseline, so this is not a like-for-like comparison: the network is doing less work, not doing it better
+- **Slow Streets — 25 km/h limit across the Loop grid** (`calm-secondary`): WORSE, -9.5% on speed_kmh, p=0.0027 — CAUTION: moves -6.3% less vehicle-distance (p=0.0197), so this is not a like-for-like comparison: the network is doing less work, not doing it better
 - **Longer greens — 40% longer cycles on the arterials** (`retime-long`): no-op (n.s.), -3.4% on speed_kmh, p=0.1269
 - **Peak-hour freight ban — no trucks in the Loop** (`truck-ban`): no-op (n.s.), 1.0% on speed_kmh, p=0.3634
 
