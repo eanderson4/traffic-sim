@@ -94,13 +94,15 @@ by the combined retiming + freight ban above.
 **"Exactly one winner" is a property of the menu, not of Chicago.** The
 shortlist is built to contain one answer, so where the measurements found
 more than one real upgrade, the extras were held back — on the Loop, a
-peak-hour freight ban is a *stronger* result than the shortlisted winner
-(+2.3%, p=0.0002, and it carries 2.2% more traffic). It is held out because
-it is the answer to the Kennedy scenario, and an answer that repeats across
-scenarios stops being a question. What the measurements support is the
-narrower claim: *of the four options on this menu, exactly one is a real
-upgrade.* Every tested option is listed under each menu, and
-[audit.md](audit.md) works through this and two other corrections.
+peak-hour freight ban is *also* a genuine upgrade (+2.3% on the discovery
+seeds, +1.8% on held-out, carrying more traffic on both). It is off the menu
+because it is the answer to the Kennedy scenario, and an answer that repeats
+across scenarios stops being a question. The two are within 0.7 points of
+each other and their ranking REVERSED between seed sets, so this study
+cannot say which is better — only that both work. What the measurements
+support is the narrower claim: *of the four options on this menu, exactly
+one is a real upgrade.* Every tested option is listed under each menu, and
+[audit.md](audit.md) works through this and the other corrections.
 
 Three things worth saying out loud when the reveal comes:
 
@@ -110,16 +112,20 @@ Three things worth saying out loud when the reveal comes:
   strong version of that claim — for widening specifically, this simulation
   cannot fully back it.
 - **Nothing was built in any of the three winners.** They are a signal
-  retiming, a 5% mode shift, and a freight ban. Every option that laid
-  concrete came back flat.
+  retiming, a retiming paired with a freight ban, and a freight ban. Every
+  option that laid concrete came back flat — and the one option that got
+  *close* by removing cars (a 5% mode shift) failed on unseen seeds.
 - **The same signal change helps and hurts depending on direction.** Shorter
   cycles are the Loop's winner at +2.1%; longer cycles are its trap at
   −3.8%. Cycle length is the single largest lever found anywhere in this
   work, in both directions.
-- **The freight ban wins on the Kennedy and does nothing in the CBD**
-  (+3.9% against +1.9%, n.s.). Trucks cost you where vehicles are fast and
-  merging; in a grid where nothing exceeds 13 km/h, a truck is just another
-  vehicle waiting at a light.
+- **The freight ban wins on the Kennedy and does nothing in the CBD on its
+  own** (+3.7% against −0.1% on held-out seeds). Trucks cost you where
+  vehicles are fast and merging; in a grid where nothing exceeds 13 km/h a
+  truck is just another vehicle waiting at a light. But pair that same
+  useless-alone freight ban with a retiming that also did not reach
+  significance alone (+3.7%, p=0.058), and the CBD gets its biggest result
+  anywhere: **+6.7%**. Two nothings make the best something in this dataset.
 
 ## How to read a result
 
