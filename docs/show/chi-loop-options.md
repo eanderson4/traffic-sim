@@ -18,6 +18,8 @@ Baseline `base`, 6 paired seeds, 12000 ticks, warmup 4000. Primary metric: `spee
 
 ## Everything tested
 
+Raw verdicts — significance only, before the practical floor and the near-miss correction applied above. An option can read `no-op (n.s.)` here and `not demonstrated (near-miss)` in the shortlist; the shortlist wording is the one to use.
+
 | option | Δ% | p | d | verdict |
 |---|---:|---:|---:|---|
 | retime-long | -3.8% | 0.0000 | -6.46 | WORSE |

@@ -180,14 +180,29 @@ def main():
                              if id(o) != id(win)][:args.pick - 1]
 
     def shown_verdict(v):
-        """The menu's verdict, demoted by the practical floor.
+        """The menu's verdict, corrected in both directions.
 
-        The raw verdict is significance only. Printing "UPGRADE" beside a
-        0.5% effect in the guest-facing table contradicts the answer key
-        three lines below it, which calls the same option a no-op.
+        The raw verdict is significance only, which mislabels two cases:
+
+        * significant but tiny — printing "UPGRADE" beside a 0.5% effect
+          contradicts the answer key three lines below it; and below the
+          ~0.3% run-to-run noise floor the p-value is measuring drift.
+        * NOT significant but large — an option at +4.0%, p=0.07 has not
+          been shown to work, which is a different claim from "it does
+          nothing". Calling that a no-op on air asserts a null result the
+          data does not support, and it is the easiest thing here to say
+          wrongly.
         """
-        if v["verdict"] == "UPGRADE" and abs(v.get("delta_pct") or 0) < args.min_effect:
+        delta = v.get("delta_pct") or 0
+        if v["verdict"] == "UPGRADE" and abs(delta) < args.min_effect:
             return "no-op (under practical floor)"
+        # SIGNED, not absolute. whatif assigns "no-op (n.s.)" on p alone,
+        # regardless of direction, so a -4% at p=0.2 would otherwise be
+        # promoted to "near-miss" — but it nearly HURT, it did not nearly
+        # work. Only a helpful-direction estimate earns the benefit of the
+        # doubt.
+        if v["verdict"].startswith("no-op") and delta >= args.min_effect:
+            return "not demonstrated (near-miss)"
         return v["verdict"]
 
     lines.append("| option | Δ vs base | Δ% | p | Cohen's d | verdict |")
@@ -214,8 +229,11 @@ def main():
                     f"vehicle-distance (p={fmt(pv, 4)}), so this is not a "
                     f"like-for-like comparison: the network is doing less "
                     f"work, not doing it better")
-        verdict = v["verdict"]
-        if verdict == "UPGRADE" and abs(v.get("delta_pct") or 0) < args.min_effect:
+        # The answer key is what gets READ OUT — it must not contradict the
+        # table three lines above it, so it goes through the same correction
+        # and then expands the reasoning.
+        verdict = shown_verdict(v)
+        if verdict.startswith("no-op (under practical floor)"):
             # Deliberately NOT "statistically real but small". Two runs of a
             # byte-identical scenario on the same seeds differ with a per-seed
             # sd of ~0.3% on network speed (scripts/nulltest.py), so a
@@ -224,11 +242,22 @@ def main():
             verdict = (f"no-op (effect under the {args.min_effect:g}% "
                        f"practical floor; p-values below ~0.3% effect are "
                        f"not separable from run-to-run drift)")
+        elif verdict.startswith("not demonstrated"):
+            verdict = ("not demonstrated — the estimate clears the "
+                       f"{args.min_effect:g}% floor but the test does not "
+                       f"reach p<{args.alpha:g} at this sample size. Say "
+                       f"\"we could not show it works\", NOT \"it does "
+                       f"nothing\": this is a power limit, not a null result")
         lines.append(f"- **{labels.get(n, n)}** (`{n}`): {verdict}, "
                      f"{fmt(v['delta_pct'], 1)}% on {metric}, p={fmt(v['p'], 4)}"
                      f"{note}")
 
     lines.append("\n## Everything tested\n")
+    lines.append("Raw verdicts — significance only, before the practical "
+                 "floor and the near-miss correction applied above. An "
+                 "option can read `no-op (n.s.)` here and "
+                 "`not demonstrated (near-miss)` in the shortlist; the "
+                 "shortlist wording is the one to use.\n")
     lines.append("| option | Δ% | p | d | verdict |")
     lines.append("|---|---:|---:|---:|---|")
     for n, v in sorted(allv.items(), key=lambda kv: kv[1]["p"]):
