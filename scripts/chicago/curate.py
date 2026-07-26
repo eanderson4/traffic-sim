@@ -68,6 +68,11 @@ def main():
     ap.add_argument("--report", required=True)
     ap.add_argument("--pick", type=int, default=4)
     ap.add_argument("--alpha", type=float, default=0.05)
+    ap.add_argument("--min-effect", type=float, default=1.0,
+                    help="practical-significance floor in percent. An option "
+                         "must clear BOTH p<alpha and this to be offered as "
+                         "the winner; significant-but-smaller ones are "
+                         "demoted to fillers rather than presented as wins.")
     ap.add_argument("--title", default=None)
     ap.add_argument("--out", default=None)
     ap.add_argument("--vmt-guard", type=float, default=0.03,
@@ -106,10 +111,23 @@ def main():
     # presenting it as the answer teaches the opposite of the lesson. A
     # guard-failing option can still be the winner if nothing else qualifies,
     # but only behind every option that does.
+    # Statistical significance is not practical significance, and with six
+    # paired seeds of a low-variance simulation it is cheap: chi-loop-urban's
+    # seed-to-seed spread on network speed is ~0.45%, so a 0.5% effect clears
+    # p<0.05 comfortably while being invisible to anyone driving in it.
+    # An option must clear BOTH bars to be offered as the answer.
+    def big_enough(v):
+        return abs(v.get("delta_pct") or 0) >= args.min_effect
+
     winners = sorted((v for v in cands.values()
-                      if v["verdict"] == "UPGRADE" and v["p"] <= args.alpha),
+                      if v["verdict"] == "UPGRADE" and v["p"] <= args.alpha
+                      and big_enough(v)),
                      key=lambda v: (not carries_its_traffic(v), v["p"]))
-    others = sorted((v for v in cands.values() if v["verdict"] != "UPGRADE"),
+    # Fillers: anything not offered as the winner. That includes options that
+    # are statistically significant but below the practical floor — they are
+    # exactly the plausible-looking near-misses the format wants.
+    others = sorted((v for v in cands.values()
+                     if v["verdict"] != "UPGRADE" or not big_enough(v)),
                     key=lambda v: -abs(v.get("cohen_d") or 0))
 
     name_of = {id(v): k for k, v in cands.items()}
@@ -157,7 +175,11 @@ def main():
                     f"vehicle-distance than baseline, so this is not a "
                     f"like-for-like comparison: the network is doing less "
                     f"work, not doing it better")
-        lines.append(f"- **{labels.get(n, n)}** (`{n}`): {v['verdict']}, "
+        verdict = v["verdict"]
+        if verdict == "UPGRADE" and abs(v.get("delta_pct") or 0) < args.min_effect:
+            verdict = (f"statistically real but below the {args.min_effect:g}% "
+                       f"practical floor")
+        lines.append(f"- **{labels.get(n, n)}** (`{n}`): {verdict}, "
                      f"{fmt(v['delta_pct'], 1)}% on {metric}, p={fmt(v['p'], 4)}"
                      f"{note}")
 
