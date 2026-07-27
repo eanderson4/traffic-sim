@@ -41,7 +41,7 @@ func TestTSIBCodecRoundTrip(t *testing.T) {
 	if string(buf[0:4]) != "TSIB" || binary.LittleEndian.Uint16(buf[4:]) != 1 {
 		t.Fatalf("bad header: % x", buf[:tsibHeaderBytes])
 	}
-	if got := binary.LittleEndian.Uint64(buf[8:]); got != 1234 {
+	if got := binary.LittleEndian.Uint64(buf[tsibTickOff:]); got != 1234 {
 		t.Fatalf("tick = %d, want 1234", got)
 	}
 	if got := binary.LittleEndian.Uint32(buf[16:]); got != uint32(len(tsibCodecCases)) {

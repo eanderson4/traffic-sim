@@ -165,6 +165,177 @@ quantization, which inflates the smallest size's publish→buffer figure
 by up to ~2% (negligible at 15k/30k); run-to-run noise on this shared
 box is ±10–15% on means and worse on p99 (see the load note above).
 
+### Batch mode (ADR-0026 M3)
+
+`BenchmarkIntentIngestBatched` (`engine/natsio/bench_intent_test.go`,
+same shared harness body) reruns the M0 scenarios with each controller
+publishing **one TSIB per tick** (`natsio.NewTSIBMsg`, informational
+header tick patched per tick) instead of n/4 v2 messages — the M2 driver
+shape. Measured 2026-07-26 on the M0 machine, near-idle box, v2 baseline
+and batch mode interleaved A/B/A/B in the same session (the v2 rerun
+landed ~10% faster than the M0 recording above — same machine, less
+load; the comparison below is the same-session rerun, M0 table stays the
+baseline of record). Ranges are the two A/B pairs; run:
+
+    go test -run '^$' -bench IntentIngest -benchtime=1x -timeout 20m ./natsio/   # v2 and batched, back to back
+
+| Vehicles | Mode | Intent msgs/tick | Delivered rate (records/s) | DrainIntents / tick | Tick p50 | Tick p99 | Complete path |
+|---|---|---|---|---|---|---|---|
+| 5,000 | v2 (rerun) | 5,000 | 2.40–2.45M | 0.96–1.00 ms | 3.06–3.07 ms | 3.64–3.69 ms | 1.64M intents/s |
+| 5,000 | TSIB | **4** | 13.3–14.4M | 0.83–0.85 ms | 1.04–1.07 ms | 2.12–2.31 ms | 4.14–4.18M intents/s |
+| 15,000 | v2 (rerun) | 15,000 | 2.98–3.01M | 3.13–3.23 ms | 8.11–8.31 ms | 9.59–9.76 ms | 1.82–1.85M intents/s |
+| 15,000 | TSIB | **4** | 23.1–35.0M | 2.95–3.18 ms | 3.49–3.55 ms | 4.51–4.75 ms | 4.16M intents/s |
+| 30,000 | v2 (rerun) | 30,000 | 3.20–3.28M | 7.63–7.94 ms | 16.68–17.11 ms | 19.02–21.36 ms | 1.73–1.79M intents/s |
+| 30,000 | TSIB | **4** | 21.2–22.5M | 7.16–7.52 ms | 8.25–8.84 ms | 10.54–12.69 ms | 3.36–3.53M intents/s |
+
+**M3 targets, point by point.**
+
+- **Intent msgs/tick ≈ controller count — MET, exactly.** 4 messages per
+  tick at every size (vs 5k/15k/30k), asserted per run via
+  `Bus.IntentBatchStats` (batches == controllers × ticks, every record
+  expanded, zero batch/record drops — the benchmark fails otherwise).
+- **Tick p99 ≤ baseline — MET with ~45–55% headroom.** 30k p99 drops
+  19.0–21.4 ms → 10.5–12.7 ms; 15k 9.6–9.8 → 4.5–4.8 ms; 5k 3.6–3.7 →
+  2.1–2.3 ms. The win lands where M0 said the wall was: per-message
+  broker route + delivery scheduling, not payload bytes.
+- **`DrainIntents` unchanged — as designed.** 0.83–0.85 / 2.95–3.18 /
+  7.16–7.52 ms vs v2's 0.96–1.00 / 3.13–3.23 / 7.63–7.94 ms — within
+  noise of identical. Expansion lands the same records upstream of the
+  claim filter, so the drain cost (including its super-linear hold-last
+  scan) is mode-independent; with the wire cost gone, the drain is now
+  ~85–90% of the complete 30k tick span and the next optimization
+  target. The complete path improves ~2.5× at 5k/15k (1.64M → ~4.16M
+  intents/s) and ~2× at 30k (1.76M → ~3.4M); delivered records/s per
+  size: 5.4–6.0× @5k, 7.7–11.7× @15k (widest sample, see caveats),
+  6.5–7.0× @30k.
+- **Applied lag: batch per-vehicle p50 AND p99 ≤ v2 at production pace,
+  plus complete-response equality — MET**, measured by
+  `TestBatchAppliedLagBoundary` at 400 vehicles (10 ms pace) and
+  confirmed at 5,000 vehicles (100 ms scale leg); the 1.5 ms straddle
+  behavior below is report-only mechanics. The per-vehicle claim ("batch
+  never worse than v2", not a universal theorem) rests on parts pinned
+  where provable:** (a) a route-update vehicle rides the IDENTICAL standalone
+  v2 wire shape in both modes, so its lag is unchanged by batching (wire
+  shape pinned by `TestBatchRouteUpdateTickStandaloneV2`); (b) a
+  route-free response of ≤ `TSIBMaxRecords` vehicles is ONE atomic
+  message in batch mode vs an N-message stream in v2 — the batch cannot
+  straddle a boundary, the stream can (covered directly by
+  `TestBatchAppliedLagBoundary`: batch splits always 0, v2 splits > 0 at
+  straddling pace); (c) above the cap the batch splits into ⌈n/20k⌉
+  messages — O(1) vs O(n), the same argument with a smaller but still
+  decisive margin (reasoning, supported by the delivered-rate data in
+  the table above); (d) a batch is published after the driver's per-tick
+  compute — the same moment the v2 stream's LAST message leaves — so
+  batch complete-delivery ≤ v2 complete-delivery for the same compute,
+  BY THE MEASUREMENTS at these scales (the encode tail is ~0.43× of
+  v2's, BenchmarkIntentEncode table below; the delivered-rate gap is the
+  M3 table) — scoped to the 5k–30k in-process envelope, not a universal
+  claim. The measurements below are the
+  empirical confirmation, not the basis. `TestBatchAppliedLagBoundary`
+  (`engine/natsio/driver_test.go`): a manual-loop harness (real engine +
+  Bus + Contract + one real driver, no RunLive) runs DrainIntents → Step
+  → AfterStep on ABSOLUTE deadlines (iteration k sleeps until
+  start + k×pace; overruns counted and reported — REQUIRED zero on
+  acceptance legs, the exact comparison is only valid on an undisturbed
+  schedule) — identical fixed schedule in both modes, warm-up quiescence
+  hard-guarded — with exact FIFO attribution of every drained fresh
+  intent to its source obs tick, recording COMPLETE-application per
+  response and application lag per INDIVIDUAL intent. 5/5 consecutive
+  runs identical:
+  - **Production pace (10 ms, 400 vehicles, 300 ticks):**
+    complete-application lag **p50 1 / p99 1, both modes** — the exact
+    cross-leg comparison (load-bearing); per-vehicle lag p50/p99 1/1
+    both modes (all 120,000 samples at lag 1); splits 0/300 both modes;
+    deadline overruns zero. (10 ms, not 3: with the real
+    DrainIntents → EnqueueIntent → Step apply in the loop, iteration
+    work has occasional ms-scale spikes — log/GC churn — and the
+    undisturbed-schedule requirement is load-bearing; the response
+    margin stays huge either way at this fleet size.)
+  - **Scale leg (100 ms, 5,000 vehicles, 100 ticks):** the same
+    undisturbed shape at fleet scale — complete-application **p50 1 /
+    p99 1, both modes**; per-vehicle p50/p99 1/1 both (all 500,000
+    samples at lag 1); splits 0/100 both modes; deadline overruns zero.
+  - **Fast pace (1.5 ms, 400 vehicles, ILLUSTRATIVE):** boundaries
+    deliberately fall mid-response; the load-bearing pins are **TSIB
+    splits 0/300 (structural) and v2 splits 17–29/300 (~6–10%, case
+    exercised)**.
+    Percentile numbers are report-only (scheduler-sensitive at this
+    pace): complete-application **p50 1 / p99 2, both modes** (one run
+    v2 p99 3); per-vehicle **p50 1 / p99 2, both modes** — with the
+    spread visible: v2 puts ~8–16% of vehicles at lag 2 (9.7–18.9k of
+    120k) vs TSIB's ~7–12% (8.8–14.4k), because v2's straddled streams
+    complete a tick later while the batch makes the same drain; on those
+    same straddle ticks v2's EARLY vehicles apply a tick earlier than
+    the batch's uniform application. Deadline overruns ~4–8% (reported).
+  The honest distributional statement: batch applies each tick's fleet
+  UNIFORMLY at the complete-response tick; v2 SPREADS application across
+  a straddle — a fraction of its vehicles applies a tick EARLIER than
+  batch's uniform tick, its tail a tick later. Per-vehicle, neither mode
+  dominates; batch's application is uniform and its p99 (the ADR's lag
+  metric) is no worse than v2's (per-vehicle p99 2 = 2 at the straddling
+  pace — the load-bearing assertion, batch per-vehicle p99 ≤ v2
+  per-vehicle p99, exact, holds). What is claimed is exactly the
+  percentiles and the observed max: max 1 at both production paces; at
+  the straddling pace max 2 (TSIB) vs max 3 (v2 — its streaming tail
+  straggles across a second boundary, 120–934 samples of 120k at lag 3;
+  TSIB never showed lag ≥ 3 in any run). v2's
+  early-application fraction under straddle is expected mechanics, NOT a
+  regression: ADR-0026's concern was a systematic +1 shift of the whole
+  fleet, which complete-response equality rules out.
+  Live-e2e corroboration: `TestBatchAppliedLag` (RunLive, wall-paced;
+  p50 1 / p99 1 both modes) is SMOKE ONLY — its passive-tap pairing
+  carries a documented ±1 tick of uncertainty and a +1 assertion
+  tolerance. The regression coverage for the ADR lag target is
+  `TestBatchAppliedLagBoundary` above, full stop. Note the
+  ingest-harness `lag_proxy_p50/lag_proxy_p99_ticks` benchmark metrics
+  are 0 BY CONSTRUCTION (the harness drains at the publish tick) — they
+  only pin the measurement path (demux/expansion adds no engine-side
+  tick).
+
+### Driver-side encode tail (ADR-0026 M3, `BenchmarkIntentEncode`)
+
+The complete-delivery claim above also rests on the encode tail: batch
+mode pays `EncodeTSIB` (O(n) fixed-section writes + one 24+44n B
+allocation per ⌈n/20k⌉ batch) AFTER collection, while v2 encodes
+incrementally (N × `EncodeIntent`, one 44 B alloc each, interleaved with
+the compute). Measured on the M0 machine, near-idle box, one op = one
+tick's encode (`go test -run '^$' -bench IntentEncode ./natsio/`):
+
+| Vehicles | v2: N × EncodeIntent | TSIB: ⌈n/20k⌉ × EncodeTSIB | Ratio |
+|---|---|---|---|
+| 5,000 | ~97 µs, 5,000 allocs | ~43 µs, 1 alloc | ~0.44× |
+| 15,000 | ~293–296 µs, 15,000 allocs | ~125–130 µs, 1 alloc | ~0.43× |
+| 30,000 | ~581–586 µs, 30,000 allocs | ~250 µs, 2 allocs | ~0.43× |
+
+The batch encode is ~0.43× of the v2 encode at every size and sub-ms
+even at 30k — the post-collection encode tail does NOT trail the v2
+incremental encode it replaces; with the delivered-rate gap in the M3
+table (one message routed vs N), batch complete-delivery ≤ v2
+complete-delivery for the same compute **at these scales** — a measured
+fact inside the 5k–30k in-process envelope, not a universal claim.
+- **Recorded batch-mode runs replay byte-identical — PROVEN in M2** by
+  `TestBatchOnOffParity` (`engine/natsio/driver_test.go`): each leg
+  (batch on and off) is re-simulated from its JetStream record and must
+  reproduce the live run's CRC chain exactly, and does. Not re-measured
+  here.
+- **Batch vs v2 paired-seed agreement — PROVEN in M2** by the same test:
+  paired-seed lanedrop legs under the established differential
+  tolerances; the recorded run's macros were *identical* across modes
+  (15 despawned, 21 lane changes, 21.55 m/s mean section-A speed, 0
+  collisions, 21,457 driver intents each leg). Not re-measured here.
+
+Caveats: same box-load sensitivity as the M0 table (±10–15% on means,
+worse on p99 — the A/B/A/B interleave is the control); the 15k TSIB
+delivered-rate range (23–35M records/s) is the widest sample, small-
+denominator noise on a ~0.5 ms span. These are INGEST-side numbers:
+driver-side per-tick encode differs by construction and is excluded on
+both modes from the table above — it is measured SEPARATELY in the
+`BenchmarkIntentEncode` subsection below (~0.43× in batch mode's favor),
+covering the v2 driver's per-vehicle `EncodeIntent` per tick vs the TSIB
+driver's per-tick `EncodeTSIB` per ⌈n/20k⌉ batch (header tick written
+directly during the encode in production; the in-place patch is only the
+ingest benchmark's payload-reuse trick).
+
 ## Consequence flags back to the KB
 
 - The fleet-scale intent-ingest gap is **filled** (§(d), ADR-0026 M0):
@@ -176,6 +347,22 @@ box is ±10–15% on means and worse on p99 (see the load note above).
   (~9 ms ≈ 9 % of the 100 ms tick at 30k) plus ~61 ns/msg `onIntent`
   callback CPU on the delivery goroutine. Revisit trigger for
   socketed/TLS deployments as with §(a).
+
+- The ADR-0026 batched-intent change (M1–M3) **meets its M3 targets**
+  (§(d) batch-mode table): intent traffic drops to O(controllers) per
+  tick (exactly 4 vs 5k–30k), tick p99 improves ~45–55%, the complete
+  path ~2–2.5×, and the applied-lag target is covered by
+  `TestBatchAppliedLagBoundary` — per-vehicle p50/p99 ≤ v2 and
+  complete-response equality at production paces (max observed 1), with
+  the straddle-pace mechanics documented (TSIB max 2, v2 max 3 — its
+  streaming tail straggles across a second boundary; early v2 vehicles
+  can beat the uniform batch under straddle — expected mechanics, not a
+  systematic shift), and
+  `DrainIntents` is unchanged — it is now the dominant term of the
+  ingest span (~85–90% at 30k, hold-last sort included), so further
+  ingest work should target the drain, not the wire. Replay determinism
+  and paired-seed batch/v2 agreement are test-pinned
+  (`TestBatchOnOffParity`).
 
 - The `arch-nats-backbone` open question "puback latency vs the 100 ms
   tick at high batch multipliers" is **answered for R=1 local file**:

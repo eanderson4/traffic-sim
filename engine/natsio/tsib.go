@@ -35,6 +35,10 @@ import (
 
 const (
 	tsibHeaderBytes = 24
+	// tsibTickOff is the header offset of the informational source-obs tick
+	// (after magic 4 + version 2 + flags 2) — shared by the encoder and the
+	// benchmark/test tick patching.
+	tsibTickOff = 8
 
 	// TSIBMaxRecords caps one batch (20,000 records = 880,024 B with the
 	// header): under the 1 MiB per-message discipline with ~32 B of headroom
@@ -65,7 +69,7 @@ func EncodeTSIB(tick uint64, intents []engine.Intent) []byte {
 	buf := make([]byte, tsibHeaderBytes+intentFixedBytes*n)
 	copy(buf[0:], "TSIB")
 	binary.LittleEndian.PutUint16(buf[4:], 1) // version; flags u16 reserved 0
-	binary.LittleEndian.PutUint64(buf[8:], tick)
+	binary.LittleEndian.PutUint64(buf[tsibTickOff:], tick)
 	off := tsibHeaderBytes
 	var count uint32
 	for _, in := range intents {

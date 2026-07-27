@@ -26,6 +26,19 @@ package natsio
 //     complete-span samples give tick p50/p99 and the drain-complete
 //     intents/s rate ADR-0026 M0 asks for.
 //
+// (d3) BenchmarkIntentIngestBatched — the M3 batch-mode rerun (ADR-0026):
+//     the identical harness, fleet sizes, claim sets, per-vehicle intents,
+//     and spans, but each controller publishes ONE TSIB per tick
+//     (natsio.NewTSIBMsg, the informational header tick patched per tick)
+//     instead of n/4 v2 messages. Same expanded records reach
+//     DrainIntents, so the drain span isolates the wire/demux change.
+//     Adds two M3 acceptance pins: messages per tick ≈ controller count
+//     (asserted exactly, via IntentBatchStats), and the applied-lag proxy
+//     (drain tick − batch header tick distribution — structurally 0 in-
+//     harness since the harness drains at the publish tick; it pins the
+//     measurement path. PRODUCTION lag is measured driver-side: the
+//     driver's batch tick vs the applied_tick ack, per the M1 triage).
+//
 // (d2) BenchmarkOnIntentCPU — the M0 "onIntent CPU" deliverable: the
 //     Bus.onIntent callback invoked directly (no broker), isolating
 //     subject tokenize + decode + lock + append per message.
@@ -33,6 +46,7 @@ package natsio
 // Numbers + interpretation live in engine/BENCHMARKS.md §(d).
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -66,12 +80,9 @@ func benchIngestEngine(tb testing.TB, n int) *engine.Engine {
 }
 
 // benchBufferedIntents reads the engine-side intent buffer length (the
-// delivery watermark for the publish→buffered measurement). Internal test
-// package access; the lock hold is nanoseconds.
+// delivery watermark for the publish→buffered measurement).
 func benchBufferedIntents(bus *Bus) int {
-	bus.mu.Lock()
-	defer bus.mu.Unlock()
-	return len(bus.buf)
+	return bus.BufferedIntents()
 }
 
 // benchAttachController runs one controller through the real attach
@@ -137,7 +148,13 @@ func benchAttachController(tb testing.TB, c *Contract, e *engine.Engine, conn *n
 	return res.reply.ControllerID
 }
 
-func BenchmarkIntentIngest(b *testing.B) {
+func BenchmarkIntentIngest(b *testing.B)        { benchmarkIntentIngest(b, false) }
+func BenchmarkIntentIngestBatched(b *testing.B) { benchmarkIntentIngest(b, true) }
+
+// benchmarkIntentIngest is the shared M0/M3 harness (see the file header):
+// batched=false is the per-vehicle v2 baseline, batched=true the TSIB
+// batch-mode rerun — same fleets, claims, intents, spans, and assertions.
+func benchmarkIntentIngest(b *testing.B, batched bool) {
 	const (
 		controllers = 4
 		warmupTicks = 3
@@ -174,7 +191,8 @@ func BenchmarkIntentIngest(b *testing.B) {
 			}
 			ctlIDs := make([]string, controllers)
 			ctlConns := make([]*nats.Conn, controllers)
-			payloads := make([][][]byte, controllers) // pre-encoded, one per claimed vehicle
+			payloads := make([][][]byte, controllers) // v2: pre-encoded, one per claimed vehicle
+			batches := make([]*nats.Msg, controllers) // batched: one TSIB per controller, tick patched per tick
 			for k := 0; k < controllers; k++ {
 				lo := k * n / controllers
 				hi := (k + 1) * n / controllers
@@ -182,11 +200,25 @@ func BenchmarkIntentIngest(b *testing.B) {
 				conn := srv.Connect(b)
 				ctlConns[k] = conn
 				ctlIDs[k] = benchAttachController(b, contract, e, conn, run, chunk)
-				msgs := make([][]byte, len(chunk))
+				intents := make([]engine.Intent, len(chunk))
 				for i, vid := range chunk {
-					msgs[i] = EncodeIntent(engine.Intent{VehicleID: vid, Accel: 0.5, AccelSet: true})
+					intents[i] = engine.Intent{VehicleID: vid, Accel: 0.5, AccelSet: true}
 				}
-				payloads[k] = msgs
+				if batched {
+					// n/4 ≤ 7500 ≪ TSIBMaxRecords, so one batch per
+					// controller covers the whole chunk — no split here
+					// (the split path is covered by TestBatchSplitAtCap).
+					batches[k] = NewTSIBMsg(SubjectCtlIntent(run, ctlIDs[k]), 0, intents)
+					if batches[k] == nil {
+						b.Fatalf("NewTSIBMsg nil: chunk of %d route-free intents over the %d cap", len(intents), TSIBMaxRecords)
+					}
+				} else {
+					msgs := make([][]byte, len(intents))
+					for i, in := range intents {
+						msgs[i] = EncodeIntent(in)
+					}
+					payloads[k] = msgs
+				}
 			}
 
 			// One tick: K publishers concurrently push their share on
@@ -196,18 +228,32 @@ func BenchmarkIntentIngest(b *testing.B) {
 			// tick for p50/p99 and the drain-complete rate.
 			var deliverElapsed, drainElapsed time.Duration
 			tickTotals := make([]time.Duration, 0, measTicks)
+			var lagSamples []int64 // batched: drain tick − batch header tick
 			runTick := func(measure bool) {
+				hTick := e.Tick
 				start := time.Now()
 				var wg sync.WaitGroup
 				for k := 0; k < controllers; k++ {
 					wg.Add(1)
 					go func(k int) {
 						defer wg.Done()
-						subj := SubjectCtlIntent(run, ctlIDs[k])
-						for _, p := range payloads[k] {
-							if err := ctlConns[k].Publish(subj, p); err != nil {
+						if batched {
+							m := batches[k]
+							// Patch the informational source-obs tick
+							// (payload pre-encoded once — same encode-
+							// excluded caveat as the v2 payloads).
+							binary.LittleEndian.PutUint64(m.Data[tsibTickOff:], hTick)
+							if err := ctlConns[k].PublishMsg(m); err != nil {
 								b.Errorf("publish: %v", err)
 								return
+							}
+						} else {
+							subj := SubjectCtlIntent(run, ctlIDs[k])
+							for _, p := range payloads[k] {
+								if err := ctlConns[k].Publish(subj, p); err != nil {
+									b.Errorf("publish: %v", err)
+									return
+								}
 							}
 						}
 						if err := ctlConns[k].Flush(); err != nil {
@@ -236,6 +282,13 @@ func BenchmarkIntentIngest(b *testing.B) {
 				if measure {
 					drainElapsed += time.Since(d0)
 					tickTotals = append(tickTotals, time.Since(start))
+					if batched {
+						lag := int64(e.Tick) - int64(hTick)
+						if lag != 0 {
+							b.Fatalf("applied-lag proxy = %d ticks, want 0 (the harness drains at the publish tick)", lag)
+						}
+						lagSamples = append(lagSamples, lag)
+					}
 				}
 				if len(keyed) != n {
 					b.Fatalf("drained %d intents, want %d (short = claim filter dropped some, over = hold-last/duplicate delivery)", len(keyed), n)
@@ -270,7 +323,12 @@ func BenchmarkIntentIngest(b *testing.B) {
 			}
 			p50 := sorted[(len(sorted)-1)/2]
 			p99 := sorted[int(math.Ceil(0.99*float64(len(sorted))))-1]
+			msgsPerTick := float64(n)
+			if batched {
+				msgsPerTick = controllers
+			}
 			b.ReportMetric(float64(n), "intents/tick")
+			b.ReportMetric(msgsPerTick, "msgs/tick")
 			b.ReportMetric(float64(n)*ticks/deliverElapsed.Seconds(), "delivered/s")
 			b.ReportMetric(float64(drainElapsed.Microseconds())/ticks, "drain_µs/tick")
 			b.ReportMetric(float64(p50.Microseconds()), "tick_p50_µs")
@@ -281,8 +339,30 @@ func BenchmarkIntentIngest(b *testing.B) {
 				b.Fatalf("claim violations = %d, want 0: the claim/claim-filter setup is broken and the drain numbers are measuring drops",
 					violations)
 			}
-			b.Logf("ticks=%d, delivered=%.0f intents/s, drain=%.0f µs/tick, tick p50=%v p99=%v, complete=%.0f intents/s",
-				int(ticks), float64(n)*ticks/deliverElapsed.Seconds(),
+			if batched {
+				// M3 acceptance pins: messages per tick == controller count
+				// (exactly, warmups included), every record expanded, no
+				// batch or record drops; the lag distribution pinned at 0.
+				gotBatches, gotRecords, batchDropped, recordDropped, _ := bus.IntentBatchStats()
+				allTicks := uint64(warmupTicks) + uint64(b.N*measTicks)
+				if want := uint64(controllers) * allTicks; gotBatches != want {
+					b.Fatalf("TSIB batches = %d, want %d (one per controller per tick)", gotBatches, want)
+				}
+				if want := uint64(n) * allTicks; gotRecords != want {
+					b.Fatalf("expanded records = %d, want %d", gotRecords, want)
+				}
+				if batchDropped != 0 || recordDropped != 0 {
+					b.Fatalf("drops: batches %d records %d, want 0/0", batchDropped, recordDropped)
+				}
+				sortedLag := append([]int64(nil), lagSamples...)
+				sort.Slice(sortedLag, func(i, j int) bool { return sortedLag[i] < sortedLag[j] })
+				lagP50 := sortedLag[(len(sortedLag)-1)/2]
+				lagP99 := sortedLag[int(math.Ceil(0.99*float64(len(sortedLag))))-1]
+				b.ReportMetric(float64(lagP50), "lag_proxy_p50_ticks")
+				b.ReportMetric(float64(lagP99), "lag_proxy_p99_ticks")
+			}
+			b.Logf("ticks=%d, msgs/tick=%.0f, delivered=%.0f intents/s, drain=%.0f µs/tick, tick p50=%v p99=%v, complete=%.0f intents/s",
+				int(ticks), msgsPerTick, float64(n)*ticks/deliverElapsed.Seconds(),
 				float64(drainElapsed.Microseconds())/ticks, p50.Round(time.Microsecond), p99.Round(time.Microsecond),
 				float64(n)*ticks/totalSum.Seconds())
 		})
@@ -332,4 +412,44 @@ func BenchmarkOnIntentCPU(b *testing.B) {
 		}
 	}
 	b.StopTimer()
+}
+
+// BenchmarkIntentEncode isolates the DRIVER-side per-tick encode tail the
+// M3 complete-delivery claim (ADR-0026) rests on: the v2 driver encodes
+// incrementally (N × EncodeIntent, one 44 B alloc each, interleaved with
+// the per-tick compute) while the batch driver pays one EncodeTSIB
+// (O(records) fixed-section writes + one 24+44n B allocation) AFTER
+// collection. Publish/delivery cost is the M0/M3 delivered-rate data; this
+// is the encode half, at the M3 fleet sizes. One op = one tick's encode.
+// encodeSink keeps the compiler honest: without it the discarded encode
+// results are dead-code eliminated (the 30k TSIB row showed 0 allocs).
+var encodeSink []byte
+
+func BenchmarkIntentEncode(b *testing.B) {
+	for _, n := range []int{5000, 15000, 30000} {
+		intents := make([]engine.Intent, n)
+		for i := range intents {
+			intents[i] = engine.Intent{VehicleID: uint64(i + 1), Accel: 0.5, AccelSet: true}
+		}
+		b.Run(fmt.Sprintf("vehicles=%d/v2_NxEncodeIntent", n), func(b *testing.B) {
+			b.SetBytes(int64(n * intentFixedBytes))
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				for j := range intents {
+					encodeSink = EncodeIntent(intents[j])
+				}
+			}
+		})
+		b.Run(fmt.Sprintf("vehicles=%d/tsib_EncodeTSIB", n), func(b *testing.B) {
+			b.SetBytes(int64(tsibHeaderBytes + n*intentFixedBytes))
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				// The production shape: ⌈n/TSIBMaxRecords⌉ batches (the M2
+				// driver splits at the cap; EncodeTSIB nils over it).
+				for off := 0; off < n; off += TSIBMaxRecords {
+					encodeSink = EncodeTSIB(1, intents[off:min(off+TSIBMaxRecords, n)])
+				}
+			}
+		})
+	}
 }

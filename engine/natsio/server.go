@@ -29,6 +29,11 @@ func NewTestServer(tb testing.TB) *TestServer {
 		DontListen: true,
 		JetStream:  true,
 		StoreDir:   tb.TempDir(),
+		// Mirror the production broker cap (cmd/serve, cmd/replay — 4 MiB;
+		// sigMaxPayload): the nats-server default is 1 MiB, under which a
+		// multi-thousand-vehicle obs frame (≈400 B/ego with policy ctx)
+		// silently fails to publish.
+		MaxPayload: 4 << 20,
 	}
 	ns, err := server.NewServer(opts)
 	if err != nil {
@@ -104,6 +109,11 @@ func SubjectCtlIntentAll(run string) string { return Namespace + "." + run + ".c
 
 // SubjectCtlAck is the per-controller applied_tick echo: ts.{run}.ctl.ack.{controller_id}.
 func SubjectCtlAck(run, ctl string) string { return Namespace + "." + run + ".ctl.ack." + ctl }
+
+// SubjectCtlAll is the whole per-run controller tree: ts.{run}.ctl.> — for
+// taps that need cross-channel delivery order (one subscription's delivery
+// order is broker order; separate subscriptions are not ordered).
+func SubjectCtlAll(run string) string { return Namespace + "." + run + ".ctl.>" }
 
 // Contract-plane subjects (ADR-0008 §3–§4): the attach handshake
 // (request/reply), claim/release (request/reply; release may be

@@ -558,6 +558,15 @@ func (b *Bus) IntentBatchStats() (batches, records, batchDropped, recordDropped,
 		b.intentBatchDropped.Load(), b.intentRecordDropped.Load(), b.intentEncodingUnknown.Load()
 }
 
+// BufferedIntents reports how many arrived intents wait undrained —
+// read-only delivery-completeness observability (the ingest benchmark and
+// the boundary-controlled applied-lag test poll it).
+func (b *Bus) BufferedIntents() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.buf)
+}
+
 // Close detaches the intent subscription.
 func (b *Bus) Close() {
 	if b.sub != nil {
