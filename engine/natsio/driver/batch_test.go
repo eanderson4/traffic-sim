@@ -308,3 +308,55 @@ func TestBatchOffByteIdenticalV2(t *testing.T) {
 		}
 	}
 }
+
+// Capability fallback (ADR-0026 M4 addendum): a hello reply WITHOUT
+// intent_encodings (a pre-TSIB engine) flips a batch-default driver into
+// v2 mode for the session — the IntentBatchOff path, byte-identical to the
+// pre-M2 stream. With "tsib" advertised the batch path stays.
+func TestIntentEncodingFallback(t *testing.T) {
+	egos := []natsio.ObsEgo{{ID: 5}, {ID: 9}, {ID: 1}}
+
+	t.Run("fallback on missing capability", func(t *testing.T) {
+		_, nc := startTestBroker(t)
+		d := batchDriver(nc, Config{})
+		d.applyIntentEncodings(nil) // pre-TSIB engine: field omitted
+		if !d.cfg.IntentBatchOff {
+			t.Fatal("fallback did not engage: driver still in batch mode")
+		}
+		var tap wireTap
+		tap.subscribe(t, nc, "t", "drv")
+		d.onObs(obsMsg(1, 0, egos))
+		msgs := tap.waitCount(t, 3)
+		if got := tap.settle(); got != 3 {
+			t.Fatalf("fallback session messages = %d, want 3 (per-vehicle v2)", got)
+		}
+		for i, m := range msgs {
+			if _, present := m.Header[tapHeaderKey]; present {
+				t.Fatalf("msg %d carries an intent_encoding header after fallback", i)
+			}
+			want := natsio.EncodeIntent(engine.Intent{VehicleID: egos[i].ID})
+			if string(m.Data) != string(want) {
+				t.Fatalf("msg %d payload = % x, want the v2 bytes % x", i, m.Data, want)
+			}
+		}
+	})
+
+	t.Run("batch on tsib advertised", func(t *testing.T) {
+		_, nc := startTestBroker(t)
+		d := batchDriver(nc, Config{})
+		d.applyIntentEncodings([]string{"v2", "tsib"})
+		if d.cfg.IntentBatchOff {
+			t.Fatal("fallback engaged against a TSIB-capable engine")
+		}
+		var tap wireTap
+		tap.subscribe(t, nc, "t", "drv")
+		d.onObs(obsMsg(1, 0, egos))
+		msgs := tap.waitCount(t, 1)
+		if got := tap.settle(); got != 1 {
+			t.Fatalf("advertised session messages = %d, want 1 (one TSIB batch)", got)
+		}
+		if recs := decodeTSIBMsg(t, msgs[0], 1); len(recs) != len(egos) {
+			t.Fatalf("batch records = %d, want %d", len(recs), len(egos))
+		}
+	})
+}

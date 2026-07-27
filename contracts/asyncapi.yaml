@@ -20,7 +20,7 @@ asyncapi: 3.0.0
 
 info:
   title: traffic-sim engine contract
-  version: 2.4.0
+  version: 2.5.0
   description: |
     The engine's NATS surface per ADR-0006 (planes, taxonomy, pipelines) and
     ADR-0008 (the engine↔controller contract — M4, schema_version 2):
@@ -91,6 +91,18 @@ info:
     ~768 KiB chunks). Client note: a reader that ignores `sig_chunk`
     would install each chunk as the whole table — chunk-aware decoding
     is required once tables exceed the chunk threshold.
+
+    **ADR-0026 changes (additive; info version 2.5.0):** batched intents
+    (TSIB v1) on `ts.{run}.ctl.intent.{controller_id}`. Alongside the
+    per-vehicle v2 encoding, a controller may publish TSIB batches on its
+    cadence tick — up to one per 20,000 route-free intents (zero on ticks
+    where all intents carry routes) — demuxed by the exact-case
+    `intent_encoding: tsib` NATS header (absent = v2, any other value =
+    drop + count, loud). A valid batch expands at ingest into per-vehicle
+    records in record order; every downstream semantic (claims, seq,
+    hold-last, arbitration, record plane) is identical to the v2 stream.
+    Skew is covered by HelloReply capability advertisement (`intent_encodings`,
+    additive) with v2 fallback — see the ctlIntent channel's migration note.
 
 servers:
   embedded:
@@ -196,11 +208,44 @@ channels:
       controller are healed by hold-last: the contract layer re-issues the
       last intent for ≤ 2 ticks past the cadence due point (logged as
       held), then zero/default (ADR-0008 §2).
+      Wire demux (ADR-0026): one message on this subject is either the
+      per-vehicle v2 encoding (ControlIntent) or a TSIB v1 batch
+      (ControlIntentBatch), discriminated by the NATS header key
+      `intent_encoding` — matched EXACT-CASE, byte-for-byte, because
+      nats.go headers are verbatim case-sensitive (no MIME
+      canonicalization): ABSENT ⇒ v2 (every pre-ADR-0026 producer; other
+      headers are ignored), `tsib` ⇒ TSIB, ANY OTHER VALUE (including
+      present-but-empty) ⇒ the message is dropped and counted
+      (intentEncodingUnknown), logged loudly — never a fall-through to v2
+      parsing, so a future encoding fails loudly against a TSIB-AWARE
+      engine instead of misparsing. (Against a PRE-TSIB engine the same
+      message reads as malformed v2: counted via the generic drop counter
+      with no dedicated signal, claim filtering as backstop — see the
+      migration note.) A valid TSIB expands at ingest into
+      per-vehicle records in record order; everything downstream (claim
+      filter, per-controller seq, hold-last, arbitration, record plane)
+      is identical to the v2 stream.
+      Migration (ADR-0026 M4 + 2026-07-26 amendment): the mechanism is
+      HelloReply capability advertisement with graceful fallback — the
+      engine advertises `intent_encodings` at attach, and a batch-capable
+      controller that does NOT see "tsib" runs the session on per-vehicle
+      v2 (the default driver does this, one log line; no config surface).
+      Deploy order engine-first, drivers-second remains RECOMMENDED but
+      is no longer load-bearing. Residual, pre-advertisement reality for
+      completeness: a pre-ADR-0026 engine has no demux rule — a
+      multi-record TSIB payload read as v2 fails v2 structural
+      validation (dropped and counted as malformed v2, never silently
+      applied), and the pathological single-record case (68 B, bytes
+      40–41 reading as route_len 24) can pass v2 decode and then dies at
+      claim filtering — the named backstop. The monorepo ships engine +
+      default driver together; external controllers on asyncapi ≥ 2.5.0
+      get the advertisement and the fallback rule above.
     parameters:
       run: { $ref: '#/components/parameters/runId' }
       controller_id: { $ref: '#/components/parameters/controllerId' }
     messages:
       controlIntent: { $ref: '#/components/messages/ControlIntent' }
+      controlIntentBatch: { $ref: '#/components/messages/ControlIntentBatch' }
 
   ctlHello:
     address: ts.{run}.ctl.hello
@@ -212,7 +257,11 @@ channels:
       accept/reject, the assigned controller_id, granted claims, and the
       current tick. The drive grant requires claim_capacity ≥ 1; cadence
       must be below the detach budget. Director and signal are elevated
-      grants (their verbs land M5+; the grants exist now).
+      grants (their verbs land M5+; the grants exist now). The reply also
+      advertises (additive, ADR-0026 M4 addendum) the intent encodings
+      the engine accepts (`intent_encodings`); a batch-capable controller
+      that does not see "tsib" runs the session on per-vehicle v2 — the
+      version-skew fallback.
     parameters:
       run: { $ref: '#/components/parameters/runId' }
     messages:
@@ -621,6 +670,26 @@ components:
         $ref: '#/components/schemas/IntentFrame'
       x-json-view: '#/components/schemas/IntentView'
 
+    ControlIntentBatch:
+      name: controlIntentBatch
+      title: TSIB v1 batched intents (ADR-0026) — up to one TSIB per 20,000 route-free intents per cadence tick per controller (zero on ticks where all intents carry routes)
+      summary: |
+        The batched form of ControlIntent: up to 20,000 per-vehicle
+        records in one message (fleets past the cap split into
+        ⌈n/20,000⌉ batches per tick), expanded at ingest into the same
+        per-vehicle buffer in record order, so every downstream semantic
+        of ctlIntent (claim filter, per-controller seq, hold-last,
+        arbitration, the record plane) is identical to the v2 stream.
+        Batch acceptance counters (intentBatches / intentRecords /
+        intentBatchDropped / intentRecordDropped / intentEncodingUnknown,
+        Bus.IntentBatchStats) are the observability substitute for 1:1
+        per-vehicle messages. Demux on the ctlIntent channel description.
+      headers: { $ref: '#/components/schemas/IntentEncodingHeaders' }
+      payload:
+        schemaFormat: application/octet-stream
+        $ref: '#/components/schemas/TSIBFrame'
+      x-json-view: '#/components/schemas/TSIBView'
+
     HelloRequest:
       name: helloRequest
       title: Attach handshake request (ADR-0008 §4)
@@ -964,6 +1033,71 @@ components:
         route: { type: string, maxLength: 48, description: 'destination lane id; persistent. The engine follows it at every multi-successor lane (shortest path by lane length); an explicit held turn wins the crossing; unknown/unreachable destinations degrade to the successor default' }
         signals: { type: integer, enum: [0, 1, 2, 3], description: '0 off, 1 left, 2 right, 3 hazard; persistent, informational in v1' }
 
+    IntentEncodingHeaders:
+      type: object
+      required: [intent_encoding]
+      properties:
+        intent_encoding:
+          type: string
+          const: tsib
+          description: 'TSIB discriminator (ADR-0026). Matched EXACT-CASE, byte-for-byte — nats.go headers are verbatim case-sensitive, no MIME canonicalization. Absent key ⇒ the message is per-vehicle v2; any other value (including present-but-empty) ⇒ dropped and counted (intentEncodingUnknown), logged loudly. A DUPLICATE key (multiple values) resolves FIRST-VALUE-WINS, matching the shipped decoder.'
+
+    TSIBFrame:
+      type: string
+      format: binary
+      description: |
+        v1, little-endian (ADR-0026):
+          header (24 B): magic "TSIB" | version u16 = 1 | flags u16 (reserved, 0) |
+                         tick u64 | count u32 | reserved u32
+          records: count × 44 B — byte-identical layout to the fixed
+            section of IntentFrame (vehicle_id u64 | flags u32 |
+            lane_delta i32 | accel f64 | speed_setpoint f64 | signals u32 |
+            turn i32 | route_len u16 | reserved u16; flag semantics as
+            defined there).
+        Whole-batch structural validity — a violation drops the WHOLE
+        batch (counted intentBatchDropped, logged), never partially
+        applied: exact length 24 + 44·count; version 1; count ≤ 20000
+        (880,024 B with the header — under the 1 MiB per-message
+        discipline; larger fleets split into multiple batches per tick);
+        every record's route_len MUST be 0 AND flag bit4 (route present)
+        MUST be clear — a route update rides one complete standalone v2
+        intent for the tick and the vehicle is omitted from that tick's
+        batch. Per-record SEMANTIC checks are per-record as in v2: a
+        NaN/Inf accel or speed setpoint drops ONLY that record (counted
+        intentRecordDropped); the rest of the batch applies.
+        tick is INFORMATIONAL ONLY (the source observation tick, for
+        diagnostics and applied-lag measurement) — never validated and
+        never gating acceptance; ingest is arrival-based exactly as for
+        v2. The flags u16 and reserved u32 header fields: encoders MUST
+        write zero, decoders MUST accept any value — reserved bits are
+        not must-understand, so an extension that requires understanding
+        them needs a version bump.
+
+    TSIBRecordView:
+      title: JSON view of one TSIB batch record (route-free — records with a route are structurally invalid, ADR-0026)
+      type: object
+      required: [vehicle_id]
+      properties:
+        vehicle_id: { type: integer, minimum: 1 }
+        accel: { type: number, description: 'm/s²; one-shot per tick; engine-clamped to [−9, type max accel]' }
+        speed_setpoint: { type: number, description: 'm/s; persistent cruise until replaced; negative clears; clamped to v0eff' }
+        lane_delta: { type: integer, enum: [-1, 0, 1], description: '+1 left, −1 right; one-shot, expires if infeasible' }
+        turn: { type: integer, enum: [-1, 0, 1], description: 'junction choice; held until consumed at the next lane crossing; 0 clears' }
+        signals: { type: integer, enum: [0, 1, 2, 3], description: '0 off, 1 left, 2 right, 3 hazard; persistent, informational in v1' }
+
+    TSIBView:
+      title: JSON view of a TSIB batch (tooling only; wire is binary)
+      type: object
+      required: [tick, count, records]
+      properties:
+        tick: { type: integer, minimum: 0, description: 'Source observation tick — informational only, never validated.' }
+        count: { type: integer, minimum: 0, maximum: 20000 }
+        records:
+          type: array
+          maxItems: 20000
+          items: { $ref: '#/components/schemas/TSIBRecordView' }
+          description: 'Route-free per-vehicle intents (route_len = 0 and flag bit4 clear enforced at decode), in wire order = per-controller engine seq order.'
+
     AckView:
       type: object
       required: [controller_id, applied_tick]
@@ -1098,6 +1232,10 @@ components:
           items: { type: integer, minimum: 1 }
           description: Initial claims granted.
         contract_version: { type: integer, const: 2 }
+        intent_encodings:
+          type: array
+          items: { type: string, enum: [v2, tsib] }
+          description: 'ADDITIVE (ADR-0026 M4 addendum): every intent wire encoding this engine accepts on ctlIntent — ["v2","tsib"] from asyncapi 2.5.0 onward, OMITTED by pre-TSIB engines (JSON consumers ignore unknown fields both directions). A batch-capable controller SHOULD fall back to per-vehicle v2 when tsib is not advertised; the default driver does exactly that (one log line, session-scoped).'
 
     VerbRequestView:
       title: Director verb request (ADR-0008 §5; M10)

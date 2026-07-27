@@ -7,6 +7,7 @@ package natsio
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"math"
 	"testing"
 	"time"
@@ -451,5 +452,71 @@ func TestTSIBBoundaryPublishMaxRecords(t *testing.T) {
 	if batches != 1 || records != TSIBMaxRecords || dropped != 0 || recordDropped != 0 || unknown != 0 {
 		t.Fatalf("counters: batches %d records %d dropped %d recordDropped %d unknown %d, want 1/%d/0/0/0",
 			batches, records, dropped, recordDropped, unknown, TSIBMaxRecords)
+	}
+}
+
+// The engine advertises every intent encoding it accepts (ADR-0026 M4
+// addendum): HelloReply.intent_encodings = ["v2","tsib"] from this engine
+// onward. Additive both ways — pre-TSIB engines omit the field (the
+// driver-side fallback signal), pre-field drivers ignore it.
+func TestHelloAdvertisesIntentEncodings(t *testing.T) {
+	srv := NewTestServer(t)
+	nc := srv.Connect(t)
+	e := benchIngestEngine(t, 4)
+	bus, err := NewBus(nc, "adv1", e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bus.Close()
+	contract, err := NewContract(nc, "adv1", ContractConfig{}, bus, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer contract.Close()
+	if err := nc.Flush(); err != nil { // SUBs registered before the hello races them
+		t.Fatal(err)
+	}
+
+	req, _ := json.Marshal(HelloRequest{
+		ContractVersion: SchemaVersion, ControllerType: "bench",
+		Grants: []string{"drive"}, ClaimCapacity: 1,
+	})
+	resCh := make(chan *nats.Msg, 1)
+	go func() {
+		m, err := nc.Request(SubjectCtlHello("adv1"), req, 10*time.Second)
+		if err == nil {
+			resCh <- m
+		}
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		select {
+		case m := <-resCh:
+			var rep HelloReply
+			if err := json.Unmarshal(m.Data, &rep); err != nil {
+				t.Fatal(err)
+			}
+			if !rep.Accepted {
+				t.Fatalf("hello rejected: %s", rep.Reason)
+			}
+			want := []string{"v2", "tsib"}
+			if len(rep.IntentEncodings) != len(want) {
+				t.Fatalf("intent_encodings = %v, want %v", rep.IntentEncodings, want)
+			}
+			for i, enc := range want {
+				if rep.IntentEncodings[i] != enc {
+					t.Fatalf("intent_encodings = %v, want %v", rep.IntentEncodings, want)
+				}
+			}
+			return
+		default:
+			if time.Now().After(deadline) {
+				t.Fatal("hello never answered")
+			}
+			if err := contract.ProcessControl(e); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(time.Millisecond)
+		}
 	}
 }

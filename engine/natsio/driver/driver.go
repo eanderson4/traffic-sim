@@ -29,6 +29,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -219,6 +221,7 @@ func New(nc *nats.Conn, js nats.JetStreamContext, cfg Config) (*Driver, error) {
 		return nil, fmt.Errorf("driver: attach rejected: %s", reply.Reason)
 	}
 	d.id = reply.ControllerID
+	d.applyIntentEncodings(reply.IntentEncodings)
 
 	bind := func(subject string, h func(*nats.Msg)) error {
 		sub, err := nc.Subscribe(subject, h)
@@ -434,6 +437,20 @@ func (d *Driver) flushBatch(tick uint64, batch []engine.Intent) {
 		}
 		batch = batch[n:]
 	}
+}
+
+// applyIntentEncodings is the capability fallback (ADR-0026 M4 addendum):
+// the engine advertises the intent encodings it accepts in its hello reply
+// — a pre-TSIB engine OMITS the field. When batching is on (the default)
+// and "tsib" is not advertised, run the session in v2 mode (the
+// IntentBatchOff path) with one log line. ("tsib" is the wire contract
+// string, pinned by contracts/asyncapi.yaml; unexported in natsio.)
+func (d *Driver) applyIntentEncodings(encs []string) {
+	if d.cfg.IntentBatchOff || slices.Contains(encs, "tsib") {
+		return
+	}
+	log.Printf("driver %s: engine does not advertise intent_encodings \"tsib\" (pre-TSIB engine); falling back to per-vehicle v2 intents for this session", d.id)
+	d.cfg.IntentBatchOff = true
 }
 
 // routeStep advances ONE ego's routing axis under the per-tick budget

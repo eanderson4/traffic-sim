@@ -152,6 +152,12 @@ type HelloReply struct {
 	Run             string   `json:"run"`
 	Tick            uint64   `json:"tick"`
 	Reason          string   `json:"reason,omitempty"`
+	// IntentEncodings advertises the intent wire encodings this engine
+	// accepts on ctlIntent (ADR-0026 M4 addendum): ["v2","tsib"] from this
+	// engine onward. Additive — pre-TSIB engines omit it (JSON consumers
+	// ignore unknown fields in both directions), so a batch-capable driver
+	// can fall back to v2 when it is absent.
+	IntentEncodings []string `json:"intent_encodings,omitempty"`
 }
 
 // ClaimRequest asks for exclusive claims on vehicles (ts.{run}.ctl.claim.{id}).
@@ -432,7 +438,7 @@ func (c *Contract) ProcessControl(e *engine.Engine) error {
 // handleHello answers one attach handshake.
 func (c *Contract) handleHello(e *engine.Engine, r ctlReq) {
 	var req HelloRequest
-	reply := HelloReply{ContractVersion: SchemaVersion, Run: c.run, Tick: e.Tick}
+	reply := HelloReply{ContractVersion: SchemaVersion, Run: c.run, Tick: e.Tick, IntentEncodings: intentEncodingsAdvertised}
 	defer func() {
 		data, _ := json.Marshal(reply)
 		if r.reply != "" {

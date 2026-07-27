@@ -55,6 +55,12 @@ const (
 	intentSubjectTokens  = 5 // ts.{run}.ctl.intent.{controller_id}
 )
 
+// intentEncodingsAdvertised is the HelloReply capability advertisement
+// (ADR-0026 M4 addendum): every intent wire encoding this engine accepts on
+// ctlIntent, v2 first. Pre-TSIB engines omit the field entirely, which is
+// the driver-side fallback signal.
+var intentEncodingsAdvertised = []string{"v2", intentEncodingTSIB}
+
 // intentFixedFlags computes the v2 flag bits for the non-route axes.
 func intentFixedFlags(in engine.Intent) uint32 {
 	var flags uint32

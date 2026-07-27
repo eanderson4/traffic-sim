@@ -1,7 +1,8 @@
 # ADR-0026: Batched intents on the live plane
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-07-26
+- Ratified: 2026-07-26 — M0–M3 evidence in engine/BENCHMARKS.md §(d) (batch-mode table, applied-lag coverage), M1–M3 test pins in engine/natsio (tsib_test.go, driver/batch_test.go, driver_test.go); contract published as asyncapi info version 2.5.0.
 - Amends: ADR-0006 §2 (self-sufficient live messages), §7 (binary SoA framing), ADR-0008 (controller contract — wire encoding only, semantics unchanged)
 
 ## Context
@@ -246,10 +247,11 @@ round before any recording or content hash binds the new codec.
   metrics protocol. Document in `BENCHMARKS.md`.
 - **M4 — Contract + ratification.** `asyncapi.yaml` ctlIntent TSIB
   schema (header demux incl. unknown-value rule, record layout,
-  route-field rule, cap, tick informational); migration note (engine
-  deploys before TSIB drivers; old engines never see batches in
-  practice because drivers attach against the engine's hello-advertised
-  version); KB index + this ADR to Accepted; `--gemini` review round.
+  route-field rule, cap, tick informational); migration note (deploy
+  order engine-first, drivers-second — RECOMMENDED but, per the
+  2026-07-26 amendment below, no longer load-bearing: hello capability
+  advertisement with v2 fallback covers skew directly); KB index + this
+  ADR to Accepted; `--gemini` review round.
 
 ## Risks / open questions
 
@@ -264,4 +266,32 @@ round before any recording or content hash binds the new codec.
   backstopped by claim filtering at worst). Deploy order (engine first)
   plus the hello-version migration note in M4 covers it; capability
   advertisement in hello is deliberately **not** added here — that is
-  region-decomposition-era machinery.
+  region-decomposition-era machinery. **(AMENDED 2026-07-26 — see
+  below: advertisement WAS added; the skew risk proved worth ~20 lines.)**
+
+## Amendment 2026-07-26 (post-ratification, M4 gate)
+
+**Hello capability advertisement with graceful v2 fallback.** The M4
+review gate rejected the "deploy order ONLY" migration story: with
+`contract_version` staying 2 and no advertisement, a default-on TSIB
+driver could not detect a pre-TSIB engine at all (batches dropped as
+malformed v2, no version signal). So the machinery this ADR deferred is
+now in, and it is small:
+
+- `HelloReply` gains the additive field `intent_encodings` — `["v2",
+  "tsib"]` from this engine onward, omitted by pre-TSIB engines (JSON
+  consumers ignore unknown fields in both directions).
+- The default driver, when batching is on (the default) and `"tsib"` is
+  NOT advertised, logs one line and runs the session in v2 mode — the
+  exact `-intent-batch=off` code path, no new config surface.
+
+Deploy order (engine first, drivers second) remains RECOMMENDED but is
+no longer load-bearing: a default-on driver against a pre-TSIB engine
+now degrades to the v2 stream instead of being silently dropped. The
+version-skew risk bullet above is amended accordingly: the
+region-decomposition-era deferral ended here because the review rounds
+showed the skew risk was worth the ~20 lines. (Contract documented in
+`contracts/asyncapi.yaml` at info version 2.5.0 — same additive change
+set; engine side `engine/natsio/contract.go` + `bus.go`, driver side
+`engine/natsio/driver/driver.go` `applyIntentEncodings`; tests
+`TestHelloAdvertisesIntentEncodings`, `TestIntentEncodingFallback`.)
