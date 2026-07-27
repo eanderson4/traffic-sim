@@ -360,3 +360,44 @@ func TestIntentEncodingFallback(t *testing.T) {
 		}
 	})
 }
+
+// Mixed route/non-route tick (ADR-0026, M4 review — a pinned DECISION, not
+// drift): the standalone route v2 publishes MID-LOOP while route-free egos
+// wait for the end-of-tick batch, so per-controller arrival order across
+// different vehicles is [route-bearing B, batched A, batched C] for ego
+// order [A,B,C] — deterministic and outcome-neutral (arbitration is
+// per-vehicle; replay re-enqueues the recorded order).
+func TestBatchMixedRouteTickArrivalOrder(t *testing.T) {
+	_, nc := startTestBroker(t)
+	d := batchDriver(nc, Config{Destination: "D1"})
+	var tap wireTap
+	tap.subscribe(t, nc, "t", "drv")
+
+	// A and C already carry the destination (obs echo confirmed → no route
+	// intent, they batch); B does not → its standalone route v2 goes out
+	// mid-loop, before the batch.
+	egos := []natsio.ObsEgo{
+		{ID: 10, Route: "D1"}, // A: confirmed route → batched
+		{ID: 20},              // B: needs the route → standalone v2, mid-loop
+		{ID: 30, Route: "D1"}, // C: confirmed route → batched
+	}
+	d.onObs(obsMsg(1, 0, egos))
+	msgs := tap.waitCount(t, 2)
+	if got := tap.settle(); got != 2 {
+		t.Fatalf("mixed-tick messages = %d, want 2 (standalone v2 + batch)", got)
+	}
+
+	// Message 1: B's complete standalone v2, headerless.
+	if _, present := msgs[0].Header[tapHeaderKey]; present {
+		t.Fatal("route-update v2 carries an intent_encoding header")
+	}
+	in, ok := natsio.DecodeIntent(msgs[0].Data)
+	if !ok || in.VehicleID != 20 || !in.RouteSet || in.Route != "D1" {
+		t.Fatalf("first arrival = %+v (ok %v), want B's standalone route v2", in, ok)
+	}
+	// Message 2: the batch holding A and C, in ego order.
+	recs := decodeTSIBMsg(t, msgs[1], 1)
+	if len(recs) != 2 || recs[0].VehicleID != 10 || recs[1].VehicleID != 30 {
+		t.Fatalf("batch records = %+v, want [A=10, C=30] in ego order", recs)
+	}
+}

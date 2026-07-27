@@ -287,6 +287,17 @@ func TestTSIBUnknownEncodingDropped(t *testing.T) {
 	if len(bus.buf) != 1 || bus.buf[0].Intent != tsibCodecCases[0] {
 		t.Fatalf("headered v2 message without intent_encoding not read as v2: %+v", bus.buf)
 	}
+
+	// An EXPLICIT intent_encoding: v2 is an exact synonym for absent — the
+	// same message works against a pre-TSIB engine (which ignores headers),
+	// so rejecting it would break such a producer on upgrade (M4 review).
+	m3 := nats.NewMsg("ts.r.ctl.intent.alpha")
+	m3.Data = EncodeIntent(tsibCodecCases[1])
+	m3.Header.Set(headerIntentEncoding, "v2")
+	bus.onIntent(m3)
+	if len(bus.buf) != 2 || bus.buf[1].Intent != tsibCodecCases[1] {
+		t.Fatalf("explicit intent_encoding=v2 not read as v2: %+v", bus.buf)
+	}
 }
 
 // tsibSetup wires a real Bus+Contract over the embedded server with one

@@ -50,7 +50,8 @@ const (
 	headerSchemaVersion  = "schema_version"
 	headerAppliedTick    = "applied_tick"
 	headerSigChunk       = "sig_chunk"       // "i/n" 1-based, ADR-0016 (absent = whole table)
-	headerIntentEncoding = "intent_encoding" // ADR-0026 demux: absent = v2, "tsib" = TSIB, else drop+count
+	headerIntentEncoding = "intent_encoding" // ADR-0026 demux: absent or "v2" = v2, "tsib" = TSIB, else drop+count
+	intentEncodingV2     = "v2"              // explicit v2: exact synonym for absent (pre-TSIB engines ignore headers, so a literal v2 works on both generations)
 	intentEncodingTSIB   = "tsib"
 	intentSubjectTokens  = 5 // ts.{run}.ctl.intent.{controller_id}
 )
@@ -59,7 +60,7 @@ const (
 // (ADR-0026 M4 addendum): every intent wire encoding this engine accepts on
 // ctlIntent, v2 first. Pre-TSIB engines omit the field entirely, which is
 // the driver-side fallback signal.
-var intentEncodingsAdvertised = []string{"v2", intentEncodingTSIB}
+var intentEncodingsAdvertised = []string{intentEncodingV2, intentEncodingTSIB}
 
 // intentFixedFlags computes the v2 flag bits for the non-route axes.
 func intentFixedFlags(in engine.Intent) uint32 {
@@ -286,12 +287,14 @@ func NewPublishBus(nc *nats.Conn, run string, e *engine.Engine) (*Bus, error) {
 
 // onIntent buffers raw intents with their controller identity. Called on a
 // nats.go delivery goroutine; never touches the engine. Demuxes on the
-// intent_encoding header (ADR-0026): ABSENT = per-vehicle v2 (every existing
-// producer, byte-identical path), "tsib" = a TSIB batch expanded into one
-// ArrivedIntent per surviving record IN RECORD ORDER (engine-assigned seqs
-// stay monotonic per controller exactly as for a v2 stream), anything else —
-// including a present-but-EMPTY value — = drop + count, LOUD: never a
-// fall-through to v2 parsing, so a future encoding against an old engine
+// intent_encoding header (ADR-0026): ABSENT or an explicit "v2" = per-vehicle
+// v2 (every existing producer, byte-identical path — pre-TSIB engines ignore
+// headers, so a literal "v2" works on both generations), "tsib" = a TSIB
+// batch expanded into one ArrivedIntent per surviving record IN RECORD ORDER
+// (engine-assigned seqs stay monotonic per controller exactly as for a v2
+// stream), anything else — including a present-but-EMPTY value — = drop +
+// count, LOUD: never a fall-through to v2 parsing, so a future encoding
+// against an old engine
 // fails loudly instead of misparsing.
 func (b *Bus) onIntent(msg *nats.Msg) {
 	tokens := strings.Split(msg.Subject, ".")
@@ -321,6 +324,12 @@ func (b *Bus) onIntent(msg *nats.Msg) {
 		enc = vals[0]
 	}
 	switch enc {
+	case intentEncodingV2:
+		// Explicit "v2": an EXACT synonym for absent. A pre-TSIB engine
+		// ignores headers entirely, so this same message works there —
+		// rejecting it would make an engine upgrade break such a producer
+		// (interop trap, M4 review).
+		b.bufferV2Intent(tokens[4], msg.Data)
 	case intentEncodingTSIB:
 		intents, recordDrops, ok := DecodeTSIB(msg.Data)
 		if !ok {

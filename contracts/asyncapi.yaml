@@ -13,6 +13,14 @@
 #     — never in subjects, never inferred from stream sequence.
 #   - Binary layouts are little-endian, fixed-size integers, versioned by
 #     the schema_version header AND an in-payload magic/version pair.
+#     The schema_version HEADER requirement applies to ENGINE-published
+#     messages: controller intent messages are headerless by shipped
+#     reality (v2, since before ADR-0026 — the schema previously
+#     contradicted the project's own traffic; 2.5.0 aligns schema to
+#     reality), and TSIB carries only the exact-case `intent_encoding:
+#     tsib` discriminator (absent or `v2` = v2) plus the in-payload
+#     version u16 — keeping the v2 intent stream byte-identical for
+#     every pre-ADR-0026 producer.
 #   - Every binary message also declares a JSON schema view (suffix "View")
 #     so tooling (docs, codegen, validators) has a machine-readable shape;
 #     the wire stays binary.
@@ -213,8 +221,11 @@ channels:
       (ControlIntentBatch), discriminated by the NATS header key
       `intent_encoding` — matched EXACT-CASE, byte-for-byte, because
       nats.go headers are verbatim case-sensitive (no MIME
-      canonicalization): ABSENT ⇒ v2 (every pre-ADR-0026 producer; other
-      headers are ignored), `tsib` ⇒ TSIB, ANY OTHER VALUE (including
+      canonicalization): ABSENT or `v2` ⇒ v2 (every pre-ADR-0026
+      producer, and an explicit `v2` — a synonym, accepted because
+      pre-TSIB engines ignore headers entirely so a literal `v2` already
+      works there; rejecting it would make an engine upgrade break such
+      a producer), `tsib` ⇒ TSIB, ANY OTHER VALUE (including
       present-but-empty) ⇒ the message is dropped and counted
       (intentEncodingUnknown), logged loudly — never a fall-through to v2
       parsing, so a future encoding fails loudly against a TSIB-AWARE
@@ -222,9 +233,19 @@ channels:
       message reads as malformed v2: counted via the generic drop counter
       with no dedicated signal, claim filtering as backstop — see the
       migration note.) A valid TSIB expands at ingest into
-      per-vehicle records in record order; everything downstream (claim
-      filter, per-controller seq, hold-last, arbitration, record plane)
-      is identical to the v2 stream.
+      per-vehicle records in record order; per-VEHICLE semantics
+      downstream (claim filter, ONE monotonic sequence per controller
+      assigned in arrival order — the vehicle id only sorts ahead of
+      seq in arbitration, first-wins arbitration per vehicle,
+      hold-last, record/replay) are
+      identical to the v2 stream. One deliberate exception: on a tick
+      where some intents carry routes, the standalone route v2 publishes
+      mid-loop while route-free intents wait for the end-of-tick batch,
+      so per-controller ARRIVAL ORDER ACROSS DIFFERENT VEHICLES may
+      differ from a pure v2 stream ([route-bearing B, batched A, batched
+      C] for ego order [A,B,C]). The difference is deterministic and
+      outcome-neutral: arbitration is per-vehicle and replay re-enqueues
+      the recorded order.
       Migration (ADR-0026 M4 + 2026-07-26 amendment): the mechanism is
       HelloReply capability advertisement with graceful fallback — the
       engine advertises `intent_encodings` at attach, and a batch-capable
@@ -237,7 +258,10 @@ channels:
       validation (dropped and counted as malformed v2, never silently
       applied), and the pathological single-record case (68 B, bytes
       40–41 reading as route_len 24) can pass v2 decode and then dies at
-      claim filtering — the named backstop. The monorepo ships engine +
+      claim filtering — the named backstop. (Symmetrically, a producer
+      sending a literal `intent_encoding: v2` works on BOTH engine
+      generations: pre-TSIB engines ignore the header, TSIB-aware engines
+      accept `v2` as an exact synonym for absent.) The monorepo ships engine +
       default driver together; external controllers on asyncapi ≥ 2.5.0
       get the advertisement and the fallback rule above.
     parameters:
@@ -663,8 +687,11 @@ components:
         until consumed), routing (destination lane id, persistent), signal
         state (persistent, informational in v1). Absent fields = no change.
         The engine clamps every intent to the vehicle's physical envelope
-        (MMU pattern, ADR-0008 §5).
-      headers: { $ref: '#/components/schemas/SchemaHeaders' }
+        (MMU pattern, ADR-0008 §5). Headers are OPTIONAL on this message:
+        the shipped v2 driver publishes headerless (absent intent_encoding
+        = v2, per the ctlIntent demux); engine-published messages stamp
+        schema_version.
+      headers: { $ref: '#/components/schemas/SchemaHeadersOptional' }
       payload:
         schemaFormat: application/octet-stream
         $ref: '#/components/schemas/IntentFrame'
@@ -677,9 +704,15 @@ components:
         The batched form of ControlIntent: up to 20,000 per-vehicle
         records in one message (fleets past the cap split into
         ⌈n/20,000⌉ batches per tick), expanded at ingest into the same
-        per-vehicle buffer in record order, so every downstream semantic
-        of ctlIntent (claim filter, per-controller seq, hold-last,
-        arbitration, the record plane) is identical to the v2 stream.
+        per-vehicle buffer in record order, so every per-vehicle
+        downstream semantic of ctlIntent (claim filter, one monotonic
+        sequence per controller assigned in arrival order, first-wins
+        arbitration per vehicle, hold-last,
+        record/replay) is identical to the v2 stream — with ONE
+        deliberate exception: on route-bearing ticks the standalone route
+        v2 publishes before the batch, so per-controller arrival order
+        across different vehicles may differ (deterministic,
+        outcome-neutral; see the ctlIntent channel description).
         Batch acceptance counters (intentBatches / intentRecords /
         intentBatchDropped / intentRecordDropped / intentEncodingUnknown,
         Bus.IntentBatchStats) are the observability substitute for 1:1
@@ -881,6 +914,18 @@ components:
       properties:
         schema_version: { type: integer, const: 2 }
 
+    SchemaHeadersOptional:
+      type: object
+      properties:
+        schema_version:
+          type: integer
+          const: 2
+          description: 'OPTIONAL on controller-published messages: engine-published messages stamp schema_version; controller intent messages do not (v2 intents are headerless on the wire — the ADR-0026 demux treats an absent intent_encoding as v2).'
+        intent_encoding:
+          type: string
+          const: v2
+          description: 'OPTIONAL; when present on a v2 intent it MUST be exactly "v2" (an explicit synonym for absent — pre-TSIB engines ignore headers, so a literal v2 works on both generations). Any other value belongs to ControlIntentBatch (tsib) or is dropped as unknown at runtime.'
+
     AckHeaders:
       type: object
       required: [tick, applied_tick, schema_version]
@@ -1040,13 +1085,17 @@ components:
         intent_encoding:
           type: string
           const: tsib
-          description: 'TSIB discriminator (ADR-0026). Matched EXACT-CASE, byte-for-byte — nats.go headers are verbatim case-sensitive, no MIME canonicalization. Absent key ⇒ the message is per-vehicle v2; any other value (including present-but-empty) ⇒ dropped and counted (intentEncodingUnknown), logged loudly. A DUPLICATE key (multiple values) resolves FIRST-VALUE-WINS, matching the shipped decoder.'
+          description: 'TSIB discriminator (ADR-0026). Matched EXACT-CASE, byte-for-byte — nats.go headers are verbatim case-sensitive, no MIME canonicalization. Absent key OR the literal value v2 ⇒ the message is per-vehicle v2 (the synonym exists because pre-TSIB engines ignore headers, so a literal v2 already works there); any other value (including present-but-empty) ⇒ dropped and counted (intentEncodingUnknown), logged loudly. A DUPLICATE key (multiple values) resolves FIRST-VALUE-WINS, matching the shipped decoder.'
 
     TSIBFrame:
       type: string
       format: binary
       description: |
-        v1, little-endian (ADR-0026):
+        v1, little-endian (ADR-0026). Header-versioning exception to the
+        file-wide convention: TSIB carries NO schema_version header — its
+        discriminator is the `intent_encoding: tsib` header (absent = v2)
+        plus the in-payload version u16 below — so the v2 intent stream
+        stays byte-identical (headerless) for pre-ADR-0026 producers.
           header (24 B): magic "TSIB" | version u16 = 1 | flags u16 (reserved, 0) |
                          tick u64 | count u32 | reserved u32
           records: count × 44 B — byte-identical layout to the fixed
@@ -1091,7 +1140,7 @@ components:
       required: [tick, count, records]
       properties:
         tick: { type: integer, minimum: 0, description: 'Source observation tick — informational only, never validated.' }
-        count: { type: integer, minimum: 0, maximum: 20000 }
+        count: { type: integer, minimum: 0, maximum: 20000, description: 'Record count. count 0 (a 24 B header-only batch) is structurally VALID and accepted — a keep-alive-shaped allowance; no shipped controller produces one.' }
         records:
           type: array
           maxItems: 20000

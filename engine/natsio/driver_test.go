@@ -1325,7 +1325,8 @@ func TestBatchAppliedLagBoundary(t *testing.T) {
 		// iteration k sleeps until start + k×pace, so boundary intervals are
 		// fixed by construction in both legs (no drift from variable work).
 		// An iteration overrunning its deadline is counted and reported —
-		// never silently absorbed; at 3 ms with sub-ms work it is zero.
+		// never silently absorbed; REQUIRED zero on acceptance legs (the
+		// exact comparison is only valid on an undisturbed schedule).
 		start := time.Now()
 		for i := 0; i < measTicks; i++ {
 			if err := contract.ProcessControl(e); err != nil {
@@ -1438,8 +1439,8 @@ func TestBatchAppliedLagBoundary(t *testing.T) {
 	accept("prod-pace", prodPace, v2Prod, tsibProd)
 
 	// Scale confirmation: the same undisturbed shape at 5,000 vehicles
-	// (obs frames ~2 MB, responses ~5k intents — the 10 ms pace leaves
-	// the same huge margin, overruns REQUIRED zero as at 3 ms).
+	// (obs frames ~2 MB, responses ~5k intents — the 100 ms pace leaves
+	// the same huge margin, overruns REQUIRED zero as at prod pace).
 	const scalePace = 100 * time.Millisecond
 	v2Scale := runLeg(t, true, 5000, 100, scalePace)
 	tsibScale := runLeg(t, false, 5000, 100, scalePace)

@@ -51,7 +51,8 @@ unchanged. One message may be either encoding. `onIntent` demuxes on a
 dedicated NATS header:
 
 - `intent_encoding` absent ⇒ **v2** (every existing producer, zero
-  migration).
+  migration). **(AMENDED 2026-07-26: an explicit `intent_encoding: v2`
+  is an exact synonym — see the amendment section.)**
 - `intent_encoding: tsib` ⇒ **TSIB**.
 - Any other value ⇒ **drop + count, loud** (`intentEncodingUnknown`).
   No fall-through to v2 parsing, so a future encoding against an old
@@ -87,7 +88,7 @@ records:        count × 44 B, byte-identical layout to the fixed section
                 route_len u16 | reserved u16)
 ```
 
-- **Batch cap: 20,000 records** (880,024 B payload + header). The
+- **Batch cap: 20,000 records** (880,024 B with the header). The
   theoretical 1 MiB ceiling (~23.8k records) leaves ~32 B of headroom —
   approximately the serialized header itself — so the cap is set
   conservatively and pinned by a boundary publish test. A controller with
@@ -133,6 +134,18 @@ filtering, seq stamping, hold-last re-issue, deterministic apply order
 per-applied-intent recording on `ts.{run}.log.intent`, replay, the bake
 pipeline — is **identical to today**. The record plane never sees a
 batch.
+
+One deliberate, deterministic exception to wire-order parity (M4 review):
+on a tick where some of a controller's intents carry routes, the
+standalone route v2 publishes mid-loop while the route-free intents wait
+for the end-of-tick batch, so per-controller **arrival order across
+different vehicles** can differ from a pure v2 stream — ego order
+[A batched, B routed, C batched] arrives [B, A, C]. Outcomes are
+unaffected: arbitration is per-vehicle (first-per-vehicle wins), claim
+filtering and hold-last are per-vehicle, and replay re-enqueues the
+recorded order; per-vehicle semantics are exactly those of the v2
+stream. A driver test (`TestBatchMixedRouteTickArrivalOrder`) pins the
+[B, A, C] shape so the reordering is a decision, not drift.
 
 This is the load-bearing choice: batching is a new message contract on
 `ctlIntent` (hence this ADR) with **no downstream semantic change**. The
@@ -295,3 +308,21 @@ showed the skew risk was worth the ~20 lines. (Contract documented in
 set; engine side `engine/natsio/contract.go` + `bus.go`, driver side
 `engine/natsio/driver/driver.go` `applyIntentEncodings`; tests
 `TestHelloAdvertisesIntentEncodings`, `TestIntentEncodingFallback`.)
+
+Two further demux/schema clarifications landed in the same M4 gate
+round, both aligning the contract to the shipped wire reality:
+
+- **Explicit `intent_encoding: v2` is an exact synonym for absent** —
+  pre-TSIB engines ignore headers entirely, so a producer sending a
+  literal `v2` already works there; rejecting it would make an engine
+  upgrade break that producer. The demux rule is therefore: absent or
+  `v2` ⇒ v2; `tsib` ⇒ TSIB; any other value (including present-empty)
+  ⇒ drop + count, loud. Duplicate keys resolve first-value-wins (the
+  shipped decoder).
+- **`schema_version` is OPTIONAL on controller intent messages** —
+  headerless v2 intents have been the shipped reality since before this
+  ADR (the schema previously contradicted the project's own traffic;
+  asyncapi 2.5.0 aligns schema to reality). The schema_version envelope
+  requirement applies to engine-published messages, not controller
+  intents; TSIB's discriminator is `intent_encoding`, never
+  schema_version.
