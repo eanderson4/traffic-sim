@@ -336,6 +336,29 @@ run in that state is not a measurement of anything. See
 [ADR-0025](../kb/decisions/ADR-0025-longitudinal-safety-gate.md) and
 [Silent Fidelity Failures](../kb/articles/concepts/silent-fidelity-failures.md).
 
-Every run reported here delivered ~100% of its declared demand and ran below
-0.1% uncontrolled coasting. Runs that do not meet those bars are called void
-by `serve` itself and are not used.
+**This bar is met by the two authored pods and NOT by the three Chicago
+A/B tables.** Corrected 2026-07-27; the previous version of this paragraph
+claimed it for every run on the page, which is false.
+
+- **The Merge and Bottleneck Town**: yes. Both were re-measured serially in
+  2026-07-27, both reports carry `"voided": []`, delivery is 100% on every
+  arm, and coasting sits at 0.06-0.07% against the 0.1% bar.
+- **The recordings**: yes. `chishow` logs 0.03% coasting
+  ([audit.md](audit.md)) and `chishow35` 0.07%; `record-hero.sh` refuses to
+  bake a run that misses either bar.
+- **The three Chicago A/B tables** (the Loop and the expressways, the CBD,
+  the Kennedy): **no, and the gap is large.** `scripts/whatif.py` passes no
+  `-drivers`, so every arm ran on ONE driver replica. Measured on the
+  `chi-loop-urban` baseline arm at 12,000 ticks with *eight* replicas:
+  **1.49%** uncontrolled coasting. On one replica it is worse — `serve`'s
+  own `-drivers` help records **35.75%** of vehicle-ticks with no controller
+  intent at ~12,000 vehicles on this network.
+
+What that does and does not mean. It does NOT mean the Chicago rankings are
+wrong: every arm ran under the same condition on the same seeds, and the
+comparison is paired. It DOES mean their absolute speeds are not a
+measurement of the scenario as written, that they would be refused outright
+by the fidelity gate this repo now applies, and that the caveat already
+attached to those rows — expressway mainlines running faster than the real
+thing — has this as one of its causes rather than being a separate quirk.
+Re-measuring them with `-drivers` is tracked.

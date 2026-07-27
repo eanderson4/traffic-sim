@@ -1,0 +1,10 @@
+ docs/kb/INDEX.md                                   |   2 +-
+ .../articles/concepts/silent-fidelity-failures.md  |  99 +++++++++-
+ docs/show/diag/bottleneck-town__setup.svg          |  12 +-
+ docs/show/diag/chi-loop-urban__setup.png           | Bin 0 -> 133790 bytes
+ docs/show/diag/index.html                          |  12 +-
+ docs/show/img/chi-congestion-fw35.png              | Bin 0 -> 159366 bytes
+ scripts/chicago/mkquiz.py                          |  32 +++-
+ scripts/show/mkcongestionmap.py                    | 201 +++++++++++++++++++++
+ viz/public/quiz.html                               |   4 +-
+ 9 files changed, 335 insertions(+), 27 deletions(-)

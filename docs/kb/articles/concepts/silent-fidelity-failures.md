@@ -1,10 +1,12 @@
 # Silent Fidelity Failures
 
 > How a run reports a clean measurement of a scenario it never simulated —
-> seven independent mechanisms, what each looked like from the outside, and
-> the counter that catches it. Five were found on chi-loop-urban at city
-> scale; two bite on a 44-lane authored pod, and the seventh is not a
-> property of any scenario at all — it is the measurement harness.
+> eight independent mechanisms, what each looked like from the outside, and
+> the counter that catches it. Most were found on chi-loop-urban at city
+> scale; two bite on a 44-lane authored pod; the seventh is not a property of
+> any scenario at all (it is the measurement harness) and the eighth is not a
+> failure of the simulation at all — it is a correct number answering a
+> different question than the one being asked of it.
 
 ## Why this article exists
 
@@ -22,7 +24,7 @@ congestion is what "things moving slowly and piling up" looks like from the
 metrics. The defence is not better physics. It is a counter on every path
 that can drop, expire, or skip work, and a loud threshold on each.
 
-## The seven mechanisms
+## The eight mechanisms
 
 ### 1. Demand that never enters (the director's 1 verb/tick ceiling)
 
@@ -197,6 +199,96 @@ one with runs silently dropped, keeping the logs for diagnosis. Batches must
 run strictly sequentially and at a calibrated concurrency; the calibration
 is a property of the machine, not of the scenario, so it is re-measured
 rather than assumed.
+
+### 8. A boundary queue reported as corridor congestion
+
+Found on chi-loop-urban at freeway-scale 3.5 (2026-07-27), while checking a
+congestion map against the corridor table that had justified shipping that
+scale. The map showed green expressways and an orange downtown; the table said the
+expressways ran at 31.7-46.4 km/h. Both were right, and the table was
+measuring the edge of the extract.
+
+An extract is a cordon. Demand enters on ORIGIN lanes — lanes with no
+predecessor — and those lanes have finite injection capacity. Past it the
+queue forms ON the origin lane, which is inside the network and inside the
+metric window, so its vehicle-time is booked against whatever corridor the
+lane belongs to.
+
+Measured on the `chishow35` bake — `data/scenarios/chi-show-fw35`, seed 42,
+6,000 ticks, `-drivers 8 -capacity 48000` — aggregating its own
+`-metrics-out` from tick 3,000. `data/` is gitignored, so the 42 MB metrics
+file is not in the repo; regenerate it with
+
+```
+scripts/chicago/record-hero.sh data/scenarios/chi-show-fw35 chishow35 6000 \
+    data/baked -drivers 8 -capacity 48000
+python3 scripts/show/mkcongestionmap.py \
+    --network data/networks/chi-loop-urban/chi-loop-urban.json \
+    --metrics data/baked/chishow35.metrics.json --warmup-tick 3000 \
+    --run-label "chishow35 (chi-show-fw35, seed 42, 6000 ticks, -drivers 8)" \
+    --out docs/show/img/chi-congestion-fw35.png
+```
+
+Other fw35 recordings exist (an earlier sweep run reads Kennedy 47.6 /
+51.4 / 8.3% against this run's 46.4 / 50.0 / 8.2%); the conclusion is
+insensitive to which, but a table is not, so every figure below is from the
+run named above:
+
+| corridor | Edie speed | excluding origin lanes | origin share of time |
+|---|---:|---:|---:|
+| Dan Ryan | 36.4 km/h | **58.9** | 49.5% |
+| Eisenhower | 41.0 | **72.0** | 62.3% |
+| Stevenson | 41.3 | **57.6** | 38.8% |
+| Lake Shore Drive | 31.7 | **48.8** | 39.9% |
+| Kennedy | 46.4 | **50.0** | 8.2% |
+
+Network-wide, origin lanes held **22.6% of all vehicle-time on 10.2% of the
+distance**. One 491 m four-lane LSD portal ran at 5-10% of its posted limit
+and absorbed a quarter of that corridor's entire vehicle-time.
+
+**Why it was invisible:** every gate passed. Demand delivery was 97%, well
+above the 95% bar, because the vehicles DO enter — they enter slowly and sit
+on the injection lane. Coasting was 0.07%. No observation frame was lost.
+Nothing that the gates watch was dropped, so nothing was counted. (The run
+does book 21,070 dropped crossings, which is the separate boundary-overlap
+accounting of ADR-0025's known gap, not demand, control or observation
+loss.)
+
+**Why it is not mechanism 5.** That one is a *burst* artifact and its
+documented mitigation is `spacing: constant`. Tested here: switching all 248
+flows from Poisson to constant moved the origin share ACROSS THE FIVE
+EXPRESSWAY CORRIDORS from 40.9% to 39.9% (network-wide it is 22.6%; the
+per-corridor figures are in the table above) and left every corridor speed
+within noise. This is saturation, not
+burstiness — the portals cannot pass the demand at any arrival pattern.
+
+**Counter:** none exists. The check is structural — partition a corridor's
+lanes by whether they have a predecessor and report both figures. A corridor
+speed quoted without that split cannot distinguish a congested road from a
+congested doorway. `scripts/show/mkcongestionmap.py` makes it visible by
+colouring each lane against its own limit, which is how this was caught.
+
+**Consequence for the show, stated carefully — the boundary queue OVERSTATES
+the congestion, it does not invent it.** Comparing the same network at
+freeway-scale 2.0 (where origin lanes hold just 2.3% of network vehicle-time,
+so the doorway is not binding) against 3.5, interior-only:
+
+| corridor | fw20 interior | fw35 interior |
+|---|---:|---:|
+| Kennedy | 76.1 km/h | **50.0** |
+| Stevenson | 80.1 | **57.6** |
+| Dan Ryan | 75.7 | **58.9** |
+| Eisenhower | 80.4 | 72.0 |
+| Lake Shore Drive | 52.1 | 48.8 |
+
+So the mainlines DO congest with demand — the Kennedy loses a third of its
+speed — and 50 km/h is far closer to the real 25-45 AM peak than fw20's 76.
+What the cordon queue did was inflate that into a headline of 31.7-46.4 km/h
+(the Kennedy's 50.0 interior reads as 46.4 with the doorway folded in; the
+Dan Ryan's 58.9 reads as 36.4). Both readings mislead if quoted alone:
+"36 km/h" credits the road with the doorway's delay, and "not congested"
+ignores a 34% drop. Quote the
+interior-only figure and say it is interior-only.
 
 ## The general shape
 
