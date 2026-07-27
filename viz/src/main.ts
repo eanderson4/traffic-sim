@@ -385,11 +385,17 @@ async function main(): Promise<void> {
     maplibregl.addProtocol("pmtiles", protocol.tile);
   }
 
+  // A ?center= deep link REPLACES the bounds fit — MapLibre lets bounds win
+  // when both are supplied, so the two are mutually exclusive by
+  // construction, not by option precedence. Without a camera param this is
+  // byte-for-byte the previous behaviour.
+  const cam = cfg.camera;
   const map = new maplibregl.Map({
     container: "map",
     style: blankStyle,
-    bounds,
-    fitBoundsOptions: { padding: 40 },
+    ...(cam !== null
+      ? { center: cam.center, zoom: cam.zoom, bearing: cam.bearing, pitch: cam.pitch }
+      : { bounds, fitBoundsOptions: { padding: 40 } }),
     attributionControl: false,
   });
   map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-right");

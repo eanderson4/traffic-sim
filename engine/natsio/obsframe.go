@@ -51,6 +51,36 @@ const (
 	ObsFeaturePolicyCtx uint16 = 1 << 1
 )
 
+// ObsEgoBytes is the wire cost of ONE ego in a frame carrying the given
+// features, excluding its route string. Exported because cmd/serve's
+// cap-diagnosis message quotes it: hardcoding the number there duplicated
+// this layout in a second place, and the duplicate would go on telling
+// operators "~392 B each, so the knee is near 10,200" after any layout
+// change, which is the wrong thing to be confidently wrong about.
+func ObsEgoBytes(features uint16) int {
+	n := obsEgoFix
+	if features&ObsFeaturePolicyCtx != 0 {
+		n += obsCtxSize
+	}
+	return n
+}
+
+// ObsEgoCapacity is how many egos fit one frame of maxPayload bytes at the
+// given features and mean route length — the "cliff" the payload cap imposes,
+// derived rather than remembered. TestObsFrameSizeCliff pins it empirically
+// against a real broker.
+func ObsEgoCapacity(maxPayload int, features uint16, routeLen int) int {
+	per := ObsEgoBytes(features) + routeLen
+	if per <= 0 {
+		return 0
+	}
+	n := (maxPayload - obsHeader) / per
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
 // ObsEgo is the exact per-claimed-vehicle block.
 type ObsEgo struct {
 	ID       uint64

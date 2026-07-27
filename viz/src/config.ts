@@ -7,6 +7,63 @@
 // `?bake=<index.json URL>` selects the baked-replay shim (ADR-0023): the
 // recording replays from static artifacts, `?ws=` is inert, and `?run=`
 // is display-only (the shim echoes the index's run id).
+// `?center=lng,lat` (+ optional `?zoom=`, `?bearing=`, `?pitch=`) pins the
+// opening camera instead of fitting the network's bounds — a deep link to
+// one intervention, so a demo opens already pointed at the thing being
+// discussed rather than at the whole city.
+
+// CameraConfig is a fully-resolved opening camera. It exists only when
+// ?center= parsed cleanly; every other field has a default, so a caller
+// never has to handle partial cameras.
+export interface CameraConfig {
+  center: [number, number]; // [lng, lat]
+  zoom: number;
+  bearing: number;
+  pitch: number;
+}
+
+// parseCamera reads the camera params, returning null unless ?center= is
+// present AND well-formed. Malformed input falls back to the bounds fit
+// rather than throwing or landing at null island: a bad deep link should
+// degrade to "shows the whole network", which is recoverable on air, not
+// to a blank ocean, which is not.
+export function parseCamera(p: URLSearchParams): CameraConfig | null {
+  const raw = p.get("center");
+  if (raw === null || raw === "") return null;
+  const parts = raw.split(",");
+  if (parts.length !== 2) return null;
+  // Empty components are rejected BEFORE Number(), for the same reason the
+  // note below gives: Number("") is 0, which is finite and in range, so
+  // "?center=,41.88" would otherwise parse as a perfectly valid camera at
+  // lng 0 — null island, dressed as success. The half-written deep link is
+  // the realistic way to produce this (a template that lost one value), and
+  // it is exactly the case the fallback-to-bounds contract exists to catch.
+  if (parts.some((s) => s.trim() === "")) return null;
+  const lng = Number(parts[0]);
+  const lat = Number(parts[1]);
+  if (!Number.isFinite(lng) || !Number.isFinite(lat)) return null;
+  if (lng < -180 || lng > 180 || lat < -90 || lat > 90) return null;
+
+  // NOTE the explicit null/empty check: Number(null) is 0, which is finite,
+  // so a bare Number(p.get(k)) would silently resolve every absent param to
+  // 0 and open the map at zoom 0 — the whole globe — instead of the street
+  // -level default. Caught by test, not by inspection.
+  const num = (key: string, dflt: number, lo: number, hi: number): number => {
+    const raw = p.get(key);
+    if (raw === null || raw === "") return dflt;
+    const v = Number(raw);
+    if (!Number.isFinite(v)) return dflt;
+    return v < lo ? lo : v > hi ? hi : v;
+  };
+  return {
+    center: [lng, lat],
+    // 15 is a street-level default: close enough to read individual
+    // vehicles, wide enough to see an intersection and its approaches.
+    zoom: num("zoom", 15, 0, 24),
+    bearing: num("bearing", 0, -360, 360),
+    pitch: num("pitch", 0, 0, 85),
+  };
+}
 
 export interface VizConfig {
   run: string;
@@ -21,6 +78,7 @@ export interface VizConfig {
   dt: number; // engine timestep, s — sim seconds per tick
   theme: string; // theme.ts THEMES key (navy default, resolved by getTheme)
   bare: boolean; // ?bare=1: hide HUD chrome + loading overlay (clean map shots)
+  camera: CameraConfig | null; // ?center=/?zoom=: opening camera, null = fit bounds
 }
 
 // localStorage key the theme toggle (main.ts, and the demos menu's inline
@@ -64,5 +122,6 @@ export function loadConfig(search: string, hostname: string): VizConfig {
     dt: Number.isFinite(dt) && dt > 0 ? dt : 0.1,
     theme: resolveThemeName(p.get("theme"), stored),
     bare: p.get("bare") === "1" || p.get("bare") === "true",
+    camera: parseCamera(p),
   };
 }

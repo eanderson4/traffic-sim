@@ -1,0 +1,73 @@
+{
+  "title": "Bottleneck Town",
+  "baseline": "base",
+  "metric": "speed_kmh",
+  "seeds": 10,
+  "ticks": 15000,
+  "winner": "bypass-north",
+  "options": [
+    {
+      "name": "bypass-north",
+      "label": "Build a bypass north of town \u2014 a new road cutting across the inside of Main Street's bend",
+      "delta_pct": 25.283975781288163,
+      "p": 2.05944718515269e-06,
+      "cohen_d": 3.3782166605297865,
+      "verdict": "UPGRADE",
+      "carries_traffic": true
+    },
+    {
+      "name": "connector-south",
+      "label": "Build a relief road south of town \u2014 a new road linking the south ends of all four cross streets",
+      "delta_pct": 7.812792740431571,
+      "p": 0.004722294504378341,
+      "cohen_d": 1.1784506271078028,
+      "verdict": "UPGRADE",
+      "carries_traffic": true
+    },
+    {
+      "name": "retime-short",
+      "label": "Shorter signal cycles \u2014 same phases, 86 s cycle down to 66 s",
+      "delta_pct": -12.533207060795279,
+      "p": 2.825222710355811e-06,
+      "cohen_d": -3.253139993639801,
+      "verdict": "WORSE",
+      "carries_traffic": false
+    },
+    {
+      "name": "green-wave",
+      "label": "Coordinate the lights into a green wave \u2014 same hardware, same green times, offsets set for an eastbound progression",
+      "delta_pct": 17.049915372837592,
+      "p": 4.3879776773260295e-09,
+      "cohen_d": 6.867195286056892,
+      "verdict": "UPGRADE",
+      "carries_traffic": true
+    }
+  ],
+  "all_tested": {
+    "add-lane": {
+      "delta_pct": 16.328019069975422,
+      "p": 1.309190672344063e-05,
+      "verdict": "UPGRADE"
+    },
+    "bypass-north": {
+      "delta_pct": 25.283975781288163,
+      "p": 2.05944718515269e-06,
+      "verdict": "UPGRADE"
+    },
+    "connector-south": {
+      "delta_pct": 7.812792740431571,
+      "p": 0.004722294504378341,
+      "verdict": "UPGRADE"
+    },
+    "green-wave": {
+      "delta_pct": 17.049915372837592,
+      "p": 4.3879776773260295e-09,
+      "verdict": "UPGRADE"
+    },
+    "retime-short": {
+      "delta_pct": -12.533207060795279,
+      "p": 2.825222710355811e-06,
+      "verdict": "WORSE"
+    }
+  }
+}

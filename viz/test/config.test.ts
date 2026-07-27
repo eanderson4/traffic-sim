@@ -43,3 +43,59 @@ test("?bake= selects the baked-replay shim (ADR-0023); default is live", () => {
     "https://data.example.com/baked/run/abc123/index.json",
   );
 });
+
+// --- ?center= opening camera -------------------------------------------
+// The camera exists so a demo can deep-link to ONE intervention. The
+// failure that matters is a malformed link on air: it must degrade to the
+// bounds fit (camera === null), never to a valid-looking camera at the
+// wrong place.
+
+test("no ?center= means no camera — the bounds fit is unchanged", () => {
+  assert.equal(loadConfig("", "localhost").camera, null);
+  assert.equal(loadConfig("?zoom=15&bearing=90", "localhost").camera, null);
+});
+
+test("?center= parses lng,lat and defaults zoom/bearing/pitch", () => {
+  const c = loadConfig("?center=-87.6298,41.8781", "localhost").camera;
+  assert.notEqual(c, null);
+  assert.deepEqual(c!.center, [-87.6298, 41.8781]);
+  assert.equal(c!.zoom, 15);
+  assert.equal(c!.bearing, 0);
+  assert.equal(c!.pitch, 0);
+});
+
+test("?zoom=/?bearing=/?pitch= ride along with a valid center", () => {
+  const c = loadConfig("?center=-87.63,41.88&zoom=17.5&bearing=45&pitch=60", "localhost").camera;
+  assert.equal(c!.zoom, 17.5);
+  assert.equal(c!.bearing, 45);
+  assert.equal(c!.pitch, 60);
+});
+
+test("malformed ?center= falls back to the bounds fit, not to null island", () => {
+  for (const bad of [
+    "?center=",
+    "?center=abc",
+    "?center=-87.63",
+    "?center=-87.63,41.88,7",
+    "?center=nan,41.88",
+    "?center=-200,41.88", // lng out of range
+    "?center=-87.63,99", // lat out of range
+    // Empty components: Number("") is 0, so these are the cases that used to
+    // parse "successfully" and open at null island / on the equator. A deep
+    // link built from a template that lost one value looks exactly like this.
+    "?center=,",
+    "?center=,41.88",
+    "?center=-87.63,",
+    "?center= ,41.88",
+  ]) {
+    assert.equal(loadConfig(bad, "localhost").camera, null, `expected null camera for ${bad}`);
+  }
+});
+
+test("out-of-range zoom/bearing/pitch clamp instead of disabling the camera", () => {
+  const c = loadConfig("?center=-87.63,41.88&zoom=99&pitch=180", "localhost").camera;
+  assert.equal(c!.zoom, 24);
+  assert.equal(c!.pitch, 85);
+  // A garbage zoom is not a reason to throw away a good center.
+  assert.equal(loadConfig("?center=-87.63,41.88&zoom=abc", "localhost").camera!.zoom, 15);
+});

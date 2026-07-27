@@ -49,6 +49,11 @@ import (
 // is real physics, while the failure this guards against lost 84%.
 const demandDeliveryWarn = 0.95
 
+// natsMaxPayload is the embedded broker's per-message cap. Named because
+// two places depend on it: the server option below, and the end-of-run
+// diagnosis that derives the observation-frame ego ceiling from it.
+const natsMaxPayload = 4 << 20
+
 // coastWarn is the share of vehicle-ticks running with no controller intent
 // above which the run's physics are the controller's latency, not the
 // network's capacity. Deliberately low: hold-last already covers ordinary
@@ -268,7 +273,7 @@ func main() {
 		// is chunked on the wire, so this is headroom for big-fleet TSSF
 		// snapshots (~1.2 MB at 50k vehicles), NOT a design allowance. A
 		// pathological frame fails LOUD (the pubErrs logging).
-		MaxPayload: 4 << 20,
+		MaxPayload: natsMaxPayload,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "serve: nats-server:", err)
@@ -392,6 +397,7 @@ func main() {
 	var finalGated, finalOverlapped int
 	var finalCross int
 	var finalCrossBySec map[string]int
+	var finalObsErrs, finalObsWorst, finalObsBridge uint64
 	go func() {
 		// PaceFloor = one tick of wall time at -pace 1 (1× realtime); -pace N
 		// divides it by N, -pace 0 disables pacing entirely (batch mode).
@@ -416,6 +422,11 @@ func main() {
 			finalVehTicks = lr.Engine.VehTicks
 			finalGated, finalOverlapped = lr.Engine.SafetyGated, lr.Engine.SafetyOverlapped
 			finalCross, finalCrossBySec = lr.Engine.CrossOverlaps, lr.Engine.CrossOverlapsBySection
+		}
+		if lr != nil && lr.Contract != nil {
+			finalObsErrs = lr.Contract.ObsErrs()
+			finalObsWorst = lr.Contract.ObsWorstOutage()
+			finalObsBridge = lr.Contract.ObsBridgeTicks()
 		}
 		runErr <- err
 	}()
@@ -537,6 +548,33 @@ func main() {
 				}
 			}
 		}
+		// Observation-frame loss comes FIRST because it is the cause and the
+		// coasting line below is its effect: a controller that never received
+		// its frame emitted no intents, so its whole claimed fleet coasted.
+		//
+		// Two different lines, because the two cases have different verdicts.
+		// ADR-0008 §2 holds the last intent across (cadence−1) + HoldLastTicks
+		// ticks, so an outage no longer than that bridge is HEALED and the
+		// fleet stayed controlled — worth reporting, never worth voiding a run
+		// over. Only a longer consecutive streak actually blinds a controller,
+		// and only that line carries the "FAILED to publish" wording the bake
+		// gate (scripts/chicago/record-hero.sh) greps for.
+		if finalObsErrs > 0 && finalObsWorst <= finalObsBridge {
+			fmt.Printf("serve: note: %d observation frame(s) lost, worst consecutive run %d of a %d-tick hold-last bridge — absorbed, the fleet stayed controlled\n",
+				finalObsErrs, finalObsWorst, finalObsBridge)
+		}
+		if finalObsWorst > finalObsBridge {
+			fmt.Printf("serve: WARNING: %d observation frames FAILED to publish, worst consecutive run %d ticks vs a %d-tick hold-last bridge — a controller was blind past the bridge and its vehicles coasted with no car-following control; this is NOT traffic congestion\n",
+				finalObsErrs, finalObsWorst, finalObsBridge)
+			// Derived from the actual cap and the actual layout, not from
+			// remembered numbers: this line is operator guidance, and the
+			// figures it quotes decide whether someone reaches for -drivers
+			// or goes looking for a traffic explanation that does not exist.
+			perEgo := natsio.ObsEgoBytes(natsio.ObsFeaturePolicyCtx)
+			knee := natsio.ObsEgoCapacity(natsMaxPayload, natsio.ObsFeaturePolicyCtx, 24)
+			fmt.Printf("serve:   most likely the %d MiB broker payload cap: the frame carries every claimed ego in ONE message (%d B each plus its route), so it stops fitting near %d vehicles at a 24 B route. Split the fleet with -drivers N (keep -capacity/N comfortably under that).\n",
+				natsMaxPayload>>20, perEgo, knee)
+		}
 		// Coasting: the driver-side twin of demand expiry, and just as silent.
 		// A holdlast vehicle past its hold window gets no car-following term at
 		// all, so it holds speed into whatever is stopped ahead — the resulting
@@ -552,6 +590,47 @@ func main() {
 			if frac > coastWarn {
 				fmt.Printf("serve: WARNING: the driver could not keep up — %.1f%% of vehicle-ticks ran with no car-following control, which manufactures overlaps that are NOT traffic congestion\n",
 					100*frac)
+				// "Could not keep up" has at least three distinct causes and
+				// they need different fixes, so print what each replica
+				// actually held and what its subscriptions dropped rather than
+				// leaving the reader to guess:
+				//
+				//   capacity-bound  fleet ≈ its capacity -> raise -capacity
+				//   obs drops       drops on ctl.obs     -> the replica cannot
+				//                   process a frame per tick; add replicas
+				//                   with -drivers
+				//   snapshot drops  drops on state.snap  -> the CLAIM backstop
+				//                   is gone. Spawns are announced ONCE, so a
+				//                   vehicle that missed its announcement is
+				//                   never re-offered and the unclaimed pool
+				//                   grows without bound.
+				//
+				// The third is invisible in every other number serve prints:
+				// capacity looks fine, no frame failed to publish, and the
+				// fleet simply stops growing while the vehicle count climbs.
+				for _, out := range attached {
+					if out.drv == nil {
+						continue
+					}
+					drops := out.drv.SubDrops()
+					fmt.Printf("serve:   %-22s fleet %5d  last obs tick %d",
+						out.client, out.drv.FleetSize(), out.drv.LastObsTick())
+					if len(drops) == 0 {
+						fmt.Printf("  no subscription drops\n")
+						continue
+					}
+					fmt.Printf("\n")
+					// Sorted: the rest of this report is stable text that gets
+					// diffed between runs, and Go randomizes map iteration.
+					subjs := make([]string, 0, len(drops))
+					for subj := range drops {
+						subjs = append(subjs, subj)
+					}
+					sort.Strings(subjs)
+					for _, subj := range subjs {
+						fmt.Printf("serve:     DROPPED %d messages on %s\n", drops[subj], subj)
+					}
+				}
 			}
 		}
 		// Safety gate. Two numbers, and they answer different questions:
@@ -642,7 +721,12 @@ type attachOutcome struct {
 	client  string // barrier identity ("default driver", "demand director")
 	desc    string // success-line detail
 	cleanup func() // deferred Close calls; nil on failure
-	err     error
+	// drv is the driver replica behind this outcome (nil for non-driver
+	// clients), retained so the end-of-run report can ask it what it
+	// actually held and what its subscriptions dropped. Without a handle,
+	// "the driver could not keep up" is a symptom with nowhere to look.
+	drv *driver.Driver
+	err error
 }
 
 // attachDriver connects and attaches the in-process default driver replica.
@@ -669,6 +753,7 @@ func attachDriver(ns *server.Server, run string, capacity int, exitRouting, inte
 		client:  name,
 		desc:    fmt.Sprintf("id %s, capacity %d", d.ID(), capacity),
 		cleanup: func() { d.Close(); dnc.Close() },
+		drv:     d,
 	}
 }
 

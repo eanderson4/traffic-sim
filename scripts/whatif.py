@@ -207,6 +207,43 @@ TRANSIENT = ("nats-server not ready", "address already in use",
              "bind: ", "connection refused")
 
 
+# The fidelity failures that make a run's numbers meaningless rather than
+# merely noisy. Every one of these is something `serve` already prints and
+# `record-hero.sh` already refuses to bake over — but until 2026-07-27 the A/B
+# harness read only the exit code, so a run serve had itself declared void
+# could be scored, ranked and shipped in a report. All three read as
+# CONGESTION if you only look at the speed:
+#
+#   * demand that never entered — the cars that could not spawn are exactly
+#     the ones that would have queued, so under-delivery makes the network
+#     look FASTER the harder you push it;
+#   * uncontrolled coasting — no car-following term, so vehicles hold speed
+#     into stopped traffic and the overlaps book as collisions;
+#   * a controller blind past the hold-last bridge — the frame IS its input,
+#     so its whole claimed fleet drove itself.
+#
+# Substrings, not regexes, and matched against serve's own wording so the
+# harness and the bake gate cannot drift apart.
+FIDELITY_FAIL = (
+    ("of demand never entered the network",
+     "demand delivery below threshold — the run did not simulate its scenario"),
+    ("the driver could not keep up",
+     "uncontrolled coasting — part of the fleet had no car-following control"),
+    ("observation frames FAILED to publish",
+     "a controller was blind past the hold-last bridge"),
+)
+
+
+def fidelity_problems(logp):
+    """Fidelity failures serve reported in this run's log (empty = clean)."""
+    try:
+        with open(logp) as lf:
+            text = lf.read()
+    except OSError:
+        return []
+    return [why for pat, why in FIDELITY_FAIL if pat in text]
+
+
 def run_one(serve_bin, scenario, seed, ticks, port, workdir, capacity, extra,
             attempts=3):
     """One serve invocation -> parsed metrics path. Returns (ok, path, log)."""
@@ -261,6 +298,12 @@ def main():
                          "shared ADR-0012 base a variant resolves against)")
     ap.add_argument("--keep", default=None,
                     help="keep run artifacts in this directory instead of a temp dir")
+    ap.add_argument("--allow-void", action="store_true",
+                    help="score the batch even if some runs failed a fidelity "
+                         "gate (under-delivered demand, uncontrolled coasting, "
+                         "a blind controller). Off by default because those "
+                         "failures all LOOK like congestion; the voided runs "
+                         "are recorded in the report either way.")
     ap.add_argument("--out", default=None, help="write the result table as JSON")
     ap.add_argument("--metric", default="speed_kmh",
                     help="primary metric for the verdict column")
@@ -282,6 +325,11 @@ def main():
         args.baseline = saved["baseline"]
         args.warmup = saved.get("warmup", 0)
         args.ticks = saved.get("ticks", 0)
+        # Carry the saved void list through a re-score. Re-scoring changes
+        # which METRIC is primary, not which runs happened, so dropping this
+        # would let `--report --out` launder a --allow-void batch into one
+        # that looks clean.
+        args.voided = saved.get("voided", [])
         report_pod(results, variants, seeds, args)
         return
 
@@ -327,6 +375,7 @@ def main():
             port += 1
 
     results = {}
+    voided = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as ex:
         futs = {ex.submit(run_one, args.serve, os.path.join(args.pod, v), s,
                           args.ticks, p, workdir, args.capacity, []): (v, s)
@@ -335,11 +384,49 @@ def main():
             v, s = futs[fut]
             ok, mpath, logp = fut.result()
             if not ok:
-                print(f"[whatif] FAILED {v} seed {s} — see {logp}", file=sys.stderr)
+                # An execution failure unbalances the paired comparison in
+                # exactly the way a fidelity void does — the seed survives
+                # for the other arms and vanishes for this one — so it goes
+                # in the same bucket. Skipping it while voiding the other
+                # kind would enforce the rule against the milder failure and
+                # wave through the worse one.
+                print(f"[whatif] VOID {v} seed {s}: run FAILED (nonzero exit "
+                      f"or no metrics) — see {logp}", file=sys.stderr)
+                voided.append((v, s))
+                continue
+            # A zero exit is necessary, not sufficient: serve exits 0 on runs
+            # it has itself reported as unfidelitous. Scoring one of those
+            # would rank a simulation the engine says did not happen.
+            bad = fidelity_problems(logp)
+            if bad:
+                for why in bad:
+                    print(f"[whatif] VOID {v} seed {s}: {why} — see {logp}",
+                          file=sys.stderr)
+                voided.append((v, s))
                 continue
             results[(v, s)] = load_metrics(mpath, args.warmup, corridors)
             print(f"[whatif] done {v} seed {s}: "
                   f"{results[(v, s)]['speed_kmh']:.1f} km/h", file=sys.stderr)
+
+    # Refuse to write a report rather than write a quietly-thinner one. A
+    # voided run does not merely weaken the comparison, it UNBALANCES it: the
+    # paired test drops that seed for one arm only, and the arms most likely
+    # to void are exactly the ones that congest hardest — the effect under
+    # test. --allow-void exists for deliberate exploration, and says so in
+    # the report so a reader cannot mistake it for a clean batch.
+    if voided and not args.allow_void:
+        # The workdir is deliberately NOT cleaned here even without --keep:
+        # the per-run logs are the only record of WHY each run voided, and
+        # the first thing anyone does on seeing this message is open one.
+        print(f"\n[whatif] REFUSING TO REPORT: {len(voided)} of {len(jobs)} runs "
+              f"were voided on fidelity grounds (listed above). The arms that "
+              f"void are the ones that congest, so dropping them biases the "
+              f"comparison toward 'no effect'. Fix the run (usually: fewer "
+              f"--jobs, more -drivers, or less demand) or pass --allow-void.\n"
+              f"[whatif] run logs kept for diagnosis: {workdir}",
+              file=sys.stderr)
+        sys.exit(2)
+    args.voided = [f"{v}:s{s}" for v, s in voided]
 
     report_pod(results, variants, seeds, args)
     if not args.keep:
@@ -355,7 +442,11 @@ def report_pod(results, variants, seeds, args):
         sys.exit("baseline produced no successful runs")
 
     report = {"pod": args.pod, "baseline": args.baseline, "seeds": seeds,
-              "ticks": args.ticks, "warmup": args.warmup, "variants": {}}
+              "ticks": args.ticks, "warmup": args.warmup,
+              # Empty on a clean batch. Non-empty only reaches here via
+              # --allow-void, and travels with the numbers so a reader of the
+              # JSON sees which runs were dropped without re-reading the logs.
+              "voided": getattr(args, "voided", []), "variants": {}}
 
     m = args.metric
     print(f"\n=== {args.pod}  (baseline {args.baseline}, {len(seeds)} seeds, "

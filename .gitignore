@@ -5,6 +5,12 @@ dist/
 .claude/settings.local.json
 data/
 analysis/ngsim/ngsim-xt
+# Go build artifacts, ~25 MB each. record-hero.sh and the pod harnesses build
+# them into the working tree on purpose (rather than dropping them somewhere
+# global), so they sit next to their sources and `git add -A engine` will
+# happily stage them if they are not named here.
+engine/serve
+engine/bake
 tools/
 viz/public/network.geojson
 __pycache__/
