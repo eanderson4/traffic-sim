@@ -1,0 +1,105 @@
+diff --git a/engine/BENCHMARKS.md b/engine/BENCHMARKS.md
+index 71c2f072ada27a411cab03a1fd8dde4a95d04c3f..a27788122dc8b33c2ac52d177b31690629a547af 100644
+--- a/engine/BENCHMARKS.md
++++ b/engine/BENCHMARKS.md
+@@ -212,9 +212,11 @@ baseline of record). Ranges are the two A/B pairs; run:
+   plus complete-response equality — MET**, measured by
+   `TestBatchAppliedLagBoundary` at 400 vehicles (10 ms pace) and
+   confirmed at 5,000 vehicles (100 ms scale leg); the 1.5 ms straddle
+-  behavior below is report-only mechanics. The per-vehicle claim ("batch
+-  never worse than v2", not a universal theorem) rests on parts pinned
+-  where provable:** (a) a route-update vehicle rides the IDENTICAL standalone
++  behavior below is report-only mechanics. The claim is exactly that
++  measured per-vehicle p50/p99 result — no stronger distributional
++  statement (see the neither-dominates mechanics note below) — and it
++  rests on parts pinned where provable: (a) a route-update vehicle rides
++  the IDENTICAL standalone
+   v2 wire shape in both modes, so its lag is unchanged by batching (wire
+   shape pinned by `TestBatchRouteUpdateTickStandaloneV2`); (b) a
+   route-free response of ≤ `TSIBMaxRecords` vehicles is ONE atomic
+diff --git a/engine/natsio/driver_test.go b/engine/natsio/driver_test.go
+index 38934cfade1604c5015171b31fd95d481784db8f..1ad6a33132a2032d764a0abb5efbf45761e8df4e 100644
+--- a/engine/natsio/driver_test.go
++++ b/engine/natsio/driver_test.go
+@@ -1164,13 +1164,33 @@ func TestBatchAppliedLagBoundary(t *testing.T) {
+ 			}
+ 			time.Sleep(2 * time.Millisecond)
+ 		}
++		// Sentinel obs: with the fleet stable at `vehicles`, one more obs
++		// — its response is provably EXACTLY `vehicles` intents (a warm-up
++		// obs can race the final claim grant and carry fewer egos).
++		// sentMark is the count BEFORE it goes out, so the response is the
++		// final contiguous block of `vehicles` published intents — the
++		// completion watermark's reference.
++		if err := contract.ProcessControl(e); err != nil {
++			t.Fatal(err)
++		}
++		for _, k := range contract.DrainIntents(e) {
++			e.EnqueueIntent(k)
++		}
++		e.Step()
++		sentMark := d.SentIntents()
++		if err := contract.AfterStep(e); err != nil {
++			t.Fatal(err)
++		}
+ 		// QUIESCENCE GUARD (hard, not a timing hope). Phase A, drain-down:
+ 		// no new obs is published, so the response stream only drains.
+ 		// A zero-fresh drain alone is NOT quiescence when the driver has a
+ 		// backlog (at fleet scale a response takes many ms to compute and
+ 		// gaps between backlogged responses false-pass), so the driver must
+-		// also have WORKED ON the last published obs (LastObsTick covers it)
+-		// before silence is trusted. Phase B, verify: 50 ms of VERIFIED
++		// also have WORKED ON the last published obs (LastObsTick covers
++		// it). That is still only a START watermark — LastObsTick is
++		// stamped before compute/publish finishes — so a COMPLETION
++		// watermark follows: SentIntents must cover the last obs's full
++		// response. Phase B, verify: 50 ms of VERIFIED
+ 		// silence — any fresh intent restarts the window (a backlogged
+ 		// response still landing is drained, not an error; the driver
+ 		// publishes nothing mid-compute in batch mode, so silence is only
+@@ -1199,6 +1219,26 @@ func TestBatchAppliedLagBoundary(t *testing.T) {
+ 			}
+ 			time.Sleep(5 * time.Millisecond)
+ 		}
++		// Completion watermark: LastObsTick is stamped at the START of
++		// onObs, BEFORE compute/publish finishes, so the driver's published
++		// count must additionally cover the last obs's full response
++		// (exactly `vehicles` intents — the fleet is stable; responses are
++		// contiguous and ordered, so the final block of that size IS the
++		// complete last response). Loud on timeout.
++		for deadline := time.Now().Add(30 * time.Second); d.SentIntents()-sentMark < uint64(vehicles); {
++			if time.Now().After(deadline) {
++				t.Fatalf("driver's published count %d short of the %d-intent completion watermark for the last warm-up obs (tick %d)",
++					d.SentIntents()-sentMark, vehicles, lastObs)
++			}
++			if err := contract.ProcessControl(e); err != nil {
++				t.Fatal(err)
++			}
++			for _, k := range contract.DrainIntents(e) {
++				e.EnqueueIntent(k)
++			}
++			e.Step()
++			time.Sleep(2 * time.Millisecond)
++		}
+ 		// Phase B, verify: 50 ms of VERIFIED silence. Any fresh intent
+ 		// RESTARTS the window (a backlogged response still landing — drain
+ 		// it and keep waiting; the driver publishes nothing mid-compute in
+diff --git a/engine/natsio/server.go b/engine/natsio/server.go
+index 91cd7ac23ad9cdb46687c275c9d4b6a5ba446626..b654be9aca0379d5e6aec1d04f04d199251813cd 100644
+--- a/engine/natsio/server.go
++++ b/engine/natsio/server.go
+@@ -111,8 +111,12 @@ func SubjectCtlIntentAll(run string) string { return Namespace + "." + run + ".c
+ func SubjectCtlAck(run, ctl string) string { return Namespace + "." + run + ".ctl.ack." + ctl }
+ 
+ // SubjectCtlAll is the whole per-run controller tree: ts.{run}.ctl.> — for
+-// taps that need cross-channel delivery order (one subscription's delivery
+-// order is broker order; separate subscriptions are not ordered).
++// taps that need cross-channel delivery on ONE subscription. Note the exact
++// guarantee: NATS ordering is PER PUBLISHER, so one wildcard callback
++// recovers per-publisher order (all of the engine's messages in engine
++// order, all of the driver's in driver order) but NOT causal order across
++// the two publishers — the reason any tap built on this is smoke-only and
++// boundary-controlled harnesses are the regression coverage.
+ func SubjectCtlAll(run string) string { return Namespace + "." + run + ".ctl.>" }
+ 
+ // Contract-plane subjects (ADR-0008 §3–§4): the attach handshake
