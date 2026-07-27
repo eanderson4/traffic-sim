@@ -1,0 +1,5 @@
+ contracts/asyncapi.yaml                       | 130 +++++++++++++++++++++++++-
+ docs/kb/INDEX.md                              |   2 +
+ docs/kb/articles/cross-topic-concerns.md      |   2 +
+ docs/kb/decisions/ADR-0026-batched-intents.md |  16 +++-
+ 4 files changed, 144 insertions(+), 6 deletions(-)

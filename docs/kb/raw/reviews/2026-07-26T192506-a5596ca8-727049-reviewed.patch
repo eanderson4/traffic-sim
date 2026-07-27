@@ -1,0 +1,156 @@
+diff --git a/contracts/asyncapi.yaml b/contracts/asyncapi.yaml
+index 9754dc9386f019768013854e9479d3b46643f05f..33708d77d37c8aad03c02b2925b593d089a57bd0 100644
+--- a/contracts/asyncapi.yaml
++++ b/contracts/asyncapi.yaml
+@@ -196,11 +196,36 @@ channels:
+       controller are healed by hold-last: the contract layer re-issues the
+       last intent for ≤ 2 ticks past the cadence due point (logged as
+       held), then zero/default (ADR-0008 §2).
++      Wire demux (ADR-0026): one message on this subject is either the
++      per-vehicle v2 encoding (ControlIntent) or a TSIB v1 batch
++      (ControlIntentBatch), discriminated by the NATS header key
++      `intent_encoding` — matched EXACT-CASE, byte-for-byte, because
++      nats.go headers are verbatim case-sensitive (no MIME
++      canonicalization): ABSENT ⇒ v2 (every pre-ADR-0026 producer; other
++      headers are ignored), `tsib` ⇒ TSIB, ANY OTHER VALUE (including
++      present-but-empty) ⇒ the message is dropped and counted
++      (intentEncodingUnknown), logged loudly — never a fall-through to v2
++      parsing, so a future encoding against an old engine fails loudly
++      instead of misparsing. A valid TSIB expands at ingest into
++      per-vehicle records in record order; everything downstream (claim
++      filter, per-controller seq, hold-last, arbitration, record plane)
++      is identical to the v2 stream.
++      Migration (ADR-0026 M4): deploy engine first, drivers second. A
++      pre-ADR-0026 engine has no demux rule: a multi-record TSIB payload
++      read as v2 fails v2 structural validation — dropped and counted as
++      malformed v2, never silently applied; the pathological
++      single-record case (68 B, bytes 40–41 reading as route_len 24) can
++      pass v2 decode and then dies at claim filtering — the named
++      backstop. The monorepo ships engine + default driver together, so
++      skew is an external-controller concern; capability advertisement in
++      hello is deliberately deferred to the region-decomposition era
++      (ADR-0026 risks).
+     parameters:
+       run: { $ref: '#/components/parameters/runId' }
+       controller_id: { $ref: '#/components/parameters/controllerId' }
+     messages:
+       controlIntent: { $ref: '#/components/messages/ControlIntent' }
++      controlIntentBatch: { $ref: '#/components/messages/ControlIntentBatch' }
+ 
+   ctlHello:
+     address: ts.{run}.ctl.hello
+@@ -621,6 +646,25 @@ components:
+         $ref: '#/components/schemas/IntentFrame'
+       x-json-view: '#/components/schemas/IntentView'
+ 
++    ControlIntentBatch:
++      name: controlIntentBatch
++      title: TSIB v1 batched intents (ADR-0026) — one message per controller per tick
++      summary: |
++        The batched form of ControlIntent: up to 20,000 per-vehicle
++        records in one message, expanded at ingest into the same
++        per-vehicle buffer in record order, so every downstream semantic
++        of ctlIntent (claim filter, per-controller seq, hold-last,
++        arbitration, the record plane) is identical to the v2 stream.
++        Batch acceptance counters (intentBatches / intentRecords /
++        intentBatchDropped / intentRecordDropped / intentEncodingUnknown,
++        Bus.IntentBatchStats) are the observability substitute for 1:1
++        per-vehicle messages. Demux on the ctlIntent channel description.
++      headers: { $ref: '#/components/schemas/IntentEncodingHeaders' }
++      payload:
++        schemaFormat: application/octet-stream
++        $ref: '#/components/schemas/TSIBFrame'
++      x-json-view: '#/components/schemas/TSIBView'
++
+     HelloRequest:
+       name: helloRequest
+       title: Attach handshake request (ADR-0008 §4)
+@@ -964,6 +1008,57 @@ components:
+         route: { type: string, maxLength: 48, description: 'destination lane id; persistent. The engine follows it at every multi-successor lane (shortest path by lane length); an explicit held turn wins the crossing; unknown/unreachable destinations degrade to the successor default' }
+         signals: { type: integer, enum: [0, 1, 2, 3], description: '0 off, 1 left, 2 right, 3 hazard; persistent, informational in v1' }
+ 
++    IntentEncodingHeaders:
++      type: object
++      required: [intent_encoding]
++      properties:
++        intent_encoding:
++          type: string
++          const: tsib
++          description: 'TSIB discriminator (ADR-0026). Matched EXACT-CASE, byte-for-byte — nats.go headers are verbatim case-sensitive, no MIME canonicalization. Absent key ⇒ the message is per-vehicle v2; any other value (including present-but-empty) ⇒ dropped and counted (intentEncodingUnknown), logged loudly.'
++
++    TSIBFrame:
++      type: string
++      format: binary
++      description: |
++        v1, little-endian (ADR-0026):
++          header (24 B): magic "TSIB" | version u16 = 1 | flags u16 (reserved, 0) |
++                         tick u64 | count u32 | reserved u32
++          records: count × 44 B — byte-identical layout to the fixed
++            section of IntentFrame (vehicle_id u64 | flags u32 |
++            lane_delta i32 | accel f64 | speed_setpoint f64 | signals u32 |
++            turn i32 | route_len u16 | reserved u16; flag semantics as
++            defined there).
++        Whole-batch structural validity — a violation drops the WHOLE
++        batch (counted intentBatchDropped, logged), never partially
++        applied: exact length 24 + 44·count; version 1; count ≤ 20000
++        (880,024 B with the header — under the 1 MiB per-message
++        discipline; larger fleets split into multiple batches per tick);
++        every record's route_len MUST be 0 AND flag bit4 (route present)
++        MUST be clear — a route update rides one complete standalone v2
++        intent for the tick and the vehicle is omitted from that tick's
++        batch. Per-record SEMANTIC checks are per-record as in v2: a
++        NaN/Inf accel or speed setpoint drops ONLY that record (counted
++        intentRecordDropped); the rest of the batch applies.
++        tick is INFORMATIONAL ONLY (the source observation tick, for
++        diagnostics and applied-lag measurement) — never validated and
++        never gating acceptance; ingest is arrival-based exactly as for
++        v2. The flags u16 and reserved u32 header fields are IGNORED on
++        decode: reserved bits are not must-understand — an extension that
++        requires understanding them needs a version bump.
++
++    TSIBView:
++      title: JSON view of a TSIB batch (tooling only; wire is binary)
++      type: object
++      required: [tick, count, records]
++      properties:
++        tick: { type: integer, minimum: 0, description: 'Source observation tick — informational only, never validated.' }
++        count: { type: integer, minimum: 0, maximum: 20000 }
++        records:
++          type: array
++          items: { $ref: '#/components/schemas/IntentView' }
++          description: 'Route-free per-vehicle intents (route_len = 0 and flag bit4 clear enforced at decode), in wire order = per-controller engine seq order.'
++
+     AckView:
+       type: object
+       required: [controller_id, applied_tick]
+diff --git a/docs/kb/INDEX.md b/docs/kb/INDEX.md
+index 0e346ff520283cc3599f548fae8243f6e370de8d..7916a36323adf2af35437317fc3096feffbd9b3b 100644
+--- a/docs/kb/INDEX.md
++++ b/docs/kb/INDEX.md
+@@ -107,6 +107,7 @@ links its source synthesis for traceability.
+ - [x] [ADR-0020](decisions/ADR-0020-demosrv-public-deployment.md) — demosrv public deployment: -wspublic verbatim ws advertisement, -admintoken bearer gate on the mutating POSTs (GETs public), -autostart with keep-serving failure semantics, -nobuild prebuilt engine binaries; all default to local-dev behavior
+ - [ ] [ADR-0022](decisions/ADR-0022-us-urban-speed-typemap.md) — PROPOSED: US urban speed typemap — netconvert's German-derived OSM defaults gave unposted secondary/primary 100 km/h across all 25 US networks; an explicit speed-only typemap sets the 30 mph statutory urban default AND disables right-before-left (30 mph sits 0.2 m/s under netconvert's rbl threshold, which silently retyped 1,218 junctions to yield-to-the-right); joins the importer identity hash, region-scoped with the US map as the default
+ - [ ] [ADR-0024](decisions/ADR-0024-bounded-memory-replay-reader.md) — ACCEPTED (pending review): bounded-memory replay reading — the Player materialized the WHOLE record (`fetchFrom` from seq 1 plus a full per-tick index, both live at once), which is why a 30-minute chi-loop cut could not be opened; measured 9,973,269 intents vs 9,000 CRCs and 91 keyframes in a 15-minute recording, so intents are 99.9% of the record at ~1 per vehicle per tick. Replaced by a forward-only `logCursor` holding one tick at a time; the RECORD FORMAT is untouched, so every existing recording still replays. Also adds `Engine.DropIntentLog` / `serve -intent-log=false` (the flag earlier planning assumed existed, and did not)
++- [ ] [ADR-0026](decisions/ADR-0026-batched-intents.md) — PROPOSED: batched intents (TSIB v1) on the live plane — one message per controller per tick on the unchanged intent subject, demuxed from per-vehicle v2 by the exact-case `intent_encoding` header; wire-only change (expand-at-ingest, identical downstream semantics), O(controllers) intent messages per tick instead of O(vehicles); M0–M3 (codec + engine ingest, driver per-tick aggregation, batch-mode measurement incl. applied-lag) landed before contract ratification
+ 
+ ---
+ *Last distilled: 2026-07-17 | 18 articles from 56 raw research files*
+@@ -121,4 +122,5 @@ links its source synthesis for traceability.
+ *ADR-0020 ratified 2026-07-25 (demosrv public deployment: GKE pod behind a 443-only TLS Ingress)*
+ *ADR-0021 PROPOSED 2026-07-25 (building-anchored OD demand for chi-loop; awaiting the external-review round)*
+ *ADR-0022 PROPOSED 2026-07-25 (US urban speed typemap; found while chasing chi-loop's collision hotspot — 79.7% of its lanes were ≥80 km/h. Review round: Kimi K3 + GPT-5.6-sol, which caught the right-before-left retyping the first draft missed)*
++*ADR-0026 PROPOSED 2026-07-26 (batched intents TSIB on the live plane; M0–M3 committed on branch batched-intents — codec + engine ingest, driver per-tick aggregation, batch-mode benchmarks and applied-lag coverage all green. Gemini milestone review round before ratification)*
+ *Run `/update-kb` to check freshness*
+diff --git a/docs/kb/articles/cross-topic-concerns.md b/docs/kb/articles/cross-topic-concerns.md
+index ef2997c6ba6dabca0bbd7bebdd3cc69335eb8a41..e5e851dd84ea83d84761f948f17f2e45e8f7b4c7 100644
+--- a/docs/kb/articles/cross-topic-concerns.md
++++ b/docs/kb/articles/cross-topic-concerns.md
+@@ -48,6 +48,8 @@
+ 
+ - **Config sprawl is the 15-year failure mode.** MATSim's module accretion and TraCI's silent protocol renumbering are why contracts are add-only, versioned, and declared in one AsyncAPI document, and why the scenario surface is deliberately small. Affects: Simulator Landscape, NATS Backbone, Vehicle & Controller Interface, Scenario Format.
+ 
++- **Silent publish failures hide fidelity failures (2026-07-26, ADR-0026 M3 hardening notes — recorded, NOT yet fixed).** (a) `publishObs` (engine/natsio/contract.go) swallows obs publish errors — `obsOut` counts successes only. A 5,000-vehicle obs frame (~1.96 MB with the policy-ctx feature) silently never published under the test broker's then-default 1 MB `max_payload`, stalling the driver with zero log lines; found via the M3 applied-lag harness (the test broker now mirrors the production 4 MiB cap). Recommendation: count obs publish failures loudly, like the snapshot/signal paths' first-3-per-run logging. (b) `NewBus`/`NewContract` subscribe without flushing — a latent subscribe/publish race: a hello or request published from another connection can beat the server-side SUB registration and fast-fail `nats: no responders`, the M1-era explanation for the load-sensitive test flakes (`TestHoldLastThenDecay` and friends under load). New tests work around it with an explicit `nc.Flush()` after construction; the shared harnesses still carry the race. Affects: NATS Backbone, Vehicle & Controller Interface.
++
+ ## Reading Order
+ 
+ For newcomers, understand topics in this order:

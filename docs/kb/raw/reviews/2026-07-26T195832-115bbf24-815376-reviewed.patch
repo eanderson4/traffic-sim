@@ -1,0 +1,522 @@
+diff --git a/contracts/asyncapi.yaml b/contracts/asyncapi.yaml
+index 9754dc9386f019768013854e9479d3b46643f05f..f2862f912454494f38138a91e929b89a7c40d2f1 100644
+--- a/contracts/asyncapi.yaml
++++ b/contracts/asyncapi.yaml
+@@ -20,7 +20,7 @@ asyncapi: 3.0.0
+ 
+ info:
+   title: traffic-sim engine contract
+-  version: 2.4.0
++  version: 2.5.0
+   description: |
+     The engine's NATS surface per ADR-0006 (planes, taxonomy, pipelines) and
+     ADR-0008 (the engine↔controller contract — M4, schema_version 2):
+@@ -92,6 +92,18 @@ info:
+     would install each chunk as the whole table — chunk-aware decoding
+     is required once tables exceed the chunk threshold.
+ 
++    **ADR-0026 changes (additive; info version 2.5.0):** batched intents
++    (TSIB v1) on `ts.{run}.ctl.intent.{controller_id}`. Alongside the
++    per-vehicle v2 encoding, a controller may publish TSIB batches on its
++    cadence tick — up to one per 20,000 route-free intents (zero on ticks
++    where all intents carry routes) — demuxed by the exact-case
++    `intent_encoding: tsib` NATS header (absent = v2, any other value =
++    drop + count, loud). A valid batch expands at ingest into per-vehicle
++    records in record order; every downstream semantic (claims, seq,
++    hold-last, arbitration, record plane) is identical to the v2 stream.
++    Skew is covered by HelloReply capability advertisement (`intent_encodings`,
++    additive) with v2 fallback — see the ctlIntent channel's migration note.
++
+ servers:
+   embedded:
+     host: in-process
+@@ -196,11 +208,44 @@ channels:
+       controller are healed by hold-last: the contract layer re-issues the
+       last intent for ≤ 2 ticks past the cadence due point (logged as
+       held), then zero/default (ADR-0008 §2).
++      Wire demux (ADR-0026): one message on this subject is either the
++      per-vehicle v2 encoding (ControlIntent) or a TSIB v1 batch
++      (ControlIntentBatch), discriminated by the NATS header key
++      `intent_encoding` — matched EXACT-CASE, byte-for-byte, because
++      nats.go headers are verbatim case-sensitive (no MIME
++      canonicalization): ABSENT ⇒ v2 (every pre-ADR-0026 producer; other
++      headers are ignored), `tsib` ⇒ TSIB, ANY OTHER VALUE (including
++      present-but-empty) ⇒ the message is dropped and counted
++      (intentEncodingUnknown), logged loudly — never a fall-through to v2
++      parsing, so a future encoding fails loudly against a TSIB-AWARE
++      engine instead of misparsing. (Against a PRE-TSIB engine the same
++      message reads as malformed v2: counted via the generic drop counter
++      with no dedicated signal, claim filtering as backstop — see the
++      migration note.) A valid TSIB expands at ingest into
++      per-vehicle records in record order; everything downstream (claim
++      filter, per-controller seq, hold-last, arbitration, record plane)
++      is identical to the v2 stream.
++      Migration (ADR-0026 M4 + 2026-07-26 amendment): the mechanism is
++      HelloReply capability advertisement with graceful fallback — the
++      engine advertises `intent_encodings` at attach, and a batch-capable
++      controller that does NOT see "tsib" runs the session on per-vehicle
++      v2 (the default driver does this, one log line; no config surface).
++      Deploy order engine-first, drivers-second remains RECOMMENDED but
++      is no longer load-bearing. Residual, pre-advertisement reality for
++      completeness: a pre-ADR-0026 engine has no demux rule — a
++      multi-record TSIB payload read as v2 fails v2 structural
++      validation (dropped and counted as malformed v2, never silently
++      applied), and the pathological single-record case (68 B, bytes
++      40–41 reading as route_len 24) can pass v2 decode and then dies at
++      claim filtering — the named backstop. The monorepo ships engine +
++      default driver together; external controllers on asyncapi ≥ 2.5.0
++      get the advertisement and the fallback rule above.
+     parameters:
+       run: { $ref: '#/components/parameters/runId' }
+       controller_id: { $ref: '#/components/parameters/controllerId' }
+     messages:
+       controlIntent: { $ref: '#/components/messages/ControlIntent' }
++      controlIntentBatch: { $ref: '#/components/messages/ControlIntentBatch' }
+ 
+   ctlHello:
+     address: ts.{run}.ctl.hello
+@@ -212,7 +257,11 @@ channels:
+       accept/reject, the assigned controller_id, granted claims, and the
+       current tick. The drive grant requires claim_capacity ≥ 1; cadence
+       must be below the detach budget. Director and signal are elevated
+-      grants (their verbs land M5+; the grants exist now).
++      grants (their verbs land M5+; the grants exist now). The reply also
++      advertises (additive, ADR-0026 M4 addendum) the intent encodings
++      the engine accepts (`intent_encodings`); a batch-capable controller
++      that does not see "tsib" runs the session on per-vehicle v2 — the
++      version-skew fallback.
+     parameters:
+       run: { $ref: '#/components/parameters/runId' }
+     messages:
+@@ -621,6 +670,26 @@ components:
+         $ref: '#/components/schemas/IntentFrame'
+       x-json-view: '#/components/schemas/IntentView'
+ 
++    ControlIntentBatch:
++      name: controlIntentBatch
++      title: TSIB v1 batched intents (ADR-0026) — up to one TSIB per 20,000 route-free intents per cadence tick per controller (zero on ticks where all intents carry routes)
++      summary: |
++        The batched form of ControlIntent: up to 20,000 per-vehicle
++        records in one message (fleets past the cap split into
++        ⌈n/20,000⌉ batches per tick), expanded at ingest into the same
++        per-vehicle buffer in record order, so every downstream semantic
++        of ctlIntent (claim filter, per-controller seq, hold-last,
++        arbitration, the record plane) is identical to the v2 stream.
++        Batch acceptance counters (intentBatches / intentRecords /
++        intentBatchDropped / intentRecordDropped / intentEncodingUnknown,
++        Bus.IntentBatchStats) are the observability substitute for 1:1
++        per-vehicle messages. Demux on the ctlIntent channel description.
++      headers: { $ref: '#/components/schemas/IntentEncodingHeaders' }
++      payload:
++        schemaFormat: application/octet-stream
++        $ref: '#/components/schemas/TSIBFrame'
++      x-json-view: '#/components/schemas/TSIBView'
++
+     HelloRequest:
+       name: helloRequest
+       title: Attach handshake request (ADR-0008 §4)
+@@ -964,6 +1033,71 @@ components:
+         route: { type: string, maxLength: 48, description: 'destination lane id; persistent. The engine follows it at every multi-successor lane (shortest path by lane length); an explicit held turn wins the crossing; unknown/unreachable destinations degrade to the successor default' }
+         signals: { type: integer, enum: [0, 1, 2, 3], description: '0 off, 1 left, 2 right, 3 hazard; persistent, informational in v1' }
+ 
++    IntentEncodingHeaders:
++      type: object
++      required: [intent_encoding]
++      properties:
++        intent_encoding:
++          type: string
++          const: tsib
++          description: 'TSIB discriminator (ADR-0026). Matched EXACT-CASE, byte-for-byte — nats.go headers are verbatim case-sensitive, no MIME canonicalization. Absent key ⇒ the message is per-vehicle v2; any other value (including present-but-empty) ⇒ dropped and counted (intentEncodingUnknown), logged loudly. A DUPLICATE key (multiple values) resolves FIRST-VALUE-WINS, matching the shipped decoder.'
++
++    TSIBFrame:
++      type: string
++      format: binary
++      description: |
++        v1, little-endian (ADR-0026):
++          header (24 B): magic "TSIB" | version u16 = 1 | flags u16 (reserved, 0) |
++                         tick u64 | count u32 | reserved u32
++          records: count × 44 B — byte-identical layout to the fixed
++            section of IntentFrame (vehicle_id u64 | flags u32 |
++            lane_delta i32 | accel f64 | speed_setpoint f64 | signals u32 |
++            turn i32 | route_len u16 | reserved u16; flag semantics as
++            defined there).
++        Whole-batch structural validity — a violation drops the WHOLE
++        batch (counted intentBatchDropped, logged), never partially
++        applied: exact length 24 + 44·count; version 1; count ≤ 20000
++        (880,024 B with the header — under the 1 MiB per-message
++        discipline; larger fleets split into multiple batches per tick);
++        every record's route_len MUST be 0 AND flag bit4 (route present)
++        MUST be clear — a route update rides one complete standalone v2
++        intent for the tick and the vehicle is omitted from that tick's
++        batch. Per-record SEMANTIC checks are per-record as in v2: a
++        NaN/Inf accel or speed setpoint drops ONLY that record (counted
++        intentRecordDropped); the rest of the batch applies.
++        tick is INFORMATIONAL ONLY (the source observation tick, for
++        diagnostics and applied-lag measurement) — never validated and
++        never gating acceptance; ingest is arrival-based exactly as for
++        v2. The flags u16 and reserved u32 header fields: encoders MUST
++        write zero, decoders MUST accept any value — reserved bits are
++        not must-understand, so an extension that requires understanding
++        them needs a version bump.
++
++    TSIBRecordView:
++      title: JSON view of one TSIB batch record (route-free — records with a route are structurally invalid, ADR-0026)
++      type: object
++      required: [vehicle_id]
++      properties:
++        vehicle_id: { type: integer, minimum: 1 }
++        accel: { type: number, description: 'm/s²; one-shot per tick; engine-clamped to [−9, type max accel]' }
++        speed_setpoint: { type: number, description: 'm/s; persistent cruise until replaced; negative clears; clamped to v0eff' }
++        lane_delta: { type: integer, enum: [-1, 0, 1], description: '+1 left, −1 right; one-shot, expires if infeasible' }
++        turn: { type: integer, enum: [-1, 0, 1], description: 'junction choice; held until consumed at the next lane crossing; 0 clears' }
++        signals: { type: integer, enum: [0, 1, 2, 3], description: '0 off, 1 left, 2 right, 3 hazard; persistent, informational in v1' }
++
++    TSIBView:
++      title: JSON view of a TSIB batch (tooling only; wire is binary)
++      type: object
++      required: [tick, count, records]
++      properties:
++        tick: { type: integer, minimum: 0, description: 'Source observation tick — informational only, never validated.' }
++        count: { type: integer, minimum: 0, maximum: 20000 }
++        records:
++          type: array
++          maxItems: 20000
++          items: { $ref: '#/components/schemas/TSIBRecordView' }
++          description: 'Route-free per-vehicle intents (route_len = 0 and flag bit4 clear enforced at decode), in wire order = per-controller engine seq order.'
++
+     AckView:
+       type: object
+       required: [controller_id, applied_tick]
+@@ -1098,6 +1232,10 @@ components:
+           items: { type: integer, minimum: 1 }
+           description: Initial claims granted.
+         contract_version: { type: integer, const: 2 }
++        intent_encodings:
++          type: array
++          items: { type: string, enum: [v2, tsib] }
++          description: 'ADDITIVE (ADR-0026 M4 addendum): every intent wire encoding this engine accepts on ctlIntent — ["v2","tsib"] from asyncapi 2.5.0 onward, OMITTED by pre-TSIB engines (JSON consumers ignore unknown fields both directions). A batch-capable controller SHOULD fall back to per-vehicle v2 when tsib is not advertised; the default driver does exactly that (one log line, session-scoped).'
+ 
+     VerbRequestView:
+       title: Director verb request (ADR-0008 §5; M10)
+diff --git a/docs/kb/INDEX.md b/docs/kb/INDEX.md
+index 0e346ff520283cc3599f548fae8243f6e370de8d..596af21305920e1f893c7bc4a0fc78773947eabd 100644
+--- a/docs/kb/INDEX.md
++++ b/docs/kb/INDEX.md
+@@ -107,6 +107,7 @@ links its source synthesis for traceability.
+ - [x] [ADR-0020](decisions/ADR-0020-demosrv-public-deployment.md) — demosrv public deployment: -wspublic verbatim ws advertisement, -admintoken bearer gate on the mutating POSTs (GETs public), -autostart with keep-serving failure semantics, -nobuild prebuilt engine binaries; all default to local-dev behavior
+ - [ ] [ADR-0022](decisions/ADR-0022-us-urban-speed-typemap.md) — PROPOSED: US urban speed typemap — netconvert's German-derived OSM defaults gave unposted secondary/primary 100 km/h across all 25 US networks; an explicit speed-only typemap sets the 30 mph statutory urban default AND disables right-before-left (30 mph sits 0.2 m/s under netconvert's rbl threshold, which silently retyped 1,218 junctions to yield-to-the-right); joins the importer identity hash, region-scoped with the US map as the default
+ - [ ] [ADR-0024](decisions/ADR-0024-bounded-memory-replay-reader.md) — ACCEPTED (pending review): bounded-memory replay reading — the Player materialized the WHOLE record (`fetchFrom` from seq 1 plus a full per-tick index, both live at once), which is why a 30-minute chi-loop cut could not be opened; measured 9,973,269 intents vs 9,000 CRCs and 91 keyframes in a 15-minute recording, so intents are 99.9% of the record at ~1 per vehicle per tick. Replaced by a forward-only `logCursor` holding one tick at a time; the RECORD FORMAT is untouched, so every existing recording still replays. Also adds `Engine.DropIntentLog` / `serve -intent-log=false` (the flag earlier planning assumed existed, and did not)
++- [x] [ADR-0026](decisions/ADR-0026-batched-intents.md) — batched intents (TSIB v1) on the live plane — one TSIB per cadence tick per controller (splitting into ⌈n/20,000⌉ bounded batches above the cap) on the unchanged intent subject, demuxed from per-vehicle v2 by the exact-case `intent_encoding` header; wire-only change (expand-at-ingest, identical downstream semantics), O(controllers) intent messages per tick instead of O(vehicles); M0–M3 (codec + engine ingest, driver per-tick aggregation, batch-mode measurement incl. applied-lag) landed before contract ratification
+ 
+ ---
+ *Last distilled: 2026-07-17 | 18 articles from 56 raw research files*
+@@ -121,4 +122,5 @@ links its source synthesis for traceability.
+ *ADR-0020 ratified 2026-07-25 (demosrv public deployment: GKE pod behind a 443-only TLS Ingress)*
+ *ADR-0021 PROPOSED 2026-07-25 (building-anchored OD demand for chi-loop; awaiting the external-review round)*
+ *ADR-0022 PROPOSED 2026-07-25 (US urban speed typemap; found while chasing chi-loop's collision hotspot — 79.7% of its lanes were ≥80 km/h. Review round: Kimi K3 + GPT-5.6-sol, which caught the right-before-left retyping the first draft missed)*
++*ADR-0026 ratified 2026-07-26 (batched intents TSIB on the live plane; M0–M3 evidence in engine/BENCHMARKS.md §(d), contract published as asyncapi info version 2.5.0)*
+ *Run `/update-kb` to check freshness*
+diff --git a/docs/kb/articles/cross-topic-concerns.md b/docs/kb/articles/cross-topic-concerns.md
+index ef2997c6ba6dabca0bbd7bebdd3cc69335eb8a41..e5e851dd84ea83d84761f948f17f2e45e8f7b4c7 100644
+--- a/docs/kb/articles/cross-topic-concerns.md
++++ b/docs/kb/articles/cross-topic-concerns.md
+@@ -48,6 +48,8 @@
+ 
+ - **Config sprawl is the 15-year failure mode.** MATSim's module accretion and TraCI's silent protocol renumbering are why contracts are add-only, versioned, and declared in one AsyncAPI document, and why the scenario surface is deliberately small. Affects: Simulator Landscape, NATS Backbone, Vehicle & Controller Interface, Scenario Format.
+ 
++- **Silent publish failures hide fidelity failures (2026-07-26, ADR-0026 M3 hardening notes — recorded, NOT yet fixed).** (a) `publishObs` (engine/natsio/contract.go) swallows obs publish errors — `obsOut` counts successes only. A 5,000-vehicle obs frame (~1.96 MB with the policy-ctx feature) silently never published under the test broker's then-default 1 MB `max_payload`, stalling the driver with zero log lines; found via the M3 applied-lag harness (the test broker now mirrors the production 4 MiB cap). Recommendation: count obs publish failures loudly, like the snapshot/signal paths' first-3-per-run logging. (b) `NewBus`/`NewContract` subscribe without flushing — a latent subscribe/publish race: a hello or request published from another connection can beat the server-side SUB registration and fast-fail `nats: no responders`, the M1-era explanation for the load-sensitive test flakes (`TestHoldLastThenDecay` and friends under load). New tests work around it with an explicit `nc.Flush()` after construction; the shared harnesses still carry the race. Affects: NATS Backbone, Vehicle & Controller Interface.
++
+ ## Reading Order
+ 
+ For newcomers, understand topics in this order:
+diff --git a/docs/kb/decisions/ADR-0026-batched-intents.md b/docs/kb/decisions/ADR-0026-batched-intents.md
+index ca8e9c1074db36c837e18c4488216d5093984ea1..9889745e2e8af4d67700118a067e021e12a56f9a 100644
+--- a/docs/kb/decisions/ADR-0026-batched-intents.md
++++ b/docs/kb/decisions/ADR-0026-batched-intents.md
+@@ -1,7 +1,8 @@
+ # ADR-0026: Batched intents on the live plane
+ 
+-- Status: Proposed
++- Status: Accepted
+ - Date: 2026-07-26
++- Ratified: 2026-07-26 — M0–M3 evidence in engine/BENCHMARKS.md §(d) (batch-mode table, applied-lag coverage), M1–M3 test pins in engine/natsio (tsib_test.go, driver/batch_test.go, driver_test.go); contract published as asyncapi info version 2.5.0.
+ - Amends: ADR-0006 §2 (self-sufficient live messages), §7 (binary SoA framing), ADR-0008 (controller contract — wire encoding only, semantics unchanged)
+ 
+ ## Context
+@@ -246,10 +247,11 @@ round before any recording or content hash binds the new codec.
+   metrics protocol. Document in `BENCHMARKS.md`.
+ - **M4 — Contract + ratification.** `asyncapi.yaml` ctlIntent TSIB
+   schema (header demux incl. unknown-value rule, record layout,
+-  route-field rule, cap, tick informational); migration note (engine
+-  deploys before TSIB drivers; old engines never see batches in
+-  practice because drivers attach against the engine's hello-advertised
+-  version); KB index + this ADR to Accepted; `--gemini` review round.
++  route-field rule, cap, tick informational); migration note (deploy
++  order engine-first, drivers-second — RECOMMENDED but, per the
++  2026-07-26 amendment below, no longer load-bearing: hello capability
++  advertisement with v2 fallback covers skew directly); KB index + this
++  ADR to Accepted; `--gemini` review round.
+ 
+ ## Risks / open questions
+ 
+@@ -264,4 +266,32 @@ round before any recording or content hash binds the new codec.
+   backstopped by claim filtering at worst). Deploy order (engine first)
+   plus the hello-version migration note in M4 covers it; capability
+   advertisement in hello is deliberately **not** added here — that is
+-  region-decomposition-era machinery.
++  region-decomposition-era machinery. **(AMENDED 2026-07-26 — see
++  below: advertisement WAS added; the skew risk proved worth ~20 lines.)**
++
++## Amendment 2026-07-26 (post-ratification, M4 gate)
++
++**Hello capability advertisement with graceful v2 fallback.** The M4
++review gate rejected the "deploy order ONLY" migration story: with
++`contract_version` staying 2 and no advertisement, a default-on TSIB
++driver could not detect a pre-TSIB engine at all (batches dropped as
++malformed v2, no version signal). So the machinery this ADR deferred is
++now in, and it is small:
++
++- `HelloReply` gains the additive field `intent_encodings` — `["v2",
++  "tsib"]` from this engine onward, omitted by pre-TSIB engines (JSON
++  consumers ignore unknown fields in both directions).
++- The default driver, when batching is on (the default) and `"tsib"` is
++  NOT advertised, logs one line and runs the session in v2 mode — the
++  exact `-intent-batch=off` code path, no new config surface.
++
++Deploy order (engine first, drivers second) remains RECOMMENDED but is
++no longer load-bearing: a default-on driver against a pre-TSIB engine
++now degrades to the v2 stream instead of being silently dropped. The
++version-skew risk bullet above is amended accordingly: the
++region-decomposition-era deferral ended here because the review rounds
++showed the skew risk was worth the ~20 lines. (Contract documented in
++`contracts/asyncapi.yaml` at info version 2.5.0 — same additive change
++set; engine side `engine/natsio/contract.go` + `bus.go`, driver side
++`engine/natsio/driver/driver.go` `applyIntentEncodings`; tests
++`TestHelloAdvertisesIntentEncodings`, `TestIntentEncodingFallback`.)
+diff --git a/engine/natsio/bus.go b/engine/natsio/bus.go
+index 6d869c077fe44886bf57d2addb46d6ae324691c0..055b620dabc249bccb671ad42ef0d98e3f97f116 100644
+--- a/engine/natsio/bus.go
++++ b/engine/natsio/bus.go
+@@ -55,6 +55,12 @@ const (
+ 	intentSubjectTokens  = 5 // ts.{run}.ctl.intent.{controller_id}
+ )
+ 
++// intentEncodingsAdvertised is the HelloReply capability advertisement
++// (ADR-0026 M4 addendum): every intent wire encoding this engine accepts on
++// ctlIntent, v2 first. Pre-TSIB engines omit the field entirely, which is
++// the driver-side fallback signal.
++var intentEncodingsAdvertised = []string{"v2", intentEncodingTSIB}
++
+ // intentFixedFlags computes the v2 flag bits for the non-route axes.
+ func intentFixedFlags(in engine.Intent) uint32 {
+ 	var flags uint32
+diff --git a/engine/natsio/contract.go b/engine/natsio/contract.go
+index f980ceef62c43af6c0959b3191ba0fb019a1f46b..f78a8560870643f7d786108f6f825d7a21a328f3 100644
+--- a/engine/natsio/contract.go
++++ b/engine/natsio/contract.go
+@@ -152,6 +152,12 @@ type HelloReply struct {
+ 	Run             string   `json:"run"`
+ 	Tick            uint64   `json:"tick"`
+ 	Reason          string   `json:"reason,omitempty"`
++	// IntentEncodings advertises the intent wire encodings this engine
++	// accepts on ctlIntent (ADR-0026 M4 addendum): ["v2","tsib"] from this
++	// engine onward. Additive — pre-TSIB engines omit it (JSON consumers
++	// ignore unknown fields in both directions), so a batch-capable driver
++	// can fall back to v2 when it is absent.
++	IntentEncodings []string `json:"intent_encodings,omitempty"`
+ }
+ 
+ // ClaimRequest asks for exclusive claims on vehicles (ts.{run}.ctl.claim.{id}).
+@@ -432,7 +438,7 @@ func (c *Contract) ProcessControl(e *engine.Engine) error {
+ // handleHello answers one attach handshake.
+ func (c *Contract) handleHello(e *engine.Engine, r ctlReq) {
+ 	var req HelloRequest
+-	reply := HelloReply{ContractVersion: SchemaVersion, Run: c.run, Tick: e.Tick}
++	reply := HelloReply{ContractVersion: SchemaVersion, Run: c.run, Tick: e.Tick, IntentEncodings: intentEncodingsAdvertised}
+ 	defer func() {
+ 		data, _ := json.Marshal(reply)
+ 		if r.reply != "" {
+diff --git a/engine/natsio/driver/batch_test.go b/engine/natsio/driver/batch_test.go
+index 019cba8b1d7c1c0ba4ce2637c527171de0ba6166..5f2e6bffe2ffa197c568f354d2002aa99b74a134 100644
+--- a/engine/natsio/driver/batch_test.go
++++ b/engine/natsio/driver/batch_test.go
+@@ -308,3 +308,55 @@ func TestBatchOffByteIdenticalV2(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// Capability fallback (ADR-0026 M4 addendum): a hello reply WITHOUT
++// intent_encodings (a pre-TSIB engine) flips a batch-default driver into
++// v2 mode for the session — the IntentBatchOff path, byte-identical to the
++// pre-M2 stream. With "tsib" advertised the batch path stays.
++func TestIntentEncodingFallback(t *testing.T) {
++	egos := []natsio.ObsEgo{{ID: 5}, {ID: 9}, {ID: 1}}
++
++	t.Run("fallback on missing capability", func(t *testing.T) {
++		_, nc := startTestBroker(t)
++		d := batchDriver(nc, Config{})
++		d.applyIntentEncodings(nil) // pre-TSIB engine: field omitted
++		if !d.cfg.IntentBatchOff {
++			t.Fatal("fallback did not engage: driver still in batch mode")
++		}
++		var tap wireTap
++		tap.subscribe(t, nc, "t", "drv")
++		d.onObs(obsMsg(1, 0, egos))
++		msgs := tap.waitCount(t, 3)
++		if got := tap.settle(); got != 3 {
++			t.Fatalf("fallback session messages = %d, want 3 (per-vehicle v2)", got)
++		}
++		for i, m := range msgs {
++			if _, present := m.Header[tapHeaderKey]; present {
++				t.Fatalf("msg %d carries an intent_encoding header after fallback", i)
++			}
++			want := natsio.EncodeIntent(engine.Intent{VehicleID: egos[i].ID})
++			if string(m.Data) != string(want) {
++				t.Fatalf("msg %d payload = % x, want the v2 bytes % x", i, m.Data, want)
++			}
++		}
++	})
++
++	t.Run("batch on tsib advertised", func(t *testing.T) {
++		_, nc := startTestBroker(t)
++		d := batchDriver(nc, Config{})
++		d.applyIntentEncodings([]string{"v2", "tsib"})
++		if d.cfg.IntentBatchOff {
++			t.Fatal("fallback engaged against a TSIB-capable engine")
++		}
++		var tap wireTap
++		tap.subscribe(t, nc, "t", "drv")
++		d.onObs(obsMsg(1, 0, egos))
++		msgs := tap.waitCount(t, 1)
++		if got := tap.settle(); got != 1 {
++			t.Fatalf("advertised session messages = %d, want 1 (one TSIB batch)", got)
++		}
++		if recs := decodeTSIBMsg(t, msgs[0], 1); len(recs) != len(egos) {
++			t.Fatalf("batch records = %d, want %d", len(recs), len(egos))
++		}
++	})
++}
+diff --git a/engine/natsio/driver/driver.go b/engine/natsio/driver/driver.go
+index a6c565c4749f070b6bed8f750e9ea08c12f5c569..294c4218a6cb0e9082ab29f0a74bcad9999ad8de 100644
+--- a/engine/natsio/driver/driver.go
++++ b/engine/natsio/driver/driver.go
+@@ -29,6 +29,8 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"log"
++	"slices"
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
+@@ -219,6 +221,7 @@ func New(nc *nats.Conn, js nats.JetStreamContext, cfg Config) (*Driver, error) {
+ 		return nil, fmt.Errorf("driver: attach rejected: %s", reply.Reason)
+ 	}
+ 	d.id = reply.ControllerID
++	d.applyIntentEncodings(reply.IntentEncodings)
+ 
+ 	bind := func(subject string, h func(*nats.Msg)) error {
+ 		sub, err := nc.Subscribe(subject, h)
+@@ -436,6 +439,20 @@ func (d *Driver) flushBatch(tick uint64, batch []engine.Intent) {
+ 	}
+ }
+ 
++// applyIntentEncodings is the capability fallback (ADR-0026 M4 addendum):
++// the engine advertises the intent encodings it accepts in its hello reply
++// — a pre-TSIB engine OMITS the field. When batching is on (the default)
++// and "tsib" is not advertised, run the session in v2 mode (the
++// IntentBatchOff path) with one log line. ("tsib" is the wire contract
++// string, pinned by contracts/asyncapi.yaml; unexported in natsio.)
++func (d *Driver) applyIntentEncodings(encs []string) {
++	if d.cfg.IntentBatchOff || slices.Contains(encs, "tsib") {
++		return
++	}
++	log.Printf("driver %s: engine does not advertise intent_encodings \"tsib\" (pre-TSIB engine); falling back to per-vehicle v2 intents for this session", d.id)
++	d.cfg.IntentBatchOff = true
++}
++
+ // routeStep advances ONE ego's routing axis under the per-tick budget
+ // (Config.RouteBudgetPerTick). The routing axis' destination parameter is
+ // persistent — sent once per vehicle; the kernel follows it at every
+diff --git a/engine/natsio/tsib_test.go b/engine/natsio/tsib_test.go
+index a24173c88659bb05fe7feca9148ab9864ed8ce78..434860bbfa9af179acae6ef03eef3c65bc6f26f7 100644
+--- a/engine/natsio/tsib_test.go
++++ b/engine/natsio/tsib_test.go
+@@ -7,6 +7,7 @@ package natsio
+ 
+ import (
+ 	"encoding/binary"
++	"encoding/json"
+ 	"math"
+ 	"testing"
+ 	"time"
+@@ -453,3 +454,69 @@ func TestTSIBBoundaryPublishMaxRecords(t *testing.T) {
+ 			batches, records, dropped, recordDropped, unknown, TSIBMaxRecords)
+ 	}
+ }
++
++// The engine advertises every intent encoding it accepts (ADR-0026 M4
++// addendum): HelloReply.intent_encodings = ["v2","tsib"] from this engine
++// onward. Additive both ways — pre-TSIB engines omit the field (the
++// driver-side fallback signal), pre-field drivers ignore it.
++func TestHelloAdvertisesIntentEncodings(t *testing.T) {
++	srv := NewTestServer(t)
++	nc := srv.Connect(t)
++	e := benchIngestEngine(t, 4)
++	bus, err := NewBus(nc, "adv1", e)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer bus.Close()
++	contract, err := NewContract(nc, "adv1", ContractConfig{}, bus, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer contract.Close()
++	if err := nc.Flush(); err != nil { // SUBs registered before the hello races them
++		t.Fatal(err)
++	}
++
++	req, _ := json.Marshal(HelloRequest{
++		ContractVersion: SchemaVersion, ControllerType: "bench",
++		Grants: []string{"drive"}, ClaimCapacity: 1,
++	})
++	resCh := make(chan *nats.Msg, 1)
++	go func() {
++		m, err := nc.Request(SubjectCtlHello("adv1"), req, 10*time.Second)
++		if err == nil {
++			resCh <- m
++		}
++	}()
++	deadline := time.Now().Add(10 * time.Second)
++	for {
++		select {
++		case m := <-resCh:
++			var rep HelloReply
++			if err := json.Unmarshal(m.Data, &rep); err != nil {
++				t.Fatal(err)
++			}
++			if !rep.Accepted {
++				t.Fatalf("hello rejected: %s", rep.Reason)
++			}
++			want := []string{"v2", "tsib"}
++			if len(rep.IntentEncodings) != len(want) {
++				t.Fatalf("intent_encodings = %v, want %v", rep.IntentEncodings, want)
++			}
++			for i, enc := range want {
++				if rep.IntentEncodings[i] != enc {
++					t.Fatalf("intent_encodings = %v, want %v", rep.IntentEncodings, want)
++				}
++			}
++			return
++		default:
++			if time.Now().After(deadline) {
++				t.Fatal("hello never answered")
++			}
++			if err := contract.ProcessControl(e); err != nil {
++				t.Fatal(err)
++			}
++			time.Sleep(time.Millisecond)
++		}
++	}
++}

@@ -1,0 +1,4 @@
+ contracts/asyncapi.yaml                  | 95 ++++++++++++++++++++++++++++++++
+ docs/kb/INDEX.md                         |  2 +
+ docs/kb/articles/cross-topic-concerns.md |  2 +
+ 3 files changed, 99 insertions(+)
