@@ -212,9 +212,11 @@ baseline of record). Ranges are the two A/B pairs; run:
   plus complete-response equality — MET**, measured by
   `TestBatchAppliedLagBoundary` at 400 vehicles (10 ms pace) and
   confirmed at 5,000 vehicles (100 ms scale leg); the 1.5 ms straddle
-  behavior below is report-only mechanics. The per-vehicle claim ("batch
-  never worse than v2", not a universal theorem) rests on parts pinned
-  where provable:** (a) a route-update vehicle rides the IDENTICAL standalone
+  behavior below is report-only mechanics. The claim is exactly that
+  measured per-vehicle p50/p99 result — no stronger distributional
+  statement (see the neither-dominates mechanics note below) — and it
+  rests on parts pinned where provable: (a) a route-update vehicle rides
+  the IDENTICAL standalone
   v2 wire shape in both modes, so its lag is unchanged by batching (wire
   shape pinned by `TestBatchRouteUpdateTickStandaloneV2`); (b) a
   route-free response of ≤ `TSIBMaxRecords` vehicles is ONE atomic

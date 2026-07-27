@@ -125,8 +125,9 @@ type Driver struct {
 	done chan struct{}
 	once sync.Once
 
-	lastObsTick atomic.Uint64
-	sentIntents atomic.Uint64
+	lastObsTick      atomic.Uint64 // obs tick at the START of onObs (work begun)
+	completedObsTick atomic.Uint64 // obs tick at the END of onObs (response fully published)
+	sentIntents      atomic.Uint64
 }
 
 // New attaches a default-driver replica to its run: registry meta → hello
@@ -274,8 +275,17 @@ func (d *Driver) FleetSize() int {
 	return len(d.fleet)
 }
 
-// LastObsTick is the newest observation tick the driver has worked on.
+// LastObsTick is the newest observation tick the driver has STARTED working
+// on (stamped at the top of onObs, before compute/publish — a begin
+// watermark only).
 func (d *Driver) LastObsTick() uint64 { return d.lastObsTick.Load() }
+
+// CompletedObsTick is the newest observation tick whose response is FULLY
+// PUBLISHED (stamped at the very end of onObs, after the tick's intents —
+// batch or per-vehicle v2 — have gone out): the "response complete through
+// obs T" watermark. Use it, never LastObsTick, wherever completion
+// semantics are meant.
+func (d *Driver) CompletedObsTick() uint64 { return d.completedObsTick.Load() }
 
 // SentIntents counts per-vehicle intents published (TSIB records plus
 // standalone v2) — the same unit in batch and batch-off mode, so the
@@ -378,6 +388,10 @@ func (d *Driver) onObs(msg *nats.Msg) {
 	if len(batch) > 0 {
 		d.flushBatch(obs.Tick, batch)
 	}
+	// Completion watermark: the tick's response (batch + any standalone v2)
+	// is fully published at this point — stamp AFTER flushBatch/publishIntent,
+	// never at the top of the callback.
+	d.completedObsTick.Store(obs.Tick)
 	// The observation's ego list is the authoritative claim view: dropped
 	// members despawned or were released engine-side.
 	d.mu.Lock()

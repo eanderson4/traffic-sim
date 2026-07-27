@@ -1164,20 +1164,19 @@ func TestBatchAppliedLagBoundary(t *testing.T) {
 			}
 			time.Sleep(2 * time.Millisecond)
 		}
-		// QUIESCENCE GUARD (hard, not a timing hope). Phase A, drain-down:
-		// no new obs is published, so the response stream only drains.
-		// A zero-fresh drain alone is NOT quiescence when the driver has a
-		// backlog (at fleet scale a response takes many ms to compute and
-		// gaps between backlogged responses false-pass), so the driver must
-		// also have WORKED ON the last published obs (LastObsTick covers it)
-		// before silence is trusted. Phase B, verify: 50 ms of VERIFIED
-		// silence — any fresh intent restarts the window (a backlogged
-		// response still landing is drained, not an error; the driver
-		// publishes nothing mid-compute in batch mode, so silence is only
-		// trusted once it outlasts a response) — bounded overall, with
-		// SentIntents unmoved across the final window, and the engine
-		// buffer REQUIRED empty: measurement starts with zero outstanding
-		// responses (the FIFO below opens empty), provably.
+		// QUIESCENCE GUARD (hard, not a timing hope), in the order that
+		// makes the watermark unspoofable: quiesce FIRST, then publish a
+		// sentinel whose published-count delta can only be its own
+		// response.
+		//
+		// Phase A, drain-down: no new obs is published, so the response
+		// stream only drains. A zero-fresh drain alone is NOT quiescence
+		// when the driver has a backlog (at fleet scale a response takes
+		// many ms to compute and gaps between backlogged responses
+		// false-pass), so the driver must also have COMPLETED the last
+		// published obs's response (CompletedObsTick covers it — stamped at
+		// the END of onObs, after the tick's intents went out) before
+		// silence is trusted.
 		lastObs := int64(e.Tick) // last warm-up AfterStep's obs
 		for drains, fresh := 0, -1; ; {
 			if drains++; drains > 500 {
@@ -1194,52 +1193,98 @@ func TestBatchAppliedLagBoundary(t *testing.T) {
 				e.EnqueueIntent(k)
 			}
 			e.Step()
-			if fresh == 0 && int64(d.LastObsTick()) >= lastObs {
+			if fresh == 0 && int64(d.CompletedObsTick()) >= lastObs {
 				break
 			}
 			time.Sleep(5 * time.Millisecond)
 		}
-		// Phase B, verify: 50 ms of VERIFIED silence. Any fresh intent
-		// RESTARTS the window (a backlogged response still landing — drain
-		// it and keep waiting; the driver publishes nothing mid-compute in
-		// batch mode, so silence is only trusted after it outlasts a
-		// response). Bounded overall: a stream that never quiesces fails
-		// loudly. Then REQUIRE SentIntents unmoved across the final window
-		// AND the engine buffer empty: measurement starts with zero
-		// outstanding responses (the FIFO below opens empty), provably.
-		sent0 := d.SentIntents()
-		quietStart := time.Now()
-		deadline := quietStart.Add(30 * time.Second)
-		for {
+		// quietWindow is 50 ms of VERIFIED silence: any fresh intent
+		// RESTARTS the window (a backlogged response still landing is
+		// drained, not an error; the driver publishes nothing mid-compute
+		// in batch mode, so silence is only trusted once it outlasts a
+		// response) — bounded overall, SentIntents unmoved across the
+		// final window, engine buffer REQUIRED empty. Loud on every bound.
+		quietWindow := func() {
+			t.Helper()
+			sent0 := d.SentIntents()
+			quietStart := time.Now()
+			deadline := quietStart.Add(30 * time.Second)
+			for {
+				if err := contract.ProcessControl(e); err != nil {
+					t.Fatal(err)
+				}
+				fresh := 0
+				for _, k := range contract.DrainIntents(e) {
+					if !k.Held {
+						fresh++
+					}
+					e.EnqueueIntent(k)
+				}
+				e.Step()
+				if fresh > 0 {
+					quietStart = time.Now()
+					sent0 = d.SentIntents()
+				}
+				if time.Since(quietStart) >= 50*time.Millisecond {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("response stream never quiesced after warm-up (tick %d)", e.Tick)
+				}
+				time.Sleep(2 * time.Millisecond)
+			}
+			if sent := d.SentIntents(); sent != sent0 {
+				t.Fatalf("driver published %d intents in the final quiescence window: backlog not drained", sent-sent0)
+			}
+			if n := bus.BufferedIntents(); n != 0 {
+				t.Fatalf("intent buffer not empty at measurement start: %d intents", n)
+			}
+		}
+		quietWindow()
+		// Sentinel obs — published only AFTER the stream is provably
+		// quiet and the buffer empty, so the published-count delta below
+		// can ONLY be the sentinel's own response (an earlier slow
+		// response cannot satisfy it — sol review). With the fleet stable
+		// at `vehicles`, the sentinel's response is provably EXACTLY
+		// `vehicles` intents (a warm-up obs can race the final claim
+		// grant and carry fewer egos).
+		if err := contract.ProcessControl(e); err != nil {
+			t.Fatal(err)
+		}
+		for _, k := range contract.DrainIntents(e) {
+			e.EnqueueIntent(k)
+		}
+		e.Step()
+		sentMark := d.SentIntents()
+		if err := contract.AfterStep(e); err != nil {
+			t.Fatal(err)
+		}
+		lastObs = int64(e.Tick)
+		// Completion watermark, airtight: CompletedObsTick covering the
+		// sentinel tick proves the response is fully published (stamped at
+		// the END of onObs, after the tick's intents went out), and
+		// SentIntents − sentMark ≥ vehicles proves its SIZE — the delta
+		// can only be the sentinel's own contiguous response, all earlier
+		// traffic being drained and silent. Loud on timeout.
+		for deadline := time.Now().Add(30 * time.Second); int64(d.CompletedObsTick()) < lastObs || d.SentIntents()-sentMark < uint64(vehicles); {
+			if time.Now().After(deadline) {
+				t.Fatalf("sentinel obs (tick %d) response incomplete: completed through obs %d, published %d/%d intents",
+					lastObs, d.CompletedObsTick(), d.SentIntents()-sentMark, vehicles)
+			}
 			if err := contract.ProcessControl(e); err != nil {
 				t.Fatal(err)
 			}
-			fresh := 0
 			for _, k := range contract.DrainIntents(e) {
-				if !k.Held {
-					fresh++
-				}
 				e.EnqueueIntent(k)
 			}
 			e.Step()
-			if fresh > 0 {
-				quietStart = time.Now()
-				sent0 = d.SentIntents()
-			}
-			if time.Since(quietStart) >= 50*time.Millisecond {
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("response stream never quiesced after warm-up (tick %d)", e.Tick)
-			}
 			time.Sleep(2 * time.Millisecond)
 		}
-		if sent := d.SentIntents(); sent != sent0 {
-			t.Fatalf("driver published %d intents in the final quiescence window: backlog not drained", sent-sent0)
-		}
-		if n := bus.BufferedIntents(); n != 0 {
-			t.Fatalf("intent buffer not empty at measurement start: %d intents", n)
-		}
+		// Phase B: verified silence again — proves the sentinel's
+		// response was CONSUMED, not merely published. Measurement starts
+		// with zero outstanding responses (the FIFO below opens empty),
+		// provably.
+		quietWindow()
 
 		// Fixed-cadence measurement, exercising the production
 		// DrainIntents → EnqueueIntent → Step path: every drained intent is
@@ -1295,8 +1340,8 @@ func TestBatchAppliedLagBoundary(t *testing.T) {
 			// Desync guard: a lost obs response (slow-consumer drop) would
 			// wedge the FIFO front — fail loudly instead of misattributing.
 			if len(queue) > 60 {
-				t.Fatalf("%d responses outstanding (obs dropped or driver stalled): tick %d, driver LastObsTick %d, front src %d needed %d",
-					len(queue), e.Tick, d.LastObsTick(), queue[0].src, queue[0].needed)
+				t.Fatalf("%d responses outstanding (obs dropped or driver stalled): tick %d, driver CompletedObsTick %d, front src %d needed %d",
+					len(queue), e.Tick, d.CompletedObsTick(), queue[0].src, queue[0].needed)
 			}
 			if deadline := start.Add(time.Duration(i+1) * pace); time.Now().After(deadline) {
 				res.overruns++

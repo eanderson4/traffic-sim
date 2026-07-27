@@ -111,8 +111,12 @@ func SubjectCtlIntentAll(run string) string { return Namespace + "." + run + ".c
 func SubjectCtlAck(run, ctl string) string { return Namespace + "." + run + ".ctl.ack." + ctl }
 
 // SubjectCtlAll is the whole per-run controller tree: ts.{run}.ctl.> — for
-// taps that need cross-channel delivery order (one subscription's delivery
-// order is broker order; separate subscriptions are not ordered).
+// taps that need cross-channel delivery on ONE subscription. Note the exact
+// guarantee: NATS ordering is PER PUBLISHER, so one wildcard callback
+// recovers per-publisher order (all of the engine's messages in engine
+// order, all of the driver's in driver order) but NOT causal order across
+// the two publishers — the reason any tap built on this is smoke-only and
+// boundary-controlled harnesses are the regression coverage.
 func SubjectCtlAll(run string) string { return Namespace + "." + run + ".ctl.>" }
 
 // Contract-plane subjects (ADR-0008 §3–§4): the attach handshake
