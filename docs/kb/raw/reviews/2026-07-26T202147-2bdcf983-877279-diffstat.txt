@@ -1,0 +1,8 @@
+ contracts/asyncapi.yaml                       | 53 ++++++++++++++++++++++-----
+ docs/kb/articles/cross-topic-concerns.md      |  2 +-
+ docs/kb/decisions/ADR-0026-batched-intents.md | 14 ++++++-
+ engine/natsio/bus.go                          |  9 ++++-
+ engine/natsio/driver/batch_test.go            | 41 +++++++++++++++++++++
+ engine/natsio/driver_test.go                  |  7 ++--
+ engine/natsio/tsib_test.go                    | 11 ++++++
+ 7 files changed, 121 insertions(+), 16 deletions(-)

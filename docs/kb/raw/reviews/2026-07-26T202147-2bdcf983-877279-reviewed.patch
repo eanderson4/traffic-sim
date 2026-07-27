@@ -1,0 +1,281 @@
+diff --git a/contracts/asyncapi.yaml b/contracts/asyncapi.yaml
+index f2862f912454494f38138a91e929b89a7c40d2f1..27f24f196c9a2b2283691a74bf338e88b87b0100 100644
+--- a/contracts/asyncapi.yaml
++++ b/contracts/asyncapi.yaml
+@@ -13,6 +13,11 @@
+ #     — never in subjects, never inferred from stream sequence.
+ #   - Binary layouts are little-endian, fixed-size integers, versioned by
+ #     the schema_version header AND an in-payload magic/version pair.
++#     EXCEPTION (ADR-0026): the TSIB batched intent carries NO
++#     schema_version header — its discriminator is the exact-case
++#     `intent_encoding: tsib` header (absent = v2) — only the in-payload
++#     version u16. This keeps the v2 intent stream byte-identical
++#     (headerless) for every pre-ADR-0026 producer.
+ #   - Every binary message also declares a JSON schema view (suffix "View")
+ #     so tooling (docs, codegen, validators) has a machine-readable shape;
+ #     the wire stays binary.
+@@ -222,9 +227,17 @@ channels:
+       message reads as malformed v2: counted via the generic drop counter
+       with no dedicated signal, claim filtering as backstop — see the
+       migration note.) A valid TSIB expands at ingest into
+-      per-vehicle records in record order; everything downstream (claim
+-      filter, per-controller seq, hold-last, arbitration, record plane)
+-      is identical to the v2 stream.
++      per-vehicle records in record order; per-VEHICLE semantics
++      downstream (claim filter, per-controller seq per vehicle,
++      first-wins arbitration per vehicle, hold-last, record/replay) are
++      identical to the v2 stream. One deliberate exception: on a tick
++      where some intents carry routes, the standalone route v2 publishes
++      mid-loop while route-free intents wait for the end-of-tick batch,
++      so per-controller ARRIVAL ORDER ACROSS DIFFERENT VEHICLES may
++      differ from a pure v2 stream ([route-bearing B, batched A, batched
++      C] for ego order [A,B,C]). The difference is deterministic and
++      outcome-neutral: arbitration is per-vehicle and replay re-enqueues
++      the recorded order.
+       Migration (ADR-0026 M4 + 2026-07-26 amendment): the mechanism is
+       HelloReply capability advertisement with graceful fallback — the
+       engine advertises `intent_encodings` at attach, and a batch-capable
+@@ -663,8 +676,11 @@ components:
+         until consumed), routing (destination lane id, persistent), signal
+         state (persistent, informational in v1). Absent fields = no change.
+         The engine clamps every intent to the vehicle's physical envelope
+-        (MMU pattern, ADR-0008 §5).
+-      headers: { $ref: '#/components/schemas/SchemaHeaders' }
++        (MMU pattern, ADR-0008 §5). Headers are OPTIONAL on this message:
++        the shipped v2 driver publishes headerless (absent intent_encoding
++        = v2, per the ctlIntent demux); engine-published messages stamp
++        schema_version.
++      headers: { $ref: '#/components/schemas/SchemaHeadersOptional' }
+       payload:
+         schemaFormat: application/octet-stream
+         $ref: '#/components/schemas/IntentFrame'
+@@ -677,9 +693,14 @@ components:
+         The batched form of ControlIntent: up to 20,000 per-vehicle
+         records in one message (fleets past the cap split into
+         ⌈n/20,000⌉ batches per tick), expanded at ingest into the same
+-        per-vehicle buffer in record order, so every downstream semantic
+-        of ctlIntent (claim filter, per-controller seq, hold-last,
+-        arbitration, the record plane) is identical to the v2 stream.
++        per-vehicle buffer in record order, so every per-vehicle
++        downstream semantic of ctlIntent (claim filter, per-controller
++        seq per vehicle, first-wins arbitration per vehicle, hold-last,
++        record/replay) is identical to the v2 stream — with ONE
++        deliberate exception: on route-bearing ticks the standalone route
++        v2 publishes before the batch, so per-controller arrival order
++        across different vehicles may differ (deterministic,
++        outcome-neutral; see the ctlIntent channel description).
+         Batch acceptance counters (intentBatches / intentRecords /
+         intentBatchDropped / intentRecordDropped / intentEncodingUnknown,
+         Bus.IntentBatchStats) are the observability substitute for 1:1
+@@ -881,6 +902,14 @@ components:
+       properties:
+         schema_version: { type: integer, const: 2 }
+ 
++    SchemaHeadersOptional:
++      type: object
++      properties:
++        schema_version:
++          type: integer
++          const: 2
++          description: 'OPTIONAL on controller-published messages: engine-published messages stamp schema_version; controller intent messages do not (v2 intents are headerless on the wire — the ADR-0026 demux treats an absent intent_encoding as v2).'
++
+     AckHeaders:
+       type: object
+       required: [tick, applied_tick, schema_version]
+@@ -1046,7 +1075,11 @@ components:
+       type: string
+       format: binary
+       description: |
+-        v1, little-endian (ADR-0026):
++        v1, little-endian (ADR-0026). Header-versioning exception to the
++        file-wide convention: TSIB carries NO schema_version header — its
++        discriminator is the `intent_encoding: tsib` header (absent = v2)
++        plus the in-payload version u16 below — so the v2 intent stream
++        stays byte-identical (headerless) for pre-ADR-0026 producers.
+           header (24 B): magic "TSIB" | version u16 = 1 | flags u16 (reserved, 0) |
+                          tick u64 | count u32 | reserved u32
+           records: count × 44 B — byte-identical layout to the fixed
+@@ -1091,7 +1124,7 @@ components:
+       required: [tick, count, records]
+       properties:
+         tick: { type: integer, minimum: 0, description: 'Source observation tick — informational only, never validated.' }
+-        count: { type: integer, minimum: 0, maximum: 20000 }
++        count: { type: integer, minimum: 0, maximum: 20000, description: 'Record count. count 0 (a 24 B header-only batch) is structurally VALID and accepted — a keep-alive-shaped allowance; no shipped controller produces one.' }
+         records:
+           type: array
+           maxItems: 20000
+diff --git a/docs/kb/articles/cross-topic-concerns.md b/docs/kb/articles/cross-topic-concerns.md
+index e5e851dd84ea83d84761f948f17f2e45e8f7b4c7..ddc5d8b81736347c6c5e77a62e9c7065324b4f25 100644
+--- a/docs/kb/articles/cross-topic-concerns.md
++++ b/docs/kb/articles/cross-topic-concerns.md
+@@ -48,7 +48,7 @@
+ 
+ - **Config sprawl is the 15-year failure mode.** MATSim's module accretion and TraCI's silent protocol renumbering are why contracts are add-only, versioned, and declared in one AsyncAPI document, and why the scenario surface is deliberately small. Affects: Simulator Landscape, NATS Backbone, Vehicle & Controller Interface, Scenario Format.
+ 
+-- **Silent publish failures hide fidelity failures (2026-07-26, ADR-0026 M3 hardening notes — recorded, NOT yet fixed).** (a) `publishObs` (engine/natsio/contract.go) swallows obs publish errors — `obsOut` counts successes only. A 5,000-vehicle obs frame (~1.96 MB with the policy-ctx feature) silently never published under the test broker's then-default 1 MB `max_payload`, stalling the driver with zero log lines; found via the M3 applied-lag harness (the test broker now mirrors the production 4 MiB cap). Recommendation: count obs publish failures loudly, like the snapshot/signal paths' first-3-per-run logging. (b) `NewBus`/`NewContract` subscribe without flushing — a latent subscribe/publish race: a hello or request published from another connection can beat the server-side SUB registration and fast-fail `nats: no responders`, the M1-era explanation for the load-sensitive test flakes (`TestHoldLastThenDecay` and friends under load). New tests work around it with an explicit `nc.Flush()` after construction; the shared harnesses still carry the race. Affects: NATS Backbone, Vehicle & Controller Interface.
++- **Silent publish failures hide fidelity failures (2026-07-26, ADR-0026 M3 hardening notes — recorded, NOT yet fixed).** (a) `publishObs` (engine/natsio/contract.go) swallows obs publish errors — `obsOut` counts successes only. A 5,000-vehicle obs frame (~1.96 MB with the policy-ctx feature) silently never published under the test broker's then-default 1 MB `max_payload`, stalling the driver with zero log lines; found via the M3 applied-lag harness (the test broker now mirrors the production 4 MiB cap). Recommendation: count obs publish failures loudly, like the snapshot/signal paths' first-3-per-run logging. The same pattern sits in the driver's intent path (`publishIntent`/`flushBatch`, engine/natsio/driver/driver.go): one failed `PublishMsg` silently loses up to 20,000 intents for the tick — hold-last heals ≤ 2 ticks, then the fleet coasts. (b) `NewBus`/`NewContract` subscribe without flushing — a latent subscribe/publish race: a hello or request published from another connection can beat the server-side SUB registration and fast-fail `nats: no responders`, the M1-era explanation for the load-sensitive test flakes (`TestHoldLastThenDecay` and friends under load). New tests work around it with an explicit `nc.Flush()` after construction; the shared harnesses still carry the race. Affects: NATS Backbone, Vehicle & Controller Interface.
+ 
+ ## Reading Order
+ 
+diff --git a/docs/kb/decisions/ADR-0026-batched-intents.md b/docs/kb/decisions/ADR-0026-batched-intents.md
+index 9889745e2e8af4d67700118a067e021e12a56f9a..af50ad295210afb86daf08d440e2f8911ae61a11 100644
+--- a/docs/kb/decisions/ADR-0026-batched-intents.md
++++ b/docs/kb/decisions/ADR-0026-batched-intents.md
+@@ -87,7 +87,7 @@ records:        count × 44 B, byte-identical layout to the fixed section
+                 route_len u16 | reserved u16)
+ ```
+ 
+-- **Batch cap: 20,000 records** (880,024 B payload + header). The
++- **Batch cap: 20,000 records** (880,024 B with the header). The
+   theoretical 1 MiB ceiling (~23.8k records) leaves ~32 B of headroom —
+   approximately the serialized header itself — so the cap is set
+   conservatively and pinned by a boundary publish test. A controller with
+@@ -134,6 +134,18 @@ per-applied-intent recording on `ts.{run}.log.intent`, replay, the bake
+ pipeline — is **identical to today**. The record plane never sees a
+ batch.
+ 
++One deliberate, deterministic exception to wire-order parity (M4 review):
++on a tick where some of a controller's intents carry routes, the
++standalone route v2 publishes mid-loop while the route-free intents wait
++for the end-of-tick batch, so per-controller **arrival order across
++different vehicles** can differ from a pure v2 stream — ego order
++[A batched, B routed, C batched] arrives [B, A, C]. Outcomes are
++unaffected: arbitration is per-vehicle (first-per-vehicle wins), claim
++filtering and hold-last are per-vehicle, and replay re-enqueues the
++recorded order; per-vehicle semantics are exactly those of the v2
++stream. A driver test (`TestBatchMixedRouteTickArrivalOrder`) pins the
++[B, A, C] shape so the reordering is a decision, not drift.
++
+ This is the load-bearing choice: batching is a new message contract on
+ `ctlIntent` (hence this ADR) with **no downstream semantic change**. The
+ determinism guarantee is **replay determinism within each recorded run**:
+diff --git a/engine/natsio/bus.go b/engine/natsio/bus.go
+index 055b620dabc249bccb671ad42ef0d98e3f97f116..0b819a95a8e5c625f0dec667bfadf29f86363668 100644
+--- a/engine/natsio/bus.go
++++ b/engine/natsio/bus.go
+@@ -51,6 +51,7 @@ const (
+ 	headerAppliedTick    = "applied_tick"
+ 	headerSigChunk       = "sig_chunk"       // "i/n" 1-based, ADR-0016 (absent = whole table)
+ 	headerIntentEncoding = "intent_encoding" // ADR-0026 demux: absent = v2, "tsib" = TSIB, else drop+count
++	intentEncodingV2     = "v2"              // explicit v2: exact synonym for absent
+ 	intentEncodingTSIB   = "tsib"
+ 	intentSubjectTokens  = 5 // ts.{run}.ctl.intent.{controller_id}
+ )
+@@ -59,7 +60,7 @@ const (
+ // (ADR-0026 M4 addendum): every intent wire encoding this engine accepts on
+ // ctlIntent, v2 first. Pre-TSIB engines omit the field entirely, which is
+ // the driver-side fallback signal.
+-var intentEncodingsAdvertised = []string{"v2", intentEncodingTSIB}
++var intentEncodingsAdvertised = []string{intentEncodingV2, intentEncodingTSIB}
+ 
+ // intentFixedFlags computes the v2 flag bits for the non-route axes.
+ func intentFixedFlags(in engine.Intent) uint32 {
+@@ -321,6 +322,12 @@ func (b *Bus) onIntent(msg *nats.Msg) {
+ 		enc = vals[0]
+ 	}
+ 	switch enc {
++	case intentEncodingV2:
++		// Explicit "v2": an EXACT synonym for absent. A pre-TSIB engine
++		// ignores headers entirely, so this same message works there —
++		// rejecting it would make an engine upgrade break such a producer
++		// (interop trap, M4 review).
++		b.bufferV2Intent(tokens[4], msg.Data)
+ 	case intentEncodingTSIB:
+ 		intents, recordDrops, ok := DecodeTSIB(msg.Data)
+ 		if !ok {
+diff --git a/engine/natsio/driver/batch_test.go b/engine/natsio/driver/batch_test.go
+index 5f2e6bffe2ffa197c568f354d2002aa99b74a134..10ed02f27afb52b83ff09ef207215f9130315e4e 100644
+--- a/engine/natsio/driver/batch_test.go
++++ b/engine/natsio/driver/batch_test.go
+@@ -360,3 +360,44 @@ func TestIntentEncodingFallback(t *testing.T) {
+ 		}
+ 	})
+ }
++
++// Mixed route/non-route tick (ADR-0026, M4 review — a pinned DECISION, not
++// drift): the standalone route v2 publishes MID-LOOP while route-free egos
++// wait for the end-of-tick batch, so per-controller arrival order across
++// different vehicles is [route-bearing B, batched A, batched C] for ego
++// order [A,B,C] — deterministic and outcome-neutral (arbitration is
++// per-vehicle; replay re-enqueues the recorded order).
++func TestBatchMixedRouteTickArrivalOrder(t *testing.T) {
++	_, nc := startTestBroker(t)
++	d := batchDriver(nc, Config{Destination: "D1"})
++	var tap wireTap
++	tap.subscribe(t, nc, "t", "drv")
++
++	// A and C already carry the destination (obs echo confirmed → no route
++	// intent, they batch); B does not → its standalone route v2 goes out
++	// mid-loop, before the batch.
++	egos := []natsio.ObsEgo{
++		{ID: 10, Route: "D1"}, // A: confirmed route → batched
++		{ID: 20},              // B: needs the route → standalone v2, mid-loop
++		{ID: 30, Route: "D1"}, // C: confirmed route → batched
++	}
++	d.onObs(obsMsg(1, 0, egos))
++	msgs := tap.waitCount(t, 2)
++	if got := tap.settle(); got != 2 {
++		t.Fatalf("mixed-tick messages = %d, want 2 (standalone v2 + batch)", got)
++	}
++
++	// Message 1: B's complete standalone v2, headerless.
++	if _, present := msgs[0].Header[tapHeaderKey]; present {
++		t.Fatal("route-update v2 carries an intent_encoding header")
++	}
++	in, ok := natsio.DecodeIntent(msgs[0].Data)
++	if !ok || in.VehicleID != 20 || !in.RouteSet || in.Route != "D1" {
++		t.Fatalf("first arrival = %+v (ok %v), want B's standalone route v2", in, ok)
++	}
++	// Message 2: the batch holding A and C, in ego order.
++	recs := decodeTSIBMsg(t, msgs[1], 1)
++	if len(recs) != 2 || recs[0].VehicleID != 10 || recs[1].VehicleID != 30 {
++		t.Fatalf("batch records = %+v, want [A=10, C=30] in ego order", recs)
++	}
++}
+diff --git a/engine/natsio/driver_test.go b/engine/natsio/driver_test.go
+index 84c96917362682a39d981bae662d7a6621a87538..6c9a7d6a9a16b4935f1c7191a40bb0a5288ada06 100644
+--- a/engine/natsio/driver_test.go
++++ b/engine/natsio/driver_test.go
+@@ -1325,7 +1325,8 @@ func TestBatchAppliedLagBoundary(t *testing.T) {
+ 		// iteration k sleeps until start + k×pace, so boundary intervals are
+ 		// fixed by construction in both legs (no drift from variable work).
+ 		// An iteration overrunning its deadline is counted and reported —
+-		// never silently absorbed; at 3 ms with sub-ms work it is zero.
++		// never silently absorbed; REQUIRED zero on acceptance legs (the
++		// exact comparison is only valid on an undisturbed schedule).
+ 		start := time.Now()
+ 		for i := 0; i < measTicks; i++ {
+ 			if err := contract.ProcessControl(e); err != nil {
+@@ -1438,8 +1439,8 @@ func TestBatchAppliedLagBoundary(t *testing.T) {
+ 	accept("prod-pace", prodPace, v2Prod, tsibProd)
+ 
+ 	// Scale confirmation: the same undisturbed shape at 5,000 vehicles
+-	// (obs frames ~2 MB, responses ~5k intents — the 10 ms pace leaves
+-	// the same huge margin, overruns REQUIRED zero as at 3 ms).
++	// (obs frames ~2 MB, responses ~5k intents — the 100 ms pace leaves
++	// the same huge margin, overruns REQUIRED zero as at prod pace).
+ 	const scalePace = 100 * time.Millisecond
+ 	v2Scale := runLeg(t, true, 5000, 100, scalePace)
+ 	tsibScale := runLeg(t, false, 5000, 100, scalePace)
+diff --git a/engine/natsio/tsib_test.go b/engine/natsio/tsib_test.go
+index 434860bbfa9af179acae6ef03eef3c65bc6f26f7..3fe40ad8309ec69bbbf0a86316e35a2471b52773 100644
+--- a/engine/natsio/tsib_test.go
++++ b/engine/natsio/tsib_test.go
+@@ -287,6 +287,17 @@ func TestTSIBUnknownEncodingDropped(t *testing.T) {
+ 	if len(bus.buf) != 1 || bus.buf[0].Intent != tsibCodecCases[0] {
+ 		t.Fatalf("headered v2 message without intent_encoding not read as v2: %+v", bus.buf)
+ 	}
++
++	// An EXPLICIT intent_encoding: v2 is an exact synonym for absent — the
++	// same message works against a pre-TSIB engine (which ignores headers),
++	// so rejecting it would break such a producer on upgrade (M4 review).
++	m3 := nats.NewMsg("ts.r.ctl.intent.alpha")
++	m3.Data = EncodeIntent(tsibCodecCases[1])
++	m3.Header.Set(headerIntentEncoding, "v2")
++	bus.onIntent(m3)
++	if len(bus.buf) != 2 || bus.buf[1].Intent != tsibCodecCases[1] {
++		t.Fatalf("explicit intent_encoding=v2 not read as v2: %+v", bus.buf)
++	}
+ }
+ 
+ // tsibSetup wires a real Bus+Contract over the embedded server with one
