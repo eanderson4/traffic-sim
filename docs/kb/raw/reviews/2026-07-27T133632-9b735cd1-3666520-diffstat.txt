@@ -1,0 +1,68 @@
+ .gitignore                                         |    6 +
+ docs/kb/INDEX.md                                   |    4 +-
+ .../articles/concepts/silent-fidelity-failures.md  |  111 +-
+ docs/kb/articles/decisions/adrs.md                 |    4 +-
+ docs/kb/decisions/ADR-0027-baked-trip-cards.md     |  156 +++
+ docs/show/README.md                                |  118 ++-
+ docs/show/baselines.json                           |   43 +
+ docs/show/bottleneck-town.md                       |  589 +++++++++++
+ docs/show/diag/bottleneck-town__bypass-north.svg   |  118 +++
+ .../show/diag/bottleneck-town__connector-south.svg |  172 +++
+ docs/show/diag/bottleneck-town__green-wave.svg     |   95 ++
+ docs/show/diag/bottleneck-town__retime-short.svg   |   98 ++
+ docs/show/diag/bottleneck-town__setup.svg          |  102 ++
+ docs/show/diag/index.html                          |  740 +++++++++++++
+ docs/show/diag/merge-pod__accel-extend.svg         |   23 +
+ docs/show/diag/merge-pod__frontage-road.svg        |   27 +
+ docs/show/diag/merge-pod__mainline-lane.svg        |   23 +
+ docs/show/diag/merge-pod__ramp-meter.svg           |   27 +
+ docs/show/diag/merge-pod__setup.svg                |   31 +
+ docs/show/img/bottleneck-town-signals.jpg          |  Bin 0 -> 35082 bytes
+ docs/show/img/quiz-merge-options.jpg               |  Bin 0 -> 46873 bytes
+ docs/show/img/quiz-page1-baseline.jpg              |  Bin 0 -> 53535 bytes
+ docs/show/img/quiz-page2-options.jpg               |  Bin 0 -> 53410 bytes
+ docs/show/img/quiz-town-options.jpg                |  Bin 0 -> 47345 bytes
+ docs/show/labels-merge.json                        |    6 +
+ docs/show/merge-options.md                         |  479 +++++++++
+ docs/show/quiz/bottleneck-town.json                |   73 ++
+ docs/show/quiz/merge-pod.json                      |   68 ++
+ docs/show/reports/bottleneck-town-heldout.json     |  467 +++++++++
+ docs/show/reports/bottleneck-town-null.json        |  204 ++++
+ docs/show/reports/bottleneck-town.json             |  687 ++++++++++++
+ docs/show/reports/merge-pod.json                   |  880 ++++++++++++++++
+ engine/cmd/serve/main.go                           |   89 +-
+ engine/natsio/contract.go                          |   97 +-
+ engine/natsio/contract_test.go                     |   66 ++
+ engine/natsio/driver/driver.go                     |   29 +
+ engine/natsio/intentload_test.go                   |  287 +++++
+ engine/natsio/obsframe.go                          |   30 +
+ scripts/chicago/corridorspeed.py                   |   86 ++
+ scripts/chicago/fwsweep.sh                         |   95 ++
+ scripts/chicago/mkquiz.py                          |  290 +++++-
+ scripts/chicago/record-hero.sh                     |    7 +
+ scripts/demos/bottleneck-town.sh                   |   68 ++
+ scripts/demos/bottleneck_town.py                   | 1095 ++++++++++++++++++++
+ scripts/demos/merge-pod.py                         |  543 ++++++++++
+ scripts/demos/merge-quiz.py                        |  113 ++
+ scripts/demos/merge-report.py                      |  153 +++
+ scripts/demos/merge-rerun.sh                       |   47 +
+ scripts/demos/merge-serve.sh                       |   29 +
+ scripts/demos/meter-sweep.sh                       |   77 ++
+ scripts/demos/town-rerun.sh                        |   50 +
+ scripts/demos/town_quiz.py                         |  111 ++
+ scripts/demos/town_report.py                       |  154 +++
+ scripts/show/build-quiz.sh                         |   68 ++
+ scripts/show/mkcontactsheet.py                     |   74 ++
+ scripts/show/mkopenslide.py                        |  259 +++++
+ scripts/show/mkoptiondiag.py                       |  482 +++++++++
+ scripts/toggle-furniture.py                        |   31 +
+ scripts/whatif.py                                  |   95 +-
+ viz/index.html                                     |    3 +
+ viz/public/apple-touch-icon.png                    |  Bin 0 -> 30619 bytes
+ viz/public/favicon-32.png                          |  Bin 0 -> 3613 bytes
+ viz/public/favicon.svg                             |    1 +
+ viz/public/quiz.html                               |  146 ++-
+ viz/src/config.ts                                  |   59 ++
+ viz/src/main.ts                                    |   10 +-
+ viz/test/config.test.ts                            |   56 +
+ 67 files changed, 10079 insertions(+), 72 deletions(-)
