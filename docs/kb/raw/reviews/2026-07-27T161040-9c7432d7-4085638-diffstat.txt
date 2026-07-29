@@ -1,0 +1,10 @@
+ AGENTS.md                                          |   3 +
+ docs/kb/decisions/ADR-0013-external-review-gate.md |  53 +++
+ docs/show/diag/chi-loop-urban__setup.png.json      |   2 +
+ hooks/pre-commit                                   |   1 +
+ scripts/chicago/mkquiz.py                          | 120 ++++++-
+ scripts/external-review.sh                         |  71 +++-
+ scripts/show/build-quiz.sh                         |  67 +++-
+ scripts/show/mkcongestionmap.py                    | 360 +++++++++++++++++++++
+ viz/public/quiz.html                               |   2 +-
+ 9 files changed, 650 insertions(+), 29 deletions(-)
