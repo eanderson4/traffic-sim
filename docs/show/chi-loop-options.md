@@ -2,6 +2,24 @@
 
 Baseline `base`, 6 paired seeds, 12000 ticks, warmup 4000. Primary metric: `speed_kmh`.
 
+> **These numbers are superseded and are being re-measured.** Two defects,
+> both in the measurement rather than the scenario:
+>
+> 1. **Window.** This run emits lane intervals [4000,7000), [7000,10000) and
+>    [10000,12000); the last is flagged `partial` because the horizon cut it
+>    short. ADR-0014 §3 says comparison tooling drops partials — as of
+>    2026-07-27 `whatif.py` and `corridorspeed.py` do, matching
+>    `mkcongestionmap.py`, which always did. The table above was produced
+>    before that fix, so it sums a truncated interval into a window it
+>    reports as 12,000 ticks. The honest window for this run is 4,000–10,000,
+>    which is what the quiz map's caption states.
+> 2. **Fidelity.** These arms ran without `-drivers`, at roughly 1.5%
+>    uncontrolled coasting — above the 0.1% bar `serve` warns at, and enough
+>    that part of the fleet had no car-following control.
+>
+> The paired design means the RANKING is likely to survive both; the absolute
+> speeds are not a measurement of the scenario as written. Re-run pending.
+
 | option | Δ vs base | Δ% | p | Cohen's d | verdict |
 |---|---:|---:|---:|---:|---|
 | Shorter signal cycles — 34% shorter, same green share | 0.70 | 2.1% | 0.0021 | 2.38 | UPGRADE |

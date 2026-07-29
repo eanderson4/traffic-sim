@@ -1,12 +1,16 @@
 # Silent Fidelity Failures
 
 > How a run reports a clean measurement of a scenario it never simulated —
-> eight independent mechanisms, what each looked like from the outside, and
+> eleven independent mechanisms, what each looked like from the outside, and
 > the counter that catches it. Most were found on chi-loop-urban at city
 > scale; two bite on a 44-lane authored pod; the seventh is not a property of
 > any scenario at all (it is the measurement harness) and the eighth is not a
 > failure of the simulation at all — it is a correct number answering a
-> different question than the one being asked of it.
+> different question than the one being asked of it. Two are about TIME: a
+> demand program longer than the run that executes it, and a mean speed read
+> off a network that has not finished filling. The eleventh is about SPACE,
+> and it is the one that hid the other ten's consequences the longest: a
+> correctly computed average over a network that is not uniform.
 
 ## Why this article exists
 
@@ -24,7 +28,7 @@ congestion is what "things moving slowly and piling up" looks like from the
 metrics. The defence is not better physics. It is a counter on every path
 that can drop, expire, or skip work, and a loud threshold on each.
 
-## The eight mechanisms
+## The eleven mechanisms
 
 ### 1. Demand that never enters (the director's 1 verb/tick ceiling)
 
@@ -181,6 +185,25 @@ of the SAME run at once on an otherwise idle 16-core box:
 The knee is between 3 and 4 and it is sharp. The same pod at `--jobs 5`
 while an unrelated job also ran voided **31 of 36** runs.
 
+**The same trap is inside a single run: `-drivers` past the core count makes
+fidelity WORSE.** Replicas shard the fleet safely, so more of them reads as
+strictly more throughput — but they contend with each other, with the engine
+loop and with embedded NATS for the same cores. Measured on chi-loop-urban
+(2026-07-28) on a Ryzen 7 9700X, **8 physical cores**, 16 threads:
+
+| `-drivers` | vehicles | coasting | while moving |
+|---:|---:|---:|---:|
+| 8 | 5,417 | 0.07% | 0.06% |
+| 8 | 9,435 | 21.03% | 1.81% |
+| 16 | 11,169 | 57.05% | 3.32% |
+
+Doubling the replicas roughly tripled the coasting. Vehicle count rose too,
+so the rows are not a clean control — but the direction settles it, because
+the reason to raise `-drivers` at all is to survive a higher vehicle count
+and it did the opposite. Read `-drivers` as bounded by PHYSICAL cores minus
+the engine and broker, not by fleet size: 6 is the working figure on this
+box. It is a property of the machine, so re-measure it on another one.
+
 **Why this one is worse than it looks.** It is not a noise term that the
 paired design cancels. Coasting scales with how many vehicles a run is
 holding, so the arms that congest hardest lose the most intents — the
@@ -262,11 +285,47 @@ per-corridor figures are in the table above) and left every corridor speed
 within noise. This is saturation, not
 burstiness — the portals cannot pass the demand at any arrival pattern.
 
-**Counter:** none exists. The check is structural — partition a corridor's
-lanes by whether they have a predecessor and report both figures. A corridor
-speed quoted without that split cannot distinguish a congested road from a
-congested doorway. `scripts/show/mkcongestionmap.py` makes it visible by
-colouring each lane against its own limit, which is how this was caught.
+**Counter (2026-07-28): `mkod.py --ramp-share`.** The doorway is narrow
+because a map cut deletes the on-ramps. The real Kennedy fills from Armitage,
+North, Division and Ohio; the extract gave it four flows of 944 veh/h on
+adjacent lanes at one coordinate. `--ramp-share F` relocates fraction F of
+each corridor's boundary inflow onto interior points spread along that
+corridor (`--ramps-per-corridor`, default 12), conserving volume — sites are
+resolved before any volume moves, so a corridor with no usable site simply
+never gets drained.
+
+Two things to know before using it:
+
+- **Site selection must be spatial, not by index.** A corridor carries
+  several parallel lanes at the same longitudinal position, so taking every
+  n-th lane from a coordinate-sorted list puts multiple picks metres apart:
+  measured on the Dan Ryan, two injection points **10 m apart** with a median
+  gap of 130 m across a 5.9 km corridor — the single-point defect, merely
+  subdivided. Greedy farthest-point selection gives 0.42-0.94 km minimum gaps
+  across all five corridors, which is realistic ramp spacing.
+- **It invalidates the freeway-scale calibration, and by a lot.** The old
+  scale was tuned while the doorway was METERING the corridor — at fw3.5 only
+  62% of directives were delivered, so a third of the demand never reached
+  the mainline. Remove the meter and the same scale gridlocks the network
+  (every expressway 4.3-8.0 km/h). A scale chosen against a saturated portal
+  is a measurement of the portal.
+
+The structural check still applies and is still the thing to report:
+partition a corridor's lanes by whether they have a predecessor and give both
+figures. A corridor speed quoted without that split cannot distinguish a
+congested road from a congested doorway.
+`scripts/show/mkcongestionmap.py` makes it visible by colouring each lane
+against its own limit, which is how this was caught.
+
+**A note on the diagnostic, since it bit twice.** "Share of delay within 1 km
+of an injection point" is a good metric under single-point injection and a
+meaningless one under `--ramp-share`, where a point every ~500 m puts every
+lane within 1 km of one and pins the number at 100%. Its replacement — share
+of delay in the worst 10% of lane-km — turned out to read 84-99% in EVERY
+regime including an uncongested arterial grid, because this network's
+lane-length distribution is dominated by short fragments that carry no delay.
+Neither number discriminates. Use speed against the AM band, density against
+the ~25 veh/km/lane critical, delivery, and moving-coasting.
 
 **Consequence for the show, stated carefully — the boundary queue OVERSTATES
 the congestion, it does not invent it.** Comparing the same network at
@@ -289,6 +348,103 @@ Dan Ryan's 58.9 reads as 36.4). Both readings mislead if quoted alone:
 "36 km/h" credits the road with the doorway's delay, and "not congested"
 ignores a 34% drop. Quote the
 interior-only figure and say it is interior-only.
+
+### 9. A demand program the horizon never finishes executing
+
+`mkod.py` emits a piecewise profile: `AM_PROFILE = [0.45, 0.70, 1.00, 1.00,
+0.80, 0.60]` over half-hour slices, a 3-hour 06:00–09:00 peak = **10,800 s =
+108,000 ticks**. Every Chicago run to date was 6,000–12,000 ticks, i.e.
+1,200 s. A ramped run therefore executed the first 1,200 s of a 10,800 s
+program — it never left the **0.45 opening ramp**, and reported that as the
+AM peak.
+
+Nothing in any output said so. The demand file was valid, every slice was
+correct, delivery was ~100%, and the run was clean. The scenario simply never
+reached the demand it described. The workaround in use (`--flat-peak`) hid
+the mismatch rather than exposing it, and carried its own version of the same
+bug: it emitted one hard-coded `0–1800 s` slice, so any run past 30 simulated
+minutes silently lost its arrival process partway through and drained without
+being asked to.
+
+**Counter:** `mkod.py --horizon-s` (passed automatically by
+`mkscenario.sh` from `ticks / 10`) refuses a program the run is too short to
+execute, and names both fixes — raise the ticks, or lower `--slice-s` to fit
+the shape into the horizon you have. Flat peak now spans the horizon.
+
+The general form: **a demand program has a duration, and it is not the run's
+duration.** Two independent time axes, no cross-check between them, and the
+failure mode is a scenario that is entirely valid and entirely not the one
+you meant to run.
+
+### 10. Measuring a network that is still filling
+
+Related but distinct: even with demand correctly executing, a mean speed
+taken over a window is only a property of the network if the network has
+settled. It usually has not. On a 12,000-tick freeway-scale-3.5 run the
+per-interval curve read:
+
+| interval | freeway km/h | freeway veh/km/ln | % of critical |
+|---|---:|---:|---:|
+| 10–15 min | 39.5 | 5.0 | 20% |
+| 15–20 min | 27.6 | 6.2 | 25% |
+
+Speed falling 30% and density still climbing steeply at the horizon: this is
+a fill curve, not an equilibrium. The window average over those two intervals
+(~33 km/h) sits inside the real AM band and looks like a calibrated result.
+It is an artefact of where the run was cut. Worse, it makes the demand knob
+and the horizon **confounded** — a scale sweep run this way partly measures
+how fast each scale fills, so raising demand and lengthening the run are
+indistinguishable in the output.
+
+**Counter:** report the per-interval curve, not just the window mean
+(`diagnose.py --curve`), and run a full peak *cycle* — ramp, plateau, taper,
+then a drain with arrivals off (`--drain-s`). A network that clears during
+the drain was genuinely loaded; one that does not was over-saturated, and the
+distinction is invisible from a flat cut that stops mid-peak.
+
+### 11. A mean over a network that is not uniform
+
+**What it looks like:** two figures, both computed correctly, both quoted as
+fidelity evidence, both wrong about the thing they were used to claim.
+
+*"Network density is 27% of critical, so we are not congested yet."* True as
+arithmetic. It is a mean over 2,203 lane-km that includes every empty
+residential street in the box. The same run had **55 lane-km at or above
+critical density moving at 6.3 km/h** — real jams, in real places. The mean
+had no way to say so.
+
+*"The corridor means are 25–41 km/h, inside the Chicago AM band, so the
+expressways are loaded like the real ones."* Also true as arithmetic. The
+distribution over the same cells:
+
+| corridor lane-km-hours | share |
+|---|---:|
+| empty | 6.2% |
+| 60+ km/h | 68.0% |
+| 45–60 km/h | 14.4% |
+| 30–45 km/h | 3.4% |
+| 20–30 km/h | 2.2% |
+| 10–20 km/h | 2.4% |
+| <10 km/h | 3.2% |
+
+The corridor mean was a blend of a few destroyed segments and mostly
+free-flowing road. The real Kennedy at 8am is not 5% jammed and 95% empty.
+The mean lands in the right band for the wrong reason, and it lands there
+*more* convincingly the more heterogeneous the network is.
+
+This one is worse than the other ten because it is not a bug. Nothing
+malfunctioned; the number is what it says it is. It survived because the
+alternative was never printed.
+
+**Counter:** report **distributions, not means** — share of lane-km (and,
+separately, share of VMT) in each density and speed band, over space-time
+cells (`scripts/runreport.py`, [ADR-0030](../../decisions/ADR-0030-run-report-protocol.md)).
+Keep empty road in its own bucket rather than averaging it in as a zero.
+Show the lane-km share and the VMT share together: when they disagree, the
+disagreement is the finding. And locate the delay — by corridor where
+corridors exist, by district everywhere else, because "the arterial grid" as
+one 1,779 lane-km bucket is not a location either.
+
 
 ## The general shape
 

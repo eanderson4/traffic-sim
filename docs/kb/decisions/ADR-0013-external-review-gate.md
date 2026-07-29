@@ -116,3 +116,56 @@ letting it accrete in tooling.
   policy), a reviewer CLI disappears (substitute a model family — keep
   two families), or the gate starts rubber-stamping (strengthen the
   completion marker into structured verdicts).
+
+## Addendum 2026-07-27: Kimi K3 as a substitute for Fable
+
+The "revisit when" clause above fired sooner than expected, and for a
+duller reason than a CLI disappearing: **Claude Fable hit a monthly spend
+limit** mid-session and every invocation returned `You've hit your
+monthly spend limit` instead of a review. The gate did exactly what §4
+asks — refused to stamp — which left finished, Sol-reviewed work
+uncommittable. A quota exhaustion is indistinguishable, from the gate's
+side, from the reviewer being gone.
+
+**Decision.** `scripts/external-review.sh --kimi` fills the non-OpenAI
+slot with **Kimi K3** (`kimi -m kimi-code/k3`). This is a *substitution*,
+not a third reviewer: the two-independent-families rule of §2 holds
+(Moonshot + OpenAI), and the round is still two reviews. The default
+remains Fable; the flag is for when Fable cannot answer.
+
+**The archive names the reviewer.** Kimi rounds land as
+`<runid>-kimi-k3.md`, never as `claude-fable.md`. A round covered by the
+substitute must not read, months later, as a round Fable saw — the
+archive is the only durable record of who reviewed what, and mislabelling
+it would be the one failure mode that survives everything else here.
+
+**Kimi gets a read-only checkout, not the live repo.** Fable is confined
+with `--allowedTools` to read-only tools. Kimi has no equivalent flag,
+and it is not theoretical: probed directly, `kimi -p` created a file
+without asking, with no approval prompt in non-interactive mode. So the
+substitute reviewer is pointed at `$work/tree`, a `git archive` checkout
+of the exact staged tree, `chmod -R a-w`. A write reflex fails with
+EACCES in the reviewer's own working directory instead of mutating the
+tree under review — and the drift check that follows would have caught a
+mutation of the *staged* tree anyway, but not one to unstaged files.
+
+This is a **guardrail, not a sandbox**, and the distinction is worth
+keeping honest: nothing stops a determined agent from writing to an
+absolute path elsewhere. It sits inside the same honest-actor boundary as
+the rest of the gate. A side benefit is that the substitute reviews the
+staged tree exactly, rather than the live working tree the other
+reviewers see — the drift the Consequences section lists as an accepted
+limitation does not apply to it.
+
+**Marker leniency.** The completion check now strips a leading indent and
+a leading `• ` before comparing against `REVIEW-COMPLETE`, because that
+is the kimi CLI's own rendering of a message rather than model output
+(kimi indents every line of its final block). Trailing-whitespace
+stripping was already there for the same reason. The fail-closed property
+of §4 is unchanged: substantive length plus the marker as the final
+nonblank line.
+
+**Revisit when:** Fable's quota resets (the default path needs no change
+— just stop passing `--kimi`), or a second reviewer needs the same
+treatment, at which point the slot should become a named list rather than
+a two-valued flag.

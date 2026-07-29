@@ -46,9 +46,11 @@
     54,
     62
   ],
+  "end_tick": 12000,
   "first_interval_tick": 4000,
   "lanes_drawn": 55555,
   "lanes_with_traffic": 32171,
+  "last_interval_end": 10000,
   "metrics": "chiquizbase.metrics.json",
   "metrics_bytes": 67547649,
   "metrics_sha256": "944a92adf4fed9784d03b81b182905f387ffaba5fc1935880d78d2ede044bf7e",

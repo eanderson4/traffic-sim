@@ -11,6 +11,8 @@ analysis/ngsim/ngsim-xt
 # happily stage them if they are not named here.
 engine/serve
 engine/bake
+engine/replay
+engine/demosrv
 tools/
 viz/public/network.geojson
 __pycache__/

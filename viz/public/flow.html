@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Flow dashboard — arrivals, departures, accumulation</title>
+<style>
+  :root {
+    --bg: #0d1226; --panel: #151c38; --ink: #e8ecff; --dim: #9aa3c8;
+    --grid: #26304f; --arr: #5f8dff; --done: #3ddc97; --strand: #ff6b6b;
+    --net: #f5b301; --now: #ffffff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 13px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    padding: 18px 20px 32px;
+  }
+  h1 { font-size: 17px; margin: 0 0 2px; font-weight: 600; }
+  .sub { color: var(--dim); font-size: 12px; margin-bottom: 16px; }
+  .cards { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
+  .card {
+    background: var(--panel); border-radius: 8px; padding: 9px 13px;
+    min-width: 108px;
+  }
+  .card .k { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .card .v { font-size: 19px; font-variant-numeric: tabular-nums; font-weight: 600; }
+  .chart { background: var(--panel); border-radius: 8px; padding: 12px; margin-bottom: 14px; }
+  .chart h2 { font-size: 13px; margin: 0 0 1px; font-weight: 600; }
+  .chart .note { color: var(--dim); font-size: 11px; margin-bottom: 8px; }
+  canvas { width: 100%; height: auto; display: block; }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 8px; font-size: 11px; color: var(--dim); }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+  .live { font-variant-numeric: tabular-nums; }
+  .live.off { color: var(--dim); }
+  footer { color: var(--dim); font-size: 11px; margin-top: 6px; }
+  code { background: #0a0e1e; padding: 1px 5px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<h1>Flow dashboard</h1>
+<div class="sub" id="sub">loading…</div>
+
+<div class="cards" id="cards"></div>
+
+<div class="chart">
+  <h2>Cumulative arrivals vs departures</h2>
+  <div class="note">
+    The <strong>vertical</strong> gap between the two curves is the number of vehicles
+    in the network. The <strong>horizontal</strong> gap is how long a vehicle entering at
+    that moment waits to get out. This is the standard queueing (Newell) diagram.
+  </div>
+  <canvas id="cum" width="1200" height="380"></canvas>
+  <div class="legend">
+    <span><i style="background:var(--arr)"></i>cumulative arrivals</span>
+    <span><i style="background:var(--done)"></i>cumulative completed</span>
+    <span><i style="background:var(--strand)"></i>completed + stranded (all exits)</span>
+    <span><i style="background:var(--now)"></i>replay position</span>
+  </div>
+</div>
+
+<div class="chart">
+  <h2>Vehicles in network</h2>
+  <div class="note">Accumulation — arrivals minus every exit channel. Filling, holding, or draining.</div>
+  <canvas id="net" width="1200" height="240"></canvas>
+</div>
+
+<div class="chart">
+  <h2>Rate per minute</h2>
+  <div class="note">
+    Arrivals in, completions out, and strandings (gridlock escape removals — a failure,
+    not a departure). Scaled to the sustained rates: the startup injection in the first
+    bin is far above them and clips off the top.
+  </div>
+  <canvas id="rate" width="1200" height="240"></canvas>
+  <div class="legend">
+    <span><i style="background:var(--arr)"></i>arriving</span>
+    <span><i style="background:var(--done)"></i>completing</span>
+    <span><i style="background:var(--strand)"></i>stranded</span>
+  </div>
+</div>
+
+<footer id="foot"></footer>
+
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const fmt = (n) => n.toLocaleString();
+
+// Live replay position. Only available when this page is served by demosrv,
+// which proxies /api/replay/status; under `vite dev` it 404s and the marker
+// is simply absent rather than the page failing.
+let nowTick = null, liveNote = "";
+
+const data = await (await fetch("chi-flow.json", { cache: "no-store" })).json();
+const { bins, ticks, dt, lastEntryTick, totals: T } = data;
+const minutes = ticks * dt / 60;
+
+$("sub").textContent =
+  `${fmt(ticks)} ticks = ${minutes.toFixed(0)} simulated minutes at dt=${dt}s · ` +
+  `${bins.length} bins of ${(data.binTicks * dt).toFixed(0)}s`;
+
+$("cards").innerHTML = [
+  ["injected", fmt(T.injected)],
+  ["completed", fmt(T.completed)],
+  ["stranded", fmt(T.stranded)],
+  ["still driving", fmt(T.activeAtHorizon)],
+  ["peak in network", fmt(T.peakInNet)],
+  ["peak at", (T.peakInNetTick * dt / 60).toFixed(0) + " min"],
+  ["arrivals stop", (lastEntryTick * dt / 60).toFixed(0) + " min"],
+].map(([k, v]) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
+
+// ── plotting ────────────────────────────────────────────────────────────
+// Deliberately hand-rolled canvas, no chart library: ADR-0003 keeps the web
+// clients dependency-free by default, and three line plots do not justify an
+// ADR to add one.
+const PAD = { l: 62, r: 14, t: 10, b: 26 };
+
+function frame(cv, ymax, yTicks) {
+  const c = cv.getContext("2d");
+  const W = cv.width, H = cv.height;
+  c.clearRect(0, 0, W, H);
+  const x0 = PAD.l, x1 = W - PAD.r, y0 = H - PAD.b, y1 = PAD.t;
+  const X = (t) => x0 + (t / ticks) * (x1 - x0);
+  const Y = (v) => y0 - (v / ymax) * (y0 - y1);
+
+  c.font = "11px ui-sans-serif, system-ui, sans-serif";
+  c.strokeStyle = getComputedStyle(document.body).getPropertyValue("--grid");
+  c.fillStyle = getComputedStyle(document.body).getPropertyValue("--dim");
+  c.lineWidth = 1;
+
+  // y grid + labels
+  c.textAlign = "right"; c.textBaseline = "middle";
+  for (let i = 0; i <= yTicks; i++) {
+    const v = (ymax / yTicks) * i, y = Math.round(Y(v)) + 0.5;
+    c.beginPath(); c.moveTo(x0, y); c.lineTo(x1, y); c.stroke();
+    c.fillText(fmt(Math.round(v)), x0 - 8, y);
+  }
+  // x grid + labels every 10 min
+  c.textAlign = "center"; c.textBaseline = "top";
+  for (let m = 0; m <= minutes; m += 10) {
+    const x = Math.round(X(m * 60 / dt)) + 0.5;
+    c.beginPath(); c.moveTo(x, y0); c.lineTo(x, y1); c.stroke();
+    c.fillText(m + "′", x, y0 + 6);
+  }
+
+  // arrivals-stop marker: the boundary between the loading and drain phases
+  if (lastEntryTick < ticks) {
+    const x = Math.round(X(lastEntryTick)) + 0.5;
+    c.save();
+    c.strokeStyle = "#7c86ad"; c.setLineDash([4, 4]);
+    c.beginPath(); c.moveTo(x, y0); c.lineTo(x, y1); c.stroke();
+    c.restore();
+    c.save();
+    c.fillStyle = "#7c86ad"; c.textAlign = "left"; c.textBaseline = "top";
+    c.fillText(" arrivals stop", x, y1 + 2);
+    c.restore();
+  }
+  return { c, X, Y, x0, x1, y0, y1 };
+}
+
+function line(g, key, color, width = 2) {
+  const { c, X, Y } = g;
+  c.strokeStyle = color; c.lineWidth = width; c.lineJoin = "round";
+  c.beginPath();
+  bins.forEach((b, i) => (i ? c.lineTo(X(b.tick), Y(b[key])) : c.moveTo(X(b.tick), Y(b[key]))));
+  c.stroke();
+}
+
+function nowLine(g) {
+  if (nowTick == null) return;
+  const { c, X, y0, y1 } = g;
+  const x = Math.round(X(Math.min(nowTick, ticks))) + 0.5;
+  c.save();
+  c.strokeStyle = getComputedStyle(document.body).getPropertyValue("--now");
+  c.lineWidth = 1.5;
+  c.beginPath(); c.moveTo(x, y0); c.lineTo(x, y1); c.stroke();
+  c.restore();
+}
+
+// The three exit channels are stacked so the topmost curve is TOTAL exits.
+// Stacking matters: plotting completions alone against arrivals would show a
+// gap that includes stranded vehicles, i.e. it would claim the network is
+// holding cars it has actually deleted.
+function drawCum() {
+  const ymax = Math.ceil(T.injected / 1000) * 1000;
+  const g = frame($("cum"), ymax, 5);
+  const { c, X, Y } = g;
+  // shade the accumulation between arrivals and all exits
+  c.beginPath();
+  bins.forEach((b, i) => (i ? c.lineTo(X(b.tick), Y(b.cumArr)) : c.moveTo(X(b.tick), Y(b.cumArr))));
+  for (let i = bins.length - 1; i >= 0; i--) {
+    const b = bins[i];
+    c.lineTo(X(b.tick), Y(b.cumDone + b.cumStrand));
+  }
+  c.closePath();
+  c.fillStyle = "rgba(245,179,1,0.10)";
+  c.fill();
+
+  line(g, "cumArr", getComputedStyle(document.body).getPropertyValue("--arr"));
+  // total exits, then completions, so the band between them is the strandings
+  bins.forEach((b) => (b._allOut = b.cumDone + b.cumStrand));
+  line(g, "_allOut", getComputedStyle(document.body).getPropertyValue("--strand"), 1.5);
+  line(g, "cumDone", getComputedStyle(document.body).getPropertyValue("--done"));
+  nowLine(g);
+}
+
+function drawNet() {
+  const ymax = Math.ceil(T.peakInNet / 1000) * 1000;
+  const g = frame($("net"), ymax, 4);
+  const { c, X, Y, y0 } = g;
+  c.beginPath();
+  bins.forEach((b, i) => (i ? c.lineTo(X(b.tick), Y(b.inNet)) : c.moveTo(X(b.tick), Y(b.inNet))));
+  c.lineTo(X(bins[bins.length - 1].tick), y0);
+  c.lineTo(X(0), y0);
+  c.closePath();
+  c.fillStyle = "rgba(245,179,1,0.16)"; c.fill();
+  line(g, "inNet", getComputedStyle(document.body).getPropertyValue("--net"));
+  nowLine(g);
+}
+
+function drawRate() {
+  // Per-minute rates regardless of bin width, so the y axis reads the same
+  // whatever --bin-s the report was built with.
+  const perMin = (data.binTicks * dt) / 60;
+  bins.forEach((b) => {
+    b._ra = b.arr / perMin; b._rd = b.done / perMin; b._rs = b.strand / perMin;
+  });
+  // Bin 0 is the startup injection — every vehicle whose arrival tick is 0
+  // enters at once, which is an order of magnitude above any sustained rate
+  // and would flatten the whole chart into the bottom eighth. Scale to the
+  // sustained rates and let bin 0 clip; the note says so, and the exact
+  // number is on the "injected" card.
+  const rest = bins.slice(1);
+  const ymax = Math.max(...rest.map((b) => b._ra), ...rest.map((b) => b._rd), 1) * 1.15;
+  const g = frame($("rate"), Math.ceil(ymax / 50) * 50, 4);
+  line(g, "_ra", getComputedStyle(document.body).getPropertyValue("--arr"), 1.5);
+  line(g, "_rd", getComputedStyle(document.body).getPropertyValue("--done"), 1.5);
+  line(g, "_rs", getComputedStyle(document.body).getPropertyValue("--strand"), 1.5);
+  nowLine(g);
+}
+
+function drawAll() { drawCum(); drawNet(); drawRate(); }
+drawAll();
+
+// ── live replay position ─────────────────────────────────────────────────
+function nearest(tick) {
+  let best = bins[0];
+  for (const b of bins) if (Math.abs(b.tick - tick) < Math.abs(best.tick - tick)) best = b;
+  return best;
+}
+
+async function poll() {
+  try {
+    const r = await fetch("/api/replay/status", { cache: "no-store" });
+    if (!r.ok) throw new Error(String(r.status));
+    const s = await r.json();
+    const t = s.tick ?? null;
+    if (t !== nowTick) {
+      nowTick = t;
+      const b = nearest(t);
+      liveNote =
+        `replay at tick ${fmt(t)} = ${(t * dt / 60).toFixed(1)} min · ` +
+        `${fmt(b.inNet)} in network · ${s.paused ? "paused" : "playing " + s.speed + "×"} · ` +
+        `crcErrors ${s.crcErrors}`;
+      drawAll();
+      $("foot").className = "live";
+      $("foot").textContent = liveNote;
+    }
+  } catch {
+    if (nowTick !== null) { nowTick = null; drawAll(); }
+    $("foot").className = "live off";
+    $("foot").textContent =
+      "no replay attached — the white position marker appears when this page is served by demosrv with a replay running.";
+  }
+}
+poll();
+setInterval(poll, 1000);
+
+addEventListener("resize", drawAll);
+</script>
+</body>
+</html>
