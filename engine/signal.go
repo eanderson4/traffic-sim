@@ -194,6 +194,43 @@ func (e *Engine) sigState(l *Lane) SigState {
 	return mapSigChar(st[l.LinkIdx])
 }
 
+// sigPermissive reports whether the approach's green in force RIGHT NOW is
+// permissive ('g') rather than protected ('G').
+//
+// mapSigChar deliberately folds both into SigGreen: for the question it
+// answers — may v pass the stop line — they are identical. They are not
+// identical for the question of who yields. In the SUMO tlLogic alphabet
+// 'G' means the movement holds right of way over its foes, while 'g' means
+// it may proceed only after yielding to them: the classic permissive left
+// across oncoming traffic, or a right turn merging into a stream that is
+// green at the same time. A signal program EXPRESSES the conflict rather
+// than separating it in time, and the yielding is the driver's job.
+//
+// Folding the two together gave every permissive movement protected
+// behavior, because rowGate returns before rowConflict on a green signalised
+// approach (the light is assumed to have separated the conflict already).
+// On this Chicago import that was 2,008 of 13,181 signal links, every one of
+// them with foes it never yielded to — 1,460 crossing and 5,384 merge foe
+// relations evaluated by nothing. Junction 256591534 alone booked 525,733 of
+// the run's 790,454 overlap observations (66%): its phase 0 is "GGgrrrGGg",
+// where permissive link 2 and link 6 — green in EVERY phase — discharge into
+// the same exit lane on every cycle.
+//
+// Kept as a separate predicate rather than a fourth SigState so that every
+// existing SigGreen comparison keeps its meaning; this asks a different
+// question of the same char.
+func (e *Engine) sigPermissive(l *Lane) bool {
+	p := l.Signal
+	if p == nil || len(p.phaseTicks) == 0 {
+		return false
+	}
+	st := p.Phases[p.phaseAt(e.Tick)].State
+	if l.LinkIdx >= len(st) {
+		return false
+	}
+	return st[l.LinkIdx] == 'g'
+}
+
 // clearanceSeconds is the red-clearance window (the all-red clearance
 // concept: the dilemma zone empties legally, then red is near-absolute).
 // Compiled to ticks per program (compileTicks) — dt is a scenario

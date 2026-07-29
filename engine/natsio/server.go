@@ -79,8 +79,13 @@ const (
 	Namespace = "ts"
 	// SchemaVersion is the wire-format version stamped on every message
 	// header and negotiated in the attach hello. Version 2 (M4): the
-	// 4-axis intent frame, observation frames, contract events, and
-	// TSKF keyframe v2 (ADR-0008).
+	// 4-axis intent frame, observation frames, and contract events
+	// (ADR-0008).
+	//
+	// This does NOT track the TSKF keyframe version, which moves on its own
+	// (v5 as of ADR-0034) and is negotiated per payload by its own version
+	// byte, not by this header. The two were the same number at M4 and the
+	// comment used to say "TSKF keyframe v2", which has been wrong since v3.
 	SchemaVersion = 2
 )
 

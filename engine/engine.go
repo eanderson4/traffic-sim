@@ -37,6 +37,17 @@ type Params struct {
 	// rest of the run. On chi-loop-urban that read out as 20.2 M collision
 	// observations and was indistinguishable from congestion.
 	SafetyDecel float64
+
+	// StrandAfterS is how long (s) a vehicle may sit stopped at the head of
+	// its lane before the kernel removes it and counts it as STRANDED
+	// (ADR-0034, gridlock.go). 0 disables the escape, which lets a gridlock
+	// cycle stop the network for the rest of the run.
+	//
+	// It is not a tuning knob for congestion: nothing reaches it that is
+	// merely queueing, since no signal cycle and no ordinary jam holds one
+	// vehicle motionless at an open junction for five minutes. It is the
+	// bound on how long the model will stay stopped before saying so.
+	StrandAfterS float64
 }
 
 // DefaultParams returns the validated M1 defaults.
@@ -59,6 +70,11 @@ func DefaultParams() Params {
 		// runs opt in (cmd/serve's -safety-decel), which is where absent
 		// controllers actually happen.
 		SafetyDecel: 0,
+		// SUMO's --time-to-teleport default, for the same reason: long
+		// enough that no signal program or ordinary queue reaches it, short
+		// enough that a gridlocked network resumes within the run
+		// (ADR-0034).
+		StrandAfterS: 300,
 	}
 }
 
@@ -79,6 +95,13 @@ type Stats struct {
 	// breakdown, not a second total.
 	Arrived  int
 	WallHits int // vehicles clamped at a dead-lane wall (should stay 0)
+	// Stranded counts vehicles removed by the gridlock escape (ADR-0034):
+	// stopped at the head of their lane for longer than Params.StrandAfterS.
+	// They are NOT included in Despawned or Arrived — a stranded vehicle did
+	// not leave the network, the kernel took it out. A nonzero count means
+	// the network gridlocked and says where.
+	Stranded          int
+	StrandedBySection map[string]int
 }
 
 // Engine is the single-threaded simulation kernel. No goroutines, no wall
@@ -97,6 +120,13 @@ type Engine struct {
 
 	crc  uint64   // rolling chained state CRC (ADR-0005)
 	CRCs []uint64 // per-tick CRC sequence — the replay oracle
+
+	// StrandedIDs are the vehicles removed by the gridlock escape during the
+	// last Step (ADR-0034), in e.order sweep order. Read by the metrics
+	// kernel, which must NOT book a strand as a completed trip: the vehicle
+	// did not drive out of the network, so there is no exit chain to
+	// account. Overwritten every tick.
+	StrandedIDs []uint64
 
 	intentQ   []KeyedIntent  // buffered, applied at the next tick boundary
 	applied   []TickedIntent // applied during the last Step (reused each Step)
@@ -319,6 +349,10 @@ func (e *Engine) Step() {
 	e.boundaries()
 	e.rebuildOccupancy()
 	e.laneChanges()
+	// The gridlock escape runs on the settled tick — after motion and lane
+	// changes, before metrics see it, so a stranded vehicle is never
+	// observed in a state it did not reach (ADR-0034).
+	e.strandStuck()
 	e.updateStats()
 	e.crc = e.computeCRC()
 	e.CRCs = append(e.CRCs, e.crc)
@@ -363,7 +397,35 @@ const maxSightM = 100.0
 // maxLaneHops AND maxSightM). skip is excluded
 // (a vehicle is never its own leader). On the ring this wraps around; a lone
 // ring vehicle resolves to "no leader" (free flow).
+//
+// The routing perspective is skip's. Where the two differ — a follower's
+// leader resolved with the ego excluded (followerCtx) — use leaderAtFor.
 func (e *Engine) leaderAt(lane *Lane, s float64, skip *Vehicle) LeaderInfo {
+	return e.leaderAtFor(lane, s, skip, skip)
+}
+
+// leaderAtFor is leaderAt with the routing perspective named separately: the
+// walk past an empty lane follows the successor `as` is ROUTED to
+// (pickSuccessor), not Successors[0].
+//
+// Following the default branch means a vehicle approaching a diverge watches
+// the queue on a road it is not taking. Measured on chi-loop-urban
+// (2026-07-28): a vehicle on n48784593_3 read a leader 831 m away at 17 m/s
+// down Successors[0] while its own branch held a standing queue 19 m past the
+// junction. Its lookahead went 831 m → 19.4 m in the single tick it crossed;
+// stopping from 20 m/s needs 22.2 m, so it braked on the clamp the whole way
+// and still ended 2.83 m inside the queue tail, where it sat for 44 s. That
+// one pair was 437 of the run's 801 collision observations (55%).
+//
+// The same class of error was already fixed for MEASUREMENT in updateStats
+// and for junction ENTRY in exitBlocked, both of which take pickSuccessor.
+// Car-following was the last place still reading the default branch (ADR-0032).
+//
+// A held turn is spent by the first crossing (boundaries()), so it steers the
+// first hop only; beyond it the walk follows route/default, exactly as
+// exitBlocked's probe does. With one successor pickSuccessor is a no-op, so
+// M1 ring/corridor networks are bit-identical.
+func (e *Engine) leaderAtFor(lane *Lane, s float64, skip, as *Vehicle) LeaderInfo {
 	a := lane.vehs
 	i := sort.Search(len(a), func(i int) bool { return a[i].S > s })
 	for i < len(a) && a[i] == skip {
@@ -375,11 +437,33 @@ func (e *Engine) leaderAt(lane *Lane, s float64, skip *Vehicle) LeaderInfo {
 	}
 	dist := lane.Length - s
 	cur := lane
+	// probe carries the routing perspective; HeldTurn is zeroed after the
+	// first hop consumes it. Built once, and only when the walk is reached.
+	var probe *Vehicle
+	if as != nil {
+		p := *as
+		probe = &p
+	}
 	for hops := 0; hops < maxLaneHops && (hops < baseLaneHops || dist < maxSightM); hops++ {
 		if len(cur.Successors) == 0 {
 			return LeaderInfo{}
 		}
 		next := cur.Successors[0]
+		if probe != nil {
+			if len(cur.Successors) > 1 {
+				next = e.pickSuccessor(cur, probe)
+			}
+			// Spend the held turn on the FIRST hop whatever that hop looked
+			// like, because that is what boundaries() does: it zeroes
+			// HeldTurn at every crossing, not only at multi-successor ones.
+			// Gating the reset on the branch count instead carried the turn
+			// across a single-successor stub — netimport emits exactly those
+			// — and applied it at the NEXT diverge, so the lookahead watched
+			// a branch the vehicle no longer had a turn for. That is the
+			// wrong-branch class ADR-0032 exists to remove, one junction
+			// downstream of where it removed it.
+			probe.HeldTurn = 0
+		}
 		if len(next.vehs) > 0 {
 			l := next.vehs[0]
 			if l == skip {
@@ -696,17 +780,7 @@ func (e *Engine) boundaries() {
 		}
 	}
 	if despawned {
-		kept := e.order[:0]
-		for _, v := range e.order {
-			if v.Lane != nil {
-				kept = append(kept, v)
-			}
-		}
-		e.order = kept
-		e.index = make(map[uint64]*Vehicle, len(kept))
-		for _, v := range kept {
-			e.index[v.ID] = v
-		}
+		e.dropDespawned()
 	}
 }
 

@@ -96,12 +96,25 @@ func (e *Engine) rowGate(v *Vehicle) (float64, bool) {
 	if next == nil {
 		return 0, false
 	}
+	// A permissive green ('g') is a green that has NOT separated the
+	// conflict: the light says go, the foes are green too, and yielding is
+	// the driver's job (sigPermissive). Protected green ('G') keeps the
+	// original contract — the light adjudicated, so the priority model below
+	// is skipped. Without this split every permissive movement behaved as
+	// protected and crossed its foes unconditionally.
+	permissive := false
 	if next.Signal != nil {
 		if w, gated := e.sigGate(v, next, dist); gated {
 			return w, true
 		}
+		permissive = e.sigPermissive(next)
 	}
-	if next.Row == RowNone {
+	// Signalised internal lanes carry RowNone (the light is their control),
+	// so a permissive approach has to be exempted from this early return to
+	// reach rowConflict at all. It lands there as a minor approach — RowNone
+	// != RowMajor — which is exactly the discipline permissive green means:
+	// yield to every crossing and merging foe.
+	if next.Row == RowNone && !permissive {
 		return 0, false
 	}
 	hold := true
@@ -188,12 +201,12 @@ func (e *Engine) rowConflict(v *Vehicle, next *Lane) bool {
 	// major approach are minor themselves and do the yielding.
 	minor := next.Row != RowMajor
 	for _, f := range next.FoesCross {
-		if minor && foeApproachBlocks(v, f, minor) {
+		if minor && e.foeApproachBlocks(v, f, minor) {
 			return true
 		}
 	}
 	for _, f := range next.FoesMerge {
-		if foeApproachBlocks(v, f, minor) {
+		if e.foeApproachBlocks(v, f, minor) {
 			return true
 		}
 	}
@@ -417,7 +430,13 @@ func (e *Engine) junctionHold(v *Vehicle, next *Lane) bool {
 // at its own line (it can start into the box at any tick), resolved by
 // priority class — minor yields to major — and within one class by lower
 // vehicle ID (deterministic tie-break).
-func foeApproachBlocks(v *Vehicle, foe *Lane, egoMinor bool) bool {
+//
+// The foe's SIGNAL is part of its priority class (ADR-0033). Reading only
+// foe.Row deadlocks a signalised junction, because a signalised internal
+// lane carries RowNone — "unmodeled, has priority" — so two permissive
+// greens facing each other each classified the other as a priority foe and
+// gave way to it forever. See foeSignalClass.
+func (e *Engine) foeApproachBlocks(v *Vehicle, foe *Lane, egoMinor bool) bool {
 	for _, p := range foe.Prevs {
 		n := len(p.vehs)
 		if n == 0 {
@@ -432,7 +451,11 @@ func foeApproachBlocks(v *Vehicle, foe *Lane, egoMinor bool) bool {
 			// Stopped AT its line: it can start into the box at any tick.
 			// Yield-class foes (minor/stop) gate themselves against us;
 			// major/unmodeled foes have the priority.
-			foeYields := foe.Row == RowMinor || foe.Row == RowStop
+			cls := e.foeSignalClass(foe)
+			if cls == foeHeld {
+				continue // its light is holding it: it cannot start
+			}
+			foeYields := foe.Row == RowMinor || foe.Row == RowStop || cls == foeYieldClass
 			if egoMinor {
 				if !foeYields {
 					return true // major/unmodeled foe has priority
@@ -455,3 +478,39 @@ func foeApproachBlocks(v *Vehicle, foe *Lane, egoMinor bool) bool {
 	}
 	return false
 }
+
+// foeSignalClass is what the foe lane's CURRENT signal state says about the
+// foe's priority, for a foe stopped at its own line (ADR-0033).
+//
+//	foeHeld       red: its own light forbids it entering. Yielding to a
+//	              vehicle that cannot move is how a permissive movement
+//	              stalls for the whole of every red the foe gets.
+//	foeYieldClass permissive green ('g'): it is required to yield too, so
+//	              this is a mutual yield and the ID tie-break decides.
+//	foePriority   protected green, amber, or no signal at all: the caller
+//	              falls back to foe.Row, which is the pre-ADR-0033 behaviour.
+//
+// Amber is deliberately priority, not held: an amber foe at its line may be
+// committed and entitled to clear the box.
+func (e *Engine) foeSignalClass(foe *Lane) foeClass {
+	if foe.Signal == nil {
+		return foePriority
+	}
+	switch e.sigState(foe) {
+	case SigRed:
+		return foeHeld
+	case SigGreen:
+		if e.sigPermissive(foe) {
+			return foeYieldClass
+		}
+	}
+	return foePriority
+}
+
+type foeClass int
+
+const (
+	foePriority foeClass = iota
+	foeYieldClass
+	foeHeld
+)

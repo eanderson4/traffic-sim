@@ -291,8 +291,8 @@ func TestKeyframeDirectiveRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := keyframeVersionOf(blob); got != keyframeVersion {
-		t.Errorf("keyframe version %d, want %d for a queue using ADR-0021 fields", got, keyframeVersion)
+	if got := keyframeVersionOf(blob); got != keyframeDestVersion {
+		t.Errorf("keyframe version %d, want %d for a queue using ADR-0021 fields", got, keyframeDestVersion)
 	}
 	back, err := RestoreState(destSpec(t, 10), blob)
 	if err != nil {

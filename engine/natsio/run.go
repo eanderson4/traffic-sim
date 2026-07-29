@@ -92,9 +92,47 @@ func RunLive(nc *nats.Conn, js nats.JetStreamContext, run string, spec engine.Ru
 		contractCfg = contractCfgs[0]
 	}
 
-	e, err := engine.NewEngine(spec)
-	if err != nil {
-		return nil, err
+	// Warm start (ADR-0029 phase 1): build from a saved state instead of an
+	// empty network at tick 0. RestoreStateChecked runs the sidecar's
+	// network fingerprint against the network this spec builds BEFORE any
+	// vehicle is placed, so a state taken under a different lane array fails
+	// here rather than producing a plausible, wrong run.
+	var e *engine.Engine
+	var err error
+	if contractCfg.InitialState != nil {
+		e, err = engine.RestoreStateChecked(spec, contractCfg.InitialState, contractCfg.InitialStateMeta)
+		if err != nil {
+			return nil, err
+		}
+		if e.Tick >= spec.Ticks {
+			return nil, fmt.Errorf("warm start: saved state is at tick %d and the run is %d ticks — nothing left to simulate", e.Tick, spec.Ticks)
+		}
+	} else {
+		e, err = engine.NewEngine(spec)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// State dump: fires once, when the loop reaches the requested tick.
+	// Refuse a tick the loop will never reach — a dump that silently never
+	// happens is exactly as bad as one that fails, and costs a whole run to
+	// discover.
+	dumped := contractCfg.StateDumpPath == ""
+	if !dumped {
+		if contractCfg.StateDumpTick < e.Tick || contractCfg.StateDumpTick > spec.Ticks {
+			return nil, fmt.Errorf("state dump at tick %d is outside this run's %d..%d — it would never fire",
+				contractCfg.StateDumpTick, e.Tick, spec.Ticks)
+		}
+	}
+	dumpState := func() error {
+		if dumped || e.Tick != contractCfg.StateDumpTick {
+			return nil
+		}
+		if err := engine.SaveState(contractCfg.StateDumpPath, e, spec, run); err != nil {
+			return fmt.Errorf("state dump at tick %d: %w", e.Tick, err)
+		}
+		dumped = true
+		return nil
 	}
 	// Retention opt-out before the first Step, so nothing is accumulated.
 	// LiveRun.Log's Intents are empty when set — the durable JetStream
@@ -109,7 +147,9 @@ func RunLive(nc *nats.Conn, js nats.JetStreamContext, run string, spec engine.Ru
 	if err != nil {
 		return nil, err
 	}
-	if err := reg.Start(run, spec); err != nil {
+	// e.Tick, not 0: on a warm start the run begins at the restored tick,
+	// and the registry is the metadata plane other services read.
+	if err := reg.Start(run, spec, e.Tick); err != nil {
 		return nil, fmt.Errorf("registry start: %w", err)
 	}
 	lr := &LiveRun{Engine: e, Registry: reg}
@@ -147,6 +187,12 @@ func RunLive(nc *nats.Conn, js nats.JetStreamContext, run string, spec engine.Ru
 	// the loop republishes it at the signalCatchUpEvery cadence for late
 	// joiners.
 	bus.PublishSignals(e)
+
+	// A dump requested AT the starting tick (tick 0, or a warm start's own
+	// tick) has no Step to hang off — take it here.
+	if err := dumpState(); err != nil {
+		return finish(err)
+	}
 
 	// Client-attach barrier: with a start gate configured, hold tick 0
 	// until it opens (serve closes it once the embedded driver/demand
@@ -186,6 +232,11 @@ func RunLive(nc *nats.Conn, js nats.JetStreamContext, run string, spec engine.Ru
 			return finish(err)
 		}
 		if err := rec.LogTick(e); err != nil {
+			return finish(err)
+		}
+		// After the tick is recorded, so the dumped tick is also a
+		// recorded one; the run carries on either way.
+		if err := dumpState(); err != nil {
 			return finish(err)
 		}
 		if e.Tick%signalCatchUpEvery == 0 {

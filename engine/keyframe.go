@@ -28,6 +28,9 @@ import (
 //	per origin lane (spawner order):
 //	  laneIdx u32 | rate f64 | spawnTick u64 | pendID u64 | pendRngDraws u64 |
 //	  pendRngLen u8 | pend rng bytes
+//	v5 only (written solely while some vehicle has a running stuck timer or
+//	a discharged stop duty), appended to each vehicle record:
+//	  stuckTicks u64 | stopDone u8
 //	v3 only (written solely while the director queue is non-empty):
 //	  nDirectives u32 | per directive: tick u64 | laneIdx u32 | typeIdx u32 |
 //	  earliestTick u64 | reqIDLen u16 | reqID bytes
@@ -54,7 +57,40 @@ const (
 	// portal spawns still marshals byte-identical v3) appends per directive:
 	//
 	//	destLen u16 | dest bytes | offsetM f64
-	keyframeVersion = 4
+	// v5 appends two per-vehicle fields:
+	//
+	//	stuckTicks u64 | stopDone u8
+	//
+	// Written only when some vehicle needs one of them, so a state with no
+	// timer running and no stop-duty discharged still marshals
+	// byte-identical to v4.
+	//
+	// stuckTicks decides WHETHER A VEHICLE EXISTS: strandStuck removes one
+	// that reaches StrandAfterS. ReplayFromStream and Player.seek both
+	// restore from the latest keyframe at or before their target and then
+	// re-simulate forward verifying every logged CRC, so a timer reset to
+	// zero by the restore strands the vehicle StrandAfterS later than the
+	// recorded run did — and every tick between the two has a vehicle in one
+	// and not the other. That is a CRC divergence and a failed replay, not a
+	// rounding difference.
+	//
+	// stopDone is here for the same reason, arrived at the hard way. It was
+	// left out on the grounds that it is derived state whose worst case is
+	// "the vehicle stops twice" — but under ADR-0029's bit-exact criterion
+	// stopping twice IS the bug. A vehicle that has discharged its stop duty
+	// and is ALREADY MOVING toward the line restores with stopDone=false,
+	// cannot re-satisfy the `V == 0 && dist <= S0+1` test that sets it, and
+	// so must brake to a full stop a second time. That is a different
+	// trajectory from the run being continued. (A vehicle still standing at
+	// the line merely loses one tick — which is also not bit-exact.)
+	// Caught in review; the comment that used to justify the omission was
+	// the reason nobody looked twice.
+	keyframeVersion = 5
+	// keyframeStuckVersion is the version the stuck timer needs.
+	keyframeStuckVersion = 5
+	// keyframeDestVersion is the version a director queue entry carrying the
+	// ADR-0021 destination/offset fields needs.
+	keyframeDestVersion = 4
 	// keyframeQueueVersion is the version a non-empty director queue needs
 	// when none of its entries use the ADR-0021 fields.
 	keyframeQueueVersion = 3
@@ -73,9 +109,18 @@ func (e *Engine) MarshalState() ([]byte, error) {
 		version = keyframeQueueVersion
 		for _, d := range e.dirQueue {
 			if d.Destination != "" || d.OffsetM != 0 {
-				version = keyframeVersion
+				version = keyframeDestVersion
 				break
 			}
+		}
+	}
+	// Lowest version that can represent this state, same rule as above: a
+	// state with no timer running does not need v5 and stays byte-identical
+	// to what v4 wrote.
+	for _, v := range e.order {
+		if v.stuckTicks > 0 || v.stopDone {
+			version = keyframeStuckVersion
+			break
 		}
 	}
 	w.u16(version)
@@ -121,6 +166,14 @@ func (e *Engine) MarshalState() ([]byte, error) {
 		w.u32(uint32(v.Signals))
 		w.u16(uint16(len(v.Route)))
 		w.bytes([]byte(v.Route))
+		if version >= keyframeStuckVersion {
+			w.u64(v.stuckTicks) // ADR-0034
+			if v.stopDone {
+				w.u8(1)
+			} else {
+				w.u8(0)
+			}
+		}
 	}
 	if e.spawner != nil {
 		for i := range e.spawner.origins {
@@ -138,10 +191,19 @@ func (e *Engine) MarshalState() ([]byte, error) {
 			w.bytes(rngBytes)
 		}
 	}
-	if len(e.dirQueue) > 0 {
-		// TSKF v3: pending director directives (seek must resume the
-		// injection queue bit-exactly; version stays 2 when empty).
-		w.u32(uint32(len(e.dirQueue)))
+	// TSKF v3+: pending director directives (seek must resume the injection
+	// queue bit-exactly). Gated on the VERSION, not on the queue being
+	// non-empty, because the reader is gated on the version — and since v5
+	// the two are no longer the same condition. A running stuck timer alone
+	// now lifts a state to v5, so a v5 state with an empty queue would leave
+	// the reader taking a count out of bytes that were never written: a short
+	// read that latches r.err, yields n = 0 by accident, and passes only
+	// because this is the last section and nothing re-checks r.err after it.
+	// Writing an explicit 0 keeps writer and reader on the same condition.
+	// v3 and v4 are unaffected — for them version >= 3 still implies a
+	// non-empty queue, so their bytes are unchanged.
+	if version >= keyframeQueueVersion {
+		w.u32(uint32(len(e.dirQueue))) // 0 when empty: writer and reader share one condition
 		for _, d := range e.dirQueue {
 			w.u64(d.Tick)
 			w.u32(uint32(d.LaneIdx))
@@ -149,7 +211,7 @@ func (e *Engine) MarshalState() ([]byte, error) {
 			w.u64(d.EarliestTick)
 			w.u16(uint16(len(d.RequestID)))
 			w.bytes([]byte(d.RequestID))
-			if version >= keyframeVersion {
+			if version >= keyframeDestVersion {
 				w.u16(uint16(len(d.Destination)))
 				w.bytes([]byte(d.Destination))
 				w.f64(d.OffsetM)
@@ -165,6 +227,14 @@ func (e *Engine) MarshalState() ([]byte, error) {
 // keyframe bytes. The spec must be the run's own spec; the keyframe does
 // not duplicate it (the record plane pairs them: run registry ↔ log stream).
 func RestoreState(spec RunSpec, data []byte) (*Engine, error) {
+	return restoreState(spec, data, nil)
+}
+
+// restoreState is RestoreState with an optional guard on the network the
+// spec builds, run after the network exists and BEFORE any keyframe bytes
+// are applied (warm start's network fingerprint — warmstart.go). A guard
+// that rejects yields an error and no engine.
+func restoreState(spec RunSpec, data []byte, checkNet func(*Network) error) (*Engine, error) {
 	r := &byteReader{buf: data}
 	if magic := r.u32(); magic != keyframeMagic {
 		return nil, fmt.Errorf("keyframe: bad magic %#08x", magic)
@@ -188,6 +258,11 @@ func RestoreState(spec RunSpec, data []byte) (*Engine, error) {
 	e, err := NewEngine(spec)
 	if err != nil {
 		return nil, err
+	}
+	if checkNet != nil {
+		if err := checkNet(e.Net); err != nil {
+			return nil, err
+		}
 	}
 	if int(nOrigins) != len(e.spawnerOrigins()) {
 		return nil, fmt.Errorf("keyframe: %d origins, spec builds %d", nOrigins, len(e.spawnerOrigins()))
@@ -226,6 +301,12 @@ func RestoreState(spec RunSpec, data []byte) (*Engine, error) {
 		heldTurn := int(int32(r.u32()))
 		signals := int(r.u32())
 		route := string(r.bytesN(int(r.u16())))
+		var stuckTicks uint64
+		var stopDone bool
+		if ver >= keyframeStuckVersion {
+			stuckTicks = r.u64() // ADR-0034
+			stopDone = r.u8() != 0
+		}
 		if r.err != nil {
 			return nil, fmt.Errorf("keyframe: vehicle %d controller state: %w", i, r.err)
 		}
@@ -244,6 +325,9 @@ func RestoreState(spec RunSpec, data []byte) (*Engine, error) {
 			HeldTurn: heldTurn,
 			Signals:  signals,
 			Route:    route,
+
+			stuckTicks: stuckTicks,
+			stopDone:   stopDone,
 		})
 	}
 	if e.spawner != nil {
@@ -276,6 +360,15 @@ func RestoreState(spec RunSpec, data []byte) (*Engine, error) {
 		// applied ticks and request ids ride along so the CRC chain and any
 		// later keyframe stay bit-identical to the live run).
 		n := r.u32()
+		// Check the read BEFORE trusting n. A short read here returns 0,
+		// which is indistinguishable from a genuinely empty queue and would
+		// make a truncated or writer/reader-mismatched payload restore
+		// silently as "no pending directives" — the exact failure the v5
+		// version gate could have introduced, and one no later check catches
+		// because this is the last section in the payload.
+		if r.err != nil {
+			return nil, fmt.Errorf("keyframe: director queue count: %w", r.err)
+		}
 		for i := uint32(0); i < n; i++ {
 			d := TickedSpawn{
 				Tick:    r.u64(),
@@ -284,7 +377,7 @@ func RestoreState(spec RunSpec, data []byte) (*Engine, error) {
 			}
 			d.EarliestTick = r.u64()
 			d.RequestID = string(r.bytesN(int(r.u16())))
-			if ver >= keyframeVersion {
+			if ver >= keyframeDestVersion {
 				d.Destination = string(r.bytesN(int(r.u16())))
 				d.OffsetM = r.f64()
 			}

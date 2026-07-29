@@ -99,6 +99,32 @@ type ContractConfig struct {
 	// latency. Dead wall-clock time like the pause gate: sim time stays
 	// frozen, invisible to tick determinism.
 	StartGate <-chan struct{}
+
+	// InitialState warm-starts the run (ADR-0029 phase 1): non-nil, it is a
+	// state saved by engine.SaveState and the run BEGINS at that state's
+	// tick with that state, instead of a fresh engine at tick 0. Everything
+	// downstream is unchanged — the loop already works against an engine at
+	// a nonzero tick, because that is what replay does.
+	//
+	// InitialStateMeta is that state's sidecar and is REQUIRED with it: it
+	// carries the network fingerprint, and without it a state taken under a
+	// different lane array would load silently onto valid WRONG lanes
+	// (engine/warmstart.go explains why that is the dangerous case). RunLive
+	// refuses InitialState without it.
+	InitialState     []byte
+	InitialStateMeta *engine.StateMeta
+	// StateDumpPath, with StateDumpTick, writes the engine's full state (and
+	// its sidecar) when the loop reaches that tick. The run CONTINUES after
+	// the dump — a run that both records and drops a state file partway is
+	// strictly more useful than one that exits, and it costs nothing. The
+	// tick loop lives inside RunLive, so this is the only seam from which a
+	// caller can reach the engine at a chosen tick.
+	//
+	// A dump that FAILS aborts the run: the file was asked for, and a run
+	// that silently produces no state file is the failure this exists to
+	// avoid. Callers should check the path is writable before starting.
+	StateDumpPath string
+	StateDumpTick uint64
 }
 
 func (c ContractConfig) withDefaults() ContractConfig {
