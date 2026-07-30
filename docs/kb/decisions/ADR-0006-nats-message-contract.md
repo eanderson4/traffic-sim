@@ -376,3 +376,38 @@ the wire already carried.
   rejected while pace is an unrecorded, client-invisible run condition
   (recording pace in run meta is already queued in the KB work-queue; a
   wall-clock budget can be reconsidered then).
+
+## Addendum (2026-07-29, ADR-0035: the intent log is batched per tick)
+
+§4's record plane gains one subject and one payload format; §5's seek
+semantics are unchanged. See
+[ADR-0035](ADR-0035-batched-intent-log.md) for the decision, the measurements
+and the migration note. What changes here:
+
+- **`ts.{run}.log.intents`** (plural) carries one tick's applied intents in a
+  single TSLB v1 message; a tick with no applied intents emits no batch. It
+  is the default. `ts.{run}.log.intent` is the
+  per-intent form it replaces; it stays readable, so every recording made
+  before this addendum replays unchanged, and `serve -log-batch=false` still
+  writes it. A recording carries one form or the other, never a mix.
+- The records inside a batch are the **same LoggedIntentFrame payloads,
+  byte-identical and in the same order**. Everything §4 says about sole
+  writership, dedup, `Nats-Expected-Last-Sequence`, and stream order being
+  application order (ADR-0008 §4) holds unchanged — one message per
+  non-empty tick instead of thousands does not alter the order of records
+  within it.
+- **Seek is unaffected.** §5's anchor is a keyframe ≤ target, and batches are
+  strictly per-tick, so tick granularity is preserved. A tick too wide for
+  the byte budget splits across consecutive messages naming that same tick,
+  with no chunk index: unlike a chunked keyframe (ADR-0015), which reassembles
+  one blob, concatenating consecutive batches' records in stream order is
+  already the original order.
+- The stream is created with **S2 storage compression**. That is a storage
+  setting, not a contract change — payloads and readers are untouched.
+
+Why: §4 as originally written implied nothing about message granularity, and
+one-message-per-applied-intent was the natural reading. At city scale that is
+one message per vehicle per tick at 10 Hz — measured ~230 bytes of framing and
+subject per 61-byte record, and 48 GiB for one 90-minute chi-loop-urban run.
+ADR-0026 had already solved the same problem one plane up and explicitly
+scoped this one out.

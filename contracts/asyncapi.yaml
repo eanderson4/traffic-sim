@@ -28,7 +28,7 @@ asyncapi: 3.0.0
 
 info:
   title: traffic-sim engine contract
-  version: 2.5.0
+  version: 2.6.0
   description: |
     The engine's NATS surface per ADR-0006 (planes, taxonomy, pipelines) and
     ADR-0008 (the engine↔controller contract — M4, schema_version 2):
@@ -45,9 +45,13 @@ info:
       (claim/release/unclaimed/pause/resume).
     - **Record plane (JetStream, at-least-once):** the arbitrated intent
       log, full-state keyframes, the rolling state CRC, and control events
-      (pause/resume), one stream per run (LimitsPolicy, R=1 file). The
-      engine is the SOLE WRITER; Nats-Expected-Last-Sequence asserts it
-      broker-side.
+      (pause/resume), one stream per run (LimitsPolicy, R=1 file, S2
+      compression since ADR-0035). The engine is the SOLE WRITER;
+      Nats-Expected-Last-Sequence asserts it broker-side. The intent log is
+      batched one message per non-empty TICK since ADR-0035 (`log.intents`,
+      TSLB v1);
+      `log.intent` is the per-intent form it replaces and stays readable, so
+      earlier recordings replay unchanged.
     - **Metadata plane (KV):** the run registry — run spec + status, and
       the latest-state pointer for late joiners.
 
@@ -438,6 +442,13 @@ channels:
       The arbitrated intent log (record plane): one message per applied
       intent, in application order, each with its applied_tick. Engine sole
       writer; replay re-applies these instead of running controllers.
+
+      SUPERSEDED AS THE DEFAULT by logIntents (TSLB batches, ADR-0035),
+      which carries the same records with one message per non-empty tick
+      instead of one per intent. Still written when the recorder runs with
+      UnbatchedIntentLog (serve -log-batch=false), and every reader still
+      accepts it, so recordings made before ADR-0035 replay unchanged. A
+      recording carries one form or the other, never a mix.
     parameters:
       run: { $ref: '#/components/parameters/runId' }
     messages:
@@ -447,6 +458,43 @@ channels:
       retention: limits
       storage: file
       replicas: 1
+      # Default; storage-layer only (payloads and readers unchanged).
+      # serve -store-compress=false writes the stream uncompressed.
+      compression: s2
+
+  logIntents:
+    address: ts.{run}.log.intents
+    description: |
+      The arbitrated intent log, batched: ONE message per NON-EMPTY tick
+      carrying that tick's applied intents in application order (TSLB v1,
+      ADR-0035). A tick with no applied intents emits no batch. The
+      default since ADR-0035; logIntent is the per-message form it replaces.
+
+      The records inside a batch are LoggedIntentFrame payloads
+      byte-identical to the ones logIntent publishes individually, in the
+      same order — a reframing, not a re-encoding. Motivation is framing
+      cost: one message per vehicle per tick at 10 Hz measured ~230 bytes
+      per message for a 61-byte fixed record, and a 90-minute
+      chi-loop-urban recording was 48 GiB of essentially this.
+
+      A tick whose records outgrow the recorder's IntentBatchMax (default
+      768 KiB) is split across consecutive TSLB messages, each
+      independently decodable and each naming the same tick. Unlike a
+      chunked keyframe (ADR-0015) there is NO i/n header: concatenating
+      consecutive messages' records in stream order is already the original
+      order, because stream order is the application order (ADR-0008 §4).
+    parameters:
+      run: { $ref: '#/components/parameters/runId' }
+    messages:
+      loggedIntentBatch: { $ref: '#/components/messages/LoggedIntentBatch' }
+    x-nats:
+      stream: TS_LOG_{run}
+      retention: limits
+      storage: file
+      replicas: 1
+      # Default; storage-layer only (payloads and readers unchanged).
+      # serve -store-compress=false writes the stream uncompressed.
+      compression: s2
 
   logKeyframe:
     address: ts.{run}.log.keyframe
@@ -604,6 +652,10 @@ operations:
     title: Engine → arbitrated record (sole writer; pubacks awaited per tick-batch; failure aborts the run loudly)
     action: send
     channel: { $ref: '#/channels/logIntent' }
+  writeLogBatched:
+    title: Engine → arbitrated record, batched (DEFAULT since ADR-0035; sole writer; one TSLB message per non-empty tick)
+    action: send
+    channel: { $ref: '#/channels/logIntents' }
   writeKeyframe:
     title: Engine → keyframe at cadence
     action: send
@@ -632,6 +684,10 @@ operations:
     title: Replayer ← record plane (read-only; ephemeral pull consumers; paces by tick, never ReplayOriginal)
     action: receive
     channel: { $ref: '#/channels/logIntent' }
+  replayRecordBatched:
+    title: Replayer ← record plane, batched (read-only; the DEFAULT form since ADR-0035; every reader accepts both)
+    action: receive
+    channel: { $ref: '#/channels/logIntents' }
 
 components:
   parameters:
@@ -836,6 +892,22 @@ components:
         schemaFormat: application/octet-stream
         $ref: '#/components/schemas/LoggedIntentFrame'
       x-json-view: '#/components/schemas/LoggedIntentView'
+
+    LoggedIntentBatch:
+      name: loggedIntentBatch
+      title: One tick's arbitrated log entries, batched (TSLB v1)
+      summary: |
+        The batched form of LoggedIntent (ADR-0035). Same sole-writer dedup +
+        OCC headers, same records, same order — the batch is a framing around
+        LoggedIntentFrame payloads, so everything LoggedIntent's summary says
+        about ordering, held, superseded and verbatim replay applies
+        unchanged. One message per tick; a tick too wide for
+        IntentBatchMax splits across consecutive messages naming the same
+        tick, with no chunk header (stream order suffices).
+      headers: { $ref: '#/components/schemas/LogHeaders' }
+      payload:
+        schemaFormat: application/octet-stream
+        $ref: '#/components/schemas/LoggedIntentBatchFrame'
 
     Keyframe:
       name: keyframe
@@ -1169,6 +1241,22 @@ components:
         applied). grant: 0 none (legacy) | 1 drive | 2 signal | 3 director.
         Stream order within a tick IS the application order (grant desc,
         then vehicle ID — ADR-0008 §4).
+
+    LoggedIntentBatchFrame:
+      type: string
+      format: binary
+      description: |
+        TSLB v1, little-endian (ADR-0035):
+          magic 'T','S','L','B' 4B | version u8 = 1 | flags u8 = 0 (reserved) |
+          count u32 | tick u64 | count × LoggedIntentFrame
+        Header is 18 bytes. Every record's applied_tick MUST equal the
+        header tick; a reader refuses the batch otherwise, because records
+        replayed at the wrong tick diverge the run silently. count must
+        account for every byte after the header — trailing bytes are an
+        error, so an undercount cannot silently drop the records it omits.
+        Records are LoggedIntentFrame payloads byte-identical to the ones
+        ts.{run}.log.intent carries individually, so a batch is a reframing
+        and not a re-encoding.
 
     LoggedIntentView:
       title: JSON view of an arbitrated log entry (tooling only)

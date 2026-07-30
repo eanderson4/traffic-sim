@@ -169,7 +169,17 @@ func SubjectEventPause(run string) string { return Namespace + "." + run + ".ctl
 func SubjectDriveIntrospect(run string) string { return Namespace + "." + run + ".drive.introspect" }
 
 // Record-plane subjects (engine sole writer): ts.{run}.log.{intent,keyframe,crc,event,verb}.
-func SubjectLogIntent(run string) string   { return Namespace + "." + run + ".log.intent" }
+func SubjectLogIntent(run string) string { return Namespace + "." + run + ".log.intent" }
+
+// SubjectLogIntents carries TSLB batches: one tick's applied intents in one
+// message (ADR-0035). A NEW subject rather than a new payload shape on
+// log.intent, so old and new recordings are told apart by the subject the
+// broker already delivers instead of by sniffing a magic number that could
+// collide with a v2 record's leading applied_tick. Additive: SubjectLogAll
+// (ts.{run}.log.>) already captures it, so the stream config is unchanged,
+// and a v2 recording keeps replaying through the log.intent path untouched.
+func SubjectLogIntents(run string) string { return Namespace + "." + run + ".log.intents" }
+
 func SubjectLogKeyframe(run string) string { return Namespace + "." + run + ".log.keyframe" }
 func SubjectLogCRC(run string) string      { return Namespace + "." + run + ".log.crc" }
 func SubjectLogEvent(run string) string    { return Namespace + "." + run + ".log.event" }
