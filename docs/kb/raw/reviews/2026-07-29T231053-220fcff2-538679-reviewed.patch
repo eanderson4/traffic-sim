@@ -1,0 +1,575 @@
+diff --git a/docs/kb/INDEX.md b/docs/kb/INDEX.md
+index 6b12ab4ac8751d0a887c26786902650d7c0ccae8..192a3117202e0d0310ee780f0c1e97314ed7eb26 100644
+--- a/docs/kb/INDEX.md
++++ b/docs/kb/INDEX.md
+@@ -109,7 +109,7 @@ links its source synthesis for traceability.
+ - [ ] [ADR-0024](decisions/ADR-0024-bounded-memory-replay-reader.md) — ACCEPTED (pending review): bounded-memory replay reading — the Player materialized the WHOLE record (`fetchFrom` from seq 1 plus a full per-tick index, both live at once), which is why a 30-minute chi-loop cut could not be opened; measured 9,973,269 intents vs 9,000 CRCs and 91 keyframes in a 15-minute recording, so intents are 99.9% of the record at ~1 per vehicle per tick. Replaced by a forward-only `logCursor` holding one tick at a time; the RECORD FORMAT is untouched, so every existing recording still replays. Also adds `Engine.DropIntentLog` / `serve -intent-log=false` (the flag earlier planning assumed existed, and did not)
+ - [x] [ADR-0026](decisions/ADR-0026-batched-intents.md) — batched intents (TSIB v1) on the live plane — one TSIB per cadence tick per controller (splitting into ⌈n/20,000⌉ bounded batches above the cap) on the unchanged intent subject, demuxed from per-vehicle v2 by the exact-case `intent_encoding` header; wire-only change (expand-at-ingest, identical downstream semantics), O(controllers) intent messages per tick instead of O(vehicles); M0–M3 (codec + engine ingest, driver per-tick aggregation, batch-mode measurement incl. applied-lag) landed before contract ratification
+ - [ ] [ADR-0027](decisions/ADR-0027-baked-trip-cards.md) — PROPOSED: baked trip cards — two new baked artifacts (`TSOD` origin/destination table, `TSRP` sharded travelled paths) so the viz can show an arrival/destination layer and answer "where did this car come from and where is it going" on a click. Baked, not live: a replay has no engine to ask, and `engine/vehicle.go:69` shows the kernel never materializes a route at all (`Route` is just the destination LANE ID), so what is baked is the path actually TRAVELLED — labelling it a "route" would invent a routing model this engine does not have. Reuses the TSRB quantization; no live-plane change, so the 4 MiB obs cliff is not approached from this direction
+-- [ ] [ADR-0028](decisions/ADR-0028-demand-profile-library.md) — PROPOSED: demand profile library — named temporal shapes (`commute-am`, `freight`, `reverse-commute`) in an authored JSON file, assigned to flows by `kind`/`class`/`corridor` with a per-rule scale, replacing the one global `AM_PROFILE` that all 248 flows shared. Generator-side only: the `slices` schema already accepts arbitrary per-flow shapes, so no engine, scenario-schema or contract change. Rejects demand-as-a-function-of-live-state (breaks replay determinism, and two A/B arms would stop sharing a demand program) and an N×T matrix (that IS `demand/main.yaml`, and it cannot survive regeneration). A trailing run of zeros is the drain; a rule matching no flow is fatal. Written after finding that a 3-hour demand program was being executed by 20-minute runs
++- [ ] [ADR-0028](decisions/ADR-0028-demand-profile-library.md) — PROPOSED: demand profile library — named temporal shapes (`commute-am`, `freight`, `reverse-commute`) in an authored JSON file, assigned to flows by `kind`/`class`/`corridor` with a per-rule scale, replacing the one global `AM_PROFILE` that all 248 flows shared. Generator-side only: the `slices` schema already accepts arbitrary per-flow shapes, so no engine, scenario-schema or contract change. Rejects demand-as-a-function-of-live-state (breaks replay determinism, and two A/B arms would stop sharing a demand program) and an N×T matrix (that IS `demand/main.yaml`, and it cannot survive regeneration). A trailing run of zeros is the drain; a rule matching no flow is fatal. Written after finding that a 3-hour demand program was being executed by 20-minute runs. **Carries a 2026-07-29 correction** from its first real use: mkod reported the demand level it was *authored* with rather than the one written to the file (profile `scale` and the shape fraction both missing, per-flow peaks summed into a rate no instant sees, a share taken on rates instead of counts), and first-match-wins lets a generic `kind` rule silently shadow a corridor-targeting one in a way `check_all_rules_fired` cannot detect
+ - [x] [ADR-0029](decisions/ADR-0029-warm-start-from-keyframe.md) — PHASE 1 ACCEPTED and shipped: warm-start a run from an ADR-0005 §5 keyframe instead of an empty network, so an A/B batch pays the 20-minute fill once rather than once per arm. The mechanism mostly existed (keyframes already resume bit-exactly); the blocker was that a keyframe binds vehicles to lane INDEX, so loading one against a widened network silently places every vehicle on a valid wrong lane. Phase 1 solves that with a SIDECAR that fingerprints the network the state was taken against — not the proposed format v4 — plus `-state-out`/`-state-in` flags on `serve`, CRC-verified bit-exact continuation, and a series of hard refusals rather than a general feature: `-metrics-out`, demand parts, `-driver` (the contract plane is not restored), and a seed mismatch (opt-out `-state-reseed`). Still Proposed: lane-id keyframes, the `initial_state:` scenario key, and the keyframe hash entering run identity (the M11 seed-in-hash lesson). Known gap: the sidecar does not fingerprint `Params`, so physics flags splice silently (#80). Flags the conceptual cost: a warm-started A/B measures response-to-change, not equilibrium-under-change
+ - [x] [ADR-0030](decisions/ADR-0030-run-report-protocol.md) — ACCEPTED and shipped (`runreport.py`, `mkzones.py`, the viz stats panel; see the review note in Consequences for the four implementation defects the first external round caught, including lane length re-derived from geometry and a subset set reported as the network): the standard run report (`scripts/runreport.py`) — density and speed DISTRIBUTIONS over space-time cells, in both lane-km share and VMT share, replacing the network means that produced two false readings ("27% of critical so not congested" over 2,203 lane-km that included every empty street; "corridor mean in the AM band" over a corridor that was 68% free-flowing). Adds `mkzones.py` and a district tiling so "where is the congestion" and "where is everyone going" are asked in the same coordinates. Partial intervals dropped and counted, denominators fixed to the network, empty road bucketed separately, overlapping sets refused
+ - [x] [ADR-0031](decisions/ADR-0031-permissive-green.md) — ACCEPTED: permissive green (`g`) yields; protected green (`G`) does not. `mapSigChar` folded both into `SigGreen` — right for "may I pass the line", wrong for "who gives way" — and because signalised internal lanes carry `RowNone`, `rowGate` returned before `rowConflict` on ANY green, so the yield that defines a permissive movement never ran. Every permissive movement in every signalised network behaved as protected. On chi-loop-urban that was 2,008 of 13,181 signal links, all with foes (1,460 crossing + 5,384 merge relations evaluated by nothing); junction 256591534 alone booked 66% of a 90-minute run's overlap observations. **Correction (same day): the ADR's claim that this is why the network never cleared is FALSE** — on the fixed engine the drain has the identical shape and overlaps rose 790,454 to 2,518,364; correct semantics, wrong causal story. Kernel-only: no schema or contract change, the `g`/`G` was already in the compiled files. **Invalidates every Chicago measurement made before it** — re-measure, do not adjust
+@@ -139,6 +139,6 @@ links its source synthesis for traceability.
+ *ADR-0031 ACCEPTED 2026-07-28 (permissive green yields — found by chasing why the Chicago network never cleared during a 30-minute drain; the yield semantics were genuinely wrong, but the causal claim did NOT survive measurement and is corrected in the ADR)*
+ *ADR-0032 ACCEPTED 2026-07-28 (car-following follows the routed branch — found by tracing the one pair of cars that was 55% of the post-0031 collision observations; 801 to 48 over 12,000 ticks)*
+ *ADR-0033 ACCEPTED 2026-07-28 (permissive mutual yield deadlock — ADR-0031's own regression, found by asking why the drain shape did not move after collisions were eliminated)*
+-*ADR-0034 ACCEPTED 2026-07-28 (gridlock escape — the fourth ADR aimed at the non-clearing Chicago network, and the one that stopped looking for a defect: the frozen lanes are 94% ordinary road, the cycle is a circular wait, and the fix is a counted escape rather than a cure)*
+ *ADR-0035 PROPOSED 2026-07-29 (batched intent log + S2 record compression; written after a storage audit found 48 GiB for one 90-minute Chicago run, essentially all of it per-intent message framing that ADR-0026 had already solved one layer up — and after the same audit found the memory ceiling binds before the disk one)*
++*ADR-0034 ACCEPTED 2026-07-28 (gridlock escape — the fourth ADR aimed at the non-clearing Chicago network, and the one that stopped looking for a defect: the frozen lanes are 94% ordinary road, the cycle is a circular wait, and the fix is a counted escape rather than a cure)*
+ *Run `/update-kb` to check freshness*
+diff --git a/docs/kb/decisions/ADR-0028-demand-profile-library.md b/docs/kb/decisions/ADR-0028-demand-profile-library.md
+index 2a5768ae6de8d2d66c857862e852f976eacb4337..217a935ef117bc520a7b77b1ff8c6e7e05bf40d4 100644
+--- a/docs/kb/decisions/ADR-0028-demand-profile-library.md
++++ b/docs/kb/decisions/ADR-0028-demand-profile-library.md
+@@ -109,9 +109,10 @@ library is reusable across networks.
+ Costs and risks:
+ 
+ - **More knobs that multiply.** `scale` × `--corridor-scale` ×
+-  `--freeway-scale` all hit the same rate. Documented as composing
+-  multiplicatively, and mkod prints the realized totals, but a demand level
+-  is now assembled from three places.
++  `--freeway-scale` all hit the same rate, so a demand level is assembled from
++  three places. The mitigation this section originally claimed —
++  "mkod prints the realized totals" — **was not true when it was written**;
++  see the correction below.
+ - **Fractions are napkin-anchored, not calibrated.** The shapes are the usual
+   diurnal curves, not Chicago count data — the same posture as every other
+   rate in this scenario, and it must not be quoted as calibrated.
+@@ -119,6 +120,55 @@ Costs and risks:
+   commuting) but mean flows stop arriving at different moments; mkod prints a
+   NOTE rather than refusing.
+ 
++> **What the first implementation got wrong (2026-07-29, first real use)**
++>
++> This ADR's mitigation for the multiplying-knobs risk was that mkod "prints
++> the realized totals". It did not. Every counter behind those prints was
++> incremented from the rate *before* the profile rule's `scale` reached it, and
++> the shape fraction never entered at all — so the reported demand level was
++> the one **authored**, not the one written to the file. The two agree only
++> while every rule has `scale: 1.0` and every profile peaks at exactly 1.00,
++> which is why nothing surfaced until a library used a scale. Four distinct
++> errors, all in the same direction:
++>
++> 1. **Profile `scale` was missing.** `realized["freeway"] += rate` ran
++>    upstream of `emit_flow(..., rate * pscale, ...)`.
++> 2. **The shape fraction was missing.** `emit_flow` writes `rate * f`.
++>    `freight` peaks at 0.90 and `reverse-commute` at 0.60, so the base rate is
++>    not a rate that appears anywhere in the file. Concretely: `--ramp-share`
++>    reported 5,258 veh/h relocated onto interior points where the file asks
++>    for 4,733 — an 11% overstatement, and the interior injections are the
++>    corridor fill, so this was the number a freeway calibration leaned on.
++> 3. **A sum of per-flow peaks is not a peak.** This ADR's whole purpose is
++>    that flows crest at different moments, which makes that sum a rate no
++>    instant in the run ever sees — and one that grows with the number of
++>    distinct *shapes* rather than with demand. It is now a max over time, on
++>    the elementary intervals between all slice boundaries so that non-uniform
++>    spans need not share a grid, and the instant is named.
++> 4. **A share was computed on rates.** The through-traffic mass balance
++>    divided one peak rate by another. Two rates only compare if they are
++>    integrated over the same span, and once flows run on different shapes they
++>    are not; it is now a vehicle count on both sides.
++>
++> Also fixed, in the same spirit: the boundary-freeway figure was printed
++> before relocation had been re-emitted, so it showed a corridor at
++> `1 - --ramp-share` of its own demand — a plausible-looking number rather than
++> a visibly missing one. And the demand file's header recorded `--total`, a
++> *target*, while recording neither the knobs that multiplied it nor the
++> realized outcome; reproducing the shipped `chi-loop-urban-half` demand
++> therefore meant guessing the invocation. The header now carries the realized
++> peak and vehicle count, the knobs, and the ordered assign rules — ordered
++> because first-match-wins makes the order part of the meaning.
++>
++> **A trap worth naming, which the validation does not catch.** Rules are
++> first-match-wins, and a generic `{"kind": "interior"}` rule shadows a later
++> `{"corridor": "X"}` one for exactly the interior mainline injections that
++> fill corridor X. `check_all_rules_fired` cannot see it: the corridor rule
++> still fires on that corridor's *portal* and *resident* flows, so it records
++> hits and passes clean while the corridor keeps the generic shape. A
++> corridor-targeting rule must be `{"kind": ..., "corridor": ...}` and must
++> precede the generic rule for its kind.
++
+ Validation is deliberately loud, because every failure here is otherwise
+ silent — a misspelled corridor, an unknown profile name, or a rule that never
+ fires all yield a perfectly valid demand file that is not the one anybody
+diff --git a/scripts/chicago/mkod.py b/scripts/chicago/mkod.py
+index 38357fd01da86cc2f56d9a7c9c10725f279fcd93..dbdd20bf400e9f840935c8a8bfade896e1245672 100644
+--- a/scripts/chicago/mkod.py
++++ b/scripts/chicago/mkod.py
+@@ -405,6 +405,45 @@ def zone_blend(weights, lane2zone, zone_share):
+     return out
+ 
+ 
++def peak_rate(segs):
++    """(max over time of the summed rate, the second at which that max starts).
++
++    `segs` is [(start_s, end_s, veh_per_h)] as WRITTEN to the demand file.
++
++    A max over time, not a sum of per-flow peaks. ADR-0028 exists precisely so
++    that flows crest at different moments — freight at slice 4, commute at 2-3,
++    reverse-commute at 3 — so adding their individual maxima yields a rate no
++    instant in the run ever sees, and it grows with the number of DISTINCT
++    shapes rather than with demand. Evaluated on the elementary intervals
++    between all slice boundaries, so non-uniform spans (--flat-peak, --drain-s,
++    or profiles of differing length) need not align on a common grid.
++
++    Half-open on [start, end) to match emit_flow's slices: a boundary second
++    belongs to the slice starting there, so back-to-back slices neither
++    double-count it nor leave it uncovered.
++    """
++    if not segs:
++        return 0.0, 0.0
++    bounds = sorted({b for s, e, _ in segs for b in (s, e)})
++    best, at = 0.0, bounds[0]
++    for i in range(len(bounds) - 1):
++        mid = (bounds[i] + bounds[i + 1]) / 2.0
++        tot = sum(r for s, e, r in segs if s <= mid < e)
++        if tot > best:
++            best, at = tot, bounds[i]
++    return best, at
++
++
++def total_veh(segs):
++    """Vehicles the program asks for: rate integrated over each slice's span.
++
++    The right basis for a share or a mass balance, where a peak rate is not:
++    two rates only compare if they cover the same span, and once flows run on
++    different shapes they do not.
++    """
++    return sum(r * (e - s) / 3600.0 for s, e, r in segs)
++
++
+ def emit_flow(out, fid, origin, rate, profile, vtypes, dests, offset=None,
+               observe=None):
+     out.append(f"  - id: {fid}")
+@@ -946,9 +985,33 @@ def main():
+                       f"destination — its inflow stays entirely at the cut "
+                       f"face and will queue there", file=sys.stderr)
+ 
+-    realized = collections.Counter()
+     stranded = []
+     relocate = collections.Counter()
++
++    # Every (start_s, end_s, veh_per_h) triple this run WRITES, by category.
++    #
++    # Two different questions need two different reductions over it, and the
++    # scalar counter that used to live here answered neither:
++    #   * how hard is the network loaded  -> max over TIME of the summed rate
++    #   * does the mass balance close     -> the integral, i.e. a vehicle count
++    #
++    # A sum of per-flow peak rates is not the first one. Flows peak at
++    # different moments by design (ADR-0028: reverse-commute crests at slice 3,
++    # freight at 4), so adding their individual maxima reports a rate no
++    # instant in the run ever sees. Nor is a sum of base rates: emit_flow
++    # writes `rate * f`, and `f` tops out at 0.90 for freight and 0.60 for
++    # reverse-commute, so the base rate is not in the file at all.
++    timeline = collections.defaultdict(list)
++
++    def tally(cat, rate, profile):
++        """Record what emit_flow will write, on the same terms it writes it."""
++        for s, e, f in profile:
++            r = rate * f
++            if r > 0:      # emit_flow drops zero slices, so neither counts one
++                timeline[cat].append((s, e, r))
++
++    def cats(*names):
++        return [sg for n in names for sg in timeline[n]]
+     for i, (lid, cls, raw, edge) in enumerate(sorted(entries)):
+         share = (args.freeway_through_share if cls in FREEWAY_CLASSES
+                  else args.through_share)
+@@ -968,41 +1031,46 @@ def main():
+         if cls in FREEWAY_CLASSES:
+             rate *= args.freeway_scale
+             rate *= corridor_scale.get(lane_corridor.get(lid), 1.0)
+-            realized["freeway"] += rate
+-        else:
+-            realized["arterial"] += rate
++        corr = lane_corridor.get(lid)
++        # Resolved BEFORE anything is counted, not at the emit call below. The
++        # profile rule's `scale` multiplies the emitted rate (ADR-0028: it
++        # composes multiplicatively with --freeway-scale and
++        # --corridor-scale), so a counter incremented off `rate` reports the
++        # demand that was AUTHORED rather than the demand in the file. Those
++        # are the same number only while every rule has scale 1.0, which is
++        # why this went unnoticed until a library used a scale.
++        pf, pscale = profile_for("portal", cls, corr)
+         # Relocate a share of this corridor's inflow to interior points. The
+         # volume is not lost — it is re-emitted below, spread along the
+         # corridor, so the corridor still carries what --freeway-scale asked
+         # for. What changes is that it does not all arrive through one lane.
+-        corr = lane_corridor.get(lid)
++        # Taken off the pre-profile rate because relocation is a split of
++        # PHYSICAL demand; the interior flows then carry the interior rule's
++        # own scale, which need not equal this one's.
+         if args.ramp_share and corr in ramp_picks and cls in FREEWAY_CLASSES:
+             moved = rate * args.ramp_share
+             relocate[corr] += moved
+             rate -= moved
+-        realized["through"] += rate * eff
++        # What emit_flow will be handed. A profile-less flow resolves to
++        # pscale 0.0 and is not emitted, so it contributes nothing here — an
++        # absent flow must not appear in a realized total.
++        emitted = rate * pscale
+         if not thru:
+             stats["portal no reachable exit"] += 1
+         if not work:
+             stats["portal no reachable workplace"] += 1
+-            stranded.append((f"p{i:03d}-{cls}", lid, cls, rate))
+-        pf, pscale = profile_for("portal", cls, corr)
++            stranded.append((f"p{i:03d}-{cls}", lid, cls, emitted))
+         if pf is None:
+             stats["portal no profile"] += 1
+             continue
+-        emit_flow(flows, f"p{i:03d}-{cls}", lid, rate * pscale, pf,
++        # Tallied here rather than above, so a flow that is never emitted is
++        # never counted: an absent flow must not appear in a realized total.
++        tally("freeway" if cls in FREEWAY_CLASSES else "arterial", emitted, pf)
++        tally("through", emitted * eff, pf)
++        emit_flow(flows, f"p{i:03d}-{cls}", lid, emitted, pf,
+                   {"car": round(1 - truck, 3), "truck": round(truck, 3)}, d,
+                   observe=observe)
+         stats["portal flows"] += 1
+-    if args.freeway_scale != 1.0:
+-        print(f"[mkod] freeway-scale {args.freeway_scale}: portal inflow "
+-              f"{realized['arterial']:.0f} veh/h arterial + "
+-              f"{realized['freeway']:.0f} veh/h freeway = "
+-              f"{realized['arterial'] + realized['freeway']:.0f} veh/h "
+-              f"(--total {args.total:.0f} sized the base; the arterial side is "
+-              f"unchanged from freeway-scale 1.0 and the freeway side is "
+-              f"{args.freeway_scale}x on top)",
+-              file=sys.stderr)
+     if stranded:
+         # Loud because it is invisible downstream: the flow still loads, still
+         # runs, and still produces plausible corridor speeds. It just sends
+@@ -1047,32 +1115,50 @@ def main():
+                       {"car": round(1 - truck, 3), "truck": round(truck, 3)},
+                       d, offset=off, observe=observe)
+             ramp_stats["interior flows"] += 1
+-            realized["interior"] += each
+-            realized["through"] += each * eff
++            # On the same terms as the portal flows above: the interior rule's
++            # scale and shape are its own, and are frequently the ones being
++            # tuned — profiles-am.json puts these on `freight`, which never
++            # reaches 1.0, so their base rate is not what reaches the network.
++            tally("interior", each * pscale, pf)
++            tally("through", each * pscale * eff, pf)
+     if relocate:
+-        print(f"[mkod] ramp-share {args.ramp_share}: relocated "
+-              f"{sum(relocate.values()):.0f} veh/h off the cut face onto "
+-              f"{ramp_stats['interior flows']} interior points across "
++        # `relocate` is a split of PHYSICAL demand, taken before any profile
++        # applied, so it says how much moved off the cut face and nothing
++        # about what arrives. The interior rule's own scale and shape land on
++        # top of it: quoting the split alone reported an unchanged 5,258 veh/h
++        # across a pair of libraries whose Kennedy demand differed by 1.57x.
++        # Both are printed, on their own terms and labelled as such.
++        int_pk, int_at = peak_rate(cats("interior"))
++        print(f"[mkod] ramp-share {args.ramp_share}: moved "
++              f"{sum(relocate.values()):,.0f} veh/h of base demand off the cut "
++              f"face onto {ramp_stats['interior flows']} interior points across "
+               f"{len(relocate)} corridors "
+-              f"({args.ramps_per_corridor} requested per corridor)",
+-              file=sys.stderr)
++              f"({args.ramps_per_corridor} requested per corridor). As "
++              f"EMITTED, after each corridor's profile scale and shape: peak "
++              f"{int_pk:,.0f} veh/h at t={int_at:.0f}s, "
++              f"{total_veh(cats('interior')):,.0f} vehicles.", file=sys.stderr)
+         for k, v in sorted(ramp_stats.items()):
+             if k != "interior flows":
+                 print(f"[mkod]   {k}: {v}", file=sys.stderr)
+ 
+     # Printed here, not with the portal totals, because the interior flows
+     # above carry through traffic too and the share has to cover both.
+-    # realized["freeway"] is the FULL freeway demand — relocation moves where
+-    # it enters, not how much there is — so it is already the right
+-    # denominator and adding realized["interior"] would double-count it.
+-    portal_tot = realized["arterial"] + realized["freeway"]
+-    if portal_tot:
+-        print(f"[mkod] through traffic: {realized['through']:.0f} of "
+-              f"{portal_tot:.0f} veh/h inflow "
+-              f"({100 * realized['through'] / portal_tot:.0f}%) exits at the "
+-              f"boundary; the rest terminates in-zone. Through trips CLOSE "
+-              f"the mass balance — without them inflow has no drain and "
+-              f"vehicle count grows without bound.", file=sys.stderr)
++    #
++    # On a VEHICLE COUNT, not a rate. A through share is a property of the
++    # whole demand program, and the two sides of the ratio only compare if
++    # they are integrated over the same span — which peak rates are not, once
++    # different flows run on different shapes. Residents are excluded on
++    # purpose: they start in-zone and have no boundary-exit movement, so
++    # folding them in would shrink the share without any through trip changing.
++    inflow_veh = total_veh(cats("arterial", "freeway", "interior"))
++    if inflow_veh:
++        thru_veh = total_veh(cats("through"))
++        print(f"[mkod] through traffic: {thru_veh:,.0f} of {inflow_veh:,.0f} "
++              f"vehicles of portal+interior inflow "
++              f"({100 * thru_veh / inflow_veh:.0f}%) exits at the boundary; "
++              f"the rest terminates in-zone. Through trips CLOSE the mass "
++              f"balance — without them inflow has no drain and vehicle count "
++              f"grows without bound.", file=sys.stderr)
+ 
+     # --- Residential interior origins: residents leaving their building.
+     top_res = sorted(res.items(), key=lambda kv: -kv[1])[:args.origin_lanes]
+@@ -1100,10 +1186,38 @@ def main():
+         if pf is None:
+             stats["resident no profile"] += 1
+             continue
++        tally("resident", rate * pscale, pf)
+         emit_flow(flows, f"r{i:03d}-resident", lid, rate * pscale, pf,
+                   {"car": 1.0}, d, offset=off, observe=observe)
+         stats["resident flows"] += 1
+ 
++    # The demand level, read off the file rather than off the flags. Printed
++    # after the resident loop because residents are inflow too, and after the
++    # interior loop because the boundary freeway figure is only a remainder
++    # until relocation has been re-emitted — printed earlier it showed a
++    # corridor at 1 - --ramp-share of its own demand, which reads as a
++    # plausible number rather than a missing one.
++    #
++    # Peak is a MAX OVER TIME of the summed rate, and the instant is named: a
++    # sum of per-flow peaks is a rate the run never sees, because ADR-0028
++    # exists precisely so that flows crest at different moments. The vehicle
++    # count is the integral, which is the figure to compare against the run
++    # report's completed + stranded + active.
++    peak, at_s = peak_rate(cats("arterial", "freeway", "interior", "resident"))
++    if peak:
++        fw_pk, _ = peak_rate(cats("freeway", "interior"))
++        art_pk, _ = peak_rate(cats("arterial"))
++        res_pk, _ = peak_rate(cats("resident"))
++        print(f"[mkod] realized demand: peak {peak:,.0f} veh/h at t={at_s:.0f}s "
++              f"(freeway {fw_pk:,.0f} + arterial {art_pk:,.0f} + resident "
++              f"{res_pk:,.0f}, each at its own crest so the parts need not sum "
++              f"to the total), {total_veh(cats('arterial', 'freeway', 'interior', 'resident')):,.0f} "
++              f"vehicles over the program. --total {args.total:.0f} sized the "
++              f"base; --freeway-scale {args.freeway_scale}, --corridor-scale "
++              f"and any profile `scale` and shape fraction multiplied on top. "
++              f"Read the demand level here, not off the flags.",
++              file=sys.stderr)
++
+     # Where the file actually aims its vehicles. Printed unconditionally,
+     # pinned or not: the CBD's share was an unexamined output of the building
+     # extract for the whole life of this script, and the only reason nobody
+@@ -1147,6 +1261,29 @@ def main():
+         "# (ADR-0021). Portal inflow + residential interior origins, both",
+         f"# routed to workplace destinations weighted by floor area.",
+         f"# Target {args.total:.0f} veh/h peak, {args.resident_share:.0%} originating in-zone.",
++        # The REALIZED level and the knobs that produced it, in the artifact
++        # rather than only on stderr. --total is a target, not an outcome:
++        # --freeway-scale, --corridor-scale and each profile rule's `scale` and
++        # shape fraction all multiply on top of it. A shipped scenario whose
++        # header recorded only the target could not be checked against its own
++        # run report without re-deriving the invocation by trial and error,
++        # which is exactly what had to be done to reproduce this file.
++        f"# REALIZED: peak {peak:,.0f} veh/h at t={at_s:.0f}s (max over TIME of"
++        f" the summed rate, not a sum of per-flow peaks —",
++        f"#   ADR-0028 shapes crest at different moments), "
++        f"{total_veh(cats('arterial', 'freeway', 'interior', 'resident')):,.0f}"
++        f" vehicles over the program.",
++        f"#   Compare against the run report's completed + stranded + active;"
++        f" a gap there is delivery, not demand.",
++        f"# Knobs: --total {args.total:.0f} --freeway-scale"
++        f" {args.freeway_scale} --ramp-share {args.ramp_share}"
++        + (f" --ramps-per-corridor {args.ramps_per_corridor}"
++           if args.ramp_share else "")
++        + ("".join(f" --corridor-scale {k}={v:g}"
++                   for k, v in sorted(corridor_scale.items()))
++           if corridor_scale else "")
++        + (f" --dest-zone-share {args.dest_zone_share}"
++           if args.dest_zone_share else ""),
+         f"# {stats['portal flows']} portal flows + {stats['resident flows']} residential flows,",
+         f"# Through share {args.through_share:.0%} arterial / "
+         f"{args.freeway_through_share:.0%} freeway portals — that fraction of"
+@@ -1154,10 +1291,22 @@ def main():
+         f"# workplace, which is what closes the mass balance.",
+         f"# {len(dest_lanes)} workplace + {len(exit_lanes)} exit destination"
+         f" lanes.",
++        # The shapes AND the assignment. Recording only the shapes leaves the
++        # header unable to distinguish two libraries that share a shape
++        # library and assign it completely differently — and assignment is
++        # where the demand level per corridor is actually decided, since a
++        # rule carries its own `scale`. First match wins, so the ORDER is part
++        # of the meaning and the rules are listed in it, not sorted.
+         (f"# Profiles from {args.profiles}: "
+          + "; ".join(f"{n}=[{','.join(f'{v:g}' for v in p)}]"
+                      for n, p in sorted(pset.profiles.items()))
+          + f" over {pset.step_s:.0f}s steps."
++         + " Assigned (first match wins): "
++         + "; ".join(
++             "[" + ", ".join(f"{k}={v}" for k, v in sorted(m.items()))
++             + f"] -> {name}" + (f" x{scale:g}" if scale != 1.0 else "")
++             for m, name, scale in pset.rules)
++         + f"; default {pset.default}."
+          if pset is not None else
+          "# Profile " + " ".join(f"{a:.0f}-{b:.0f}s@{f:.2f}"
+                                  for a, b, f in profile)
+diff --git a/scripts/chicago/profiles-am-kennedy.json b/scripts/chicago/profiles-am-kennedy.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..941bc33bc656fdbc530f2e323aafca2040847ffb
+--- /dev/null
++++ b/scripts/chicago/profiles-am-kennedy.json
+@@ -0,0 +1,63 @@
++{
++  "version": 1,
++  "_comment": [
++    "AM peak with the Kennedy loaded, for chi-loop-urban. Same 600 s x 9 =",
++    "5400 s = 54,000 tick span as profiles-am.json, so the horizon is",
++    "unchanged and the last three slices are still the drain.",
++    "",
++    "WHY THIS EXISTS, AND WHY IT IS NOT A GLOBAL SCALE: the run report says",
++    "the freeway carries 38% of travel with p99 density at 69% of critical,",
++    "while the arterial grid is already at 235% of critical at the tail. A",
++    "uniform lift multiplies the arterial strandings (1,021 of them) and",
++    "tells you nothing new. This targets the corridor that has headroom.",
++    "",
++    "The shape matters as much as the level. profiles-am.json assigns every",
++    "interior mainline injection the `freight` curve, which tops out at 0.90",
++    "and never reaches 1.00 -- and those interior injections ARE the Kennedy",
++    "fill (the ramp block relocates boundary volume onto Armitage/North/",
++    "Division/Ohio-like mainline points). So the corridor with headroom was",
++    "the one whose arrival curve was deliberately peak-shaved. `kennedy-am`",
++    "holds 1.00 for three consecutive slices: a 10-minute peak cannot build",
++    "a queue, a 30-minute plateau can.",
++    "",
++    "Fractions are napkin-anchored diurnal shapes, NOT calibrated Chicago",
++    "counts (ADR-0028). Do not quote them as counts."
++  ],
++  "step_s": 600,
++  "profiles": {
++    "commute-am": [0.45, 0.70, 1.00, 1.00, 0.80, 0.60, 0.0, 0.0, 0.0],
++    "kennedy-am": [0.55, 0.85, 1.00, 1.00, 1.00, 0.85, 0.0, 0.0, 0.0],
++    "freight": [0.70, 0.80, 0.85, 0.90, 0.90, 0.85, 0.0, 0.0, 0.0],
++    "reverse-commute": [0.30, 0.40, 0.55, 0.60, 0.55, 0.45, 0.0, 0.0, 0.0],
++    "baseline": [0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.0, 0.0, 0.0]
++  },
++  "default": "commute-am",
++  "assign": [
++    {
++      "_why": "The Kennedy's interior mainline injections are what actually fills it. This rule MUST precede the generic kind=interior rule below: first match wins, so ordering it after would leave these flows on `freight` while the rule still fired on other Kennedy flows -- check_all_rules_fired would pass and the corridor would stay peak-shaved.",
++      "kind": "interior",
++      "corridor": "kennedy",
++      "profile": "kennedy-am",
++      "scale": 1.5
++    },
++    {
++      "_why": "The boundary portal remainder on the same corridor: whatever --ramp-share did not relocate. It gets the same shape and level, or the corridor arrives in two different curves.",
++      "kind": "portal",
++      "corridor": "kennedy",
++      "profile": "kennedy-am",
++      "scale": 1.5
++    },
++    {
++      "_why": "Residents leaving downtown towers are largely counter-peak: they are already in the core, so they are not what fills the inbound expressways.",
++      "kind": "resident",
++      "profile": "reverse-commute",
++      "scale": 1.0
++    },
++    {
++      "_why": "Interior injections on every OTHER corridor keep the freight mix and its earlier, flatter peak. Unchanged from profiles-am.json -- this is the control side of the comparison.",
++      "kind": "interior",
++      "profile": "freight",
++      "scale": 1.0
++    }
++  ]
++}
+diff --git a/scripts/chicago/test_mkod.py b/scripts/chicago/test_mkod.py
+index c8f9cd2196b277e1bfd48744de0afb35d84e52f3..581273ff7e87f48b358e07f656b712be4c7c6003 100644
+--- a/scripts/chicago/test_mkod.py
++++ b/scripts/chicago/test_mkod.py
+@@ -27,6 +27,8 @@ build_profile = _mod.build_profile
+ ProfileSet = _mod.ProfileSet
+ emit_flow = _mod.emit_flow
+ zone_blend = _mod.zone_blend
++peak_rate = _mod.peak_rate
++total_veh = _mod.total_veh
+ AM_PROFILE = _mod.AM_PROFILE
+ 
+ 
+@@ -473,5 +475,87 @@ class TestZoneBlend(unittest.TestCase):
+         self.assertGreater(got["x1"], 0.0)
+ 
+ 
++class TestPeakRate(unittest.TestCase):
++    """What mkod reports as the demand level.
++
++    The figure it used to print was a sum of per-flow BASE rates. Two separate
++    errors lived in that: the base rate is not what emit_flow writes (it writes
++    `rate * f`, and `f` tops out at 0.90 for freight), and a sum of per-flow
++    peaks is not a peak at all once flows crest at different moments — which is
++    the entire point of ADR-0028's shape library.
++    """
++
++    def test_concurrent_flows_add(self):
++        got, at = peak_rate([(0, 600, 100.0), (0, 600, 50.0)])
++        self.assertAlmostEqual(got, 150.0)
++        self.assertEqual(at, 0)
++
++    def test_flows_that_never_overlap_do_not_add(self):
++        # THE bug, in miniature: summing per-flow peaks gives 150; no instant
++        # in this program carries more than 100.
++        got, at = peak_rate([(0, 600, 100.0), (600, 1200, 50.0)])
++        self.assertAlmostEqual(got, 100.0)
++        self.assertEqual(at, 0)
++
++    def test_the_peak_can_be_in_the_middle(self):
++        # Two shapes cresting at different slices, overlapping on the middle
++        # one. The max is neither flow's own peak moment alone.
++        segs = [(0, 600, 80.0), (600, 1200, 100.0),          # commute-ish
++                (600, 1200, 40.0), (1200, 1800, 90.0)]       # freight-ish
++        got, at = peak_rate(segs)
++        self.assertAlmostEqual(got, 140.0)
++        self.assertEqual(at, 600)
++
++    def test_boundaries_are_half_open_so_neighbours_do_not_double_count(self):
++        # emit_flow writes [start, end) slices; back-to-back slices from ONE
++        # flow must never look like two concurrent flows at the shared second.
++        got, _ = peak_rate([(0, 600, 100.0), (600, 1200, 100.0)])
++        self.assertAlmostEqual(got, 100.0)
++
++    def test_non_uniform_spans_need_no_common_grid(self):
++        # --flat-peak and --drain-s produce unequal spans, and ADR-0028 allows
++        # profiles of differing length. Overlap is 500-600.
++        got, at = peak_rate([(0, 600, 70.0), (500, 2400, 30.0)])
++        self.assertAlmostEqual(got, 100.0)
++        self.assertEqual(at, 500)
++
++    def test_an_empty_program_has_no_peak_rather_than_crashing(self):
++        self.assertEqual(peak_rate([]), (0.0, 0.0))
++
++    def test_the_reported_second_is_where_the_max_starts(self):
++        _, at = peak_rate([(0, 600, 10.0), (1800, 2400, 99.0)])
++        self.assertEqual(at, 1800)
++
++
++class TestTotalVeh(unittest.TestCase):
++    """The mass-balance basis: a count, not a rate.
++
++    A through SHARE only means anything if both sides are integrated over the
++    same span, and once flows run on different shapes they are not.
++    """
++
++    def test_an_hour_at_a_rate_is_that_many_vehicles(self):
++        self.assertAlmostEqual(total_veh([(0, 3600, 250.0)]), 250.0)
++
++    def test_a_ten_minute_slice_is_a_sixth_of_the_rate(self):
++        self.assertAlmostEqual(total_veh([(0, 600, 600.0)]), 100.0)
++
++    def test_slices_accumulate_across_the_whole_program(self):
++        # The 9-slice x 600 s shape ADR-0028 uses, at a flat 100 veh/h: 90 min.
++        segs = [(i * 600, (i + 1) * 600, 100.0) for i in range(9)]
++        self.assertAlmostEqual(total_veh(segs), 150.0)
++
++    def test_a_short_flat_peak_is_not_the_same_as_a_long_taper(self):
++        # Same peak RATE, different vehicle counts — which is exactly why the
++        # demand level cannot be read off a peak alone.
++        flat = total_veh([(0, 600, 100.0)])
++        taper = total_veh([(0, 600, 100.0), (600, 3000, 50.0)])
++        self.assertAlmostEqual(flat, 16.6667, places=3)
++        self.assertGreater(taper, flat)
++
++    def test_an_empty_program_asks_for_no_vehicles(self):
++        self.assertAlmostEqual(total_veh([]), 0.0)
++
++
+ if __name__ == "__main__":
+     unittest.main()
