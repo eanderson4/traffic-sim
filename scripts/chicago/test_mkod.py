@@ -27,6 +27,8 @@ build_profile = _mod.build_profile
 ProfileSet = _mod.ProfileSet
 emit_flow = _mod.emit_flow
 zone_blend = _mod.zone_blend
+peak_rate = _mod.peak_rate
+total_veh = _mod.total_veh
 AM_PROFILE = _mod.AM_PROFILE
 
 
@@ -471,6 +473,88 @@ class TestZoneBlend(unittest.TestCase):
         got = zone_blend(w, Z, {"cbd": 0.50})
         self.assertAlmostEqual(sum(got.values()), 1.0)
         self.assertGreater(got["x1"], 0.0)
+
+
+class TestPeakRate(unittest.TestCase):
+    """What mkod reports as the demand level.
+
+    The figure it used to print was a sum of per-flow BASE rates. Two separate
+    errors lived in that: the base rate is not what emit_flow writes (it writes
+    `rate * f`, and `f` tops out at 0.90 for freight), and a sum of per-flow
+    peaks is not a peak at all once flows crest at different moments — which is
+    the entire point of ADR-0028's shape library.
+    """
+
+    def test_concurrent_flows_add(self):
+        got, at = peak_rate([(0, 600, 100.0), (0, 600, 50.0)])
+        self.assertAlmostEqual(got, 150.0)
+        self.assertEqual(at, 0)
+
+    def test_flows_that_never_overlap_do_not_add(self):
+        # THE bug, in miniature: summing per-flow peaks gives 150; no instant
+        # in this program carries more than 100.
+        got, at = peak_rate([(0, 600, 100.0), (600, 1200, 50.0)])
+        self.assertAlmostEqual(got, 100.0)
+        self.assertEqual(at, 0)
+
+    def test_the_peak_can_be_in_the_middle(self):
+        # Two shapes cresting at different slices, overlapping on the middle
+        # one. The max is neither flow's own peak moment alone.
+        segs = [(0, 600, 80.0), (600, 1200, 100.0),          # commute-ish
+                (600, 1200, 40.0), (1200, 1800, 90.0)]       # freight-ish
+        got, at = peak_rate(segs)
+        self.assertAlmostEqual(got, 140.0)
+        self.assertEqual(at, 600)
+
+    def test_boundaries_are_half_open_so_neighbours_do_not_double_count(self):
+        # emit_flow writes [start, end) slices; back-to-back slices from ONE
+        # flow must never look like two concurrent flows at the shared second.
+        got, _ = peak_rate([(0, 600, 100.0), (600, 1200, 100.0)])
+        self.assertAlmostEqual(got, 100.0)
+
+    def test_non_uniform_spans_need_no_common_grid(self):
+        # --flat-peak and --drain-s produce unequal spans, and ADR-0028 allows
+        # profiles of differing length. Overlap is 500-600.
+        got, at = peak_rate([(0, 600, 70.0), (500, 2400, 30.0)])
+        self.assertAlmostEqual(got, 100.0)
+        self.assertEqual(at, 500)
+
+    def test_an_empty_program_has_no_peak_rather_than_crashing(self):
+        self.assertEqual(peak_rate([]), (0.0, 0.0))
+
+    def test_the_reported_second_is_where_the_max_starts(self):
+        _, at = peak_rate([(0, 600, 10.0), (1800, 2400, 99.0)])
+        self.assertEqual(at, 1800)
+
+
+class TestTotalVeh(unittest.TestCase):
+    """The mass-balance basis: a count, not a rate.
+
+    A through SHARE only means anything if both sides are integrated over the
+    same span, and once flows run on different shapes they are not.
+    """
+
+    def test_an_hour_at_a_rate_is_that_many_vehicles(self):
+        self.assertAlmostEqual(total_veh([(0, 3600, 250.0)]), 250.0)
+
+    def test_a_ten_minute_slice_is_a_sixth_of_the_rate(self):
+        self.assertAlmostEqual(total_veh([(0, 600, 600.0)]), 100.0)
+
+    def test_slices_accumulate_across_the_whole_program(self):
+        # The 9-slice x 600 s shape ADR-0028 uses, at a flat 100 veh/h: 90 min.
+        segs = [(i * 600, (i + 1) * 600, 100.0) for i in range(9)]
+        self.assertAlmostEqual(total_veh(segs), 150.0)
+
+    def test_a_short_flat_peak_is_not_the_same_as_a_long_taper(self):
+        # Same peak RATE, different vehicle counts — which is exactly why the
+        # demand level cannot be read off a peak alone.
+        flat = total_veh([(0, 600, 100.0)])
+        taper = total_veh([(0, 600, 100.0), (600, 3000, 50.0)])
+        self.assertAlmostEqual(flat, 16.6667, places=3)
+        self.assertGreater(taper, flat)
+
+    def test_an_empty_program_asks_for_no_vehicles(self):
+        self.assertAlmostEqual(total_veh([]), 0.0)
 
 
 if __name__ == "__main__":

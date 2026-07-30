@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "_comment": [
+    "AM peak with the Kennedy loaded, for chi-loop-urban. Same 600 s x 9 =",
+    "5400 s = 54,000 tick span as profiles-am.json, so the horizon is",
+    "unchanged and the last three slices are still the drain.",
+    "",
+    "WHY THIS EXISTS, AND WHY IT IS NOT A GLOBAL SCALE: the run report says",
+    "the freeway carries 38% of travel with p99 density at 69% of critical,",
+    "while the arterial grid is already at 235% of critical at the tail. A",
+    "uniform lift multiplies the arterial strandings (1,021 of them) and",
+    "tells you nothing new. This targets the corridor that has headroom.",
+    "",
+    "The shape matters as much as the level. profiles-am.json assigns every",
+    "interior mainline injection the `freight` curve, which tops out at 0.90",
+    "and never reaches 1.00 -- and those interior injections ARE the Kennedy",
+    "fill (the ramp block relocates boundary volume onto Armitage/North/",
+    "Division/Ohio-like mainline points). So the corridor with headroom was",
+    "the one whose arrival curve was deliberately peak-shaved. `kennedy-am`",
+    "holds 1.00 for three consecutive slices: a 10-minute peak cannot build",
+    "a queue, a 30-minute plateau can.",
+    "",
+    "Fractions are napkin-anchored diurnal shapes, NOT calibrated Chicago",
+    "counts (ADR-0028). Do not quote them as counts."
+  ],
+  "step_s": 600,
+  "profiles": {
+    "commute-am": [0.45, 0.70, 1.00, 1.00, 0.80, 0.60, 0.0, 0.0, 0.0],
+    "kennedy-am": [0.55, 0.85, 1.00, 1.00, 1.00, 0.85, 0.0, 0.0, 0.0],
+    "freight": [0.70, 0.80, 0.85, 0.90, 0.90, 0.85, 0.0, 0.0, 0.0],
+    "reverse-commute": [0.30, 0.40, 0.55, 0.60, 0.55, 0.45, 0.0, 0.0, 0.0],
+    "baseline": [0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.0, 0.0, 0.0]
+  },
+  "default": "commute-am",
+  "assign": [
+    {
+      "_why": "The Kennedy's interior mainline injections are what actually fills it. This rule MUST precede the generic kind=interior rule below: first match wins, so ordering it after would leave these flows on `freight` while the rule still fired on other Kennedy flows -- check_all_rules_fired would pass and the corridor would stay peak-shaved.",
+      "kind": "interior",
+      "corridor": "kennedy",
+      "profile": "kennedy-am",
+      "scale": 1.5
+    },
+    {
+      "_why": "The boundary portal remainder on the same corridor: whatever --ramp-share did not relocate. It gets the same shape and level, or the corridor arrives in two different curves.",
+      "kind": "portal",
+      "corridor": "kennedy",
+      "profile": "kennedy-am",
+      "scale": 1.5
+    },
+    {
+      "_why": "Residents leaving downtown towers are largely counter-peak: they are already in the core, so they are not what fills the inbound expressways.",
+      "kind": "resident",
+      "profile": "reverse-commute",
+      "scale": 1.0
+    },
+    {
+      "_why": "Interior injections on every OTHER corridor keep the freight mix and its earlier, flatter peak. Unchanged from profiles-am.json -- this is the control side of the comparison.",
+      "kind": "interior",
+      "profile": "freight",
+      "scale": 1.0
+    }
+  ]
+}

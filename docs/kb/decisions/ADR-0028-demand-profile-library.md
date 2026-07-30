@@ -109,15 +109,70 @@ library is reusable across networks.
 Costs and risks:
 
 - **More knobs that multiply.** `scale` × `--corridor-scale` ×
-  `--freeway-scale` all hit the same rate. Documented as composing
-  multiplicatively, and mkod prints the realized totals, but a demand level
-  is now assembled from three places.
+  `--freeway-scale` all hit the same rate, so a demand level is assembled from
+  three places. The mitigation this section originally claimed —
+  "mkod prints the realized totals" — **was not true when it was written**;
+  see the correction below.
 - **Fractions are napkin-anchored, not calibrated.** The shapes are the usual
   diurnal curves, not Chicago count data — the same posture as every other
   rate in this scenario, and it must not be quoted as calibrated.
 - **Profiles of differing length** are allowed (freight may outlast
   commuting) but mean flows stop arriving at different moments; mkod prints a
   NOTE rather than refusing.
+
+> **What the first implementation got wrong (2026-07-29, first real use)**
+>
+> This ADR's mitigation for the multiplying-knobs risk was that mkod "prints
+> the realized totals". It did not. Every counter behind those prints was
+> incremented from the rate *before* the profile rule's `scale` reached it, and
+> the shape fraction never entered at all — so the reported demand level was
+> the one **authored**, not the one written to the file. The two agree only
+> while every rule has `scale: 1.0` and every profile peaks at exactly 1.00,
+> which is why nothing surfaced until a library used a scale. Four distinct
+> errors, all in the same direction:
+>
+> 1. **Profile `scale` was missing.** `realized["freeway"] += rate` ran
+>    upstream of `emit_flow(..., rate * pscale, ...)`.
+> 2. **The shape fraction was missing.** `emit_flow` writes `rate * f`.
+>    `freight` peaks at 0.90 and `reverse-commute` at 0.60, so the base rate is
+>    not a rate that appears anywhere in the file. Concretely: `--ramp-share`
+>    reported 5,258 veh/h relocated onto interior points where the file asks
+>    for 4,733 — an 11% overstatement, and the interior injections are the
+>    corridor fill, so this was the number a freeway calibration leaned on.
+> 3. **A sum of per-flow peaks is not a peak.** This ADR's whole purpose is
+>    that flows crest at different moments, which makes that sum a rate no
+>    instant in the run ever sees — and one that grows with the number of
+>    distinct *shapes* rather than with demand. It is now a max over time, on
+>    the elementary intervals between all slice boundaries so that non-uniform
+>    spans need not share a grid, and the instant is named.
+> 4. **A share was computed on rates.** The through-traffic mass balance
+>    divided one peak rate by another. Two rates only compare if they are
+>    integrated over the same span, and once flows run on different shapes they
+>    are not; it is now a vehicle count on both sides. The same defect sat in
+>    the destinations-by-district table, which weight-averaged flows by
+>    pre-shape rate — caught in review as the same error class, and now also
+>    on vehicle counts (`observe` takes the flow's whole-program count, the
+>    integral of the slices emit_flow wrote), as is the stranded-portal
+>    warning.
+>
+> Also fixed, in the same spirit: the boundary-freeway figure was printed
+> before relocation had been re-emitted, so it showed a corridor at
+> `1 - --ramp-share` of its own demand — a plausible-looking number rather than
+> a visibly missing one. And the demand file's header recorded `--total`, a
+> *target*, while recording neither the knobs that multiplied it nor the
+> realized outcome; reproducing the shipped `chi-loop-urban-half` demand
+> therefore meant guessing the invocation. The header now carries the realized
+> peak and vehicle count, the knobs, and the ordered assign rules — ordered
+> because first-match-wins makes the order part of the meaning.
+>
+> **A trap worth naming, which the validation does not catch.** Rules are
+> first-match-wins, and a generic `{"kind": "interior"}` rule shadows a later
+> `{"corridor": "X"}` one for exactly the interior mainline injections that
+> fill corridor X. `check_all_rules_fired` cannot see it: the corridor rule
+> still fires on that corridor's *portal* and *resident* flows, so it records
+> hits and passes clean while the corridor keeps the generic shape. A
+> corridor-targeting rule must be `{"kind": ..., "corridor": ...}` and must
+> precede the generic rule for its kind.
 
 Validation is deliberately loud, because every failure here is otherwise
 silent — a misspelled corridor, an unknown profile name, or a rule that never

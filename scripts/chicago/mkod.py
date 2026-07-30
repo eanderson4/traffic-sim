@@ -405,6 +405,45 @@ def zone_blend(weights, lane2zone, zone_share):
     return out
 
 
+def peak_rate(segs):
+    """(max over time of the summed rate, the second at which that max starts).
+
+    `segs` is [(start_s, end_s, veh_per_h)] as WRITTEN to the demand file.
+
+    A max over time, not a sum of per-flow peaks. ADR-0028 exists precisely so
+    that flows crest at different moments — freight at slice 4, commute at 2-3,
+    reverse-commute at 3 — so adding their individual maxima yields a rate no
+    instant in the run ever sees, and it grows with the number of DISTINCT
+    shapes rather than with demand. Evaluated on the elementary intervals
+    between all slice boundaries, so non-uniform spans (--flat-peak, --drain-s,
+    or profiles of differing length) need not align on a common grid.
+
+    Half-open on [start, end) to match emit_flow's slices: a boundary second
+    belongs to the slice starting there, so back-to-back slices neither
+    double-count it nor leave it uncovered.
+    """
+    if not segs:
+        return 0.0, 0.0
+    bounds = sorted({b for s, e, _ in segs for b in (s, e)})
+    best, at = 0.0, bounds[0]
+    for i in range(len(bounds) - 1):
+        mid = (bounds[i] + bounds[i + 1]) / 2.0
+        tot = sum(r for s, e, r in segs if s <= mid < e)
+        if tot > best:
+            best, at = tot, bounds[i]
+    return best, at
+
+
+def total_veh(segs):
+    """Vehicles the program asks for: rate integrated over each slice's span.
+
+    The right basis for a share or a mass balance, where a peak rate is not:
+    two rates only compare if they cover the same span, and once flows run on
+    different shapes they do not.
+    """
+    return sum(r * (e - s) / 3600.0 for s, e, r in segs)
+
+
 def emit_flow(out, fid, origin, rate, profile, vtypes, dests, offset=None,
               observe=None):
     out.append(f"  - id: {fid}")
@@ -446,7 +485,14 @@ def emit_flow(out, fid, origin, rate, profile, vtypes, dests, offset=None,
         for lane in sorted(kept):
             out.append(f"      {lane}: {kept[lane]:.4f}")
         if observe:
-            observe(rate, kept)
+            # VEHICLES, not the rate: observe aggregates a share, and a
+            # share is only meaningful on counts integrated over the same
+            # span — rates on different profile shapes do not have one (the
+            # ADR-0028 correction; the district table divided such rates
+            # until then). The slices above are what was WRITTEN, so the
+            # count is their integral.
+            observe(total_veh([(s, e, rate * f) for s, e, f in profile
+                               if rate * f > 0]), kept)
 
 
 def main():
@@ -774,8 +820,8 @@ def main():
               f"; the remaining {1 - tot:.0%} splits by floor area",
               file=sys.stderr)
 
-    # Realized share per district, rate-weighted, accumulated as flows are
-    # emitted. A pin is a REQUEST: an origin that cannot reach the CBD has its
+    # Realized share per district, VEHICLE-weighted, accumulated as flows
+    # are emitted. A pin is a REQUEST: an origin that cannot reach the CBD has its
     # pinned share redistributed over what it can reach, so the aggregate can
     # land below what was asked for. Printing it is what makes that visible
     # instead of a number nobody checks.
@@ -785,20 +831,23 @@ def main():
         w = {d: dest_area[d] for d in dest_lanes if origin in reach[d]}
         return zone_blend(w, lane2zone, zone_share)
 
-    def observe(rate, dests):
+    def observe(veh, dests):
         """Tally where the demand file actually sends vehicles.
 
-        Called with what emit_flow WROTE, after blending and after
-        negligible-weight destinations were dropped, so it measures the file
-        rather than the intent. Boundary exits are counted separately: a
-        through trip has no district, and folding it in would make every
-        district's share depend on how much traffic merely crosses the box.
+        Called with the flow's whole-program VEHICLE COUNT (the integral of
+        the slices emit_flow wrote — a share over rates would overweight
+        peak-shaved shapes, the ADR-0028 correction), after blending and
+        after negligible-weight destinations were dropped, so it measures
+        the file rather than the intent. Boundary exits are counted
+        separately: a through trip has no district, and folding it in would
+        make every district's share depend on how much traffic merely
+        crosses the box.
         """
         for d, v in dests.items():
             if d in exit_set:
-                zone_realized["(through)"] += rate * v
+                zone_realized["(through)"] += veh * v
             else:
-                zone_realized[lane2zone.get(d) or "(unzoned)"] += rate * v
+                zone_realized[lane2zone.get(d) or "(unzoned)"] += veh * v
 
     def through_for(origin, cls, edge):
         """Normalized boundary-exit weights for a portal origin.
@@ -946,9 +995,33 @@ def main():
                       f"destination — its inflow stays entirely at the cut "
                       f"face and will queue there", file=sys.stderr)
 
-    realized = collections.Counter()
     stranded = []
     relocate = collections.Counter()
+
+    # Every (start_s, end_s, veh_per_h) triple this run WRITES, by category.
+    #
+    # Two different questions need two different reductions over it, and the
+    # scalar counter that used to live here answered neither:
+    #   * how hard is the network loaded  -> max over TIME of the summed rate
+    #   * does the mass balance close     -> the integral, i.e. a vehicle count
+    #
+    # A sum of per-flow peak rates is not the first one. Flows peak at
+    # different moments by design (ADR-0028: reverse-commute crests at slice 3,
+    # freight at 4), so adding their individual maxima reports a rate no
+    # instant in the run ever sees. Nor is a sum of base rates: emit_flow
+    # writes `rate * f`, and `f` tops out at 0.90 for freight and 0.60 for
+    # reverse-commute, so the base rate is not in the file at all.
+    timeline = collections.defaultdict(list)
+
+    def tally(cat, rate, profile):
+        """Record what emit_flow will write, on the same terms it writes it."""
+        for s, e, f in profile:
+            r = rate * f
+            if r > 0:      # emit_flow drops zero slices, so neither counts one
+                timeline[cat].append((s, e, r))
+
+    def cats(*names):
+        return [sg for n in names for sg in timeline[n]]
     for i, (lid, cls, raw, edge) in enumerate(sorted(entries)):
         share = (args.freeway_through_share if cls in FREEWAY_CLASSES
                  else args.through_share)
@@ -968,52 +1041,67 @@ def main():
         if cls in FREEWAY_CLASSES:
             rate *= args.freeway_scale
             rate *= corridor_scale.get(lane_corridor.get(lid), 1.0)
-            realized["freeway"] += rate
-        else:
-            realized["arterial"] += rate
+        corr = lane_corridor.get(lid)
+        # Resolved BEFORE anything is counted, not at the emit call below. The
+        # profile rule's `scale` multiplies the emitted rate (ADR-0028: it
+        # composes multiplicatively with --freeway-scale and
+        # --corridor-scale), so a counter incremented off `rate` reports the
+        # demand that was AUTHORED rather than the demand in the file. Those
+        # are the same number only while every rule has scale 1.0, which is
+        # why this went unnoticed until a library used a scale.
+        pf, pscale = profile_for("portal", cls, corr)
         # Relocate a share of this corridor's inflow to interior points. The
         # volume is not lost — it is re-emitted below, spread along the
         # corridor, so the corridor still carries what --freeway-scale asked
         # for. What changes is that it does not all arrive through one lane.
-        corr = lane_corridor.get(lid)
-        if args.ramp_share and corr in ramp_picks and cls in FREEWAY_CLASSES:
+        # Taken off the pre-profile rate because relocation is a split of
+        # PHYSICAL demand; the interior flows then carry the interior rule's
+        # own scale, which need not equal this one's. Guarded on pf: a
+        # profile-less flow is never emitted, and its relocated share must
+        # not ship anyway as interior injections — an absent flow appears in
+        # NO realized total, including via the detour through relocate.
+        if pf is not None and args.ramp_share and corr in ramp_picks and cls in FREEWAY_CLASSES:
             moved = rate * args.ramp_share
             relocate[corr] += moved
             rate -= moved
-        realized["through"] += rate * eff
+        # What emit_flow will be handed. A profile-less flow resolves to
+        # pscale 0.0 and is not emitted, so it contributes nothing here — an
+        # absent flow must not appear in a realized total.
+        emitted = rate * pscale
         if not thru:
             stats["portal no reachable exit"] += 1
-        if not work:
-            stats["portal no reachable workplace"] += 1
-            stranded.append((f"p{i:03d}-{cls}", lid, cls, rate))
-        pf, pscale = profile_for("portal", cls, corr)
         if pf is None:
             stats["portal no profile"] += 1
             continue
-        emit_flow(flows, f"p{i:03d}-{cls}", lid, rate * pscale, pf,
+        if not work:
+            stats["portal no reachable workplace"] += 1
+            # After the pf check: a profile-less flow is never emitted, so it
+            # must not appear in the stranded list either (the tally's rule —
+            # an absent flow appears in no realized total — applies here).
+            # Counted in VEHICLES over the program, on the same terms as the
+            # realized totals.
+            stranded.append((f"p{i:03d}-{cls}", lid, cls,
+                             total_veh([(s, e, emitted * f) for s, e, f in pf
+                                        if emitted * f > 0])))
+        # Tallied here rather than above, so a flow that is never emitted is
+        # never counted: an absent flow must not appear in a realized total.
+        tally("freeway" if cls in FREEWAY_CLASSES else "arterial", emitted, pf)
+        tally("through", emitted * eff, pf)
+        emit_flow(flows, f"p{i:03d}-{cls}", lid, emitted, pf,
                   {"car": round(1 - truck, 3), "truck": round(truck, 3)}, d,
                   observe=observe)
         stats["portal flows"] += 1
-    if args.freeway_scale != 1.0:
-        print(f"[mkod] freeway-scale {args.freeway_scale}: portal inflow "
-              f"{realized['arterial']:.0f} veh/h arterial + "
-              f"{realized['freeway']:.0f} veh/h freeway = "
-              f"{realized['arterial'] + realized['freeway']:.0f} veh/h "
-              f"(--total {args.total:.0f} sized the base; the arterial side is "
-              f"unchanged from freeway-scale 1.0 and the freeway side is "
-              f"{args.freeway_scale}x on top)",
-              file=sys.stderr)
     if stranded:
         # Loud because it is invisible downstream: the flow still loads, still
         # runs, and still produces plausible corridor speeds. It just sends
         # every vehicle straight back out of the box.
         lost = sum(r for _, _, _, r in stranded)
         print(f"[mkod] WARNING: {len(stranded)} portal origin(s) can reach NO "
-              f"workplace destination, so 100% of their {lost:.0f} veh/h "
+              f"workplace destination, so 100% of their {lost:,.0f} vehicles "
               f"becomes through traffic regardless of --through-share:",
               file=sys.stderr)
-        for fid, lid, cls, rate in stranded:
-            print(f"[mkod]   {fid} ({cls}, {rate:.0f} veh/h) origin {lid}",
+        for fid, lid, cls, veh in stranded:
+            print(f"[mkod]   {fid} ({cls}, {veh:,.0f} vehicles) origin {lid}",
                   file=sys.stderr)
 
     # --- Interior corridor origins: the on-ramps a map cut removes.
@@ -1047,32 +1135,50 @@ def main():
                       {"car": round(1 - truck, 3), "truck": round(truck, 3)},
                       d, offset=off, observe=observe)
             ramp_stats["interior flows"] += 1
-            realized["interior"] += each
-            realized["through"] += each * eff
+            # On the same terms as the portal flows above: the interior rule's
+            # scale and shape are its own, and are frequently the ones being
+            # tuned — profiles-am.json puts these on `freight`, which never
+            # reaches 1.0, so their base rate is not what reaches the network.
+            tally("interior", each * pscale, pf)
+            tally("through", each * pscale * eff, pf)
     if relocate:
-        print(f"[mkod] ramp-share {args.ramp_share}: relocated "
-              f"{sum(relocate.values()):.0f} veh/h off the cut face onto "
-              f"{ramp_stats['interior flows']} interior points across "
+        # `relocate` is a split of PHYSICAL demand, taken before any profile
+        # applied, so it says how much moved off the cut face and nothing
+        # about what arrives. The interior rule's own scale and shape land on
+        # top of it: quoting the split alone reported an unchanged 5,258 veh/h
+        # across a pair of libraries whose Kennedy demand differed by 1.57x.
+        # Both are printed, on their own terms and labelled as such.
+        int_pk, int_at = peak_rate(cats("interior"))
+        print(f"[mkod] ramp-share {args.ramp_share}: moved "
+              f"{sum(relocate.values()):,.0f} veh/h of base demand off the cut "
+              f"face onto {ramp_stats['interior flows']} interior points across "
               f"{len(relocate)} corridors "
-              f"({args.ramps_per_corridor} requested per corridor)",
-              file=sys.stderr)
+              f"({args.ramps_per_corridor} requested per corridor). As "
+              f"EMITTED, after each corridor's profile scale and shape: peak "
+              f"{int_pk:,.0f} veh/h at t={int_at:.0f}s, "
+              f"{total_veh(cats('interior')):,.0f} vehicles.", file=sys.stderr)
         for k, v in sorted(ramp_stats.items()):
             if k != "interior flows":
                 print(f"[mkod]   {k}: {v}", file=sys.stderr)
 
     # Printed here, not with the portal totals, because the interior flows
     # above carry through traffic too and the share has to cover both.
-    # realized["freeway"] is the FULL freeway demand — relocation moves where
-    # it enters, not how much there is — so it is already the right
-    # denominator and adding realized["interior"] would double-count it.
-    portal_tot = realized["arterial"] + realized["freeway"]
-    if portal_tot:
-        print(f"[mkod] through traffic: {realized['through']:.0f} of "
-              f"{portal_tot:.0f} veh/h inflow "
-              f"({100 * realized['through'] / portal_tot:.0f}%) exits at the "
-              f"boundary; the rest terminates in-zone. Through trips CLOSE "
-              f"the mass balance — without them inflow has no drain and "
-              f"vehicle count grows without bound.", file=sys.stderr)
+    #
+    # On a VEHICLE COUNT, not a rate. A through share is a property of the
+    # whole demand program, and the two sides of the ratio only compare if
+    # they are integrated over the same span — which peak rates are not, once
+    # different flows run on different shapes. Residents are excluded on
+    # purpose: they start in-zone and have no boundary-exit movement, so
+    # folding them in would shrink the share without any through trip changing.
+    inflow_veh = total_veh(cats("arterial", "freeway", "interior"))
+    if inflow_veh:
+        thru_veh = total_veh(cats("through"))
+        print(f"[mkod] through traffic: {thru_veh:,.0f} of {inflow_veh:,.0f} "
+              f"vehicles of portal+interior inflow "
+              f"({100 * thru_veh / inflow_veh:.0f}%) exits at the boundary; "
+              f"the rest terminates in-zone. Through trips CLOSE the mass "
+              f"balance — without them inflow has no drain and vehicle count "
+              f"grows without bound.", file=sys.stderr)
 
     # --- Residential interior origins: residents leaving their building.
     top_res = sorted(res.items(), key=lambda kv: -kv[1])[:args.origin_lanes]
@@ -1100,9 +1206,37 @@ def main():
         if pf is None:
             stats["resident no profile"] += 1
             continue
+        tally("resident", rate * pscale, pf)
         emit_flow(flows, f"r{i:03d}-resident", lid, rate * pscale, pf,
                   {"car": 1.0}, d, offset=off, observe=observe)
         stats["resident flows"] += 1
+
+    # The demand level, read off the file rather than off the flags. Printed
+    # after the resident loop because residents are inflow too, and after the
+    # interior loop because the boundary freeway figure is only a remainder
+    # until relocation has been re-emitted — printed earlier it showed a
+    # corridor at 1 - --ramp-share of its own demand, which reads as a
+    # plausible number rather than a missing one.
+    #
+    # Peak is a MAX OVER TIME of the summed rate, and the instant is named: a
+    # sum of per-flow peaks is a rate the run never sees, because ADR-0028
+    # exists precisely so that flows crest at different moments. The vehicle
+    # count is the integral, which is the figure to compare against the run
+    # report's completed + stranded + active.
+    peak, at_s = peak_rate(cats("arterial", "freeway", "interior", "resident"))
+    if peak:
+        fw_pk, _ = peak_rate(cats("freeway", "interior"))
+        art_pk, _ = peak_rate(cats("arterial"))
+        res_pk, _ = peak_rate(cats("resident"))
+        print(f"[mkod] realized demand: peak {peak:,.0f} veh/h at t={at_s:.0f}s "
+              f"(freeway incl. interior {fw_pk:,.0f} + arterial {art_pk:,.0f} + resident "
+              f"{res_pk:,.0f}, each at its own crest so the parts need not sum "
+              f"to the total), {total_veh(cats('arterial', 'freeway', 'interior', 'resident')):,.0f} "
+              f"vehicles over the program. --total {args.total:.0f} sized the "
+              f"base; --freeway-scale {args.freeway_scale}, --corridor-scale "
+              f"and any profile `scale` and shape fraction multiplied on top. "
+              f"Read the demand level here, not off the flags.",
+              file=sys.stderr)
 
     # Where the file actually aims its vehicles. Printed unconditionally,
     # pinned or not: the CBD's share was an unexamined output of the building
@@ -1112,8 +1246,8 @@ def main():
         tot_r = sum(zone_realized.values())
         in_zone = tot_r - zone_realized.get("(through)", 0.0)
         print(f"[mkod] destinations by district "
-              f"({in_zone:,.0f} veh/h terminating in-zone, "
-              f"{zone_realized.get('(through)', 0.0):,.0f} veh/h through):",
+              f"({in_zone:,.0f} vehicles terminating in-zone, "
+              f"{zone_realized.get('(through)', 0.0):,.0f} through):",
               file=sys.stderr)
         for z, v in sorted(zone_realized.items(), key=lambda kv: -kv[1]):
             if z == "(through)":
@@ -1129,7 +1263,7 @@ def main():
                         + (f", SHORT by {100 * (want - got):.1f} pts — some "
                            f"origins cannot reach it" if want - got > 0.005
                            else "") + ")")
-            print(f"         {z:14s} {v:9,.0f} veh/h  "
+            print(f"         {z:14s} {v:9,.0f} veh  "
                   f"{100 * v / in_zone if in_zone else 0:5.1f}%{note}",
                   file=sys.stderr)
 
@@ -1147,6 +1281,31 @@ def main():
         "# (ADR-0021). Portal inflow + residential interior origins, both",
         f"# routed to workplace destinations weighted by floor area.",
         f"# Target {args.total:.0f} veh/h peak, {args.resident_share:.0%} originating in-zone.",
+        # The REALIZED level and the knobs that produced it, in the artifact
+        # rather than only on stderr. --total is a target, not an outcome:
+        # --freeway-scale, --corridor-scale and each profile rule's `scale` and
+        # shape fraction all multiply on top of it. A shipped scenario whose
+        # header recorded only the target could not be checked against its own
+        # run report without re-deriving the invocation by trial and error,
+        # which is exactly what had to be done to reproduce this file.
+        f"# REALIZED: peak {peak:,.0f} veh/h at t={at_s:.0f}s (max over TIME of"
+        f" the summed rate, not a sum of per-flow peaks —",
+        f"#   ADR-0028 shapes crest at different moments), "
+        f"{total_veh(cats('arterial', 'freeway', 'interior', 'resident')):,.0f}"
+        f" vehicles over the program.",
+        f"#   Compare against the run report's completed + stranded + active."
+        f" The count is NOMINAL — the integral the Poisson sampler draws from,"
+        f" not the seed-dependent number it emits — so a small gap is sampling;"
+        f" a large one is delivery, not demand.",
+        f"# Knobs: --total {args.total:.0f} --freeway-scale"
+        f" {args.freeway_scale} --ramp-share {args.ramp_share}"
+        + (f" --ramps-per-corridor {args.ramps_per_corridor}"
+           if args.ramp_share else "")
+        + ("".join(f" --corridor-scale {k}={v:g}"
+                   for k, v in sorted(corridor_scale.items()))
+           if corridor_scale else "")
+        + (f" --dest-zone-share {args.dest_zone_share}"
+           if args.dest_zone_share else ""),
         f"# {stats['portal flows']} portal flows + {stats['resident flows']} residential flows,",
         f"# Through share {args.through_share:.0%} arterial / "
         f"{args.freeway_through_share:.0%} freeway portals — that fraction of"
@@ -1154,10 +1313,22 @@ def main():
         f"# workplace, which is what closes the mass balance.",
         f"# {len(dest_lanes)} workplace + {len(exit_lanes)} exit destination"
         f" lanes.",
+        # The shapes AND the assignment. Recording only the shapes leaves the
+        # header unable to distinguish two libraries that share a shape
+        # library and assign it completely differently — and assignment is
+        # where the demand level per corridor is actually decided, since a
+        # rule carries its own `scale`. First match wins, so the ORDER is part
+        # of the meaning and the rules are listed in it, not sorted.
         (f"# Profiles from {args.profiles}: "
          + "; ".join(f"{n}=[{','.join(f'{v:g}' for v in p)}]"
                      for n, p in sorted(pset.profiles.items()))
          + f" over {pset.step_s:.0f}s steps."
+         + " Assigned (first match wins): "
+         + "; ".join(
+             "[" + ", ".join(f"{k}={v}" for k, v in sorted(m.items()))
+             + f"] -> {name}" + (f" x{scale:g}" if scale != 1.0 else "")
+             for m, name, scale in pset.rules)
+         + f"; default {pset.default}."
          if pset is not None else
          "# Profile " + " ".join(f"{a:.0f}-{b:.0f}s@{f:.2f}"
                                  for a, b, f in profile)
