@@ -1,6 +1,8 @@
 # ADR-0030: The standard run report — distributions, not means
 
-- Status: Proposed
+- Status: Accepted 2026-07-29; `runreport.py`, `mkzones.py` and the viz
+  stats panel shipped. See the review note at the end of Consequences for
+  what the first external round found in the implementation.
 - Date: 2026-07-28
 - Adds: `scripts/runreport.py`, `scripts/chicago/mkzones.py`, and the
   `districts.json` lane→district map. Establishes a versioned report JSON
@@ -106,6 +108,49 @@ Costs and risks:
 - **Districts are rectangles on Chicago cut lines, not neighbourhood
   outlines.** They are honest about which side of the river or of Congress a
   lane is on, and dishonest about anything finer.
+
+> **What the first implementation got wrong (2026-07-29, external review)**
+>
+> Four defects, all of the shape this ADR exists to prevent — a number that
+> is wrong without looking wrong. Recorded here because the decision above
+> reads as though stating the rule were sufficient, and it was not.
+>
+> - **Lane length was re-derived from `shape` instead of read from the
+>   network's `length` field.** On chi-loop-urban 4,697 of 55,555 lanes
+>   (8.5%) disagree by more than 5%, and 895 carry a positive length against
+>   a polyline measuring exactly 0 m — junction internals emitted with a
+>   single point. Those became 0.0 km and fell out of every distribution and
+>   every group denominator. The "denominators fixed to the network" rule was
+>   honoured in the code that computed the denominator and broken in the code
+>   that measured its parts: **the survivorship bias of §3 reached by
+>   arithmetic rather than by omission.** The network total barely moves
+>   (+0.1 lane-km) because the affected lanes are short, which is exactly why
+>   it survived — no headline figure looked wrong.
+> - **A measurement set over a SUBSET of the network was reported as the
+>   network.** ADR-0014 permits subset sets. Lane-km came from the network
+>   file while travel came only from lanes that reported, so the report
+>   divided a fraction of the traffic by all of the road. The metrics header
+>   carries no `elements` declaration to read, so coverage must be DERIVED
+>   from the lanes that appear; it is now printed, carried in the report JSON
+>   as `coverage`, used as the fixed denominator, and the distribution scope
+>   is labelled `measured subset` rather than `network`.
+> - **`time_loss_s` was assumed present.** It is optional — nil when the
+>   `time_loss` group is off — so a legal metrics file produced a bare
+>   KeyError. Refused by name now: delay is a headline and hotspots are
+>   RANKED by it, so a silently-zero report would read as "no delay" instead
+>   of "not measured".
+> - **A lane was assigned to a district by its middle SHAPE POINT, not its
+>   arclength midpoint.** Vertices bunch where a road bends; for a two-point
+>   lane `s[len(s) // 2]` is the far END. 188 Chicago lanes change district,
+>   which moves both the district table and `mkod.py --dest-zones`
+>   destination shares. The prose above already promised assignment "by its
+>   MIDPOINT"; the code did something else, and the unit test asserted the
+>   endpoint — it pinned the bug, which is how the bug survived.
+>
+> Still open: the report carries no real network fingerprint, so a consumer
+> can project hotspot coordinates against a different network than the report
+> was computed on (#86). The `coverage` block's `network` path and
+> `network_lanes` count are a weak stand-in, not a hash.
 
 ## See also
 

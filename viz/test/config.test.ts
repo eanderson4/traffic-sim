@@ -36,6 +36,11 @@ test("overlay URLs default to the demosrv /overlay/ route, overridable", () => {
   assert.equal(custom.buildingsUrl, "/o/bl.geojson");
 });
 
+test("?report= points the stats panel at a run report; default is the sample", () => {
+  assert.equal(loadConfig("", "localhost").reportUrl, "/sample-runreport.json");
+  assert.equal(loadConfig("?report=/runs/ab/report.json", "localhost").reportUrl, "/runs/ab/report.json");
+});
+
 test("?bake= selects the baked-replay shim (ADR-0023); default is live", () => {
   assert.equal(loadConfig("", "localhost").bake, null);
   assert.equal(

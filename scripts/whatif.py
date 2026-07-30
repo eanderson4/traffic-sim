@@ -139,22 +139,88 @@ ADDED_LANE_SUFFIX = "_w1"
 
 # ------------------------------------------------------------------ metrics
 
-def load_metrics(path, warmup, corridors=None):
+def load_metrics(path, warmup, corridors=None, set_id=None):
     """Reduce one run's metrics JSON to the comparison scalars.
 
     Intervals are Edie's definitions per lane per interval, so network speed
     is sum(distance)/sum(time) over the window — NOT a mean of per-lane
     speeds, which would weight an empty side street the same as the Kennedy.
+
+    PARTIAL INTERVALS ARE DROPPED (ADR-0014 §3: comparison tooling drops
+    partials). A partial is the final window, cut short by the horizon: it
+    is emitted flagged rather than suppressed so tooling can decide, and the
+    decision of record is to exclude it. That makes the INTERVAL metrics
+    (speed, vmt, corridors) cover a window ending at the last complete
+    boundary, which can be well short of the horizon — the shipped Chicago
+    run's last interval is [10000,12000) of a 12,000-tick run, so its speed
+    window ends at 10,000. The window actually used is returned so the
+    report states it instead of implying the horizon.
+
+    TRIP MEANS STAY COMPLETED-ONLY, and that is the opposite of the naive
+    survivorship reading. A censored trip's time-loss is TRUNCATED at the
+    horizon, so folding it into the mean drags the mean DOWN — and the size
+    of that pull scales with active_at_horizon, which is precisely the
+    quantity that differs between arms. The arm that jams worst gets the
+    biggest downward bias on the metric that is supposed to show it jammed.
+    Same reasoning as engine/cmd/metview/main.go's tripBucket, and the
+    decision of record: docs/kb/articles/podcast-demo-workqueue.md (item g)
+    pins completed-only as v1 semantics, cemented by main_test.go, and says
+    changing it needs an ADR-0014 interpretation — with the likely answer
+    being a censored-inclusive BOUND alongside, not a redefinition.
+
+    So that is what this does. `mean_time_loss_s` is unchanged. Alongside it,
+    `time_loss_bound_s` averages every entered trip's accumulated loss —
+    a strict LOWER bound on what the full journeys would have shown, since
+    each censored term is truncated — and `censored_frac` states how much of
+    the population is censored, which ADR-0014 §2 requires of any
+    distribution statistic over trip records. A bound plus its censoring
+    share says what the mean alone cannot: whether the comparison is between
+    journeys or between jams.
+
+    ONE MEASUREMENT SET, for the same reason mkcongestionmap.py and
+    corridorspeed.py refuse otherwise: ADR-0014 permits overlapping sets over
+    the same lanes, and summing them counts the same vehicle-time twice.
     """
     with open(path) as f:
         m = json.load(f)
 
+    intervals = m.get("intervals", ())
+    sets = {iv.get("set_id") for iv in intervals}
+    if set_id is not None:
+        if set_id not in sets:
+            sys.exit(f"whatif: no measurement set {set_id!r} in {path} "
+                     f"(has {sorted(x for x in sets if x)})")
+        intervals = [iv for iv in intervals if iv.get("set_id") == set_id]
+    elif len(sets) > 1:
+        # len(sets), not len(named): an unset id is still a distinct set for
+        # double-counting purposes. --set is the way out, matching
+        # mkcongestionmap.py and corridorspeed.py rather than making the A/B
+        # harness the one tool that cannot read a legal file.
+        sys.exit(f"whatif: {path} carries {len(sets)} measurement sets "
+                 f"({sorted(x for x in sets if x)}) — summing them "
+                 f"double-counts vehicle-time in speed_kmh, vmt_km and every "
+                 f"corridor metric. Pass --set to pick one.")
+
     dist = time_s = 0.0
+    iv_begin = iv_end = None
     cdist = collections.Counter()
     ctime = collections.Counter()
-    for iv in m.get("intervals", ()):
+    for iv in intervals:
         if iv["begin_tick"] < warmup:
             continue
+        if iv.get("partial"):
+            continue
+        # The window is what was RETAINED, at both edges. Reporting the
+        # requested warmup as the start overstates precision the aggregate
+        # does not have: the cut lands on an interval boundary, so a warmup
+        # falling mid-interval drops that whole interval and the real start
+        # is later than the request.
+        bt = iv["begin_tick"]
+        if iv_begin is None or bt < iv_begin:
+            iv_begin = bt
+        et = iv.get("end_tick")
+        if et is not None and (iv_end is None or et > iv_end):
+            iv_end = et
         d, t = iv["sum_dist_m"], iv["sum_time_s"]
         dist += d
         time_s += t
@@ -172,22 +238,46 @@ def load_metrics(path, warmup, corridors=None):
                 cdist[key] += d
                 ctime[key] += t
 
-    losses, completed, trip_times = [], 0, []
+    losses, completed, censored, trip_times = [], 0, 0, []
+    all_losses = []
     for tr in m.get("trips", ()):
         if tr["entry_tick"] < warmup:
             continue
+        # Every entered trip feeds the BOUND; only completed ones feed the
+        # mean. See the docstring: censored losses are truncated, so mixing
+        # them into the mean biases it low in proportion to how jammed the
+        # arm is.
+        all_losses.append(tr["time_loss_s"])
         if tr.get("completed"):
             completed += 1
             losses.append(tr["time_loss_s"])
             trip_times.append((tr["exit_tick"] - tr["entry_tick"]) * m["dt"])
+        else:
+            censored += 1
 
     out = {
         "speed_kmh": (dist / time_s * 3.6) if time_s else float("nan"),
         "completed": completed,
         "mean_time_loss_s": mean(losses) if losses else float("nan"),
+        # Censored-inclusive LOWER bound: every entered trip's accumulated
+        # loss, with the unfinished ones truncated at the horizon. Read it
+        # against mean_time_loss_s — a large gap means the completed-only
+        # mean is describing the traffic that got out.
+        "time_loss_bound_s": mean(all_losses) if all_losses else float("nan"),
+        # Share of entered trips still in-network at the horizon. ADR-0014 §2
+        # requires distribution statistics over trip records to state their
+        # censored fraction: at 90% censoring the completed-only mean is a
+        # statement about the lucky, not about journeys.
+        "censored_frac": (censored / len(all_losses)) if all_losses
+                         else float("nan"),
         "mean_trip_s": mean(trip_times) if trip_times else float("nan"),
         "vmt_km": dist / 1000.0,
         "active_at_horizon": m["totals"]["active_at_horizon"],
+        # The window the INTERVAL metrics above actually cover — retained
+        # boundaries, not the requested ones. Carried per run rather than
+        # assumed from --ticks: the horizon is what was asked for, this is
+        # what was measured.
+        "interval_window": [iv_begin, iv_end],
     }
     dem = m["totals"].get("demand")
     out["delivered_frac"] = dem["delivered_frac"] if dem else float("nan")
@@ -290,9 +380,22 @@ def main():
     ap.add_argument("--jobs", type=int, default=6)
     ap.add_argument("--port-base", type=int, default=8600)
     ap.add_argument("--capacity", type=int, default=40000)
+    ap.add_argument("--drivers", type=int, default=0,
+                    help="serve -drivers N: driver controller replicas. The "
+                         "observation frame carries every claimed ego in ONE "
+                         "message and stops fitting the 4 MiB broker cap near "
+                         "10,200 egos PER CONTROLLER, so a run that peaks "
+                         "above that goes blind on one replica and its fleet "
+                         "coasts — which reads as congestion and voids the "
+                         "run. 0 leaves the flag off (serve's own default). "
+                         "Size it so peak vehicles / N stays under ~6,000.")
     ap.add_argument("--serve", default="./serve",
                     help="path to a built cmd/serve binary")
     ap.add_argument("--corridors", default=None)
+    ap.add_argument("--set", dest="set_id", default=None,
+                    help="measurement set to read when a run emits more than "
+                         "one (ADR-0014 permits overlapping sets; summing "
+                         "them double-counts vehicle-time)")
     ap.add_argument("--exclude", action="append", default=[],
                     help="pod subdirectory that is not an option (e.g. a "
                          "shared ADR-0012 base a variant resolves against)")
@@ -330,6 +433,26 @@ def main():
         # would let `--report --out` launder a --allow-void batch into one
         # that looks clean.
         args.voided = saved.get("voided", [])
+        # FAIL CLOSED on a report written before interval_window existed.
+        # Every checked-in report predates it, and they are exactly the
+        # measurements this tool now rejects: they summed horizon-partial
+        # intervals into a window they reported as the horizon. Skipping the
+        # window check for records that lack the field would let --report
+        # re-rank precisely those runs, and --out would then write them back
+        # carrying an empty window as though it had been verified.
+        # The window cannot be recovered from the report — it is a property
+        # of the metrics files, which --report does not read.
+        missing = sorted({v for v, rec in saved["variants"].items()
+                          for m in rec["per_seed"].values()
+                          if "interval_window" not in m})
+        if missing:
+            sys.exit(
+                f"whatif: {args.report} predates interval-window tracking "
+                f"(arms {missing} carry no interval_window), so its numbers "
+                f"include the horizon-partial interval that ADR-0014 §3 says "
+                f"comparison tooling drops — the defect that makes them "
+                f"unpublishable. Re-run the pod; a re-score cannot recover "
+                f"the window, because the metrics files are not read here.")
         report_pod(results, variants, seeds, args)
         return
 
@@ -376,9 +499,14 @@ def main():
 
     results = {}
     voided = []
+    # Every arm gets the SAME controller configuration. Driver count changes
+    # how much of the fleet stays under control, so varying it between arms
+    # would put a fidelity difference inside the measured difference.
+    serve_extra = ["-drivers", str(args.drivers)] if args.drivers else []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as ex:
         futs = {ex.submit(run_one, args.serve, os.path.join(args.pod, v), s,
-                          args.ticks, p, workdir, args.capacity, []): (v, s)
+                          args.ticks, p, workdir, args.capacity,
+                          serve_extra): (v, s)
                 for v, s, p in jobs}
         for fut in concurrent.futures.as_completed(futs):
             v, s = futs[fut]
@@ -404,7 +532,8 @@ def main():
                           file=sys.stderr)
                 voided.append((v, s))
                 continue
-            results[(v, s)] = load_metrics(mpath, args.warmup, corridors)
+            results[(v, s)] = load_metrics(mpath, args.warmup, corridors,
+                                           args.set_id)
             print(f"[whatif] done {v} seed {s}: "
                   f"{results[(v, s)]['speed_kmh']:.1f} km/h", file=sys.stderr)
 
@@ -435,14 +564,52 @@ def main():
 
 def report_pod(results, variants, seeds, args):
     """Rank and score. Split out so --report can re-score a saved run."""
-    keys = sorted({k for r in results.values() for k in r})
+    # Numeric metrics only: everything in `keys` gets averaged across seeds
+    # and t-tested, and interval_window is a pair of ticks, not a measurement.
+    keys = sorted({k for r in results.values() for k, v in r.items()
+                   if isinstance(v, (int, float))})
     base_by_seed = {s: results[(args.baseline, s)] for s in seeds
                     if (args.baseline, s) in results}
     if not base_by_seed:
         sys.exit("baseline produced no successful runs")
 
+    # What the interval metrics actually cover, as opposed to the horizon
+    # that was requested. Dropping the horizon-partial interval (ADR-0014 §3)
+    # ends the speed window at the last complete boundary, so a 12,000-tick
+    # run with 3,000-tick intervals reports speed over 4,000-10,000. Every
+    # arm should land on the same window — they share seeds, horizon and
+    # interval grid — so a disagreement means the arms are not comparable on
+    # these metrics, and it is reported rather than averaged away.
+    # sorted() with a key that cannot compare None: an arm whose intervals
+    # were ALL dropped reports [None, None], and sorting that against an
+    # integer pair raises TypeError — a crash in the very path that exists to
+    # report incomparability.
+    windows = sorted({tuple(r["interval_window"]) for r in results.values()
+                      if r.get("interval_window")},
+                     key=lambda w: tuple(-1 if x is None else x for x in w))
+    if len(windows) > 1:
+        # FAIL CLOSED. A warning here would be printed above a report that
+        # still t-tests the arms, labels them UPGRADE/WORSE and writes the
+        # JSON — and the whole point of the finding is that those numbers do
+        # not describe the same window. This is the same rule the fidelity
+        # gate follows: refuse to publish rather than publish with a caveat
+        # nobody reads.
+        sys.exit(f"whatif: arms measured DIFFERENT interval windows "
+                 f"{[list(w) for w in windows]} — interval metrics (speed, "
+                 f"vmt_km, corridor:*) are not comparable across them, so "
+                 f"ranking them would be meaningless. Re-run the arms that "
+                 f"disagree on the same horizon and interval grid.")
+    if windows and any(x is None for x in windows[0]):
+        sys.exit(f"whatif: no complete measurement interval survived the "
+                 f"warmup cut (window {list(windows[0])}) — every interval "
+                 f"was either before --warmup {args.warmup} or flagged "
+                 f"partial. There is nothing to compare.")
+
     report = {"pod": args.pod, "baseline": args.baseline, "seeds": seeds,
               "ticks": args.ticks, "warmup": args.warmup,
+              # A pair [warmup, last complete interval end], or several if
+              # the arms disagreed. NOT the horizon — see above.
+              "interval_window": [list(w) for w in windows],
               # Empty on a clean batch. Non-empty only reaches here via
               # --allow-void, and travels with the numbers so a reader of the
               # JSON sees which runs were dropped without re-reading the logs.
@@ -487,7 +654,12 @@ def report_pod(results, variants, seeds, args):
     # Secondary metrics, unranked — an option that raises speed by shutting
     # traffic out is not an upgrade, and throughput is where that shows.
     print(f"\n--- supporting metrics (means over seeds)")
-    sec = [k for k in ("completed", "mean_time_loss_s", "mean_trip_s",
+    # censored_frac and time_loss_bound_s ride WITH mean_time_loss_s, not
+    # only in the JSON: a completed-only mean whose population is 40%
+    # censored is a different claim from one at 2%, and the printed table is
+    # what gets read aloud and pasted into docs.
+    sec = [k for k in ("completed", "mean_time_loss_s", "time_loss_bound_s",
+                       "censored_frac", "mean_trip_s",
                        "active_at_horizon", "delivered_frac") if k in keys]
     corr = [k for k in keys if k.startswith("corridor:")]
     hdr = sec + corr

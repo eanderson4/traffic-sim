@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "_comment": [
+    "AM peak demand profiles for chi-loop-urban, as fractions of each flow's",
+    "peak-hour rate. 600 s steps x 9 = 5400 s = 54,000 ticks at dt=0.1.",
+    "",
+    "Shapes differ by TRIP PURPOSE, which is the point: a single global curve",
+    "makes freight peak with commuters and sends the reverse-commute direction",
+    "downtown at the same moment as the inbound direction. Fractions are",
+    "napkin-anchored to the usual diurnal shapes, NOT calibrated counts -- the",
+    "same posture as every other rate in this scenario.",
+    "",
+    "All four end in zeros so the network drains with arrivals off. Whether",
+    "congestion clears during that tail is what separates a loaded network",
+    "from an over-saturated one."
+  ],
+  "step_s": 600,
+  "profiles": {
+    "commute-am": [0.45, 0.70, 1.00, 1.00, 0.80, 0.60, 0.0, 0.0, 0.0],
+    "freight": [0.70, 0.80, 0.85, 0.90, 0.90, 0.85, 0.0, 0.0, 0.0],
+    "reverse-commute": [0.30, 0.40, 0.55, 0.60, 0.55, 0.45, 0.0, 0.0, 0.0],
+    "baseline": [0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.0, 0.0, 0.0]
+  },
+  "default": "commute-am",
+  "assign": [
+    {
+      "_why": "Residents leaving downtown towers are largely counter-peak: they are already in the core, so they are not what fills the inbound expressways.",
+      "kind": "resident",
+      "profile": "reverse-commute",
+      "scale": 1.0
+    },
+    {
+      "_why": "Interior mainline injections carry the freight mix (see mkod.py's ramp block), and freight peaks earlier and flatter than commuting.",
+      "kind": "interior",
+      "profile": "freight",
+      "scale": 1.0
+    }
+  ]
+}

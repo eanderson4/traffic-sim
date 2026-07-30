@@ -7,6 +7,9 @@
 // `?bake=<index.json URL>` selects the baked-replay shim (ADR-0023): the
 // recording replays from static artifacts, `?ws=` is inert, and `?run=`
 // is display-only (the shim echoes the index's run id).
+// `?report=` points the run-statistics panel (statspanel.ts) at a
+// runreport.py --json document; the report itself can also be dropped onto
+// the map, since reports live in gitignored run directories (ADR-0030).
 // `?center=lng,lat` (+ optional `?zoom=`, `?bearing=`, `?pitch=`) pins the
 // opening camera instead of fitting the network's bounds — a deep link to
 // one intervention, so a demo opens already pointed at the thing being
@@ -74,6 +77,8 @@ export interface VizConfig {
   boundariesUrl: string;
   waterUrl: string;
   buildingsUrl: string;
+  reportUrl: string; // ?report= — runreport.py --json document (ADR-0030 schema v1)
+  flowUrl: string; // ?flow= — mkflowcurve.py document (flowpanel.ts schema v1)
   bufferMs: number;
   dt: number; // engine timestep, s — sim seconds per tick
   theme: string; // theme.ts THEMES key (navy default, resolved by getTheme)
@@ -118,6 +123,16 @@ export function loadConfig(search: string, hostname: string): VizConfig {
     boundariesUrl: p.get("boundaries") ?? "/overlay/boundaries.geojson",
     waterUrl: p.get("water") ?? "/overlay/water.geojson",
     buildingsUrl: p.get("buildings") ?? "/overlay/buildings.geojson",
+    // The checked-in sample so the panel has something real to render on a
+    // bare `pnpm dev`; a run's own report is passed with ?report= or
+    // dropped on the map.
+    reportUrl: p.get("report") ?? "/sample-runreport.json",
+    // The flow curve is a SEPARATE document from the report, not a block
+    // inside it: runreport.py streams the metrics file and deliberately
+    // avoids a second full pass over `trips`, which is exactly what the
+    // curve needs. Optional like every other panel source — a 404 hides
+    // the panel rather than failing the app.
+    flowUrl: p.get("flow") ?? "/sample-flow.json",
     bufferMs: Number.isFinite(buffer) && buffer >= 0 ? buffer : 250,
     dt: Number.isFinite(dt) && dt > 0 ? dt : 0.1,
     theme: resolveThemeName(p.get("theme"), stored),

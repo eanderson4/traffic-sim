@@ -17,6 +17,7 @@ Self-contained by construction: no CDN, no fetch, no build step. The page
 has to work on a laptop with flaky conference wifi.
 """
 import argparse
+import base64
 import html
 import json
 import os
@@ -68,6 +69,14 @@ CAVEATS = {
         "in it is signal queueing under full car-following control, and the "
         "options are compared against the same baseline on the same seeds.",
     "chi-loop-urban":
+        "<b>These numbers are superseded and are being re-measured.</b> They "
+        "were produced before the comparison tooling dropped horizon-partial "
+        "intervals (ADR-0014 §3), so they average a truncated final interval "
+        "into a window reported as 12,000 ticks; and the arms ran without "
+        "<code>-drivers</code>, at about 1.5% uncontrolled coasting against a "
+        "0.1% bar, so part of the fleet had no car-following control. The "
+        "paired design means the RANKING is likely to survive both; the "
+        "absolute speeds are not a measurement of the scenario as written. "
         "Lane widening is <b>inconclusive</b>, not disproven: added lanes "
         "carry only ~6.6% of their corridor's traffic in this model, so a "
         "widening result cannot separate \"it doesn't help\" from \"we "
@@ -141,7 +150,12 @@ border-color:var(--accent);font-weight:600}
    changes size between the setup and the options reads as a different one. */
 #setup{background:var(--card);border:1px solid var(--edge);border-radius:12px;
 padding:1rem 1.2rem;margin:0 0 1rem;max-width:calc(50% - .5rem)}
-#setup svg{display:block;width:100%;height:auto}
+#setup svg,#setup img{display:block;width:100%;height:auto}
+.lgnd{display:flex;flex-wrap:wrap;gap:.5rem .9rem;align-items:center;
+margin-top:.6rem;font-size:.78rem;color:var(--dim)}
+.lgnd .sw{display:inline-flex;align-items:center;gap:.3rem}
+.lgnd .sw i{width:.85rem;height:.85rem;border-radius:2px;display:inline-block}
+.lgnd-note{flex-basis:100%;color:var(--dim)}
 @media (max-width:720px){#setup{max-width:none}}
 /* Exactly two columns: four options auto-fitted at 1100px wrap 3+1, which
    reads as a ranking rather than a set of equals. */
@@ -360,15 +374,134 @@ Neither shape was arranged in advance — the measurement decided it.</p>
 """
 
 
-def diagram(root, key, option):
-    """Inline SVG for one option, or "" when none was generated."""
-    if not root:
+def diagram(root, key, option, omit=()):
+    """Inline artwork for one option, or "" when none was generated.
+
+    `omit` names artwork to leave OUT of the page while leaving the file on
+    disk. build-quiz.sh's CHI_SKIP_MAP path needs that: the Chicago map and
+    its sidecar are tracked files, and deleting them to suppress the slide
+    left a stageable deletion in the checkout — one `git add -A` from
+    committing the removal of a shipped asset. Suppression is a property of
+    this build, not a reason to destroy the artifact.
+
+    SVG first, then PNG as a data URI. The two authored pods draw as plan
+    views (mkoptiondiag.py), which are vector and tiny. The Chicago cut
+    cannot be: 55,555 lanes is 10-20 MB of SVG, and the page inlines what it
+    shows. Its setup slide is a rendered congestion map instead
+    (mkcongestionmap.py), ~150 KB of PNG, which base64 inlines to ~200 KB —
+    acceptable for a page that must open on conference wifi with no CDN and
+    no fetch, which an SVG of the same map would not be.
+    """
+    if not root or f"{key}__{option}" in omit:
         return ""
-    path = os.path.join(root, f"{key}__{option}.svg")
-    if not os.path.exists(path):
-        return ""
-    with open(path) as f:
-        return f.read().strip()
+    svg = os.path.join(root, f"{key}__{option}.svg")
+    if os.path.exists(svg):
+        with open(svg) as f:
+            return f.read().strip()
+    png = os.path.join(root, f"{key}__{option}.png")
+    if os.path.exists(png):
+        with open(png, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+        alt = (f"{key} network, every lane coloured by its measured speed as "
+               f"a share of its posted limit")
+        out = (f'<img src="data:image/png;base64,{b64}" '
+               f'alt="{html.escape(alt)}">')
+        # A colour map nobody can decode is decoration. The legend and the
+        # provenance ride WITH the picture, from the sidecar the generator
+        # writes — not retyped here, for the same reason no number is.
+        # A PNG with no readable sidecar is a build FAILURE, not a quiet
+        # downgrade to an uncaptioned image. Without it the page would show a
+        # colour map whose bands, measurement window and source run are all
+        # unknown — precisely the "drawing of an opinion" the generator's
+        # banner disclaims, and indistinguishable on screen from a good one.
+        try:
+            with open(png + ".json") as f:
+                prov = json.load(f)
+        except (OSError, ValueError) as exc:
+            sys.exit(f"mkquiz: {png} has no readable provenance sidecar "
+                     f"({png}.json: {exc}). Regenerate it with "
+                     f"scripts/show/mkcongestionmap.py, which writes the "
+                     f"sidecar alongside the image.")
+        if prov.get("lanes_with_traffic") == 0:
+            sys.exit(f"mkquiz: {png} was drawn from a window in which NO lane "
+                     f"carried traffic (sidecar lanes_with_traffic=0) — an "
+                     f"all-empty map reads as a quiet network. Regenerate it "
+                     f"against a window the run actually covers.")
+        # The legend is what makes the picture readable: without it the map
+        # is coloured shapes with no key, which is the same undecodable
+        # artefact the missing-sidecar exit above refuses. Validate the shape
+        # too — indexing rgb[0..2] on a hand-edited sidecar would otherwise
+        # die with a bare IndexError while every other failure here explains
+        # itself.
+        def _rgb_ok(c):
+            return (isinstance(c, (list, tuple)) and len(c) >= 3
+                    and all(isinstance(x, int) for x in c[:3]))
+
+        bands = prov.get("bands")
+        if not bands or not all(
+                isinstance(b, (list, tuple)) and len(b) == 2
+                and isinstance(b[0], (int, float)) and _rgb_ok(b[1])
+                for b in bands):
+            sys.exit(f"mkquiz: {png}'s sidecar has no usable 'bands' — the "
+                     f"map would render with no legend, which is a picture "
+                     f"of colours nobody can read. Regenerate it with "
+                     f"mkcongestionmap.py.")
+        if not _rgb_ok(prov.get("empty_rgb")):
+            sys.exit(f"mkquiz: {png}'s sidecar has no usable 'empty_rgb' — "
+                     f"the 'no traffic' colour would be unlabelled, and an "
+                     f"empty lane reads as a fast one. Regenerate it with "
+                     f"mkcongestionmap.py.")
+        swatches, lo = [], 0.0
+        for hi, rgb in bands:
+            # Non-overlapping and half-open [lo, hi). "under 40%" was
+            # wrong in the other direction — it also contains the under-20%
+            # band, so two swatches claimed the same lane.
+            if hi > 1.0:
+                label = f"{lo:.0%}+"
+            elif lo == 0.0:
+                label = f"under {hi:.0%}"
+            else:
+                label = f"{lo:.0%}\u2013{hi:.0%}"
+            swatches.append(
+                f'<span class="sw"><i style="background:rgb({rgb[0]},{rgb[1]},'
+                f'{rgb[2]})"></i>{label}</span>')
+            lo = hi
+        e = prov["empty_rgb"]
+        swatches.append(
+            f'<span class="sw"><i style="background:rgb({e[0]},{e[1]},'
+            f'{e[2]})"></i>no traffic</span>')
+        n = prov.get("lanes_with_traffic")
+        tot = prov.get("lanes_drawn")
+        note = "share of each lane\u2019s own posted speed limit"
+        # `is not None`: 0 is the case worth printing loudest, not the case
+        # to hide — though the guard above means it cannot reach here.
+        if n is not None and tot:
+            note += f" \u00b7 {n:,} of {tot:,} lanes carried traffic"
+        # `is not None`, not truthiness: warmup 0 is the case where saying
+        # so matters most, because the fill-up transient is then included.
+        eff = prov.get("first_interval_tick")
+        if eff is None:
+            eff = prov.get("warmup_tick")
+        # BOTH ends, not just the start. Dropping partial intervals
+        # (ADR-0014) can pull the effective end well short of the run's
+        # horizon \u2014 the shipped Chicago map covers 4,000-10,000 of a
+        # 12,000-tick run, because the last interval was cut short by the
+        # horizon \u2014 and a caption that gives only the start reads as though
+        # the window runs to the end of the run.
+        end = prov.get("last_interval_end")
+        if eff is not None and end is not None:
+            note += f" \u00b7 measured over ticks {eff:,}\u2013{end:,}"
+        elif eff is not None:
+            note += f" \u00b7 measured from tick {eff:,}"
+        if prov.get("run_label"):
+            note += f" \u00b7 {prov['run_label']}"
+        cav = prov.get("note")
+        extra = (f'<span class="lgnd-note">{html.escape(cav)}</span>'
+                 if cav else "")
+        return (out + '<div class="lgnd">' + "".join(swatches) +
+                f'<span class="lgnd-note">{html.escape(note)}</span>'
+                + extra + '</div>')
+    return ""
 
 
 def main():
@@ -385,10 +518,22 @@ def main():
                     help="filesystem root the baselines' /baked/... paths "
                          "resolve against, for that existence check")
     ap.add_argument("--diagrams", default="",
-                    help="directory of mkoptiondiag.py SVGs, named "
-                         "<scenario>__<option>.svg; missing ones are simply "
-                         "omitted so a scenario can ship text-only")
+                    help="directory of artwork named "
+                         "<scenario>__<option>.svg (mkoptiondiag.py plan "
+                         "views) or <scenario>__<option>.png "
+                         "(mkcongestionmap.py rasters, inlined as data URIs "
+                         "with the legend and provenance from the sidecar "
+                         "<name>.png.json). SVG wins if both exist; missing "
+                         "artwork is simply omitted so a scenario can ship "
+                         "text-only")
+    ap.add_argument("--omit-diagram", action="append", default=[],
+                    metavar="SCENARIO__OPTION",
+                    help="leave this artwork out of the page without "
+                         "deleting it (repeatable). For suppressing a "
+                         "tracked asset in one build — deleting it instead "
+                         "leaves a stageable deletion behind")
     args = ap.parse_args()
+    omit = set(args.omit_diagram)
 
     baselines = {}
     if args.baselines:
@@ -422,7 +567,7 @@ def main():
             "caveat": CAVEATS.get(key, ""),
             "baseline": baselines.get(key),
             # Same inlining rationale as the per-option diagrams below.
-            "setup": diagram(args.diagrams, key, "setup"),
+            "setup": diagram(args.diagrams, key, "setup", omit),
             "winner": d["winner"], "seeds": d["seeds"], "ticks": d["ticks"],
             "metric": d["metric"],
             "options": [{
@@ -438,7 +583,7 @@ def main():
                 # network. Not escaped, unlike the label — this is markup
                 # this repo generated from the simulated network, and
                 # escaping it would print the SVG source.
-                "diagram": diagram(args.diagrams, key, o["name"]),
+                "diagram": diagram(args.diagrams, key, o["name"], omit),
                 "assumption": html.escape(
                     ASSUMPTIONS.get((key, o["name"]), "")),
             } for o in d["options"]],

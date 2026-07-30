@@ -46,16 +46,26 @@
     54,
     62
   ],
+  "end_tick": null,
   "first_interval_tick": 3000,
   "lanes_drawn": 55555,
+  "lanes_measured_empty": 30962,
+  "lanes_unmeasured": 0,
   "lanes_with_traffic": 24593,
+  "last_interval_end": 6000,
+  "measured_lanes_in_set": 55555,
   "metrics": "data/baked/chishow35.metrics.json",
   "metrics_bytes": 42560318,
   "metrics_sha256": "6e348d4bb7abb94c50e8e93de23d3293b2b64feaedde8fe56c8aef800f1a8f06",
   "network": "data/networks/chi-loop-urban/chi-loop-urban.json",
   "note": "",
-  "run_label": "chishow35 (chi-show-fw35, seed 42, 6000 ticks, -drivers 8)",
+  "run_label": "",
   "set_id": "net",
+  "unmeasured_rgb": [
+    28,
+    32,
+    38
+  ],
   "warmup_tick": 3000,
   "width": 1600
 }

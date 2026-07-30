@@ -61,6 +61,8 @@ import { Legend } from "./legend.ts";
 import { DEFAULT_TOGGLES, layerOpsFor, type ToggleState } from "./layertoggles.ts";
 import { DemoSwitcher, demoIdFromNetUrl } from "./switcher.ts";
 import { ModelPanel } from "./modelpanel.ts";
+import { StatsPanel } from "./statspanel.ts";
+import { FlowPanel } from "./flowpanel.ts";
 import { ReplayPanel } from "./replaypanel.ts";
 import { THEMES, getTheme, glyphByCls } from "./theme.ts";
 import { bodyImages, glyphImageId, TRACTOR_IMAGE_ID, TRAILER_IMAGE_ID, ICON_SIZE_STOPS } from "./glyphs.ts";
@@ -399,6 +401,33 @@ async function main(): Promise<void> {
     attributionControl: false,
   });
   map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-right");
+
+  // Run statistics (statspanel.ts): the standard run report — ADR-0030
+  // schema v1, written by scripts/runreport.py --json. Mounted here rather
+  // than with the other panels because the hotspot rows fly the map: the
+  // report's coordinates are the ENGINE's local metric frame, so they go
+  // through the same projector the network did. Reports live in gitignored
+  // run directories, hence the drop target on the whole document — a
+  // report from any run can be inspected without serving it first. Hides
+  // itself when ?report= (default /sample-runreport.json) 404s, like every
+  // other optional panel.
+  void new StatsPanel(document.getElementById("stats")!, {
+    url: cfg.reportUrl,
+    dropTarget: document.body,
+    onHotspot: (h) => {
+      // Zoom 16: close enough to see the queue on the lane, wide enough to
+      // keep its upstream approach in frame.
+      map.flyTo({ center: project(h.x, h.y), zoom: Math.max(map.getZoom(), 16) });
+    },
+  }).init();
+
+  // Flow (flowpanel.ts): arrivals, departures and the accumulation between
+  // them, from a mkflowcurve.py document. Its marker is driven by the
+  // SNAPSHOT tick below rather than by polling the replay control plane, so
+  // it follows play, pause, speed and seek with no extra machinery — and it
+  // works identically on a live run, which has no control plane to poll.
+  const flowPanel = new FlowPanel(document.getElementById("flow")!, { url: cfg.flowUrl });
+  void flowPanel.init();
 
   // currentDt is THE sim timestep for every viz-side sim-math consumer
   // (buffer speeds, seek-gate threshold, artic integration). It starts at
@@ -1351,6 +1380,7 @@ async function main(): Promise<void> {
         }
         hud.setFrame(sample.tick, sample.vehicles.length, sample.starved);
         legend.setTick(sample.tick);
+        flowPanel.setTick(sample.tick);
         updateCongestion(nowMs);
         updateSignals(sample.tick);
       }
