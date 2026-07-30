@@ -20,6 +20,25 @@
   "covers_network": true,
   "zero_length_lanes": 0
  },
+ "totals_scope": {
+  "window": [
+   "veh_km",
+   "veh_h",
+   "edie_kmh"
+  ],
+  "run": [
+   "completed_trips",
+   "active_at_horizon",
+   "injected_trips",
+   "mean_time_loss_s",
+   "total_time_loss_s"
+  ],
+  "static": [
+   "lane_km",
+   "corridor_lane_km"
+  ],
+  "window_is_whole_run": true
+ },
  "totals": {
   "lane_km": 2203.79708,
   "corridor_lane_km": 424.81232,
