@@ -227,13 +227,20 @@ def load_metrics(path, warmup, corridors=None, set_id=None):
         if corridors:
             lid = iv["lane_id"]
             key = corridors.get(lid)
-            if key is None and lid.endswith(ADDED_LANE_SUFFIX):
+            if key is None:
                 # A lane added by mknetvariant --add-lane is not in the base
                 # network's corridor lookup, so it would be dropped from the
                 # corridor average — silently excluding exactly the capacity
                 # the variant added, and biasing the widened arm against
                 # itself. Attribute the clone to its donor's corridor.
-                key = corridors.get(lid[:-len(ADDED_LANE_SUFFIX)])
+                # Repeated widening STACKS the suffix (X_w1_w1), so strip
+                # until the label map recognizes what is left — one strip
+                # only would drop the second added lane from exactly the
+                # comparison it exists to inform.
+                base = lid
+                while key is None and base.endswith(ADDED_LANE_SUFFIX):
+                    base = base[:-len(ADDED_LANE_SUFFIX)]
+                    key = corridors.get(base)
             if key:
                 cdist[key] += d
                 ctime[key] += t

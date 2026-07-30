@@ -9,14 +9,23 @@ rather than a hand-edited 45 MB file.
     mknetvariant.py --network in.json --out out.json \\
         --corridors corridors.json --add-lane "Lake Shore" --retime 0.66
 
-Operations (composable, applied in the order listed here):
+Operations (composable, applied in the order listed here — note that is
+drop-lane BEFORE add-lane, so within one invocation a drop cannot remove
+a lane the same invocation added; doing both to one corridor reshuffles
+rather than no-ops):
 
   --retime F            scale every GREEN phase duration by F, holding amber
                         and all-red fixed. F<1 shortens the cycle.
-  --add-lane CORRIDOR   widen every edge of a corridor by one lane
-  --drop-lane CORRIDOR  narrow every edge of a corridor by one lane (a bus
-                        lane or protected bikeway taken from general traffic)
   --speed CORRIDOR=KPH  reset the speed limit on a corridor
+  --drop-lane CORRIDOR  narrow every edge of a corridor by one lane (a bus
+                        lane or protected bikeway taken from general
+                        traffic). Sees only LABELLED lanes: a drop in a
+                        LATER invocation than an --add-lane removes the
+                        outermost labelled lane, not the synthetic clone.
+  --add-lane CORRIDOR   widen every edge of a corridor by one lane;
+                        repeat it to widen by two (the second pass clones
+                        the first pass's clones, one lateral step further
+                        out — a single pass can only ever add one)
 
 WHAT ADDING A LANE ACTUALLY MEANS HERE
 --------------------------------------------------------------------------
@@ -233,9 +242,26 @@ def main():
     # ---- lane additions -------------------------------------------------
     for name in args.add_lane:
         ids, keys = corridor_lanes(lanes, corridors, name)
+        # Corridor membership comes from the label map, which never learns
+        # about clones — but a clone belongs to the same EDGE as its donor,
+        # and the outermost lane of that edge is the donor for the NEXT
+        # widening. Group the whole edge so a repeated --add-lane (widen by
+        # two) widens past its own clones; grouping only the labelled lanes
+        # would clone the same outermost lane twice under the same _w1 id.
+        edges = {L.get("edge") for L in lanes if L["id"] in ids}
+        # A labelled lane carrying "edge": null (or no edge key) would put
+        # None in the set and match every internal lane (they carry no edge
+        # key) into a by_edge[None] group. None in this network today; keep
+        # the invariant true rather than observed.
+        edges.discard(None)
         by_edge = collections.defaultdict(list)
         for L in lanes:
-            if L["id"] in ids:
+            # Junction-internal lanes carry no edge key; they are never a
+            # widening donor, so they simply cannot match. The group is the
+            # WHOLE edge, not just the labelled lanes: the donor of the
+            # clone can be an unlabelled outermost lane of a corridor edge
+            # — you widen the edge, not the label.
+            if L.get("edge") in edges:
                 by_edge[L["edge"]].append(L)
         added = []
         feeders = {}
