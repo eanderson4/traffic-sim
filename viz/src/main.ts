@@ -89,7 +89,7 @@ function headSizeAt(z: number): number {
 }
 
 async function main(): Promise<void> {
-  const cfg = loadConfig(location.search, location.hostname);
+  const cfg = loadConfig(location.search, location.hostname, location.protocol);
   // Resolve the palette once (?theme=, navy default): every MapLibre paint
   // prop, the legend, the signal-head sprite, and the HUD CSS variables
   // below read from this one ThemeSpec.
@@ -1177,7 +1177,17 @@ async function main(): Promise<void> {
   const snapSub =
     cfg.bake !== null
       ? (bakedSub = await subscribeBaked(cfg.bake, onSnapFrame, handleSigMessage, onSnapStatus))
-      : await subscribeSnapshots(cfg.ws, cfg.run, onSnapFrame, handleSigMessage, onSnapStatus);
+      : await subscribeSnapshots(cfg.ws, cfg.run, onSnapFrame, handleSigMessage, onSnapStatus).catch((err) => {
+          // The failure is known to be the engine connection, so the
+          // guidance can name the target and the fallback without
+          // misdiagnosing an unrelated startup error. /quiz.html is the
+          // route that works under every static server (Pages pretty-URLs
+          // it to /quiz; the local serve-baked does no rewrite).
+          const why = err instanceof Error ? err.message : String(err);
+          throw new Error(
+            `cannot reach a live engine at ${cfg.ws} (${why}) — this page drives a live connection; the recorded scenarios are at /quiz.html`,
+          );
+        });
   natsConn = snapSub.nc;
   requestSig(); // attach-time pull (ADR-0016 §3): don't wait out a catch-up round
   reportViewport(); // the shim's first region set + vehicle-gate state

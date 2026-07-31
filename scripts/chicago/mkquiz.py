@@ -329,6 +329,8 @@ window.addEventListener('DOMContentLoaded', () => {
 PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+<link rel="alternate icon" type="image/png" href="/favicon-32.png" />
 <title>Which upgrade actually works? — traffic simulation</title>
 <style>%(css)s</style></head><body>
 <div class="wrap">

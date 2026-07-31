@@ -99,7 +99,7 @@ export function resolveThemeName(urlParam: string | null, stored: string | null)
   return "navy";
 }
 
-export function loadConfig(search: string, hostname: string): VizConfig {
+export function loadConfig(search: string, hostname: string, protocol = "http:"): VizConfig {
   const p = new URLSearchParams(search);
   const buffer = Number(p.get("buffer") ?? "250");
   const dt = Number(p.get("dt") ?? "0.1");
@@ -114,7 +114,9 @@ export function loadConfig(search: string, hostname: string): VizConfig {
   }
   return {
     run: p.get("run") ?? "demo",
-    ws: p.get("ws") ?? `ws://${hostname}:8443`,
+    // Scheme follows the page: an https page may not open an insecure ws://
+    // socket (mixed content), so static hosting over TLS must default wss.
+    ws: p.get("ws") ?? `${protocol === "https:" ? "wss" : "ws"}://${hostname}:8443`,
     bake: p.get("bake"),
     networkUrl: p.get("net") ?? "/network.geojson",
     // Static WGS84 overlays (demosrv /overlay/); optional — a 404 just

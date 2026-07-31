@@ -49,6 +49,15 @@ test("?bake= selects the baked-replay shim (ADR-0023); default is live", () => {
   );
 });
 
+// An https page may not open an insecure ws:// socket (mixed content), so
+// the default ws URL's scheme follows the page protocol — static hosting
+// over TLS (the Pages quiz deploy) must not die on a mixed-content throw.
+test("default ws scheme follows the page protocol", () => {
+  assert.equal(loadConfig("", "localhost").ws, "ws://localhost:8443");
+  assert.equal(loadConfig("", "localhost", "https:").ws, "wss://localhost:8443");
+  assert.equal(loadConfig("?ws=ws://explicit:1", "localhost", "https:").ws, "ws://explicit:1");
+});
+
 // --- ?center= opening camera -------------------------------------------
 // The camera exists so a demo can deep-link to ONE intervention. The
 // failure that matters is a malformed link on air: it must degrade to the
