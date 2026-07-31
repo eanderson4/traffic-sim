@@ -1,6 +1,10 @@
 # ADR-0035: Batched intent log and compressed record storage
 
-- **Status:** PROPOSED
+- **Status:** PROPOSED — **BLOCKED, do not enable by default.** The storage
+  win is measured and real (11.1× end to end), but so is a fidelity cost found
+  while measuring it: batching makes the record plane fast enough to change
+  which tick an asynchronous controller's intents land on, and a live run stops
+  being reproducible run to run. See "Measured outcome" below.
 - **Date:** 2026-07-29
 - **Amends:** ADR-0006 §4–§5 (record plane) by adding one subject and one
   payload format. ADR-0026's scope note ("the record plane never sees a
@@ -145,6 +149,55 @@ Costs and risks:
   requirement at that horizon, not a tuning knob. `scripts/whatif.py` passes
   it; `scripts/chicago/fwsweep.sh` does not. Storage and memory are separate
   ceilings and the memory one binds first.
+
+## Measured outcome (2026-07-29)
+
+6,000 ticks of `chi-loop-urban` (the A/B base demand), `-drivers 8`,
+`-intent-log=false`, one config per run, store measured on disk:
+
+| config | store | vs. before |
+|---|---|---|
+| per-message, uncompressed (before) | 1,214,946,593 B | — |
+| **batched**, uncompressed | 354,768,830 B | **3.42×** |
+| **batched + S2** | 109,489,567 B | **11.10×** |
+
+So batching is the larger single factor and S2 adds another 3.24× on top.
+Stream blocks fell from 145 to 43. Extrapolated, the 48 GiB `chihalf`
+recording would be ~4.3 GiB.
+
+**And the blocker.** Repeating the identical run per config, comparing the
+engine's own end-of-run counters:
+
+| config | lanechanges over repeated runs | reproducible |
+|---|---|---|
+| per-message, uncompressed | 2586, 2586, 2586, 2586, 2586 | **yes (5/5)** |
+| batched, uncompressed | 2565, 2586, 2580 | **no** |
+| batched + S2 | 2562, 2577, 2588 | **no** |
+
+`despawned` moves with it (180–182 against a stable 181). The pre-change
+format is bit-stable across five runs; both new configs vary across three
+each, so this is **introduced here, not a pre-existing property** — which is
+what the repeated pre-change runs were done to establish, after an initial
+reading of "compression changed the simulation" turned out to be the wrong
+attribution.
+
+The mechanism is speed, not correctness. `LogTick` ends in `awaitBatch`, so
+the tick loop blocks on pubacks; going from ~3,500 publishes per tick to one
+makes a tick complete far sooner. Under `-pace 0` there is no per-tick barrier
+against the driver — only the attach barrier at tick 0 — so the engine races
+ahead and a controller's TSIB for tick N can arrive after tick N was stepped,
+landing the intents a tick later and taking hold-last re-issues
+(`logFlagHeld`) instead. The old format was slow enough that the driver always
+kept up. Nothing about the record is wrong: whatever happened is recorded
+faithfully and replays exactly, CRC-verified. What breaks is the comparability
+of two LIVE runs, which is the foundation of the paired-seed A/B protocol.
+
+This must be resolved before either flag defaults on. Candidate directions,
+none yet evaluated: make the engine wait for each controller's cadence-due
+intents under `-pace 0` (a real per-tick barrier, which is arguably the right
+fix independent of this ADR and would make live runs reproducible for the
+first time); or decouple `awaitBatch` from the tick loop so record-plane speed
+cannot influence the engine/driver race in either direction.
 
 ## Migration note
 
