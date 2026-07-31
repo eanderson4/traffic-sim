@@ -87,7 +87,12 @@ shape as the pre-existing first-use build rule.
 
 Hysteresis: lane i keeps its FREE-FLOW (static-table) next-hop unless the
 new path beats the static path's cost under current frozen weights by
-more than max(30 s, 15%). The reference is the static table, NOT the
+more than max(30 s, 15%). Both costs are REALIZED for the candidate (the
+mixed chain with the splice installed), while the defended old path is
+the pure static chain — a documented asymmetry: if downstream lanes
+already accepted splices, the served old path and the compared static
+path can differ; the static chain is the stable reference, so that is
+the comparison the rule makes. The reference is the static table, NOT the
 previous epoch's adaptive table — with hysteresis history, a mid-run
 restore (derived tables rebuilt empty) picks hops the live engine had
 rejected, an ADR-0029 replay violation found in external review; with the

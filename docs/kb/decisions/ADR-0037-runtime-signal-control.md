@@ -70,7 +70,7 @@ network-level adaptive control is a research program of its own.
   per-approach state. Per-phase with hold-until is the current lean —
   expressive enough for actuation, coarse enough to keep the starvation
   rails simple.
-- Keyframe/CRС scope: override table per signal id, plus the
+- Keyframe/CRC scope: override table per signal id, plus the
   deterministic resume point of the underlying fixed-time program
   (derived from tick — no extra state, verify at implementation).
 - Interaction with epoch routing (ADR-0036): a held phase changes lane
