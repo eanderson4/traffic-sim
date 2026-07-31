@@ -1,0 +1,102 @@
+diff --git a/scripts/chicago/mkquiz.py b/scripts/chicago/mkquiz.py
+index 565dd5a2d71a1e2906c728b50eba7fe4dbf539d1..c67c6fd62752dd8a07651a25d4416d335b79966c 100755
+--- a/scripts/chicago/mkquiz.py
++++ b/scripts/chicago/mkquiz.py
+@@ -329,6 +329,8 @@ window.addEventListener('DOMContentLoaded', () => {
+ PAGE = """<!doctype html>
+ <html lang="en"><head><meta charset="utf-8">
+ <meta name="viewport" content="width=device-width,initial-scale=1">
++<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
++<link rel="alternate icon" type="image/png" href="/favicon-32.png" />
+ <title>Which upgrade actually works? — traffic simulation</title>
+ <style>%(css)s</style></head><body>
+ <div class="wrap">
+diff --git a/viz/public/quiz.html b/viz/public/quiz.html
+index 5ece5934a698c30dd24015669fa761877186b1ab..6c47cddb79a095f681875a4b05c06003f1e48860 100644
+--- a/viz/public/quiz.html
++++ b/viz/public/quiz.html
+@@ -1,6 +1,8 @@
+ <!doctype html>
+ <html lang="en"><head><meta charset="utf-8">
+ <meta name="viewport" content="width=device-width,initial-scale=1">
++<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
++<link rel="alternate icon" type="image/png" href="/favicon-32.png" />
+ <title>Which upgrade actually works? — traffic simulation</title>
+ <style>
+ :root{--bg:#0d1117;--card:#161b22;--edge:#30363d;--ink:#e6edf3;--dim:#8b949e;
+diff --git a/viz/src/config.ts b/viz/src/config.ts
+index ded0c7116bbdd74e4766d1d00a57efbf24dfe551..92321b523c5222b973fb0e18ca71d595cf4e9145 100644
+--- a/viz/src/config.ts
++++ b/viz/src/config.ts
+@@ -99,7 +99,7 @@ export function resolveThemeName(urlParam: string | null, stored: string | null)
+   return "navy";
+ }
+ 
+-export function loadConfig(search: string, hostname: string): VizConfig {
++export function loadConfig(search: string, hostname: string, protocol = "http:"): VizConfig {
+   const p = new URLSearchParams(search);
+   const buffer = Number(p.get("buffer") ?? "250");
+   const dt = Number(p.get("dt") ?? "0.1");
+@@ -114,7 +114,9 @@ export function loadConfig(search: string, hostname: string): VizConfig {
+   }
+   return {
+     run: p.get("run") ?? "demo",
+-    ws: p.get("ws") ?? `ws://${hostname}:8443`,
++    // Scheme follows the page: an https page may not open an insecure ws://
++    // socket (mixed content), so static hosting over TLS must default wss.
++    ws: p.get("ws") ?? `${protocol === "https:" ? "wss" : "ws"}://${hostname}:8443`,
+     bake: p.get("bake"),
+     networkUrl: p.get("net") ?? "/network.geojson",
+     // Static WGS84 overlays (demosrv /overlay/); optional — a 404 just
+diff --git a/viz/src/main.ts b/viz/src/main.ts
+index 8536dfa26eec62d8338f1f099f4f416ead224a90..6d3d29955d7656c205d975eb3560926c7ace3e21 100644
+--- a/viz/src/main.ts
++++ b/viz/src/main.ts
+@@ -89,7 +89,7 @@ function headSizeAt(z: number): number {
+ }
+ 
+ async function main(): Promise<void> {
+-  const cfg = loadConfig(location.search, location.hostname);
++  const cfg = loadConfig(location.search, location.hostname, location.protocol);
+   // Resolve the palette once (?theme=, navy default): every MapLibre paint
+   // prop, the legend, the signal-head sprite, and the HUD CSS variables
+   // below read from this one ThemeSpec.
+@@ -1177,7 +1177,17 @@ async function main(): Promise<void> {
+   const snapSub =
+     cfg.bake !== null
+       ? (bakedSub = await subscribeBaked(cfg.bake, onSnapFrame, handleSigMessage, onSnapStatus))
+-      : await subscribeSnapshots(cfg.ws, cfg.run, onSnapFrame, handleSigMessage, onSnapStatus);
++      : await subscribeSnapshots(cfg.ws, cfg.run, onSnapFrame, handleSigMessage, onSnapStatus).catch((err) => {
++          // The failure is known to be the engine connection, so the
++          // guidance can name the target and the fallback without
++          // misdiagnosing an unrelated startup error. /quiz.html is the
++          // route that works under every static server (Pages pretty-URLs
++          // it to /quiz; the local serve-baked does no rewrite).
++          const why = err instanceof Error ? err.message : String(err);
++          throw new Error(
++            `cannot reach a live engine at ${cfg.ws} (${why}) — this page drives a live connection; the recorded scenarios are at /quiz.html`,
++          );
++        });
+   natsConn = snapSub.nc;
+   requestSig(); // attach-time pull (ADR-0016 §3): don't wait out a catch-up round
+   reportViewport(); // the shim's first region set + vehicle-gate state
+diff --git a/viz/test/config.test.ts b/viz/test/config.test.ts
+index a310c06095cdbea1b8fdaf88f386604bd7df4c83..b9a09f21d6736eeb4d2541346bb0946e1fda5045 100644
+--- a/viz/test/config.test.ts
++++ b/viz/test/config.test.ts
+@@ -49,6 +49,15 @@ test("?bake= selects the baked-replay shim (ADR-0023); default is live", () => {
+   );
+ });
+ 
++// An https page may not open an insecure ws:// socket (mixed content), so
++// the default ws URL's scheme follows the page protocol — static hosting
++// over TLS (the Pages quiz deploy) must not die on a mixed-content throw.
++test("default ws scheme follows the page protocol", () => {
++  assert.equal(loadConfig("", "localhost").ws, "ws://localhost:8443");
++  assert.equal(loadConfig("", "localhost", "https:").ws, "wss://localhost:8443");
++  assert.equal(loadConfig("?ws=ws://explicit:1", "localhost", "https:").ws, "ws://explicit:1");
++});
++
+ // --- ?center= opening camera -------------------------------------------
+ // The camera exists so a demo can deep-link to ONE intervention. The
+ // failure that matters is a malformed link on air: it must degrade to the
