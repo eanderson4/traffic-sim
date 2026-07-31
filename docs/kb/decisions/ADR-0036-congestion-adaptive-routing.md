@@ -1,6 +1,6 @@
 # ADR-0036: Congestion-adaptive routing
 
-- **Status:** PROPOSED
+- **Status:** ACCEPTED (default flipped ON 2026-07-31 — see addendum)
 - **Date:** 2026-07-30
 - **Amends:** ADR-0021 (route following), ADR-0006 addendum 2026-07-30
   (route resolution cost model). No subject changes. Two payload surfaces
@@ -188,3 +188,67 @@ implemented in v1.
   real cities and they do not dead-stop — the missing mechanism is the
   diversion, and the seed-42 dead stop is a model artifact as much as a
   demand artifact.
+
+## Addendum 2026-07-31: validation results; default flipped ON
+
+The validation plan above ran. The verdict is two-regime:
+
+- **Survivable demand (seeds 1000–1003, 54k ticks,
+  `data/runs/whatif-chi-adaptive.json`):** adaptive beats static on every
+  measure — mean speed 24.34 vs 19.84 km/h (+22.7%, paired p=0.0006,
+  Cohen's d=7.77), completions 5,382 vs 4,329 (+24%), active-at-horizon
+  −27%. Diversion works where alternatives have room.
+- **2× sustained oversaturation (seed 42, 216k-tick drain,
+  `data/runs/drain-chi-adaptive-final/`):** no effect — both arms
+  dead-stop on the same schedule (0.00 km/h from ~min 90; 786 vs 766
+  completions; ~6.3k frozen each). Validation item 1 FAILS honestly:
+  nothing in the routing layer fixes a network whose demand is double
+  its discharge capacity (~12.8k veh/h injected vs a peak observed
+  completion rate of ~6k). That gap is demand-side: metering/gating is
+  ADR-0037's territory, plus profile calibration.
+- Oscillation and determinism items pass: hysteresis bounded the
+  next-hop churn on the bracket runs, and the flag-on CRC/restore
+  tests (`TestAdaptiveRestoreIsCRCExact` et al.) are green.
+
+**Decision:** `DefaultParams().AdaptiveRouting` is now **true**. Two
+grounds: the bracket says it strictly helps the regime the network can
+survive, and static all-or-nothing routing is the less faithful model —
+real fleets reroute around congestion, so the flag being on is the
+realism baseline, not the experiment. The scenario-manifest field became
+`*bool` (`adaptive_routing: false` now expresses the static baseline);
+run directories whose published numbers were measured on static routing —
+all of `docs/show/`'s what-if arms — are reproducible by setting that in
+the manifest. Flag-off behavior remains bit-identical to pre-ADR-0036, so
+every M1–M3 CRC fixture and recorded baseline stays valid.
+
+**Run identity (review triage, Sol blocker).** A manifest that omits
+`adaptive_routing` keeps its ADR-0012 content hash while its materialized
+behavior changes — so identical (hash, seed) spans two trajectories across
+this commit. Accepted, on two grounds: this is the same class as every
+engine behavior change that already shipped under a constant hash (the
+ADR-0006 free-flow-time weights, the ADR-0034 escape), i.e. the hash
+identifies scenario CONTENT and behavioral identity has always been
+(hash, seed, engine build); and live-run artifacts self-describe the
+regime — RunMeta embeds the fully-resolved `Params`, so recordings made
+either side of the flip show `AdaptiveRouting` false/true explicitly.
+Offline artifacts are weaker: metrics JSONs and what-if reports record
+neither resolved params nor engine build, so for THOSE the regime is
+pinned by the scenario manifest — which is why every published docs/show
+arm now carries an explicit `adaptive_routing: false` pin (stamped on disk
+alongside this commit — `data/` is gitignored — and emitted by the
+scenario generators: mkscenario.sh, mkscenario-portal.sh, fwsweep.sh,
+merge-pod.py, bottleneck_town.py, so regeneration keeps it; their content
+hashes shift, their trajectories do not). Two adjacent review notes, both
+accepted: (a) restoring a pre-v6 keyframe into a now-default-adaptive spec
+switches the routing regime at the restore — that migration is this ADR's
+explicit design; the sim core cannot log (ADR-0005), so `RestoreState`
+sets `RestoreNotice` and every edge caller (natsio replay/bake/player ×2,
+RunLive warm-start) logs it. Direct engine-API callers must read the
+field; manifests pinned false keep such restores bit-exact. (b) The manifest field's bool→*bool change would
+alter canonical bytes for a manifest carrying an explicit
+`adaptive_routing: false` — but no such manifest existed before this
+commit (the only two users set `true`, identical under both types), so no
+existing scenario hash moves and `scenario-hash/v1` stands.
+Re-hashing defaulted params instead would invalidate every recorded run
+and bake repo-wide — disproportionate to a change whose flag state is
+now explicit everywhere it is measured.

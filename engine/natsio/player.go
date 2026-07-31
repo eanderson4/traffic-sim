@@ -207,6 +207,9 @@ func NewPlayer(nc *nats.Conn, js nats.JetStreamContext, cfg PlayerConfig) (*Play
 	if err != nil {
 		return nil, fmt.Errorf("run %q: restore tick-0 keyframe: %w", cfg.Run, err)
 	}
+	if e.RestoreNotice != "" {
+		lg.Print(e.RestoreNotice)
+	}
 	// A dirty store (a run id recorded twice into the same stream) can
 	// yield two keyframes at the same tick — refuse the corrupt record
 	// loud and early rather than seeking into an ambiguous log.
@@ -495,6 +498,9 @@ func (p *Player) seek(target uint64) error {
 	e, err := engine.RestoreState(p.spec, kf.payload)
 	if err != nil {
 		return fmt.Errorf("restore keyframe tick %d: %w", kf.tick, err)
+	}
+	if e.RestoreNotice != "" {
+		p.log.Print(e.RestoreNotice)
 	}
 	// Re-anchor the forward cursor behind the landing keyframe. kf.seq is the
 	// keyframe's LAST message, so the re-sim starts at seq+1 — after the

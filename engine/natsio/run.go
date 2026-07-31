@@ -2,6 +2,7 @@ package natsio
 
 import (
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -103,6 +104,9 @@ func RunLive(nc *nats.Conn, js nats.JetStreamContext, run string, spec engine.Ru
 		e, err = engine.RestoreStateChecked(spec, contractCfg.InitialState, contractCfg.InitialStateMeta)
 		if err != nil {
 			return nil, err
+		}
+		if e.RestoreNotice != "" {
+			log.Print(e.RestoreNotice)
 		}
 		if e.Tick >= spec.Ticks {
 			return nil, fmt.Errorf("warm start: saved state is at tick %d and the run is %d ticks — nothing left to simulate", e.Tick, spec.Ticks)

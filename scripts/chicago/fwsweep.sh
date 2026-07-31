@@ -61,6 +61,10 @@ demand:
   - demand/main.yaml
 metrics:
   - metrics/main.yaml
+# Calibrated against the static-routing baseline (docs/show); the engine
+# default is adaptive-on since 2026-07-31 (ADR-0036 addendum).
+params:
+  adaptive_routing: false
 YAML
     # Clear BOTH outputs before the run, not just the store. A sweep is
     # normally re-run into the same directory, and `|| true` below means a

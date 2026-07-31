@@ -277,6 +277,14 @@ Kennedy winners clear it; the CBD winner (p=0.0122) does not. See
 
 ## What the simulation can and cannot answer
 
+**Routing baseline (2026-07-31).** Every number on this page was measured
+on STATIC routing. ADR-0036's congestion-adaptive routing is now the engine
+default; re-running `scripts/whatif.py` today measures a different baseline
+unless the manifests set `adaptive_routing: false`. Whether each published
+effect survives under adaptive routing is unmeasured — the one bracket we
+ran (baseline demand, seeds 1000–1003) showed adaptive strictly better than
+static, but intervention effects need not move the same way.
+
 Stated up front because two of the tested options are limited by the model
 rather than by traffic.
 

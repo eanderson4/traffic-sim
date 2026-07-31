@@ -152,7 +152,9 @@ func TestAdaptiveHysteresisMargin(t *testing.T) {
 // whole suite's CRC fixtures pin the trajectory; here the keyframe itself
 // must stay at v5 or below — v6 is written only while AdaptiveRouting is on.
 func TestAdaptiveOffStaysBelowV6(t *testing.T) {
-	e, err := NewEngine(routeDiamondSpec(t)) // flag off by default
+	spec := routeDiamondSpec(t)
+	spec.Params.AdaptiveRouting = false // explicit: the engine default is ON
+	e, err := NewEngine(spec)
 	if err != nil {
 		t.Fatal(err)
 	}

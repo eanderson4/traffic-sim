@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"strconv"
 	"strings"
@@ -109,6 +110,9 @@ func ReplayFromStream(js nats.JetStreamContext, meta *RunMeta, target uint64) (*
 	e, err := engine.RestoreState(meta.Spec, kf.payload)
 	if err != nil {
 		return nil, fmt.Errorf("restore keyframe tick %d: %w", kf.tick, err)
+	}
+	if e.RestoreNotice != "" {
+		log.Print(e.RestoreNotice)
 	}
 
 	msgs, err := fetchFrom(js, stream, run, kf.seq+1)

@@ -49,6 +49,10 @@ types:
   - truck
 demand:
   - demand/main.yaml
+# Published on the static-routing baseline (docs/show); the engine default
+# is adaptive-on since 2026-07-31 (ADR-0036 addendum).
+params:
+  adaptive_routing: false
 EOF
 
 echo "[mkscenario] $OUT ready ($ID, $TICKS ticks)" >&2

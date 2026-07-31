@@ -573,6 +573,9 @@ func TestStuckKeyframeRoundTripsWithAnEmptyDirectorQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 	spec := RunSpec{Net: NetSpec{Kind: "file", Path: path}, Params: DefaultParams(), Seed: 1, Ticks: 6000}
+	// v5 is the stuck-timer format on the static-routing baseline; with the
+	// default-on adaptive flag the same state marshals as v6 (ADR-0036).
+	spec.Params.AdaptiveRouting = false
 	e, err := NewEngine(spec)
 	if err != nil {
 		t.Fatal(err)

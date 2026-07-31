@@ -91,6 +91,10 @@ func main() {
 		"longitudinal safety gate: max emergency deceleration (m/s²) the kernel "+
 			"applies to keep any vehicle out of its leader, capping every control "+
 			"path the way the right-of-way gate does; 0 disables it")
+	adaptiveRouting := flag.Bool("adaptive-routing", true,
+		"congestion-adaptive route resolution (ADR-0036, engine default ON), -netfile runs only: "+
+			"with -scenario the manifest's content-hashed adaptive_routing pin owns this and an explicit flag is rejected. "+
+			"Pass -adaptive-routing=false when warm-starting (-state-in) a pre-v6 static-routing state whose continuation must stay bit-exact")
 	stateOut := flag.String("state-out", "", "write the engine's full state to this file at -state-at, plus FILE.meta.json binding it to this network; the run CONTINUES after the dump (ADR-0029 phase 1)")
 	stateAt := flag.Uint64("state-at", 0, "tick at which -state-out writes the state file (required with -state-out, and only with it)")
 	stateIn := flag.String("state-in", "", "warm-start from a state file written by -state-out: the run begins at that state's tick with that state instead of an empty network at tick 0. -ticks stays ABSOLUTE, so a state at tick 20000 with -ticks 54000 simulates the remaining 34000. Refuses a state saved against a different network (lane fingerprint), and refuses a missing sidecar")
@@ -135,11 +139,13 @@ func main() {
 	if *scenarioDir != "" {
 		// The scenario owns network, demand, and the type list; the
 		// deliberate sweep overrides (-seed/-ticks) are the only flags
-		// allowed beside it.
+		// allowed beside it. adaptive_routing joins the owned set: it is
+		// part of the manifest's content hash (ADR-0012), so a CLI
+		// override would put two trajectories under one (hash, seed).
 		conflicting := []string{}
 		flag.Visit(func(f *flag.Flag) {
 			switch f.Name {
-			case "rate", "density", "types":
+			case "rate", "density", "types", "adaptive-routing":
 				conflicting = append(conflicting, "-"+f.Name)
 			}
 		})
@@ -218,11 +224,23 @@ func main() {
 	// missing sidecar or a state from another network costs nothing but the
 	// message that says so.
 	stateAtSet := false
+	adaptiveSet := false
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "state-at" {
 			stateAtSet = true
 		}
+		if f.Name == "adaptive-routing" {
+			adaptiveSet = true
+		}
 	})
+	// Adaptive routing (ADR-0036; default ON since the 2026-07-31 flip).
+	// -netfile runs only: with -scenario the manifest owns the flag (it is
+	// content-hashed, ADR-0012) and an explicit -adaptive-routing is
+	// rejected above. -adaptive-routing=false is the netfile path's opt-out
+	// and the warm-start continuation pin for pre-v6 state files.
+	if adaptiveSet {
+		spec.Params.AdaptiveRouting = *adaptiveRouting
+	}
 	var initialState []byte
 	var initialMeta *engine.StateMeta
 	if *stateIn != "" {

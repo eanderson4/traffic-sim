@@ -111,23 +111,35 @@ func TestLoadRunSpec(t *testing.T) {
 
 // The manifest params block maps onto RunSpec.Params, with zero fields
 // keeping the engine defaults (ADR-0036's flag is the case that matters:
-// a scenario must be able to turn adaptive routing on).
+// the engine default is ON, so a scenario must be able to turn adaptive
+// routing OFF to reproduce the static-routing baseline).
 func TestRunSpecParamsOverride(t *testing.T) {
-	dir := t.TempDir()
-	writeNet(t, dir)
-	writeFile(t, dir, ManifestFile, strings.Replace(goodManifest, "ticks: 3000",
-		"ticks: 3000\nparams: {adaptive_routing: true}", 1))
-	writeFile(t, dir, "demand/main.yaml", goodDemand)
-	s, err := Load(dir)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
+	types := map[string]*engine.VehicleType{"car": &engine.Car, "truck": &engine.Truck}
+	load := func(params string) engine.RunSpec {
+		dir := t.TempDir()
+		writeNet(t, dir)
+		writeFile(t, dir, ManifestFile, strings.Replace(goodManifest, "ticks: 3000",
+			"ticks: 3000\n"+params, 1))
+		writeFile(t, dir, "demand/main.yaml", goodDemand)
+		s, err := Load(dir)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		spec, err := s.RunSpec(types)
+		if err != nil {
+			t.Fatalf("RunSpec: %v", err)
+		}
+		return spec
 	}
-	spec, err := s.RunSpec(map[string]*engine.VehicleType{"car": &engine.Car, "truck": &engine.Truck})
-	if err != nil {
-		t.Fatalf("RunSpec: %v", err)
+	if spec := load("params: {adaptive_routing: true}"); !spec.Params.AdaptiveRouting {
+		t.Errorf("adaptive_routing: true did not map: %+v", spec.Params)
 	}
-	if !spec.Params.AdaptiveRouting {
-		t.Errorf("params override did not map: %+v", spec.Params)
+	if spec := load("params: {adaptive_routing: false}"); spec.Params.AdaptiveRouting {
+		t.Errorf("adaptive_routing: false did not map: %+v", spec.Params)
+	}
+	// Absent params inherit the engine default (on, ADR-0036 addendum).
+	if spec := load(""); !spec.Params.AdaptiveRouting {
+		t.Errorf("absent params should inherit the default-on flag: %+v", spec.Params)
 	}
 }
 
@@ -209,6 +221,39 @@ func TestGoldenHash(t *testing.T) {
 	const want = "a09f7f6848ac6dd273bebf24081d4375beedf8f46be2b6e1e89e885fe11ebff2"
 	if s.Hash() != want {
 		t.Fatalf("hash = %s, want golden %s", s.Hash(), want)
+	}
+}
+
+// The ADR-0036 routing pin is CONTENT: an explicit `adaptive_routing:`
+// must move the hash off the absent-params golden, and the bool→*bool
+// migration (2026-07-31, default flip) must not change explicit-true's
+// canonical bytes — the second golden is the canary for that.
+func TestAdaptiveRoutingPinMovesHash(t *testing.T) {
+	load := func(dir, params string) string {
+		writeFile(t, dir, ManifestFile, strings.Replace(goodManifest, "ticks: 3000",
+			"ticks: 3000\n"+params, 1))
+		s, err := Load(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s.Hash()
+	}
+	dir := goodScenario(t)
+	absent := load(dir, "")
+	off := load(dir, "params: {adaptive_routing: false}")
+	on := load(dir, "params: {adaptive_routing: true}")
+	if absent == off {
+		t.Error("explicit adaptive_routing: false did not move the content hash — the pin is invisible to run identity")
+	}
+	if on == off {
+		t.Error("true and false pins hash identically — the flag's value is invisible to run identity")
+	}
+	// Explicit true canonicalizes exactly as it did under the pre-flip
+	// bool field (both emit the key); a move here means the *bool
+	// migration changed canonicalization — a format event (ADR-0012 §8).
+	const wantOn = "e2e90ee0f5708b1037dfc04ab744cdbf96beb4e851e0e080e1374f473d652f03"
+	if on != wantOn {
+		t.Fatalf("explicit-true hash = %s, want golden %s", on, wantOn)
 	}
 }
 

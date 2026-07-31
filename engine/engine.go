@@ -60,7 +60,8 @@ type Params struct {
 	AdaptiveRouting bool
 }
 
-// DefaultParams returns the validated M1 defaults.
+// DefaultParams returns the validated defaults (M1; ADR-0036 addendum
+// 2026-07-31 flipped AdaptiveRouting on — see engine.go's Params doc).
 func DefaultParams() Params {
 	return Params{
 		Dt:               0.1, // 100 ms, validated by Kesting & Treiber (ADR-0005)
@@ -85,10 +86,14 @@ func DefaultParams() Params {
 		// enough that a gridlocked network resumes within the run
 		// (ADR-0034).
 		StrandAfterS: 300,
-		// Off by default until the validation baselines land (ADR-0036's
-		// validation plan); flipping the default is a follow-up with its own
-		// measured bracket.
-		AdaptiveRouting: false,
+		// On by default (ADR-0036 addendum): congestion-adaptive routing is
+		// the more faithful model — real drivers reroute around jams — and
+		// the seeds-1000–1003 chi-loop-urban bracket measured +22.7% mean
+		// speed, +24% completions (p=0.0006, d=7.77) with no replay or CRC
+		// regressions. Scenarios needing the static-routing baseline (the
+		// docs/show what-if arms were measured on it) opt out with
+		// `adaptive_routing: false` in the manifest.
+		AdaptiveRouting: true,
 	}
 }
 
@@ -222,6 +227,14 @@ type Engine struct {
 	ttRelaxTicks    float64         // 600 s in ticks at this run's dt
 
 	Stats Stats
+
+	// RestoreNotice is set by RestoreState when a pre-v6 (static-routing)
+	// keyframe is restored into a flag-ON spec — the ADR-0036 migration
+	// path, which since the default flip also fires on a plain -state-in of
+	// an old static keyframe. The sim core cannot log (ADR-0005: no wall
+	// clock inside it), so this is deterministic state; edge callers
+	// (natsio replay/bake/player) surface it. Never serialized, never CRC'd.
+	RestoreNotice string
 }
 
 // NewEngine builds a kernel from a run spec: network, initial population,
@@ -292,29 +305,36 @@ func NewEngine(spec RunSpec) (*Engine, error) {
 	if e.spawner != nil {
 		e.spawner.init(e)
 	}
-	// Adaptive routing (ADR-0036 §1): the travel-time EMA starts at free
-	// flow, so the first epoch's tables are exactly the static ones and the
-	// mechanism reduces to ADR-0021 until dwell evidence says otherwise.
-	// Keyframe restore overwrites ttEMA and ttSnap from the lane section
-	// (format v6). The time constants are SECONDS converted to ticks here:
-	// dt is a scenario parameter, and 600/6000 ticks are 60 s/10 min only
-	// at the validated 0.1 s tick.
+	// Adaptive routing (ADR-0036 §1) — see initAdaptiveRouting, which Step
+	// also calls lazily for engines that never passed through NewEngine.
 	if e.Params.AdaptiveRouting {
-		e.ttSnap = make([]float64, len(net.Lanes))
-		for _, l := range net.Lanes {
-			l.ttEMA = freeFlowTime(l)
-			e.ttSnap[l.Index] = l.ttEMA
-		}
-		e.routeEpochs = map[int]uint64{}
-		dt := e.Params.Dt
-		if dt <= 0 { // validated upstream; never divide by a bad tick
-			dt = 0.1
-		}
-		e.routeEpochTicks = max(1, uint64(math.Round(60/dt)))
-		e.ttRelaxTicks = max(1, math.Round(600/dt))
+		e.initAdaptiveRouting()
 	}
 	e.rebuildOccupancy()
 	return e, nil
+}
+
+// initAdaptiveRouting allocates and seeds the ADR-0036 state: per-lane
+// ttEMA/ttSnap at free flow (so the first epoch's tables are exactly the
+// static ones and the mechanism reduces to ADR-0021 until dwell evidence
+// says otherwise), the per-destination epoch map, and the dt-derived time
+// constants. Keyframe restore overwrites ttEMA and ttSnap from the lane
+// section (format v6). The time constants are SECONDS converted to ticks
+// here: dt is a scenario parameter, and 600/6000 ticks are 60 s/10 min only
+// at the validated 0.1 s tick.
+func (e *Engine) initAdaptiveRouting() {
+	e.ttSnap = make([]float64, len(e.Net.Lanes))
+	for _, l := range e.Net.Lanes {
+		l.ttEMA = freeFlowTime(l)
+		e.ttSnap[l.Index] = l.ttEMA
+	}
+	e.routeEpochs = map[int]uint64{}
+	dt := e.Params.Dt
+	if dt <= 0 { // validated upstream; never divide by a bad tick
+		dt = 0.1
+	}
+	e.routeEpochTicks = max(1, uint64(math.Round(60/dt)))
+	e.ttRelaxTicks = max(1, math.Round(600/dt))
 }
 
 // newVehicle allocates the next sequential ID and its derived stream.
@@ -395,6 +415,18 @@ func (e *Engine) Step() {
 	// gated on the flag — off stays bit-identical — and both are pure
 	// functions of tick and lane order, so replay re-derives them.
 	if e.Params.AdaptiveRouting {
+		if e.routeEpochTicks == 0 {
+			// Engines built as struct literals (unit tests) never pass
+			// through NewEngine — initialize here, deterministically, rather
+			// than dividing by a zero routeEpochTicks/ttRelaxTicks. This
+			// covers Step only: a struct-literal engine that calls
+			// routeNextHop BEFORE its first Step still divides by zero —
+			// test-only surface, NewEngine-built engines never see it.
+			// Invariant this relies on: every RESTORE path constructs via
+			// NewEngine (keyframe.go), so the sentinel is nonzero there and
+			// this branch can never clobber restored ttEMA/ttSnap.
+			e.initAdaptiveRouting()
+		}
 		e.relaxTravelTimes()
 		// Epoch rollover: freeze the routing weights (ADR-0036 §2). Tables
 		// are built over the SNAPSHOT, not the live EMA, so a table is a

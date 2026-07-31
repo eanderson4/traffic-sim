@@ -26,6 +26,9 @@ func destSpec(t *testing.T, ticks uint64) RunSpec {
 	spec.Scen.Types = []*VehicleType{&Car, &Truck}
 	spec.Scen.SpawnRatePerLaneHour = 0 // director-only demand
 	spec.Scen.UncontrolledPolicy = PolicyIDM
+	// These are ADR-0021 director-queue tests on the static-routing
+	// baseline; the engine default is adaptive-on (ADR-0036 addendum).
+	spec.Params.AdaptiveRouting = false
 	return spec
 }
 

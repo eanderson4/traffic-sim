@@ -77,11 +77,11 @@ type Manifest struct {
 // (ADR-0005: tick length is a scenario parameter, 100 ms the default).
 type Params struct {
 	Dt float64 `yaml:"dt,omitempty"`
-	// AdaptiveRouting turns on congestion-adaptive route resolution
-	// (ADR-0036). Go's zero value means the manifest cannot express
-	// "explicitly off" — acceptable while the engine default is off;
-	// revisit with a *bool if the default ever flips.
-	AdaptiveRouting bool `yaml:"adaptive_routing,omitempty"`
+	// AdaptiveRouting turns congestion-adaptive route resolution (ADR-0036)
+	// on or off. Pointer because the engine default is ON: nil inherits the
+	// default, an explicit `adaptive_routing: false` restores the
+	// static-routing baseline the docs/show what-if arms were measured on.
+	AdaptiveRouting *bool `yaml:"adaptive_routing,omitempty"`
 }
 
 // Spawner configures the kernel's built-in deterministic spawner — the
@@ -415,8 +415,8 @@ func (s *Scenario) RunSpec(typeReg map[string]*engine.VehicleType) (engine.RunSp
 	if s.Manifest.Params.Dt != 0 {
 		spec.Params.Dt = s.Manifest.Params.Dt
 	}
-	if s.Manifest.Params.AdaptiveRouting {
-		spec.Params.AdaptiveRouting = true
+	if s.Manifest.Params.AdaptiveRouting != nil {
+		spec.Params.AdaptiveRouting = *s.Manifest.Params.AdaptiveRouting
 	}
 	if sp := s.Manifest.Spawner; sp != nil {
 		spec.Scen.SpawnRatePerLaneHour = sp.RatePerLaneHour

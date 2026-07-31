@@ -451,7 +451,11 @@ def write_variant(pod, variant, args):
             "demand:\n"
             "  - demand/main.yaml\n"
             "metrics:\n"
-            "  - metrics/main.yaml\n")
+            "  - metrics/main.yaml\n"
+            "# Published on the static-routing baseline (docs/show); the engine\n"
+            "# default is adaptive-on since 2026-07-31 (ADR-0036 addendum).\n"
+            "params:\n"
+            "  adaptive_routing: false\n")
     return d
 
 

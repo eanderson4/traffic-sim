@@ -312,6 +312,14 @@ func restoreState(spec RunSpec, data []byte, checkNet func(*Network) error) (*En
 	if ver >= keyframeAdaptiveVersion && !e.Params.AdaptiveRouting {
 		return nil, fmt.Errorf("keyframe: v%d payload carries adaptive-routing state but the spec has AdaptiveRouting off", ver)
 	}
+	// The reverse direction is the designed migration path (ADR-0036: a
+	// pre-v6 payload into a flag-ON spec seeds every dwell clock at the
+	// restore tick), but since the default flipped ON it also fires on a
+	// plain -state-in of an old static keyframe — record it for the edge
+	// caller to surface (the sim core cannot log, ADR-0005).
+	if ver < keyframeAdaptiveVersion && e.Params.AdaptiveRouting {
+		e.RestoreNotice = fmt.Sprintf("keyframe: pre-v%d (static-routing) payload restored into an adaptive-routing spec — routing switches regime at this restore; pin adaptive_routing: false to continue bit-exactly", keyframeAdaptiveVersion)
+	}
 	if checkNet != nil {
 		if err := checkNet(e.Net); err != nil {
 			return nil, err

@@ -978,6 +978,9 @@ def write_variant(root, variant, ticks, seed, period_s):
         f.write("types:\n  - car\n  - truck\n")
         f.write("demand:\n  - demand/main.yaml\n")
         f.write("metrics:\n  - metrics/main.yaml\n")
+        f.write("# Published on the static-routing baseline (docs/show); the engine\n")
+        f.write("# default is adaptive-on since 2026-07-31 (ADR-0036 addendum).\n")
+        f.write("params:\n  adaptive_routing: false\n")
     return net, cycle
 
 
