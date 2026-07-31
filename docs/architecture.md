@@ -4,6 +4,7 @@
 > The message contract is the source of truth for subjects and wire formats
 > (`contracts/asyncapi.yaml`); these diagrams are a map, not a contract.
 > Drift audit of the same date: see the reconciliation note in `docs/kb/INDEX.md`.
+> **Nodes are clickable on GitHub** — they link to the source file each box is drawn from.
 
 ## High level
 
@@ -37,6 +38,17 @@ flowchart LR
     NATS --> VIZ
     K --> REC
     REC --> RPL --> WEB --> VIZ
+
+    click K "https://github.com/eanderson4/traffic-sim/blob/main/engine/engine.go" "engine/engine.go — Engine.Step()"
+    click NET "https://github.com/eanderson4/traffic-sim/tree/main/engine/netimport" "engine/netimport — OSM/netconvert importer"
+    click SCN "https://github.com/eanderson4/traffic-sim/tree/main/engine/scenario" "engine/scenario — scenario format (ADR-0012)"
+    click NATS "https://github.com/eanderson4/traffic-sim/blob/main/contracts/asyncapi.yaml" "contracts/asyncapi.yaml — message contract"
+    click CTL "https://github.com/eanderson4/traffic-sim/tree/main/engine/cmd/default-driver" "engine/cmd/default-driver — reference controller"
+    click DIR "https://github.com/eanderson4/traffic-sim/blob/main/engine/natsio/verb.go" "engine/natsio/verb.go — director verbs"
+    click VIZ "https://github.com/eanderson4/traffic-sim/blob/main/viz/src/main.ts" "viz/src/main.ts — MapLibre app"
+    click REC "https://github.com/eanderson4/traffic-sim/blob/main/engine/natsio/recorder.go" "engine/natsio/recorder.go — record plane"
+    click RPL "https://github.com/eanderson4/traffic-sim/tree/main/engine/cmd/replay" "engine/cmd/replay — VCR replay"
+    click WEB "https://github.com/eanderson4/traffic-sim/blob/main/contracts/baked-replay-v1.md" "contracts/baked-replay-v1.md — baked format"
 ```
 
 ### 2. Data flow — what crosses the engine boundary
@@ -59,6 +71,15 @@ flowchart LR
     end
 
     IN --> ENG --> OUT
+
+    click A "https://github.com/eanderson4/traffic-sim/blob/main/engine/intent.go" "engine/intent.go — the 4-axis Intent (ADR-0008)"
+    click B "https://github.com/eanderson4/traffic-sim/blob/main/engine/natsio/verb.go" "engine/natsio/verb.go — director verbs"
+    click C "https://github.com/eanderson4/traffic-sim/blob/main/engine/natsio/contract.go" "engine/natsio/contract.go — claims & heartbeats"
+    click ENG "https://github.com/eanderson4/traffic-sim/blob/main/engine/engine.go" "engine/engine.go — Engine.Step()"
+    click D "https://github.com/eanderson4/traffic-sim/blob/main/engine/natsio/frame.go" "engine/natsio/frame.go — TSSF snapshot codec"
+    click E "https://github.com/eanderson4/traffic-sim/blob/main/engine/natsio/obsframe.go" "engine/natsio/obsframe.go — TSOB observation frames"
+    click F "https://github.com/eanderson4/traffic-sim/blob/main/engine/natsio/tslb.go" "engine/natsio/tslb.go — TSLB batched intent log"
+    click G "https://github.com/eanderson4/traffic-sim/blob/main/engine/metrics.go" "engine/metrics.go — metric kernel (ADR-0014)"
 ```
 
 ### 3. Tick cycle — one 100 ms step
@@ -80,6 +101,15 @@ flowchart LR
 
     P0 --> P1 --> P2 --> P3 --> P4 --> P5 --> P6 --> P7
     P7 -->|"next tick (10 Hz)"| P0
+
+    click P0 "https://github.com/eanderson4/traffic-sim/blob/main/engine/routing.go" "engine/routing.go — adaptive routing (ADR-0036)"
+    click P1 "https://github.com/eanderson4/traffic-sim/blob/main/engine/spawn.go" "engine/spawn.go — deterministic spawner"
+    click P2 "https://github.com/eanderson4/traffic-sim/blob/main/engine/engine.go" "engine/engine.go — applyIntents + safetyGate (ADR-0025)"
+    click P3 "https://github.com/eanderson4/traffic-sim/blob/main/engine/vehicle.go" "engine/vehicle.go — idmAccel (IDM)"
+    click P4 "https://github.com/eanderson4/traffic-sim/blob/main/engine/engine.go" "engine/engine.go — integrate (ballistic)"
+    click P5 "https://github.com/eanderson4/traffic-sim/blob/main/engine/rightofway.go" "engine/rightofway.go — rowGate / rowConflict (ADR-0010)"
+    click P6 "https://github.com/eanderson4/traffic-sim/blob/main/engine/mobil.go" "engine/mobil.go — MOBIL lane changes"
+    click P7 "https://github.com/eanderson4/traffic-sim/blob/main/engine/metrics.go" "engine/metrics.go — metrics + rolling CRC"
 ```
 
 ---
@@ -123,6 +153,16 @@ flowchart LR
     K -- "sole writer" --> JS
     K --> KV
     K --> MET
+
+    click K "https://github.com/eanderson4/traffic-sim/blob/main/engine/engine.go" "engine/engine.go — Engine.Step()"
+    click DD "https://github.com/eanderson4/traffic-sim/tree/main/engine/cmd/default-driver" "engine/cmd/default-driver — reference controller"
+    click DIR "https://github.com/eanderson4/traffic-sim/tree/main/engine/natsio/demand" "engine/natsio/demand — demand director"
+    click BR "https://github.com/eanderson4/traffic-sim/blob/main/engine/natsio/server.go" "engine/natsio/server.go — embedded broker + WS listener"
+    click NC "https://github.com/eanderson4/traffic-sim/blob/main/viz/src/nats-client.ts" "viz/src/nats-client.ts — browser NATS over WebSocket"
+    click JS "https://github.com/eanderson4/traffic-sim/blob/main/engine/natsio/recorder.go" "engine/natsio/recorder.go — JetStream record plane"
+    click KV "https://github.com/eanderson4/traffic-sim/blob/main/engine/natsio/registry.go" "engine/natsio/registry.go — KV metadata plane"
+    click MET "https://github.com/eanderson4/traffic-sim/blob/main/engine/metrics.go" "engine/metrics.go — metric kernel"
+    click EXT "https://github.com/eanderson4/traffic-sim/blob/main/contracts/asyncapi.yaml" "contracts/asyncapi.yaml — contract plane"
 ```
 
 ## 5. NATS planes and subjects
@@ -208,6 +248,14 @@ flowchart LR
     REC --> P --> VIZ1
     REC --> RS
     ART --> HOST --> VIZ2
+
+    click REC "https://github.com/eanderson4/traffic-sim/blob/main/engine/natsio/recorder.go" "engine/natsio/recorder.go — record plane"
+    click P "https://github.com/eanderson4/traffic-sim/blob/main/engine/natsio/player.go" "engine/natsio/player.go — paced replay publisher"
+    click RS "https://github.com/eanderson4/traffic-sim/blob/main/engine/natsio/resim.go" "engine/natsio/resim.go — CRC-verified re-simulation"
+    click ART "https://github.com/eanderson4/traffic-sim/blob/main/contracts/baked-replay-v1.md" "contracts/baked-replay-v1.md — baked artifact format"
+    click HOST "https://github.com/eanderson4/traffic-sim/blob/main/scripts/serve-baked.py" "scripts/serve-baked.py — local baked server"
+    click VIZ1 "https://github.com/eanderson4/traffic-sim/blob/main/viz/src/nats-client.ts" "viz/src/nats-client.ts — live path"
+    click VIZ2 "https://github.com/eanderson4/traffic-sim/blob/main/viz/src/baked.ts" "viz/src/baked.ts — baked transport shim"
 ```
 
 ## 8. Network & scenario authoring pipeline
@@ -220,6 +268,13 @@ flowchart LR
     SC --> VAL["cmd/scenario<br/>validate / fmt / hash"]
     SC --> SRV["serve -scenario …"]
     PORT["cmd/portals — demand portal inventory"] -.-> SC
+
+    click NCV "https://github.com/eanderson4/traffic-sim/blob/main/scripts/import-city.sh" "scripts/import-city.sh — OSM → netconvert"
+    click NI "https://github.com/eanderson4/traffic-sim/tree/main/engine/netimport" "engine/netimport — .net.xml → network JSON"
+    click SC "https://github.com/eanderson4/traffic-sim/tree/main/engine/scenario" "engine/scenario — scenario format (ADR-0012)"
+    click VAL "https://github.com/eanderson4/traffic-sim/tree/main/engine/cmd/scenario" "engine/cmd/scenario — validate / fmt / hash"
+    click SRV "https://github.com/eanderson4/traffic-sim/tree/main/engine/cmd/serve" "engine/cmd/serve — live run server"
+    click PORT "https://github.com/eanderson4/traffic-sim/tree/main/engine/cmd/portals" "engine/cmd/portals — demand portal inventory"
 ```
 
 ## 9. Deployment shape (as built)
@@ -240,4 +295,8 @@ flowchart TB
     BR2["browser"] -->|"HTTPS :8900"| DS
     BR2 <-->|"wss://ws.phantomjam.com :8443"| EN
     BR2 -->|"baked replays (?bake=)"| PAGES["Cloudflare Pages<br/>data.phantomjam.com"]
+
+    click DS "https://github.com/eanderson4/traffic-sim/tree/main/engine/cmd/demosrv" "engine/cmd/demosrv — demo launcher + static server"
+    click EN "https://github.com/eanderson4/traffic-sim/tree/main/engine/cmd/serve" "engine/cmd/serve / cmd/replay — engine child"
+    click PAGES "https://github.com/eanderson4/traffic-sim/blob/main/contracts/baked-replay-v1.md" "contracts/baked-replay-v1.md — baked artifacts"
 ```
