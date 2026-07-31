@@ -416,3 +416,58 @@ forming cycle rather than rescuing a formed one. It is a behavioural change
 with network-wide effects, it needs the route-abandonment work above to land
 first (there is no point improving route choice while routes are being
 abandoned), and the escape does not depend on it.
+
+## Amendment (2026-07-30): the in-box gap is closed
+
+The "Narrowed after external review" correction above tracked a hole: a
+vehicle stuck INSIDE a junction box — lane internal, routed successor an
+ordinary road — could never satisfy the escape's condition (`next.Internal
+&& boxBlocked`) and was never rescued; on `base34` five such boxes stayed
+occupied to the horizon with every crossing movement through them blocked.
+
+The condition now has a second arm (`engine/gridlock.go`,
+`jammedAtJunction`): head of an INTERNAL lane, routed successor a road, and
+the entry gate's own exit-chain test run from v's current lane
+(`exitBlocked(v, lane, false)`) — no room for v behind the first queue
+tail. That is the same "cannot clear" test, applied from the far side of
+the stop line; a red light still cannot trigger it (a holding stop line
+caps room but does not seal it, and a draining exit has room behind its
+tail almost always).
+
+Fixtures (`engine/gridlock_test.go`): `TestInBoxStrandedVehicleIsRescued`
+seals a box exit bumper-to-bumper and strands the in-box vehicle at the
+threshold; `TestInBoxEscapeIgnoresADrainingExit` keeps the same geometry
+with an open boundary and strands nothing. The full suite, including every
+M1–M3 CRC fixture, is bit-identical.
+
+One fixture lesson worth recording: an in-box vehicle whose exit road has
+ANY compactable room does not stay in the box — the in-box motion gate
+defers to car-following (`exitBlocked(..., inBox=true)` returns "own-path
+tail" on the first occupied exit), and the vehicle creeps onto the exit
+road and queues there, freeing the box itself. The gap case needs the exit
+sealed to its very start, which is exactly the base34 pathology.
+
+Two refinements landed with the second review round:
+
+- **A holding stop line is not a seal — at EITHER arm.** `exitBlocked`
+  gained a cause-reporting variant (`exitWalk`, with `boxWalk` alongside):
+  when the only thing capping the room is a downstream red/amber
+  (`downstreamHold`), neither arm fires. The entry arm previously counted
+  a red one stub past the box as a seal (pre-existing); the doctrine "a
+  red light is never a trigger" is now symmetric, and
+  `TestInBoxDiscriminatorReadsTheSeal` pins all three readings of the
+  same geometry (room behind the tail → drains; tail to the very start →
+  seal; empty stubs capped by a red → the signal's domain) at both arms.
+- **The in-box walk honors a held turn.** Its first hop is the crossing
+  that will consume `HeldTurn`, so it runs unspent (`turnSpent=false`);
+  entry-gate callers keep the turn spent, as before. Moot on netimport
+  networks — internal lanes are single-successor, one movement per
+  internal lane — but controllers can set HeldTurn at any time, and the
+  discriminator must not classify against a branch the vehicle will not
+  take (`TestInBoxWalkHonorsTheHeldTurn`).
+- **Funnel starvation counts as stranded, deliberately.** An in-box head
+  starved 300 s by the merge-funnel arbitration (a continuous sibling
+  stream winning every merge) with a sealed exit DOES strand. That is
+  starvation, not a closed cycle — but 300 s motionless in a box is a jam
+  by any measure, and loud beats silent: the strand counter is the
+  diagnosis channel, the same spirit as the sealed-road bleed.

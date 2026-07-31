@@ -139,14 +139,16 @@ func (e *Engine) strandStuck() {
 }
 
 // jammedAtJunction reports whether v is waiting on a JUNCTION it cannot
-// enter, rather than on the vehicle in front of it. Two conditions:
+// clear, rather than on the vehicle in front of it. Two conditions:
 //
 //   - v is the head of its lane (the last entry of the s-sorted occupancy).
 //     Anything behind the head is stopped for a reason the kernel already
 //     models — the vehicle ahead — and removing it would unlock nothing.
-//   - the box v is routed into is BLOCKED: a foe inside it, or no room on
-//     the far side for v to clear it. This is the wait that closes a
-//     gridlock cycle, and it is the whole discriminator.
+//   - the junction wait is the kind that closes a cycle: either the box v
+//     is routed into is BLOCKED (a foe inside it, or no room on the far
+//     side for v to clear it), or v is itself INSIDE a box whose routed
+//     exit chain has no room for it — the same test, from the far side.
+//     This is the whole discriminator.
 //
 // The second condition is not a refinement, it is the definition. Without
 // it the rule fires on ordinary queueing: measured on the I-80 M3 fixture —
@@ -157,10 +159,12 @@ func (e *Engine) strandStuck() {
 // merely long is not a jam the model needs rescuing from; a queue whose head
 // cannot enter the junction in front of it might be.
 //
-// A red light is deliberately NOT a trigger: sigGate holds the vehicle and
-// boxBlocked is false, so a signal queue — however punishing the cycle —
-// never reaches the escape. A signal that never goes green is a broken
-// program, a different pathology with its own diagnosis.
+// A red light is deliberately NOT a trigger, at EITHER arm: a red at v's
+// own stop line holds it via sigGate with boxBlocked false, and a red one
+// stub past the box caps the exit walk's room as a holdSeal, which both
+// arms discard. A signal queue — however punishing the cycle — never
+// reaches the escape. A signal that never goes green is a broken program,
+// a different pathology with its own diagnosis.
 func (e *Engine) jammedAtJunction(v *Vehicle, lane *Lane) bool {
 	if a := lane.vehs; len(a) == 0 || a[len(a)-1] != v {
 		return false
@@ -169,7 +173,33 @@ func (e *Engine) jammedAtJunction(v *Vehicle, lane *Lane) bool {
 		return false // a dead end; the wall clamp (WallHits) owns that
 	}
 	next := e.pickSuccessor(lane, v)
-	return next.Internal && e.boxBlocked(v, next)
+	if next.Internal {
+		blocked, holdSeal := e.boxWalk(v, next)
+		return blocked && !holdSeal
+	}
+	if !lane.Internal {
+		return false
+	}
+	// v is INSIDE a box (lane.Internal) and its routed exit is an ordinary
+	// road: the entry-time gate no longer owns this wait — v is already
+	// in. The wait that seals a box for good is the exit chain having no
+	// room for v at all, which is the entry gate's own test run from v's
+	// current lane. Measured on base34 (ADR-0034 consequences): the 5
+	// lanes still frozen at the horizon were all internal — boxes occupied
+	// for the rest of the run, every crossing movement through them
+	// blocked, and this condition is what reaches them.
+	//
+	// Two refinements, both review-found: a HOLDING stop line is not a
+	// seal (a downstream red capping the room is stop-line starvation, the
+	// signal's domain — the doctrine above holds at this arm exactly as at
+	// the entry arm), and the walk's first hop is the crossing that will
+	// CONSUME v's held turn, so it runs with turnSpent=false (moot on
+	// netimport networks, whose internal lanes are single-successor —
+	// movement per internal lane — but controllers can set HeldTurn any
+	// time, and the engine must not classify against a branch the vehicle
+	// will not take).
+	blocked, holdSeal := e.exitWalk(v, lane, false, false)
+	return blocked && !holdSeal
 }
 
 // resetStuckBehind clears the stuck timer of every vehicle on lane and on

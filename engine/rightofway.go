@@ -219,19 +219,27 @@ func (e *Engine) rowConflict(v *Vehicle, next *Lane) bool {
 // (ADR-0010) and the signal guardrail (ADR-0011 — green never means enter
 // a box you cannot exit).
 func (e *Engine) boxBlocked(v *Vehicle, next *Lane) bool {
+	blocked, _ := e.boxWalk(v, next)
+	return blocked
+}
+
+// boxWalk is boxBlocked with the cause attached (see exitWalk for the
+// holdSeal contract): the gridlock escape needs to tell a capacity seal
+// from a holding stop line, entry gating does not.
+func (e *Engine) boxWalk(v *Vehicle, next *Lane) (blocked, holdSeal bool) {
 	// Box occupancy: never enter against conflicting traffic already inside
 	// (any class — a vehicle physically in the conflict zone owns it).
 	for _, f := range next.FoesCross {
 		if len(f.vehs) > 0 {
-			return true
+			return true, false
 		}
 	}
 	for _, f := range next.FoesMerge {
 		if len(f.vehs) > 0 {
-			return true
+			return true, false
 		}
 	}
-	return e.exitBlocked(v, next, false)
+	return e.exitWalk(v, next, false, true)
 }
 
 // exitBlocked reports whether the lane's EXIT chain cannot take v. The
@@ -258,6 +266,23 @@ func (e *Engine) boxBlocked(v *Vehicle, next *Lane) bool {
 // (leaderAt) already brakes for it, and walling the box end against it
 // serialized discharge to one vehicle per box traversal.
 func (e *Engine) exitBlocked(v *Vehicle, next *Lane, inBox bool) bool {
+	blocked, _ := e.exitWalk(v, next, inBox, true)
+	return blocked
+}
+
+// exitWalk is exitBlocked with the cause attached: the second return
+// reports whether the seal — when there is one — is a HOLDING STOP LINE
+// (red/amber downstream) rather than capacity. Entry gating treats the
+// two identically (both mean "do not enter"); the gridlock escape must
+// not — a red that holds an in-box vehicle past the strand threshold is
+// stop-line starvation, a signal's domain, and the escape's doctrine is
+// that a red light is never a trigger (ADR-0034, jammedAtJunction).
+//   - turnSpent says whether v's held turn was already consumed reaching
+//     `next`. Every entry-gate caller passes true (the crossing into next
+//     spent it, boundaries()); the escape's IN-BOX arm passes false — v is
+//     still in the box and the walk's FIRST hop is the crossing that will
+//     consume the turn (leaderAt spends it there for the same reason).
+func (e *Engine) exitWalk(v *Vehicle, next *Lane, inBox, turnSpent bool) (blocked, holdSeal bool) {
 	need := v.Type.Length + v.Type.S0
 	free := 0.0
 	// dist is v's distance to the lane being examined; it is consumed by
@@ -265,16 +290,20 @@ func (e *Engine) exitBlocked(v *Vehicle, next *Lane, inBox bool) bool {
 	// there, so next.Length is correct). In the entry case it is unused.
 	dist := next.Length - v.S
 	cur := next
-	// Virtual walk: reaching `next` already consumed the held turn (the
-	// crossing into it spends it, boundaries()) — every hop here follows
-	// the route/default only.
+	// Virtual walk: when turnSpent, reaching `next` already consumed the
+	// held turn (the crossing into it spends it, boundaries()) — every hop
+	// then follows the route/default only. Otherwise the FIRST pick below
+	// honors the held turn and spends it, matching boundaries().
 	probe := *v
-	probe.HeldTurn = 0
+	if turnSpent {
+		probe.HeldTurn = 0
+	}
 	for hops := 0; hops < maxLaneHops; hops++ {
 		if len(cur.Successors) == 0 {
 			break
 		}
 		exit := e.pickSuccessor(cur, &probe) // v's actual route, not the default
+		probe.HeldTurn = 0                   // the first hop spent it, if still held
 		// A shared funnel (several lanes feeding one) arbitrates
 		// simultaneous arrivals itself: no foe set covers cross-junction
 		// merges (netimport compiles foes WITHIN a junction only), so a
@@ -288,11 +317,11 @@ func (e *Engine) exitBlocked(v *Vehicle, next *Lane, inBox bool) bool {
 		// (rowConflict/foe approaches) owns near-merge arbitration, and
 		// entry distances would make every converging branch a blocker.
 		if inBox && len(exit.Prevs) > 1 && e.mergeThreat(v, cur, exit, dist) {
-			return true
+			return true, false
 		}
 		if n := len(exit.vehs); n > 0 {
 			if inBox {
-				return false // own-path tail: car-following owns it
+				return false, false // own-path tail: car-following owns it
 			}
 			first := exit.vehs[0]
 			// Room behind the tail measured from this lane's start; a tail
@@ -303,24 +332,25 @@ func (e *Engine) exitBlocked(v *Vehicle, next *Lane, inBox bool) bool {
 		if exit.Internal {
 			for _, f := range exit.FoesCross {
 				if len(f.vehs) > 0 {
-					return true
+					return true, false
 				}
 			}
 			for _, f := range exit.FoesMerge {
 				if len(f.vehs) > 0 {
-					return true
+					return true, false
 				}
 			}
 			// A HOLDING stop line caps the room at its start; shallow by
 			// design (signal wall states + stop class only): no foe
 			// evaluation, so no recursion into rowConflict → boxBlocked.
 			if e.downstreamHold(exit) {
+				holdSeal = true
 				break
 			}
-			return false // the next box's gate takes over from here
+			return false, false // the next box's gate takes over from here
 		}
 		if exit.Exit {
-			return false // drains out of the network: room is unbounded
+			return false, false // drains out of the network: room is unbounded
 		}
 		free += exit.Length
 		dist += exit.Length
@@ -330,9 +360,9 @@ func (e *Engine) exitBlocked(v *Vehicle, next *Lane, inBox bool) bool {
 		cur = exit
 	}
 	if free < need {
-		return true
+		return true, holdSeal
 	}
-	return false
+	return false, false
 }
 
 // mergeThreat reports whether a vehicle on a sibling branch feeding exit

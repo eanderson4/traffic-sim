@@ -297,6 +297,166 @@ func TestSealedJunctionBleedsRatherThanFlushes(t *testing.T) {
 	}
 }
 
+// A vehicle stopped INSIDE a box whose exit is sealed is the ADR-0034
+// known gap: its lane is internal and its successor is an ordinary road,
+// so the entry-time condition (routed into a blocked box) could never
+// reach it, and on base34 five such boxes stayed occupied for the rest of
+// the run with every crossing movement through them blocked. The in-box
+// condition — head of an internal lane, exit chain with no room for it —
+// must strand it like any other cycle head.
+func TestInBoxStrandedVehicleIsRescued(t *testing.T) {
+	const seconds = 700 // room for the escape threshold plus slack
+	nf := &NetFile{Version: 1, Name: "sealed-inbox", Lanes: []NetLane{
+		{ID: "nA_0", Section: "A", Length: 200, SpeedLimit: 13.89, Successors: []string{"iJ_0"}},
+		{ID: "iJ_0", Section: "j:J", Length: 20, SpeedLimit: 13.89, Internal: true,
+			Junction: "J", Row: "major", Successors: []string{"nE_0"}},
+		{ID: "nE_0", Section: "E", Length: 30, SpeedLimit: 13.89, EndWall: true},
+	}}
+	e := newFileEngine(t, nf, seconds*10)
+	box := laneOf(t, e, "iJ_0")
+	blocked := laneOf(t, e, "nE_0")
+	// The exit packed bumper to bumper with the tail protruding before the
+	// lane start: nothing can compact forward, so the box exit is sealed
+	// for good and the in-box vehicle cannot leak onto the exit road.
+	for s := 27.5; s >= 0.5; s -= 6.75 {
+		e.AddInitialVehicle(blocked, 0, s, 0, 1)
+	}
+	stuck := e.AddInitialVehicle(box, 0, 10, 0, 1) // fully inside the box, sealed in
+	for e.Tick < uint64(seconds*10) {
+		e.Step()
+		assertNoNaN(t, e)
+	}
+	if e.Stats.Stranded == 0 {
+		t.Fatalf("the in-box vehicle was never rescued in %d s", seconds)
+	}
+	if stuck.Lane != nil {
+		t.Errorf("the sealed in-box vehicle is still on the network")
+	}
+}
+
+// A vehicle stopped inside a box behind a queue that DRAINS is ordinary
+// congestion, not a cycle: the in-box condition must stay inert while the
+// exit chain has room. Same sealed-box geometry, but the exit road is an
+// open boundary — the box clears within seconds and nothing may strand.
+func TestInBoxEscapeIgnoresADrainingExit(t *testing.T) {
+	const seconds = 700
+	nf := &NetFile{Version: 1, Name: "draining-inbox", Lanes: []NetLane{
+		{ID: "nA_0", Section: "A", Length: 200, SpeedLimit: 13.89, Successors: []string{"iJ_0"}},
+		{ID: "iJ_0", Section: "j:J", Length: 8, SpeedLimit: 13.89, Internal: true,
+			Junction: "J", Row: "major", Successors: []string{"nE_0"}},
+		{ID: "nE_0", Section: "E", Length: 200, SpeedLimit: 13.89, Exit: true},
+	}}
+	e := newFileEngine(t, nf, seconds*10)
+	box := laneOf(t, e, "iJ_0")
+	e.AddInitialVehicle(box, 0, 4, 0, 1)
+	for e.Tick < uint64(seconds*10) {
+		e.Step()
+		assertNoNaN(t, e)
+	}
+	if e.Stats.Stranded != 0 {
+		t.Errorf("%d vehicles stranded with an open exit — the in-box rescue fires on draining traffic",
+			e.Stats.Stranded)
+	}
+}
+
+// The in-box discriminator itself, white-box: a motionless head-of-box at
+// the strand threshold is rescued only when the seal is CAPACITY. Three
+// configurations of the same geometry — exit tail with room behind it
+// (drains: not blocked), exit packed solid to its start (sealed: blocked),
+// and empty stubs capped by a downstream RED (holdSeal: the signal's
+// domain, never a trigger — the doctrine the entry arm already follows).
+func TestInBoxDiscriminatorReadsTheSeal(t *testing.T) {
+	tlLink0 := 0
+	mk := func(stubLen float64) (*Engine, *Lane) {
+		nf := &NetFile{Version: 1, Name: "discrim", Lanes: []NetLane{
+			{ID: "nA_0", Section: "A", Length: 200, SpeedLimit: 13.89, Successors: []string{"iJ_0"}},
+			{ID: "iJ_0", Section: "j:J", Length: 20, SpeedLimit: 13.89, Internal: true,
+				Junction: "J", Row: "major", Successors: []string{"nE_0"}},
+			{ID: "nE_0", Section: "E", Length: stubLen, SpeedLimit: 13.89, Successors: []string{"iJ2_0"}},
+			{ID: "iJ2_0", Section: "j:J2", Length: 8, SpeedLimit: 13.89, Internal: true,
+				Junction: "J2", Row: "major", TL: "J2", TLLink: &tlLink0, Successors: []string{"nX_0"}},
+			{ID: "nX_0", Section: "X", Length: 100, SpeedLimit: 13.89, Exit: true},
+		}, Signals: []NetSignal{{ID: "J2", Junction: "J2", Phases: []NetSignalPhase{
+			{Duration: 30, State: "g"},
+			{Duration: 400, State: "r"},
+		}}}}
+		e := newFileEngine(t, nf, 1)
+		return e, laneOf(t, e, "iJ_0")
+	}
+	atThreshold := func(e *Engine, box *Lane) *Vehicle {
+		v := e.AddInitialVehicle(box, 0, 10, 0, 1)
+		v.stuckTicks = uint64(e.Params.StrandAfterS/e.Params.Dt) + 1
+		return v
+	}
+
+	// Room behind the tail: 25 m of it — the exit takes v eventually.
+	e, box := mk(40)
+	e.AddInitialVehicle(laneOf(t, e, "nE_0"), 0, 30, 0, 1)
+	if e.jammedAtJunction(atThreshold(e, box), box) {
+		t.Error("tail with room reads as a seal — a draining queue would strand")
+	}
+
+	// Tail protruding before the exit start: no room, a capacity seal.
+	e, box = mk(2)
+	e.AddInitialVehicle(laneOf(t, e, "nE_0"), 0, 0.5, 0, 1) // occupies -4.5..0.5
+	if !e.jammedAtJunction(atThreshold(e, box), box) {
+		t.Error("bumper-to-bumper seal does not read as blocked — the rescue lost its target")
+	}
+
+	// Empty stubs, red ahead: room capped by the hold, NOT a seal.
+	e, box = mk(2)
+	for e.Tick < 310 { // into the 400 s red phase
+		e.Step()
+	}
+	if e.jammedAtJunction(atThreshold(e, box), box) {
+		t.Error("a downstream red reads as a seal — the escape would strand a signal queue")
+	}
+
+	// The ENTRY arm reads the same hold the same way: one lane upstream,
+	// same red-capped stubs, and the doctrine is symmetric.
+	e, _ = mk(2)
+	for e.Tick < 310 {
+		e.Step()
+	}
+	approach := laneOf(t, e, "nA_0")
+	if e.jammedAtJunction(atThreshold(e, approach), approach) {
+		t.Error("entry arm strands on a downstream red — the arms disagree on the doctrine")
+	}
+}
+
+// The in-box walk's FIRST hop is the crossing that consumes a held turn,
+// so the discriminator must classify against the branch the vehicle will
+// actually take. Internal lanes are single-successor on netimport networks
+// (movement per internal lane), but a controller can set HeldTurn any
+// time; misreading the branch would strand a vehicle over a seal it was
+// never going to meet.
+func TestInBoxWalkHonorsTheHeldTurn(t *testing.T) {
+	nf := &NetFile{Version: 1, Name: "inbox-turn", Lanes: []NetLane{
+		{ID: "nA_0", Section: "A", Length: 200, SpeedLimit: 13.89, Successors: []string{"iJ_0"}},
+		{ID: "iJ_0", Section: "j:J", Length: 20, SpeedLimit: 13.89, Internal: true,
+			Junction: "J", Row: "major", Successors: []string{"nL_0", "nR_0"}},
+		{ID: "nL_0", Section: "L", Length: 2, SpeedLimit: 13.89, EndWall: true},
+		{ID: "nR_0", Section: "R", Length: 100, SpeedLimit: 13.89, Exit: true},
+	}}
+	mk := func(held int) (*Engine, *Lane, *Vehicle) {
+		e := newFileEngine(t, nf, 1)
+		box := laneOf(t, e, "iJ_0")
+		e.AddInitialVehicle(laneOf(t, e, "nL_0"), 0, 0.5, 0, 1) // the left exit, sealed
+		v := e.AddInitialVehicle(box, 0, 10, 0, 1)
+		v.HeldTurn = held
+		v.stuckTicks = uint64(e.Params.StrandAfterS/e.Params.Dt) + 1
+		return e, box, v
+	}
+	e, box, v := mk(1) // held left: into the seal
+	if !e.jammedAtJunction(v, box) {
+		t.Error("held toward the sealed branch: not jammed — the walk ignored the turn")
+	}
+	e, box, v = mk(-1) // held right: onto the open exit
+	if e.jammedAtJunction(v, box) {
+		t.Error("held toward the open branch: jammed — classified against the wrong branch")
+	}
+}
+
 // A keyframe taken while a stuck timer is running must carry it. The timer
 // decides whether a vehicle EXISTS — strandStuck removes one that reaches
 // StrandAfterS — and ReplayFromStream and Player.seek both restore from the
