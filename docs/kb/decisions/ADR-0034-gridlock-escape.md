@@ -428,7 +428,8 @@ occupied to the horizon with every crossing movement through them blocked.
 The condition now has a second arm (`engine/gridlock.go`,
 `jammedAtJunction`): head of an INTERNAL lane, routed successor a road, and
 the entry gate's own exit-chain test run from v's current lane
-(`exitBlocked(v, lane, false)`) — no room for v behind the first queue
+(`exitWalk(v, lane, false, false)` — turn unspent; see the held-turn
+refinement below) — no room for v behind the first queue
 tail. That is the same "cannot clear" test, applied from the far side of
 the stop line; a red light still cannot trigger it (a holding stop line
 caps room but does not seal it, and a draining exit has room behind its
@@ -447,7 +448,7 @@ tail" on the first occupied exit), and the vehicle creeps onto the exit
 road and queues there, freeing the box itself. The gap case needs the exit
 sealed to its very start, which is exactly the base34 pathology.
 
-Two refinements landed with the second review round:
+Three refinements landed across the later review rounds:
 
 - **A holding stop line is not a seal — at EITHER arm.** `exitBlocked`
   gained a cause-reporting variant (`exitWalk`, with `boxWalk` alongside):
