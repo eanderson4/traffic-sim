@@ -19,6 +19,24 @@ import (
 // run, so a table never invalidates. The cache is derived state: not
 // serialized, not folded into the CRC, recomputed identically on demand.
 //
+// Adaptive mode (ADR-0036, Params.AdaptiveRouting): the weights stop being
+// free-flow constants. Each lane carries ttEMA, a smoothed travel time fed
+// by vehicle dwell samples and relaxed back toward free flow every tick
+// (engine.go), frozen into ttSnap at each 60-second epoch rollover, and the
+// memoized tables gain an epoch stamp — accessing a stale table recomputes
+// it over the frozen weights, immediately and unmetered, so every table in
+// play is always current-epoch and a restore rebuilds exactly what the
+// live engine served. Recomputation is damped by hysteresis against the
+// STATIC free-flow table (a lane keeps its free-flow next-hop unless the
+// new path beats it by more than max(30 s, 15%), so a shared table cannot
+// flip the whole flow between two arms every epoch) and guarded by a
+// constructive reachability check (rerouteTable). The static reference is
+// what makes every table a pure function of (frozen weights, network) —
+// no hysteresis history to keyframe. The lateral-depth tables below are
+// topology-based and do NOT participate. Stamps and table caches stay
+// derived state; ttSnap is keyframed. With the flag off none of this runs
+// and every byte is what the static builder produced.
+//
 // Determinism (ADR-0005): adjacency walks fixed slice order (predecessor
 // lists are built in lane-then-successor order), heap ties break toward
 // the lower lane index, equal-cost relaxations keep the first (fixed)
@@ -154,18 +172,209 @@ func freeFlowTime(l *Lane) float64 {
 	return l.Length / l.SpeedLimit
 }
 
+// routeWeight is the edge weight the table builder uses: the lane's
+// EPOCH-FROZEN travel time (ttSnap, snapshotted from the EMA at each epoch
+// rollover, engine.go) while AdaptiveRouting is on — the freeze is what
+// makes a table a pure function of (keyframed state, network), so a
+// mid-epoch restore recomputes exactly the table the live engine was
+// serving. With the flag off it is free-flow time, and the builder runs
+// once per destination and never again.
+func (e *Engine) routeWeight(l *Lane) float64 {
+	if e.Params.AdaptiveRouting {
+		return e.ttSnap[l.Index]
+	}
+	return freeFlowTime(l)
+}
+
 // routeTable returns — computing and memoizing on first use — the next-hop
 // table toward the destination lane at destIdx: tab[i] is the index of the
 // successor of lane i on the shortest-FREE-FLOW-TIME path to the destination,
 // −1 when lane i cannot reach it (or is the destination itself).
+//
+// Adaptive mode (ADR-0036 §2): the memoized entry carries an epoch stamp
+// (epoch = tick / e.routeEpochTicks). Serving a stale entry recomputes it
+// over the epoch-frozen weights, IMMEDIATELY and unmetered — the same rule
+// as a first-use build. A budget that served stale tables under pressure
+// was designed here and rejected in review: tables from different epochs
+// coexisting is what a mid-run restore cannot reproduce (the old freeze is
+// gone), so every table in play is always current-epoch — a pure function
+// of (frozen weights, network), bit-exact across restore. The price is an
+// epoch-boundary CPU spike of one Dijkstra per destination actually asked
+// for that epoch, on the tick it is first asked.
 func (e *Engine) routeTable(destIdx int) []int32 {
 	if t, ok := e.routeTabs[destIdx]; ok {
+		if !e.Params.AdaptiveRouting {
+			return t
+		}
+		epoch := e.Tick / e.routeEpochTicks
+		if e.routeEpochs[destIdx] >= epoch {
+			return t
+		}
+		t = e.rerouteTable(destIdx)
+		e.routeTabs[destIdx] = t
+		e.routeEpochs[destIdx] = epoch
 		return t
 	}
+	var next []int32
+	if e.Params.AdaptiveRouting {
+		// First-use builds go through the SAME hysteretic construction as
+		// stale recomputes: after a mid-epoch restore every cache is cold,
+		// and a raw Dijkstra would take hops the uninterrupted run's
+		// hysteresis rejected — a replay divergence on marginal congestion
+		// (external review, 2026-07-30). At epoch 0 the frozen weights ARE
+		// free flow, so this reduces exactly to the static table.
+		next = e.rerouteTable(destIdx)
+	} else {
+		next, _ = e.routeDijkstra(destIdx, e.routeWeight)
+	}
+	if e.routeTabs == nil {
+		e.routeTabs = map[int][]int32{}
+	}
+	e.routeTabs[destIdx] = next
+	if e.routeEpochs != nil {
+		e.routeEpochs[destIdx] = e.Tick / e.routeEpochTicks
+	}
+	return next
+}
+
+// staticRouteTable memoizes the FREE-FLOW next-hop table toward destIdx —
+// the hysteresis reference for adaptive recomputes. The network is
+// immutable for the run, so this never invalidates; it is exactly the
+// table the flag-off builder produces.
+func (e *Engine) staticRouteTable(destIdx int) []int32 {
+	if t, ok := e.staticTabs[destIdx]; ok {
+		return t
+	}
+	next, _ := e.routeDijkstra(destIdx, freeFlowTime)
+	if e.staticTabs == nil {
+		e.staticTabs = map[int][]int32{}
+	}
+	e.staticTabs[destIdx] = next
+	return next
+}
+
+// rerouteTable recomputes the next-hop table toward destIdx over the
+// epoch-frozen travel-time weights and reconciles it with the STATIC
+// free-flow table under hysteresis (ADR-0036 §2): lane i keeps its
+// free-flow next-hop unless the new path beats the free-flow path's cost
+// (under CURRENT weights) by more than max(30 s, 15%). Without the margin
+// the whole flow flips between two near-equal arms every epoch
+// (braess-style oscillation); with it only clearly-better alternatives
+// divert, and traffic falls back to the free-flow routes as congestion
+// clears.
+//
+// The reference is the static table, not the previous epoch's adaptive
+// table, for one reason above all: replay. A table is then a PURE FUNCTION
+// of (epoch-frozen weights, network) — no hysteresis history to keyframe,
+// and a restore at any tick recomputes exactly what the live engine served
+// (external review, 2026-07-30).
+//
+// ACYCLICITY IS CONSTRUCTED, not argued. Splicing individual Dijkstra hops
+// into the static tree can in principle close a cycle (the additive 30 s
+// margin defeats the proportional-telescoping argument, and a free-flow
+// loop would feed floored dwell samples that never break it — both review
+// findings). So a candidate hop is installed only if the MIXED chain from
+// i — with every candidate before i already installed — still reaches the
+// destination within one hop per lane. Candidates install in fixed lane
+// order; the induction is that reachability holds for the static table
+// and each accepted splice preserves it, so the served table is always a
+// functional graph whose every path terminates at the destination.
+// Costs are the REALIZED ones: the margin is earned by the mixed chain
+// the vehicle will actually drive, not the fresh Dijkstra's idealized
+// path (downstream lanes whose own margins did not clear keep static
+// hops, so the two can differ — review round 4).
+func (e *Engine) rerouteTable(destIdx int) []int32 {
+	fresh, _ := e.routeDijkstra(destIdx, e.routeWeight)
+	next := e.staticRouteTable(destIdx)
+	mixed := make([]int32, len(next))
+	copy(mixed, next)
+	for i := range fresh {
+		if fresh[i] == next[i] || fresh[i] < 0 {
+			continue
+		}
+		// Two walks per candidate. The STATIC chain gives the cost to beat
+		// (the free-flow path under current weights, same convention as the
+		// builder: successors summed, destination included, i excluded).
+		oldCost := math.Inf(1)
+		if j := int(next[i]); j >= 0 {
+			cost, reached := 0.0, false
+			for hops := 0; hops <= len(next); hops++ {
+				cost += e.routeWeight(e.Net.Lanes[j])
+				if j == destIdx {
+					reached = true
+					break
+				}
+				if j = int(next[j]); j < 0 {
+					break
+				}
+			}
+			if reached {
+				oldCost = cost
+			}
+		}
+		// The MIXED chain with the candidate installed gives both the
+		// reachability guarantee and the REALIZED cost: downstream lanes
+		// whose own margins did not clear keep static hops, so the path
+		// the vehicle actually drives can cost more than the fresh
+		// Dijkstra's idealized one — the margin must be earned by the
+		// path that will be served (review round 4). The candidate is
+		// installed BEFORE the walk and reverted on failure: validating
+		// with i's stale static hop still in place lets a chain that
+		// returns to i escape through it and read as reaching the
+		// destination, and the install then closes a real cycle (review
+		// round 5).
+		mixed[i] = fresh[i]
+		j, reached := int(fresh[i]), false
+		mixedCost := math.Inf(1)
+		{
+			cost := 0.0
+			for hops := 0; hops <= len(mixed); hops++ {
+				cost += e.routeWeight(e.Net.Lanes[j])
+				if j == destIdx {
+					reached = true
+					break
+				}
+				if j = int(mixed[j]); j < 0 {
+					break
+				}
+			}
+			if reached {
+				mixedCost = cost
+			}
+		}
+		if !reached {
+			mixed[i] = next[i] // the splice strands i or closes a cycle
+			continue
+		}
+		if !math.IsInf(oldCost, 1) {
+			margin := 30.0
+			if m := 0.15 * oldCost; m > margin {
+				margin = m
+			}
+			if mixedCost >= oldCost-margin {
+				mixed[i] = next[i] // not CLEARLY better: keep the free-flow hop
+				continue
+			}
+		}
+	}
+	return mixed
+}
+
+// routeDijkstra runs the reverse Dijkstra toward destIdx over the given
+// edge weight and returns the next-hop table and the cost-to-destination
+// of every lane. This is the static builder's exact algorithm — same
+// predecessor order, same heap tie-breaks, same strict-< relaxation — so
+// with weights ≡ free flow its tables are the static ones bit-for-bit.
+//
+// Reverse relaxation: forward edge p→u costs the travel time of the lane
+// ENTERED. Measured on chi-loop-urban (2026-07): length weights route
+// traffic through short alleys in preference to faster arterials,
+// concentrating flow on exactly the links that saturate first.
+func (e *Engine) routeDijkstra(destIdx int, weight func(*Lane) float64) (next []int32, dist []float64) {
 	n := len(e.Net.Lanes)
 	preds := e.routePreds()
-	dist := make([]float64, n)
-	next := make([]int32, n)
+	dist = make([]float64, n)
+	next = make([]int32, n)
 	for i := range dist {
 		dist[i], next[i] = math.Inf(1), -1
 	}
@@ -178,14 +387,7 @@ func (e *Engine) routeTable(destIdx int) []int32 {
 			continue
 		}
 		done[u] = true
-		// Reverse relaxation: forward edge p→u costs the FREE-FLOW TIME of
-		// the lane entered (length / speed limit). Measured on chi-loop-urban
-		// (2026-07): length weights route traffic through short alleys in
-		// preference to faster arterials, concentrating flow on exactly the
-		// links that saturate first. A zero/negative limit degrades to the
-		// lane's length rather than dividing by zero.
-		ul := e.Net.Lanes[u]
-		w := dist[u] + freeFlowTime(ul)
+		w := dist[u] + weight(e.Net.Lanes[u])
 		for _, p := range preds[u] {
 			pi := int(p)
 			if !done[pi] && w < dist[pi] {
@@ -195,11 +397,7 @@ func (e *Engine) routeTable(destIdx int) []int32 {
 			}
 		}
 	}
-	if e.routeTabs == nil {
-		e.routeTabs = map[int][]int32{}
-	}
-	e.routeTabs[destIdx] = next
-	return next
+	return next, dist
 }
 
 // routePreds returns — building once — the predecessor adjacency of the

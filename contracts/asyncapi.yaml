@@ -911,16 +911,23 @@ components:
 
     Keyframe:
       name: keyframe
-      title: Full-state keyframe (engine.MarshalState bytes, TSKF v2; v3 while director directives pending)
+      title: Full-state keyframe (engine.MarshalState bytes, TSKF v2–v6 by run state and params)
       summary: |
         Complete dynamic state: tick, rolling CRC, next vehicle id, every
         vehicle (id, lane, type, s, v, f, cooldown, RNG words + draw count,
         persistent controller axes — cruise setpoint, held turn, signals,
         route), spawner demand state. Layout: engine/keyframe.go ("TSKF";
-        v2 adds the controller axes, v3 — written ONLY while the director
+        v2 adds the controller axes; v3 — written ONLY while the director
         injection queue is non-empty — appends the pending directives so a
-        seek resumes them bit-exactly; an empty queue marshals
-        byte-identical v2, and readers accept v2|v3). A keyframe larger
+        seek resumes them bit-exactly; v4 appends per-directive
+        destination/offset while any queued directive carries them
+        (ADR-0021); v5 appends per-vehicle stuckTicks/stopDone while any
+        such timer or duty is live (ADR-0034); v6 — written ONLY while
+        Params.AdaptiveRouting is on — appends per-vehicle laneEntryTick
+        and a per-lane ttEMA/ttSnap section (ADR-0036). Each higher
+        version is state-gated, so a run with no qualifying state marshals
+        byte-identical to a lower one; readers accept v2–v6, and a v6
+        payload into a flag-off spec is rejected loudly). A keyframe larger
         than the recorder's KeyframeChunkMax (default 768 KiB) is split
         into consecutive chunk messages (ADR-0015); reassembled bytes are
         exactly this payload.
@@ -1281,12 +1288,14 @@ components:
       type: string
       format: binary
       description: |
-        Magic "TSKF", version 2; canonical layout documented in
-        engine/keyframe.go. Contains the full CRC-covered state plus raw
-        RNG words, spawner demand state, and (since v2) the persistent
-        controller axes (cruise setpoint, held turn, signals, route), so
-        RestoreState resumes the run bit-exactly. Does NOT contain the run
-        spec — that pairs via the run registry (ts.{run}.meta).
+        Magic "TSKF", versions 2–6 (state- and params-gated; readers accept
+        the whole line, v6 only from runs with Params.AdaptiveRouting on —
+        ADR-0036); canonical layout documented in engine/keyframe.go.
+        Contains the full CRC-covered state plus raw RNG words, spawner
+        demand state, and (since v2) the persistent controller axes (cruise
+        setpoint, held turn, signals, route), so RestoreState resumes the
+        run bit-exactly. Does NOT contain the run spec — that pairs via
+        the run registry (ts.{run}.meta).
 
     LoggedCRCFrame:
       type: string

@@ -48,6 +48,16 @@ type Params struct {
 	// vehicle motionless at an open junction for five minutes. It is the
 	// bound on how long the model will stay stopped before saying so.
 	StrandAfterS float64
+
+	// AdaptiveRouting turns on congestion-adaptive route resolution
+	// (ADR-0036): lanes carry a smoothed travel-time estimate fed by vehicle
+	// dwell samples, frozen per 60-second epoch into the routing weights,
+	// and the memoized next-hop tables are recomputed once per epoch over
+	// those weights instead of serving free-flow tables forever. OFF is
+	// bit-identical to pre-ADR-0036 behavior — same tables, same keyframe
+	// bytes — which is what keeps every M1–M3 CRC fixture and recorded
+	// baseline valid.
+	AdaptiveRouting bool
 }
 
 // DefaultParams returns the validated M1 defaults.
@@ -75,6 +85,10 @@ func DefaultParams() Params {
 		// enough that a gridlocked network resumes within the run
 		// (ADR-0034).
 		StrandAfterS: 300,
+		// Off by default until the validation baselines land (ADR-0036's
+		// validation plan); flipping the default is a follow-up with its own
+		// measured bracket.
+		AdaptiveRouting: false,
 	}
 }
 
@@ -194,6 +208,19 @@ type Engine struct {
 	latTabs   map[int][]int32 // dest lane index → lateral-depth table
 	preds     [][]int32       // predecessor adjacency, built once
 
+	// Adaptive-routing state (ADR-0036, routing.go). ttSnap is the
+	// epoch-frozen routing weight per lane — snapshotted from ttEMA at each
+	// epoch rollover, KEYFRAMED (it decides behavior). routeEpochs and the
+	// table caches are pure functions of (tick, keyframed state,
+	// deterministic sweep order), so they stay derived: not keyframed, not
+	// CRC'd. routeEpochTicks/ttRelaxTicks are dt-derived constants computed
+	// at NewEngine. All unused while Params.AdaptiveRouting is off.
+	ttSnap          []float64       // lane index → epoch-frozen travel time
+	routeEpochs     map[int]uint64  // dest lane index → epoch of the cached table
+	staticTabs      map[int][]int32 // dest lane index → free-flow table (hysteresis reference)
+	routeEpochTicks uint64          // 60 s in ticks at this run's dt
+	ttRelaxTicks    float64         // 600 s in ticks at this run's dt
+
 	Stats Stats
 }
 
@@ -256,6 +283,7 @@ func NewEngine(spec RunSpec) (*Engine, error) {
 			v.S = float64(i) * spacing
 			v.V = veq
 			v.F = 1
+			v.laneEntryTick = e.Tick
 			e.register(v)
 		}
 	}
@@ -263,6 +291,27 @@ func NewEngine(spec RunSpec) (*Engine, error) {
 	e.spawner = newSpawner(e.scen, net)
 	if e.spawner != nil {
 		e.spawner.init(e)
+	}
+	// Adaptive routing (ADR-0036 §1): the travel-time EMA starts at free
+	// flow, so the first epoch's tables are exactly the static ones and the
+	// mechanism reduces to ADR-0021 until dwell evidence says otherwise.
+	// Keyframe restore overwrites ttEMA and ttSnap from the lane section
+	// (format v6). The time constants are SECONDS converted to ticks here:
+	// dt is a scenario parameter, and 600/6000 ticks are 60 s/10 min only
+	// at the validated 0.1 s tick.
+	if e.Params.AdaptiveRouting {
+		e.ttSnap = make([]float64, len(net.Lanes))
+		for _, l := range net.Lanes {
+			l.ttEMA = freeFlowTime(l)
+			e.ttSnap[l.Index] = l.ttEMA
+		}
+		e.routeEpochs = map[int]uint64{}
+		dt := e.Params.Dt
+		if dt <= 0 { // validated upstream; never divide by a bad tick
+			dt = 0.1
+		}
+		e.routeEpochTicks = max(1, uint64(math.Round(60/dt)))
+		e.ttRelaxTicks = max(1, math.Round(600/dt))
 	}
 	e.rebuildOccupancy()
 	return e, nil
@@ -307,6 +356,7 @@ func (e *Engine) AddInitialVehicle(lane *Lane, typeIdx int, s, v, f float64) *Ve
 	veh.S = s
 	veh.V = v
 	veh.F = f
+	veh.laneEntryTick = e.Tick
 	e.register(veh)
 	e.rebuildOccupancy()
 	return veh
@@ -322,6 +372,9 @@ func (e *Engine) CRC() uint64 { return e.crc }
 
 // Step advances the simulation exactly one tick. Phase order:
 //
+//  0. adaptive routing (flag-gated, ADR-0036): travel-time EMA
+//     relaxation, epoch-rollover weight freeze — before anything routes
+//     this tick
 //  1. events: deterministic spawner, then director spawn directives
 //     (ADR-0005: events fire before the sweep; the director queue's fixed
 //     point is documented in director.go)
@@ -335,6 +388,24 @@ func (e *Engine) CRC() uint64 { return e.crc }
 //  7. metrics + rolling state CRC
 func (e *Engine) Step() {
 	e.Tick++
+	// Adaptive routing (ADR-0036): relax every lane's travel-time EMA back
+	// toward free flow BEFORE the sweep, so this tick's routing sees this
+	// tick's relaxation, and freeze the routing weights at epoch rollover.
+	// Both are
+	// gated on the flag — off stays bit-identical — and both are pure
+	// functions of tick and lane order, so replay re-derives them.
+	if e.Params.AdaptiveRouting {
+		e.relaxTravelTimes()
+		// Epoch rollover: freeze the routing weights (ADR-0036 §2). Tables
+		// are built over the SNAPSHOT, not the live EMA, so a table is a
+		// pure function of (keyframed state, network): a mid-epoch restore
+		// recomputes exactly the table the live engine was serving.
+		if e.Tick%e.routeEpochTicks == 0 {
+			for _, l := range e.Net.Lanes {
+				e.ttSnap[l.Index] = l.ttEMA
+			}
+		}
+	}
 	for _, v := range e.order {
 		v.reqAccOK, v.reqLane = false, 0
 	}
@@ -356,6 +427,46 @@ func (e *Engine) Step() {
 	e.updateStats()
 	e.crc = e.computeCRC()
 	e.CRCs = append(e.CRCs, e.crc)
+}
+
+// relaxTravelTimes moves every lane's travel-time EMA one tick back toward
+// its free-flow time (ADR-0036 §1): an exponential decay with a 10-minute
+// time constant, so a jam that has CLEARED stops repelling traffic on the
+// same timescale it formed. Dwell samples alone only ever move the estimate
+// while vehicles cross; without this term a poisoned lane would repel
+// forever. Per-lane, in fixed lane order — 55k lanes per tick is a plain
+// loop. The constant is dt-derived at NewEngine: 6000 ticks is 10 min only
+// at the validated 0.1 s tick, and dt is a scenario parameter.
+func (e *Engine) relaxTravelTimes() {
+	for _, l := range e.Net.Lanes {
+		l.ttEMA += (freeFlowTime(l) - l.ttEMA) / e.ttRelaxTicks
+	}
+}
+
+// noteLaneLeave folds v's dwell on its current lane into the lane's
+// travel-time EMA and restarts v's dwell clock (ADR-0036 §1). Called on
+// every lane departure — junction crossing, lateral hop, exit or arrival
+// despawn, and strand removal — so the EMA sees one sample per vehicle per
+// lane traversal, α = 1/8. The sample is capped at StrandAfterS so one
+// stranded vehicle cannot poison a lane for longer than the escape's own
+// horizon (a disabled escape, StrandAfterS == 0, means no cap), and FLOORED
+// at the lane's free-flow time: a chained same-tick hop would otherwise
+// feed dwell ≈ 0 and let frequently-chained short lanes read cheaper than
+// empty — a systematic optimistic bias with no physical counterpart.
+func (e *Engine) noteLaneLeave(v *Vehicle) {
+	if !e.Params.AdaptiveRouting {
+		return
+	}
+	l := v.Lane
+	dwell := float64(e.Tick-v.laneEntryTick) * e.Params.Dt
+	if capS := e.Params.StrandAfterS; capS > 0 && dwell > capS {
+		dwell = capS
+	}
+	if ff := freeFlowTime(l); dwell < ff {
+		dwell = ff
+	}
+	l.ttEMA += (dwell - l.ttEMA) / 8
+	v.laneEntryTick = e.Tick
 }
 
 // rebuildOccupancy re-sorts every lane's vehicle list by s (ties by ID —
@@ -723,6 +834,7 @@ func (e *Engine) boundaries() {
 			}
 			switch {
 			case lane.Exit:
+				e.noteLaneLeave(v) // ADR-0036: the exit lane's last dwell sample
 				v.Lane = nil
 				despawned = true
 				e.Stats.Despawned++
@@ -733,6 +845,7 @@ func (e *Engine) boundaries() {
 				// unreachable as a trip end — the vehicle would roll past it
 				// and the route would re-steer it back (the cyclic-network
 				// loop-back recorded in ADR-0019's deferrals).
+				e.noteLaneLeave(v)
 				v.Lane = nil
 				despawned = true
 				e.Stats.Despawned++
@@ -756,6 +869,7 @@ func (e *Engine) boundaries() {
 						e.CrossOverlapsBySection[next.Section]++
 					}
 				}
+				e.noteLaneLeave(v) // ADR-0036: dwell sample for the lane just left
 				v.Lane = next
 				v.HeldTurn = 0 // turn-at-junction is held until consumed
 				// Stop-line duty is per junction APPROACH (ADR-0010), and an
@@ -912,6 +1026,21 @@ func (e *Engine) computeCRC() uint64 {
 			u(uint64(d.TypeIdx))
 			u(d.EarliestTick)
 			h.Write([]byte(d.RequestID))
+		}
+	}
+	// Adaptive-routing state (ADR-0036): ttEMA, the epoch-frozen ttSnap,
+	// and each vehicle's dwell clock all decide behavior, so a replay that
+	// diverges in them must diverge in the CRC the same tick — not whenever
+	// a later route decision happens to expose it (ADR-0005's verification
+	// claim). Flag-gated like the directive fold: flag-off runs keep the
+	// pre-ADR-0036 byte stream bit-identical. Lane order is network order.
+	if e.Params.AdaptiveRouting {
+		for _, l := range e.Net.Lanes {
+			f(l.ttEMA)
+			f(e.ttSnap[l.Index])
+		}
+		for _, v := range e.order {
+			u(v.laneEntryTick)
 		}
 	}
 	return h.Sum64()

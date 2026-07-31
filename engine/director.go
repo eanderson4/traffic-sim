@@ -296,6 +296,7 @@ func (e *Engine) injectDirective(d *TickedSpawn, lane *Lane, speed float64) {
 	v.Route = d.Destination              // routing axis set at birth (ADR-0021)
 	v.V = math.Min(speed, v.v0eff(lane)) // the plan is F-free; apply the driver's own factor
 	v.Cooldown = e.Params.SpawnCooldown
+	v.laneEntryTick = e.Tick // ADR-0036 dwell clock starts at injection
 	e.register(v)
 	e.Stats.Spawned++
 	if d.OffsetM > 0 {

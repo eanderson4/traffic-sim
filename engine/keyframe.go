@@ -31,6 +31,11 @@ import (
 //	v5 only (written solely while some vehicle has a running stuck timer or
 //	a discharged stop duty), appended to each vehicle record:
 //	  stuckTicks u64 | stopDone u8
+//	v6 only (written solely while Params.AdaptiveRouting is on), appended to
+//	each vehicle record after the v5 fields:
+//	  laneEntryTick u64
+//	v6 only, a lane section between the spawner and director sections:
+//	  nLanes u32 | per lane (network order): ttEMA f64 | ttSnap f64
 //	v3 only (written solely while the director queue is non-empty):
 //	  nDirectives u32 | per directive: tick u64 | laneIdx u32 | typeIdx u32 |
 //	  earliestTick u64 | reqIDLen u16 | reqID bytes
@@ -85,7 +90,25 @@ const (
 	// the line merely loses one tick — which is also not bit-exact.)
 	// Caught in review; the comment that used to justify the omission was
 	// the reason nobody looked twice.
-	keyframeVersion = 5
+	//
+	// v6 (ADR-0036, written ONLY while Params.AdaptiveRouting is on — flag
+	// off keeps the v5/v4/v3 bytes exactly) appends one per-vehicle field
+	// after the v5 fields and a lane section between the spawner and
+	// director sections:
+	//
+	//	per vehicle: laneEntryTick u64
+	//	lanes: nLanes u32 | per lane (network order): ttEMA f64 | ttSnap f64
+	//
+	// Both decide what vehicles DO — the dwell clock feeds the travel-time
+	// samples, the travel times weight the epoch recompute — so both are
+	// keyframed on the stuckTicks precedent: anything that decides behavior
+	// must survive a restore exactly. ttEMA is float64, no quantization.
+	// The next-hop tables and epoch stamps are NOT here: they are derived
+	// state, recomputed identically from tick and keyframed state.
+	keyframeVersion = 6
+	// keyframeAdaptiveVersion is the version the ADR-0036 adaptive-routing
+	// state (laneEntryTick, ttEMA) needs.
+	keyframeAdaptiveVersion = 6
 	// keyframeStuckVersion is the version the stuck timer needs.
 	keyframeStuckVersion = 5
 	// keyframeDestVersion is the version a director queue entry carrying the
@@ -122,6 +145,13 @@ func (e *Engine) MarshalState() ([]byte, error) {
 			version = keyframeStuckVersion
 			break
 		}
+	}
+	// Adaptive routing (ADR-0036) needs v6 unconditionally: ttEMA exists on
+	// every lane from the first tick, so there is no "nothing to record"
+	// state to stay below v6 with. Flag off never reaches this and keeps
+	// the v5/v4/v3 bytes exactly.
+	if e.Params.AdaptiveRouting {
+		version = keyframeAdaptiveVersion
 	}
 	w.u16(version)
 	w.u16(0)
@@ -174,6 +204,9 @@ func (e *Engine) MarshalState() ([]byte, error) {
 				w.u8(0)
 			}
 		}
+		if version >= keyframeAdaptiveVersion {
+			w.u64(v.laneEntryTick) // ADR-0036 dwell clock
+		}
 	}
 	if e.spawner != nil {
 		for i := range e.spawner.origins {
@@ -189,6 +222,20 @@ func (e *Engine) MarshalState() ([]byte, error) {
 			w.u64(st.pend.rng.Draws())
 			w.u8(uint8(len(rngBytes)))
 			w.bytes(rngBytes)
+		}
+	}
+	// TSKF v6 (ADR-0036): the per-lane travel-time EMAs and their
+	// epoch-frozen routing snapshots, in network order. Placed between the
+	// spawner and director sections — the reader is gated on the same
+	// version condition, so the two never disagree. ttSnap is keyframed
+	// for the same reason ttEMA is: it decides what vehicles do, and a
+	// table rebuilt after a restore must be the table the live engine was
+	// serving.
+	if version >= keyframeAdaptiveVersion {
+		w.u32(uint32(len(e.Net.Lanes)))
+		for _, l := range e.Net.Lanes {
+			w.f64(l.ttEMA)
+			w.f64(e.ttSnap[l.Index])
 		}
 	}
 	// TSKF v3+: pending director directives (seek must resume the injection
@@ -259,6 +306,12 @@ func restoreState(spec RunSpec, data []byte, checkNet func(*Network) error) (*En
 	if err != nil {
 		return nil, err
 	}
+	// A v6 payload is written only by a flag-ON engine (ADR-0036); reading
+	// one into a flag-OFF spec would silently drop the travel-time state
+	// the run's routing depends on. Refuse the mismatch loudly instead.
+	if ver >= keyframeAdaptiveVersion && !e.Params.AdaptiveRouting {
+		return nil, fmt.Errorf("keyframe: v%d payload carries adaptive-routing state but the spec has AdaptiveRouting off", ver)
+	}
 	if checkNet != nil {
 		if err := checkNet(e.Net); err != nil {
 			return nil, err
@@ -307,6 +360,14 @@ func restoreState(spec RunSpec, data []byte, checkNet func(*Network) error) (*En
 			stuckTicks = r.u64() // ADR-0034
 			stopDone = r.u8() != 0
 		}
+		// A pre-v6 keyframe carries no dwell clock. Restoring one into a
+		// flag-ON spec with laneEntryTick = 0 would make every vehicle's
+		// first departure a capped run-long poison sample; starting the
+		// clock at the restore tick is the honest "no evidence yet".
+		laneEntryTick := tick
+		if ver >= keyframeAdaptiveVersion {
+			laneEntryTick = r.u64() // ADR-0036 dwell clock
+		}
 		if r.err != nil {
 			return nil, fmt.Errorf("keyframe: vehicle %d controller state: %w", i, r.err)
 		}
@@ -328,6 +389,8 @@ func restoreState(spec RunSpec, data []byte, checkNet func(*Network) error) (*En
 
 			stuckTicks: stuckTicks,
 			stopDone:   stopDone,
+
+			laneEntryTick: laneEntryTick,
 		})
 	}
 	if e.spawner != nil {
@@ -353,6 +416,27 @@ func restoreState(spec RunSpec, data []byte, checkNet func(*Network) error) (*En
 			st.rate = rate
 			st.tick = spawnTick
 			st.pend = &Vehicle{ID: pendID, rng: stream}
+		}
+	}
+	// TSKF v6 (ADR-0036): the per-lane travel-time EMAs, in network order,
+	// between the spawner and director sections — writer and reader are
+	// gated on the same version condition, so the two never disagree. The
+	// count must equal the lane count of the network the spec built, or
+	// this keyframe pairs with the wrong spec.
+	if ver >= keyframeAdaptiveVersion {
+		nLanes := r.u32()
+		if r.err != nil {
+			return nil, fmt.Errorf("keyframe: lane count: %w", r.err)
+		}
+		if int(nLanes) != len(e.Net.Lanes) {
+			return nil, fmt.Errorf("keyframe: %d lanes, spec builds %d", nLanes, len(e.Net.Lanes))
+		}
+		for _, l := range e.Net.Lanes {
+			l.ttEMA = r.f64()
+			e.ttSnap[l.Index] = r.f64()
+		}
+		if r.err != nil {
+			return nil, fmt.Errorf("keyframe: lane section: %w", r.err)
 		}
 	}
 	if ver >= 3 {

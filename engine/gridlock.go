@@ -121,7 +121,11 @@ func (e *Engine) strandStuck() {
 		// Off the lane immediately, not at the end of the sweep: later
 		// vehicles in this same tick's sweep read lane.vehs for their own
 		// head test and their own boxBlocked, and must not see a vehicle
-		// that is already gone.
+		// that is already gone. The strand IS a lane departure: fold the
+		// capped dwell sample into the adaptive EMA first (ADR-0036 §1) —
+		// the failure mode the feature exists to route around is exactly
+		// the one that must leave congestion evidence.
+		e.noteLaneLeave(v)
 		lane.vehs = removeVehicle(lane.vehs, v)
 		v.Lane = nil
 		stranded = true

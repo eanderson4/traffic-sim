@@ -1,0 +1,4 @@
+ contracts/asyncapi.yaml |  2 +-
+ engine/routing.go       | 35 +++++++++++++++++++++++---------
+ engine/routing_test.go  | 53 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 80 insertions(+), 10 deletions(-)

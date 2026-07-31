@@ -109,6 +109,28 @@ func TestLoadRunSpec(t *testing.T) {
 	}
 }
 
+// The manifest params block maps onto RunSpec.Params, with zero fields
+// keeping the engine defaults (ADR-0036's flag is the case that matters:
+// a scenario must be able to turn adaptive routing on).
+func TestRunSpecParamsOverride(t *testing.T) {
+	dir := t.TempDir()
+	writeNet(t, dir)
+	writeFile(t, dir, ManifestFile, strings.Replace(goodManifest, "ticks: 3000",
+		"ticks: 3000\nparams: {adaptive_routing: true}", 1))
+	writeFile(t, dir, "demand/main.yaml", goodDemand)
+	s, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	spec, err := s.RunSpec(map[string]*engine.VehicleType{"car": &engine.Car, "truck": &engine.Truck})
+	if err != nil {
+		t.Fatalf("RunSpec: %v", err)
+	}
+	if !spec.Params.AdaptiveRouting {
+		t.Errorf("params override did not map: %+v", spec.Params)
+	}
+}
+
 func TestHashStableAcrossFormatting(t *testing.T) {
 	dir := goodScenario(t)
 	s1, err := Load(dir)

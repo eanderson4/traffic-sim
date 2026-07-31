@@ -98,6 +98,16 @@ type Vehicle struct {
 	// whole StrandAfterS late and diverges the replay.
 	// TestStuckTimerSurvivesAKeyframe pins it; do not make this derived.
 	stuckTicks uint64
+
+	// laneEntryTick is the tick the vehicle entered its current lane; the
+	// difference from e.Tick at the next departure is the dwell sample fed
+	// into the lane's travel-time EMA (ADR-0036 §1). Set at injection and at
+	// every lane crossing and lateral hop. Keyframed (format v6) for the
+	// stuckTicks reason above: a restored zero would attribute the whole
+	// pre-restore dwell to the post-restore lane and poison ITS travel time,
+	// diverging every later routing decision. Written but never read while
+	// Params.AdaptiveRouting is off.
+	laneEntryTick uint64
 }
 
 // v0eff is the vehicle's desired speed on the given lane: type desired speed
