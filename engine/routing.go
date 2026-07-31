@@ -9,9 +9,10 @@ import (
 // persistent routing axis: a destination lane id, set once by a controller
 // and carried on the vehicle (keyframe-persisted, obs-frame-visible). The
 // kernel resolves it at every multi-successor lane: the vehicle takes the
-// successor on the shortest path (by lane length) to its destination
-// instead of the leftmost-successor default. A held turn intent still wins
-// — an explicit junction choice beats the route for that crossing.
+// successor on the shortest path (by FREE-FLOW TIME — lane length over speed
+// limit) to its destination instead of the leftmost-successor default. A
+// held turn intent still wins — an explicit junction choice beats the route
+// for that crossing.
 //
 // Next-hop tables are computed once per destination lane by a reverse
 // Dijkstra and memoized on the Engine; the network is immutable for the
@@ -141,10 +142,22 @@ func (e *Engine) routeLatDepth(destIdx int) []int32 {
 	return depth
 }
 
+// freeFlowTime is the routing edge weight: seconds to cross the lane at its
+// speed limit, empty. A zero/negative limit degrades to the lane's length —
+// i.e. an assumed 1 m/s, arbitrary but unreachable: netfile validation
+// rejects non-positive limits (netfile.go), and the built-in constructors
+// pass a shared positive limit.
+func freeFlowTime(l *Lane) float64 {
+	if l.SpeedLimit <= 0 {
+		return l.Length
+	}
+	return l.Length / l.SpeedLimit
+}
+
 // routeTable returns — computing and memoizing on first use — the next-hop
 // table toward the destination lane at destIdx: tab[i] is the index of the
-// successor of lane i on the shortest path to the destination, −1 when
-// lane i cannot reach it (or is the destination itself).
+// successor of lane i on the shortest-FREE-FLOW-TIME path to the destination,
+// −1 when lane i cannot reach it (or is the destination itself).
 func (e *Engine) routeTable(destIdx int) []int32 {
 	if t, ok := e.routeTabs[destIdx]; ok {
 		return t
@@ -165,10 +178,14 @@ func (e *Engine) routeTable(destIdx int) []int32 {
 			continue
 		}
 		done[u] = true
-		// Reverse relaxation: forward edge p→u costs u.Length (the lane
-		// entered), the same weight convention the retired driver-side
-		// router used.
-		w := dist[u] + e.Net.Lanes[u].Length
+		// Reverse relaxation: forward edge p→u costs the FREE-FLOW TIME of
+		// the lane entered (length / speed limit). Measured on chi-loop-urban
+		// (2026-07): length weights route traffic through short alleys in
+		// preference to faster arterials, concentrating flow on exactly the
+		// links that saturate first. A zero/negative limit degrades to the
+		// lane's length rather than dividing by zero.
+		ul := e.Net.Lanes[u]
+		w := dist[u] + freeFlowTime(ul)
 		for _, p := range preds[u] {
 			pi := int(p)
 			if !done[pi] && w < dist[pi] {

@@ -411,3 +411,40 @@ one message per vehicle per tick at 10 Hz — measured ~230 bytes of framing and
 subject per 61-byte record, and 48 GiB for one 90-minute chi-loop-urban run.
 ADR-0026 had already solved the same problem one plane up and explicitly
 scoped this one out.
+
+## Addendum (2026-07-30, Route resolution cost model: free-flow time, not lane length)
+
+Contract-semantics clarification in the 2026-07-24 line: no wire change —
+`route` remains "destination lane id; persistent"; subjects, layouts and
+versions untouched. What changes is how the kernel resolves it.
+
+- **Next-hop tables are now weighted by FREE-FLOW TIME** (lane length over
+  speed limit) instead of raw lane length (`engine/routing.go`,
+  `freeFlowTime`). Measured on chi-loop-urban (2026-07): length weights
+  route traffic through short alleys in preference to faster arterials —
+  the network's shortest-distance paths concentrate flow on exactly the
+  links that saturate first, one contributor to the observed oversaturation
+  spiral (inflow ~2× discharge capacity; 41% of trips incomplete).
+- **Determinism behavior note:** resolution stays a pure function of
+  (network, vehicle state) — same Dijkstra, same tie-breaks, no new state —
+  but any run whose vehicles carry Route intents may change trajectory and
+  CRC versus the length-weighted kernel. Runs without Route intents are
+  bit-identical.
+- **Durable-binding check (2026-07-30):** routed recordings now exist
+  (`data/recordings/chi-loop-od-peak`, `chi-half-*`), so the 2026-07-24
+  "every recording predates Route intents" escape no longer applies. Both
+  replay paths re-execute `Step()` and verify logged CRCs
+  (`engine/replay.go`, `engine/natsio/player.go`) — routing IS re-derived
+  during replay, so **routed recordings made under length weights are
+  incompatible with strict replay under this kernel**: they diverge after
+  the first affected routing decision (`Replay` aborts; `Player` logs and
+  continues per its loud-and-continue policy). Those recordings are
+  gitignored, regenerable artifacts and are superseded as of this change;
+  BAKED viz artifacts (`data/baked/`) are plain data and play unaffected.
+  The what-if comparison tables built under length weights
+  (`data/runs/whatif-chi-*`) were paired-bracket designs measured against
+  a same-build baseline, so their rankings stand; absolute speeds from
+  before this change are not comparable to runs after it.
+- Versioning note: same formal supersession as 2026-07-24 — contract
+  versions version the wire, not the world model; engine behavior fixes
+  change trajectories without versioning the contract.

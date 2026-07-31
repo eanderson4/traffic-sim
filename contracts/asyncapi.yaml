@@ -1147,7 +1147,7 @@ components:
         speed_setpoint: { type: number, description: 'm/s; persistent cruise until replaced; negative clears; clamped to v0eff' }
         lane_delta: { type: integer, enum: [-1, 0, 1], description: '+1 left, −1 right; one-shot, expires if infeasible' }
         turn: { type: integer, enum: [-1, 0, 1], description: 'junction choice; held until consumed at the next lane crossing; 0 clears' }
-        route: { type: string, maxLength: 48, description: 'destination lane id; persistent. The engine follows it at every multi-successor lane (shortest path by lane length); an explicit held turn wins the crossing; unknown/unreachable destinations degrade to the successor default' }
+        route: { type: string, maxLength: 48, description: 'destination lane id; persistent. The engine follows it at every multi-successor lane (shortest path by FREE-FLOW TIME — lane length over speed limit; ADR-0006 addendum 2026-07-30); an explicit held turn wins the crossing; unknown/unreachable destinations degrade to the successor default' }
         signals: { type: integer, enum: [0, 1, 2, 3], description: '0 off, 1 left, 2 right, 3 hazard; persistent, informational in v1' }
 
     IntentEncodingHeaders:
