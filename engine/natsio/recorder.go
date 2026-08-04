@@ -45,25 +45,25 @@ type RecorderConfig struct {
 	// headers). A larger keyframe is split into chunk messages reassembled
 	// by the reader (ADR-0015).
 	KeyframeChunkMax int
-	// UnbatchedIntentLog restores the pre-ADR-0035 record plane: one message
-	// per applied intent on ts.{run}.log.intent instead of one TSLB batch per
-	// tick on ts.{run}.log.intents. Named for the non-default so the zero
-	// value is the batched form, matching DropEngineIntentLog's convention.
-	// Kept for A/B measurement and for writing a recording an older reader
-	// can consume.
-	UnbatchedIntentLog bool
+	// BatchedIntentLog selects the ADR-0035 record plane: one TSLB batch per
+	// non-empty tick on ts.{run}.log.intents instead of one message per
+	// applied intent on ts.{run}.log.intent. The zero value is the
+	// per-message form — the measured-reproducible configuration, and the
+	// default while ADR-0035's live-run reproducibility blocker stands.
+	BatchedIntentLog bool
 	// IntentBatchMax bounds one TSLB message's payload in bytes (default
 	// 768 KiB, same budget and same reasoning as KeyframeChunkMax). A tick
 	// with more intents than fit is split across several batch messages.
 	IntentBatchMax int
-	// UncompressedStore turns OFF JetStream S2 storage compression for the
-	// run's stream. Named for the non-default: compression is on, because the
-	// log is dominated by a repeated subject, a repeated applied_tick and a
-	// repeated controller name per record — measured 6.2x (gzip -3) and 7.2x
-	// (zstd -3) on a real stream block. Set this if the write-side CPU cost
-	// ever matters more than the bytes; it changes only how the file store
-	// persists messages, never their content.
-	UncompressedStore bool
+	// CompressedStore turns ON JetStream S2 storage compression for the
+	// run's stream (ADR-0035). The zero value is uncompressed, matching the
+	// flag default while the reproducibility blocker stands. Compression
+	// earns its keep because the log is dominated by a repeated subject, a
+	// repeated applied_tick and a repeated controller name per record —
+	// measured 6.2x (gzip -3) and 7.2x (zstd -3) on a real stream block.
+	// It changes only how the file store persists messages, never their
+	// content.
+	CompressedStore bool
 }
 
 func (c *RecorderConfig) withDefaults() RecorderConfig {
@@ -138,7 +138,7 @@ func NewRecorder(js nats.JetStreamContext, run string, cfg RecorderConfig) (*Rec
 	// subjects and every reader are untouched, so this is not a change to the
 	// message contract — only to how the file store persists blocks.
 	compression := nats.S2Compression
-	if r.cfg.UncompressedStore {
+	if !r.cfg.CompressedStore {
 		compression = nats.NoCompression
 	}
 	scfg := &nats.StreamConfig{
@@ -199,7 +199,7 @@ func (r *Recorder) LogStart(e *engine.Engine) error {
 // cadences — and awaits the batch's pubacks.
 func (r *Recorder) LogTick(e *engine.Engine) error {
 	tick := e.Tick
-	if r.cfg.UnbatchedIntentLog {
+	if !r.cfg.BatchedIntentLog {
 		for _, t := range e.AppliedIntents() {
 			if err := r.logIntent(t); err != nil {
 				return err

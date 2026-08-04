@@ -68,9 +68,9 @@ func writeLog(t *testing.T, run string, unbatched bool, program [][]engine.Ticke
 	srv := NewTestServer(t)
 	_, js := srv.JetStream(t)
 	r, err := NewRecorder(js, run, RecorderConfig{
-		CRCEvery:           1,
-		UnbatchedIntentLog: unbatched,
-		IntentBatchMax:     tslbHeader + 3*loggedIntentMax, // forces some splits
+		CRCEvery:         1,
+		BatchedIntentLog: !unbatched,
+		IntentBatchMax:   tslbHeader + 3*loggedIntentMax, // forces some splits
 	})
 	if err != nil {
 		t.Fatalf("NewRecorder: %v", err)
@@ -197,7 +197,7 @@ func TestRecorderRefusesToAdoptANonEmptyStream(t *testing.T) {
 	_, js := srv.JetStream(t)
 
 	// A stream holding a message stands in for a preserved recording. It is
-	// created without S2, so the recorder's default config DIFFERS and the
+	// created without S2, so the recorder's S2 config DIFFERS and the
 	// adoption fallback is the path under test.
 	if _, err := js.AddStream(&nats.StreamConfig{
 		Name:     StreamName("occupied"),
@@ -209,18 +209,18 @@ func TestRecorderRefusesToAdoptANonEmptyStream(t *testing.T) {
 	if _, err := js.Publish(SubjectLogCRC("occupied"), []byte("x")); err != nil {
 		t.Fatalf("seed message: %v", err)
 	}
-	if _, err := NewRecorder(js, "occupied", RecorderConfig{}); err == nil {
+	if _, err := NewRecorder(js, "occupied", RecorderConfig{CompressedStore: true}); err == nil {
 		t.Fatal("NewRecorder adopted a non-empty stream")
 	} else if !strings.Contains(err.Error(), "non-empty") {
 		t.Fatalf("wrong refusal: %v", err)
 	}
 
 	// The case the fallback exists for: an EMPTY stream whose config DIFFERS
-	// from the recorder's (seeded without compression, adopted under the S2
-	// default) converges via UpdateStream instead of failing. Adopting with
-	// UncompressedStore would NOT exercise this — server normalization makes
-	// that config identical to the seed's, AddStream succeeds idempotently,
-	// and the fallback never runs.
+	// from the recorder's (seeded without compression, adopted under an S2
+	// config) converges via UpdateStream instead of failing. Adopting with a
+	// zero-value (uncompressed) RecorderConfig would NOT exercise this —
+	// server normalization makes that config identical to the seed's,
+	// AddStream succeeds idempotently, and the fallback never runs.
 	if _, err := js.AddStream(&nats.StreamConfig{
 		Name:     StreamName("emptyadopt"),
 		Subjects: []string{SubjectLogAll("emptyadopt")},
@@ -228,7 +228,7 @@ func TestRecorderRefusesToAdoptANonEmptyStream(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed empty stream: %v", err)
 	}
-	if _, err := NewRecorder(js, "emptyadopt", RecorderConfig{}); err != nil {
+	if _, err := NewRecorder(js, "emptyadopt", RecorderConfig{CompressedStore: true}); err != nil {
 		t.Fatalf("empty-stream adoption with a differing config refused: %v", err)
 	}
 	info, err := js.StreamInfo(StreamName("emptyadopt"))
@@ -237,5 +237,30 @@ func TestRecorderRefusesToAdoptANonEmptyStream(t *testing.T) {
 	}
 	if info.Config.Compression != nats.S2Compression {
 		t.Errorf("adopted stream compression = %v, want S2 (the adoption fallback did not converge the config)", info.Config.Compression)
+	}
+}
+
+func TestZeroValueRecorderConfigIsTheReproducibleDefault(t *testing.T) {
+	// ADR-0035 pins the zero value while its reproducibility blocker stands:
+	// an unconfigured Recorder must select the measured-reproducible plane —
+	// per-message log.intent, uncompressed stream. A regression here
+	// silently re-enables the blocked configuration for library callers.
+	if (RecorderConfig{}).BatchedIntentLog {
+		t.Error("zero-value RecorderConfig selects the batched intent log (blocked under ADR-0035)")
+	}
+	if (RecorderConfig{}).CompressedStore {
+		t.Error("zero-value RecorderConfig selects S2 compression (blocked under ADR-0035)")
+	}
+	srv := NewTestServer(t)
+	_, js := srv.JetStream(t)
+	if _, err := NewRecorder(js, "zerodefault", RecorderConfig{}); err != nil {
+		t.Fatalf("NewRecorder: %v", err)
+	}
+	info, err := js.StreamInfo(StreamName("zerodefault"))
+	if err != nil {
+		t.Fatalf("StreamInfo: %v", err)
+	}
+	if info.Config.Compression != nats.NoCompression {
+		t.Errorf("zero-value recorder stream compression = %v, want none", info.Config.Compression)
 	}
 }

@@ -142,7 +142,10 @@ batch.
 > eliminated. Measured later: ~230 bytes per message for a 61-byte record,
 > and 48 GiB for a single 90-minute chi-loop-urban recording. ADR-0035
 > carries the batch across that boundary as TSLB v1 on
-> `ts.{run}.log.intents`. Keyframes, replay and the bake pipeline are
+> `ts.{run}.log.intents` (opt-in via `-log-batch`; default off since
+> 2026-08-04 under ADR-0035's reproducibility blocker, so unflagged the
+> per-intent expansion described above is again the shipped behavior).
+> Keyframes, replay and the bake pipeline are
 > still as described here.
 
 One deliberate, deterministic exception to wire-order parity (M4 review):

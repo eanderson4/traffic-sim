@@ -386,10 +386,11 @@ and the migration note. What changes here:
 
 - **`ts.{run}.log.intents`** (plural) carries one tick's applied intents in a
   single TSLB v1 message; a tick with no applied intents emits no batch. It
-  is the default. `ts.{run}.log.intent` is the
-  per-intent form it replaces; it stays readable, so every recording made
-  before this addendum replays unchanged, and `serve -log-batch=false` still
-  writes it. A recording carries one form or the other, never a mix.
+  is opt-in (`serve -log-batch`, default off under ADR-0035's reproducibility
+  blocker since 2026-08-04). `ts.{run}.log.intent` is the
+  per-intent default form; it stays readable either way, so every recording
+  made before this addendum replays unchanged. A recording carries one form
+  or the other, never a mix.
 - The records inside a batch are the **same LoggedIntentFrame payloads,
   byte-identical and in the same order**. Everything §4 says about sole
   writership, dedup, `Nats-Expected-Last-Sequence`, and stream order being
@@ -402,8 +403,10 @@ and the migration note. What changes here:
   with no chunk index: unlike a chunked keyframe (ADR-0015), which reassembles
   one blob, concatenating consecutive batches' records in stream order is
   already the original order.
-- The stream is created with **S2 storage compression**. That is a storage
-  setting, not a contract change — payloads and readers are untouched.
+- The stream is created with **S2 storage compression when
+  `-store-compress` is set** (default off under ADR-0035's blocker since
+  2026-08-04). That is a storage setting, not a contract change — payloads
+  and readers are untouched.
 
 Why: §4 as originally written implied nothing about message granularity, and
 one-message-per-applied-intent was the natural reading. At city scale that is

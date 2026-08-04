@@ -59,8 +59,10 @@ type Lane struct {
 	// and relaxed back toward free flow every tick with a 10-minute time
 	// constant. It is the congestion signal the epoch recompute weights its
 	// Dijkstra with. State that decides behavior → keyframed (format v6,
-	// the stuckTicks precedent); not in the CRC, which stays the trajectory
-	// oracle. Zero-valued and unused while Params.AdaptiveRouting is off.
+	// the stuckTicks precedent) and folded into the CRC in lane order when
+	// adaptive routing is on (engine.go); flag-off the CRC stays the
+	// pre-v6 trajectory oracle. Zero-valued and unused while
+	// Params.AdaptiveRouting is off.
 	ttEMA float64
 }
 

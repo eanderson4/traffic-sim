@@ -4,7 +4,9 @@
   win is measured and real (11.1× end to end), but so is a fidelity cost found
   while measuring it: batching makes the record plane fast enough to change
   which tick an asynchronous controller's intents land on, and a live run stops
-  being reproducible run to run. See "Measured outcome" below.
+  being reproducible run to run. See "Measured outcome" below. (As first
+  merged the flags defaulted ON, contradicting this status; corrected to
+  default off 2026-08-04 — see §5.)
 - **Date:** 2026-07-29
 - **Amends:** ADR-0006 §4–§5 (record plane) by adding one subject and one
   payload format. ADR-0026's scope note ("the record plane never sees a
@@ -81,16 +83,22 @@ and each naming the same tick. Unlike ADR-0015 keyframes — which reassemble
 records in stream order *is* the original order, because stream order is the
 application order (ADR-0006 §4).
 
-**4. S2 storage compression on the run's stream.** `Compression:
-nats.S2Compression` on the `StreamConfig`. This is a storage-layer setting:
+**4. S2 storage compression on the run's stream, opt-in.** `Compression:
+nats.S2Compression` on the `StreamConfig` when `-store-compress` is set
+(default off — see §5). This is a storage-layer setting:
 payloads, subjects and every reader are untouched, so it is **not** a change
 to the message contract — only to how the file store persists blocks.
 
-**5. Both are flags, defaulting on.** `serve -log-batch=false` restores the
-per-message record plane; `-store-compress=false` turns compression off. In
-`RecorderConfig` they are `UnbatchedIntentLog` and `UncompressedStore`, named
-for the non-default so the zero value is the new behaviour — the
-`DropEngineIntentLog` convention.
+**5. Both are flags, defaulting OFF since 2026-08-04.** They were merged
+defaulting on, which contradicted this ADR's own blocking condition — the
+defaults were flipped so an unflagged run gets the measured-reproducible
+configuration. `serve -log-batch` enables the batched record plane;
+`-store-compress` turns compression on. In `RecorderConfig` they are
+`BatchedIntentLog` and `CompressedStore` (renamed from the inverse
+`Unbatched…`/`Uncompressed…` forms in the same correction), so the zero
+value is the per-message, uncompressed configuration for library callers
+too — inverting the `DropEngineIntentLog` convention on purpose: here the
+safe default, not the new behaviour, is what a zero config must select.
 
 **6. `AddStream` falls back to `UpdateStream` on name-already-in-use.** The
 recorder *adopts* an existing stream (serve's `checkFreshRecording` permits an
@@ -138,10 +146,11 @@ Costs and risks:
 - **A reader that predates this cannot read a new recording.** It sees an
   unknown subject and — depending on the reader — ignores it, yielding a run
   with no intents. In-repo readers are all updated (`MaterializeRunRecord`,
-  `indexLogMsgs`, `logcursor`); `-log-batch=false` writes a recording an older
-  reader can consume. See the migration note.
+  `indexLogMsgs`, `logcursor`); the default per-message form writes a
+  recording an older reader can consume. See the migration note.
 - **Compression costs write-side CPU.** Unmeasured under load at the time of
-  writing; `-store-compress=false` is the escape hatch.
+  writing; compression is opt-in (`-store-compress`), so the escape hatch is
+  simply not opting in.
 - **This does not fix the harder scaling wall, which is RAM.** A 54,000-tick
   chi-loop-urban run was OOM-killed at tick 38,200 on a 123 GB machine,
   because the engine's whole-run **in-memory** intent log retains ~225M
@@ -201,17 +210,23 @@ cannot influence the engine/driver race in either direction.
 
 ## Migration note
 
-- **Reading:** every in-repo reader handles both subjects. A recording written
-  before this change is byte-for-byte what it was and replays through the
-  `log.intent` path; a recording written after it carries `log.intents`.
-- **Writing:** `serve -log-batch=false` reproduces the old record plane
-  exactly, for an external reader or for A/B measurement.
+- **Reading:** every in-repo reader handles both subjects. A recording
+  written by a per-message recorder (the default; every recording predating
+  this ADR) replays through the `log.intent` path; one written with
+  `-log-batch` carries `log.intents`. Either replays unchanged.
+- **Writing:** an unflagged `serve` reproduces the old record plane
+  exactly, for an external reader or for A/B measurement; `serve -log-batch`
+  opts into the batched plane.
 - **No re-recording is required or offered.** The 48 GiB `chihalf` recording
   and the ~120 GiB in `data/recordings/` stay readable as they are; they do
   not shrink retroactively, and reclaiming that space means re-recording those
   runs, which is a separate decision (#24, #62 already cover re-baking).
-- **Compression applies to blocks written from here on.** An existing stream
-  is not rewritten.
+- **Compression, when enabled, applies to blocks written from here on.** An
+  existing stream is not rewritten.
+- **Go API (2026-08-04):** `RecorderConfig.UnbatchedIntentLog` and
+  `.UncompressedStore` were renamed to the positive `BatchedIntentLog` /
+  `CompressedStore` when the defaults flipped, so the zero value selects the
+  reproducible configuration. In-repo callers are the only consumers.
 - **Nothing in the ADR-0012 content hash changes**, so scenario identity and
   paired-seed A/B comparison are unaffected.
 
