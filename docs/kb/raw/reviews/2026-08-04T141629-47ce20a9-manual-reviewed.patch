@@ -1,0 +1,2397 @@
+diff --git a/analysis/lit-lineage/README.md b/analysis/lit-lineage/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..4db5c8cf24746c9d4d6e99437743fda874d98263
+--- /dev/null
++++ b/analysis/lit-lineage/README.md
+@@ -0,0 +1,55 @@
++# lit-lineage — a lineage graph of traffic-flow research
++
++An open, CC0-sourced academic-literature lineage of traffic-flow research:
++who published what, who cites whom, and how the field's main ideas (LWR,
++car-following, fundamental diagram, MFD, three-phase, IDM, ...) descend
++from one another. Built from [OpenAlex](https://openalex.org), a free CC0
++catalog of scholarly works.
++
++## Plan
++
++1. **Harvest the corpus.** Bounded seed-query pulls from the OpenAlex
++   `/works` API; raw pages cached, merged into a deduplicated works table.
++   *Done — see `research/first-pull.md`.*
++2. **Analyze.** Citation / co-authorship / main-path analysis over the
++   works table → a lineage graph (seminal papers, schools, key edges).
++   *Done — filter + classic-era anchors + SPC key-route main path, see
++   `research/phase-2.md`; dataset in `data/traffic_lineage.json`.*
++3. **Present.** Interactive web viz on the traffic-sim site, plus a Manim
++   video for *Math vs Vibes*.
++
++## Re-running the harvest
++
++From the repo root (Python 3.9+, standard library only):
++
++```
++python3 analysis/lit-lineage/scripts/harvest.py              # cached pages reused
++python3 analysis/lit-lineage/scripts/harvest.py --refresh    # re-fetch everything
++python3 analysis/lit-lineage/scripts/harvest.py --max-pages 5
++```
++
++Raw API pages land in `data/raw/`, the merged works table in
++`data/works.jsonl`, and the corpus summary in `research/first-pull.md`.
++
++## Re-running the analysis
++
++```
++python3 analysis/lit-lineage/scripts/filter.py       # works.jsonl -> corpus.jsonl
++python3 analysis/lit-lineage/scripts/anchors.py      # fetch/flag classic-era anchors
++python3 analysis/lit-lineage/scripts/analyze.py      # graph, main path, dataset JSON
++python3 analysis/lit-lineage/scripts/export_csv.py   # dataset JSON -> nodes/edges CSV
++```
++
++## Provenance and licensing
++
++All metadata comes from OpenAlex, which is CC0; if you use the data, cite
++Priem, Piwowar & Orr (2022), *OpenAlex: A fully-open index of scholarly
++works, authors, venues, institutions, and concepts*
++(https://arxiv.org/abs/2205.01833). We ship bibliographic metadata and
++citation edges only — full text is linked out via DOI, never copied.
++
++## Relation to sci-fi-lineage
++
++This sub-project will later mirror the structure of the sibling
++sci-fi-lineage project: a dataset JSON as the source of truth, generated
++CSVs, and web + Manim outputs derived from it.
+diff --git a/analysis/lit-lineage/research/first-pull.md b/analysis/lit-lineage/research/first-pull.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..1bb968129a09ec2d379b79436384ec9be35bbf58
+--- /dev/null
++++ b/analysis/lit-lineage/research/first-pull.md
+@@ -0,0 +1,274 @@
++# First pull — OpenAlex traffic-flow corpus
++
++Seed queries: 14, up to 3 pages (600 works) each, relevance-ranked. Raw pages cached in `data/raw/`; merged table in `data/works.jsonl`.
++
++**Unique works: 7264** (year range 1928–2026).
++
++## Per-query counts (unique works contributed)
++
++| seed query | works | unique to this query |
++|---|---|---|
++| traffic flow theory | 600 | 393 |
++| car-following model | 600 | 520 |
++| Lighthill Whitham Richards | 600 | 439 |
++| kinematic wave traffic | 600 | 371 |
++| fundamental diagram traffic flow | 600 | 252 |
++| cell transmission model | 600 | 566 |
++| macroscopic fundamental diagram | 600 | 418 |
++| microscopic traffic simulation | 600 | 517 |
++| traffic assignment | 600 | 558 |
++| three-phase traffic theory | 600 | 411 |
++| intelligent driver model | 600 | 520 |
++| lane changing model traffic | 600 | 440 |
++| stop-and-go waves | 600 | 537 |
++| traffic state estimation | 600 | 480 |
++
++## Publication-decade histogram
++
++```
++1920s      1  #
++1930s      1  #
++1950s      9  #
++1960s     53  #
++1970s     81  #
++1980s    121  #
++1990s    431  #####
++2000s   1541  ##################
++2010s   3380  ########################################
++2020s   1641  ###################
++```
++
++## Top 30 works by citation count (unfiltered)
++
++Raw relevance pulls catch mega-cited off-field papers — this table documents that contamination; see the filtered table below.
++
++| # | title | year | venue | cited by |
++|---|---|---|---|---|
++| 1 |  | 2021 | DROPS (Schloss Dagstuhl – Leibniz Center for Informatics) | 50423 |
++| 2 | SciPy 1.0: fundamental algorithms for scientific computing in Python | 2020 | Nature Methods | 38808 |
++| 3 | QUANTUM ESPRESSO: a modular and open-source software project for quantum simulations of materials | 2009 | Journal of Physics Condensed Matter | 29034 |
++| 4 | <b>lmerTest</b> Package: Tests in Linear Mixed Effects Models | 2017 | Journal of Statistical Software | 23891 |
++| 5 | A pneumonia outbreak associated with a new coronavirus of probable bat origin | 2020 | Nature | 23385 |
++| 6 | Grey Wolf Optimizer | 2014 | Advances in Engineering Software | 18732 |
++| 7 | Ferroptosis: An Iron-Dependent Form of Nonapoptotic Cell Death | 2012 | Cell | 18477 |
++| 8 | A Multi-Modal Distributed Real-Time IoT System for Urban Traffic Control (Invited Paper) | 2024 | DROPS (Schloss Dagstuhl – Leibniz Center for Informatics) | 14351 |
++| 9 | MOLSCRIPT: a program to produce both detailed and schematic plots of protein structures | 1991 | Journal of Applied Crystallography | 14154 |
++| 10 | 2013 ESH/ESC Guidelines for the management of arterial hypertension | 2013 | European Heart Journal | 13688 |
++| 11 | Ultrastructural Characterization of the Lower Motor System in a Mouse Model of Krabbe Disease | 2016 | Scientific Reports | 13292 |
++| 12 | Internet of Things (IoT): A vision, architectural elements, and future directions | 2013 | Future Generation Computer Systems | 12056 |
++| 13 | LAMMPS - a flexible simulation tool for particle-based materials modeling at the atomic, meso, and continuum scales | 2021 | Computer Physics Communications | 11940 |
++| 14 | First principles phonon calculations in materials science | 2015 | Scripta Materialia | 11473 |
++| 15 | The Internationalization Process of the Firm—A Model of Knowledge Development and Increasing Foreign Market Commitments | 1977 | Journal of International Business Studies | 10875 |
++| 16 | Dementia prevention, intervention, and care: 2020 report of the Lancet Commission | 2020 | The Lancet | 10434 |
++| 17 | Designing qualitative research | 1989 | Choice Reviews Online | 9934 |
++| 18 | A familial cluster of pneumonia associated with the 2019 novel coronavirus indicating person-to-person transmission: a study of a family cluster | 2020 | The Lancet | 9625 |
++| 19 | Declining Morbidity and Mortality among Patients with Advanced Human Immunodeficiency Virus Infection | 1998 | New England Journal of Medicine | 9518 |
++| 20 | Explainable Artificial Intelligence (XAI): Concepts, taxonomies, opportunities and challenges toward responsible AI | 2019 | Information Fusion | 9337 |
++| 21 | Partial Least Squares Structural Equation Modeling (PLS-SEM) Using R | 2021 | Classroom companion: business | 8856 |
++| 22 | A fast quantum mechanical algorithm for database search | 1996 | None | 8698 |
++| 23 | The Health Belief Model: A Decade Later | 1984 | Health Education Quarterly | 8435 |
++| 24 | Quantum cryptography | 2002 | Reviews of Modern Physics | 8421 |
++| 25 | What Will 5G Be? | 2014 | IEEE Journal on Selected Areas in Communications | 8213 |
++| 26 | Prevention of HIV-1 Infection with Early Antiretroviral Therapy | 2011 | New England Journal of Medicine | 6981 |
++| 27 | Culture of Human Endothelial Cells Derived from Umbilical Veins. IDENTIFICATION BY MORPHOLOGIC AND IMMUNOLOGIC CRITERIA | 1973 | Journal of Clinical Investigation | 6909 |
++| 28 | Massive MIMO for next generation wireless systems | 2014 | IEEE Communications Magazine | 6896 |
++| 29 | Technological transitions as evolutionary reconfiguration processes: a multi-level perspective and a case-study | 2002 | Research Policy | 6864 |
++| 30 | The Problem of Pattern and Scale in Ecology: The Robert H. MacArthur Award Lecture | 1992 | Ecology | 6805 |
++
++## Top 30 on-topic works by citation count
++
++Filtered to works tagged with a traffic OpenAlex topic (5 topics, see harvest.py `ON_TOPIC_TOPICS`). This is where the classics should surface.
++
++| # | title | year | venue | cited by |
++|---|---|---|---|---|
++On-topic works: **5248** of 7264.
++
++| 1 | Machine Learning: Algorithms, Real-World Applications and Research Directions | 2021 | SN Computer Science | 5235 |
++| 2 | Congested traffic states in empirical observations and microscopic simulations | 2000 | Physical review. E, Statistical physics, plasmas, fluids, and related interdisciplinary topics | 4640 |
++| 3 | On kinematic waves II. A theory of traffic flow on long crowded roads | 1955 | Proceedings of the Royal Society of London A Mathematical and Physical Sciences | 4627 |
++| 4 | Shock Waves on the Highway | 1956 | Operations Research | 3631 |
++| 5 | Spatio-Temporal Graph Convolutional Networks: A Deep Learning Framework for Traffic Forecasting | 2018 | None | 3388 |
++| 6 | Microscopic Traffic Simulation using SUMO | 2018 | None | 3165 |
++| 7 | The cell transmission model: A dynamic representation of highway traffic consistent with the hydrodynamic theory | 1994 | Transportation Research Part B Methodological | 2916 |
++| 8 | Attention Based Spatial-Temporal Graph Convolutional Networks for Traffic Flow Forecasting | 2019 | Proceedings of the AAAI Conference on Artificial Intelligence | 2855 |
++| 9 | A behavioural car-following model for computer simulation | 1981 | Transportation Research Part B Methodological | 2339 |
++| 10 | Recent Development and Applications of SUMO - Simulation of Urban MObility | 2012 | elib (German Aerospace Center) | 1979 |
++| 11 | The cell transmission model, part II: Network traffic | 1995 | Transportation Research Part B Methodological | 1965 |
++| 12 | Full velocity difference model for a car-following theory | 2001 | Physical review. E, Statistical physics, plasmas, fluids, and related interdisciplinary topics | 1577 |
++| 13 | The Impact of Cooperative Adaptive Cruise Control on Traffic-Flow Characteristics | 2006 | IEEE Transactions on Intelligent Transportation Systems | 1493 |
++| 14 | A Multiagent Approach to Autonomous Intersection Management | 2008 | Journal of Artificial Intelligence Research | 1313 |
++| 15 | General Lane-Changing Model MOBIL for Car-Following Models | 2007 | Transportation Research Record Journal of the Transportation Research Board | 1308 |
++| 16 | Car-following: a historical review | 1999 | Transportation Research Part F Traffic Psychology and Behaviour | 1271 |
++| 17 | Review of road traffic control strategies | 2003 | Proceedings of the IEEE | 1230 |
++| 18 | SUMO - Simulation of Urban MObility An Overview | 2011 | elib (German Aerospace Center) | 1206 |
++| 19 | Generalized force model of traffic dynamics | 1998 | Physical review. E, Statistical physics, plasmas, fluids, and related interdisciplinary topics | 1172 |
++| 20 | A model for the structure of lane-changing decisions | 1986 | Transportation Research Part B Methodological | 1151 |
++| 21 | AI-Based Modeling: Techniques, Applications and Research Issues Towards Automation, Intelligent and Smart Systems | 2022 | SN Computer Science | 1119 |
++| 22 | Modeling cooperative and autonomous adaptive cruise control dynamic responses using experimental data | 2014 | Transportation Research Part C Emerging Technologies | 1089 |
++| 23 | The Traffic Assignment Problem: Models and Methods | 1994 | Medical Entomology and Zoology | 1055 |
++| 24 | Human mobility: Models and applications | 2018 | Physics Reports | 1038 |
++| 25 | The physics of traffic jams | 2002 | Reports on Progress in Physics | 979 |
++| 26 | A simplified car-following theory: a lower order model | 2002 | Transportation Research Part B Methodological | 966 |
++| 27 | Traffic Equilibrium and Variational Inequalities | 1980 | Transportation Science | 936 |
++| 28 | On Stochastic Models of Traffic Assignment | 1977 | Transportation Science | 933 |
++| 29 | Impacts of Cooperative Adaptive Cruise Control on Freeway Traffic Flow | 2012 | Transportation Research Record Journal of the Transportation Research Board | 884 |
++| 30 | BIOGEME: a free package for the estimation of discrete choice models | 2003 | Infoscience (Ecole Polytechnique Fédérale de Lausanne) | 875 |
++
++## Topics and keywords (top 25 each)
++
++OpenAlex topic | works
++|---|---
++Traffic control and management | 4597
++Transportation Planning and Optimization | 3620
++Traffic Prediction and Management Techniques | 2787
++Autonomous Vehicle Technology and Safety | 731
++Traffic and Road Safety | 728
++Evacuation and Crowd Dynamics | 582
++Vehicle emissions and performance | 291
++Transportation and Mobility Innovations | 278
++Urban Transport and Accessibility | 212
++Vehicular Ad Hoc Networks (VANETs) | 195
++Simulation Techniques and Applications | 138
++Fluid Dynamics and Turbulent Flows | 118
++Human-Automation Interaction and Safety | 102
++Human Mobility and Location-Based Analysis | 98
++Network Traffic and Congestion Control | 89
++Time Series Analysis and Forecasting | 86
++Anomaly Detection Techniques and Applications | 79
++Data Management and Algorithms | 71
++Cellular Automata and Applications | 59
++Video Surveillance and Tracking Methods | 58
++Smart Parking Systems Research | 57
++Vehicle Dynamics and Control Systems | 56
++Complex Systems and Time Series Analysis | 55
++Network Security and Intrusion Detection | 53
++Pulsars and Gravitational Waves Research | 53
++
++OpenAlex keyword | works
++|---|---
++Computer science | 6183
++Engineering | 3969
++Mathematics | 3152
++Transport engineering | 2542
++Traffic flow (computer networking) | 2289
++Artificial intelligence | 2125
++Simulation | 2111
++Physics | 2107
++Computer network | 1396
++Flow (mathematics) | 1268
++Mathematical optimization | 1197
++Real-time computing | 1142
++Traffic congestion | 1129
++Algorithm | 1112
++Statistics | 909
++Control (management) | 882
++Mechanics | 867
++Control theory (sociology) | 806
++Traffic generation model | 799
++Statistical physics | 709
++Mathematical analysis | 671
++Computer security | 654
++Telecommunications | 644
++Automotive engineering | 627
++Applied mathematics | 615
++
++## Boundaries observed
++
++Heuristic title scan flags **664 works** as probably about network/data traffic rather than road traffic (title matches `(network|data|internet|packet|...)…traffic`). Sample:
++
++- Making NGSIM Data Usable for Studies on Traffic Flow Theory (2013, Transportation Research Record Journal of the Transportation Research Board)
++- Network traffic flow theory: Microscopic simulation experiments on supercomputers (1990, Transportation Research Part A General)
++- Attention Based Spatial-Temporal Graph Convolutional Networks for Traffic Flow Forecasting (2019, Proceedings of the AAAI Conference on Artificial Intelligence)
++- The cell transmission model, part II: Network traffic (1995, Transportation Research Part B Methodological)
++- THREE-DIMENSIONAL RELATIONSHIPS AMONG TRAFFIC FLOW THEORY VARIABLES (1989, Transportation Research Record Journal of the Transportation Research Board)
++- Spatio-Temporal Graph Convolutional Networks: A Deep Learning Framework for Traffic Forecasting (2018, None)
++- Anomalous Data Detection in Vehicular Networks Using Traffic Flow Theory (2019, None)
++- Trajectory data-based traffic flow studies: A revisit (2020, Transportation Research Part C Emerging Technologies)
++- Recent advances in ITS, traffic flow theory, and network operations (2016, Transportation Research Part C Emerging Technologies)
++- Multiple sources and multiple measures based traffic flow prediction using the chaos theory and support vector regression method (2016, Physica A Statistical Mechanics and its Applications)
++- Traffic flow matrix-based graph neural network with attention mechanism for traffic flow prediction (2023, Information Fusion)
++- ON THE THEORY OF TRAFFIC FLOW IN NETWORKS (1967, Traffic quarterly)
++- A kinematic wave theory of multi-commodity network traffic flow (2012, Transportation Research Part B Methodological)
++- PPCA-Based Missing Data Imputation for Traffic Flow Volume: A Systematical Approach (2009, IEEE Transactions on Intelligent Transportation Systems)
++- Probabilistic description of traffic flow (2005, Physics Reports)
++- Traffic flow data forecasting based on interval type-2 fuzzy sets theory (2016, IEEE/CAA Journal of Automatica Sinica)
++- Introduction to Network Traffic Flow Theory (2021, Elsevier eBooks)
++- Reliable travel time prediction for freeways: Bridging artificial neural networks and traffic flow theory (2004, Research Repository (Delft University of Technology))
++- Diagnosing network-wide traffic anomalies (2004, None)
++- Principles of highway engineering and traffic analysis (1990, Choice Reviews Online)
++- Big-data-generated traffic flow prediction using deep learning and dempster-shafer theory (2016, None)
++- Dynamic Traffic Congestion Simulation and Dissipation Control Based on Traffic Flow Theory Model and Neural Network Data Calibration Algorithm (2017, Complexity)
++- Application of Chaos Theory in the Prediction of Motorised Traffic Flows on Urban Networks (2016, Mathematical Problems in Engineering)
++- A fully-discrete-state kinetic theory approach to traffic flow on road networks (2014, Mathematical Models and Methods in Applied Sciences)
++- Citywide Traffic Volume Estimation Using Trajectory Data (2016, IEEE Transactions on Knowledge and Data Engineering)
++- Missing data imputation for traffic flow based on combination of fuzzy neural network and rough set theory (2020, Journal of Intelligent Transportation Systems)
++- Catastrophe theory and patterns in 30-second freeway traffic data— Implications for incident detection (1989, Transportation Research Part A General)
++- Dynamic Network Traffic Assignment Considered as a Continuous Time Optimal Control Problem (1989, Operations Research)
++- Traffic theory and the Internet (2001, IEEE Communications Magazine)
++- Traffic phase effects in packet-switched gateways (1991, ACM SIGCOMM Computer Communication Review)
++- A Robust and Efficient Method for Fusing Heterogeneous Data from Traffic Sensors on Freeways (2009, Computer-Aided Civil and Infrastructure Engineering)
++- Dynamic data-driven local traffic state estimation and prediction (2013, Transportation Research Part C Emerging Technologies)
++- Offloading in Internet of Vehicles: A Fog-Enabled Real-Time Traffic Management System (2018, IEEE Transactions on Industrial Informatics)
++- Traffic assignment problem for a general network (1969, Journal of Research of the National Bureau of Standards Section B Mathematical Sciences)
++- Probability Distributions of Travel Times on Arterial Networks: Traffic Flow and Horizontal Queuing Theory Approach (2012, Transportation Research Board 91st Annual MeetingTransportation Research Board)
++- Understanding Traffic Systems: Data Analysis and Presentation (1996, Medical Entomology and Zoology)
++- Overview and Principles of Internet Traffic Engineering (2002, None)
++- Theory-data dual driven car following model in traffic flow mixed of AVs and HDVs (2024, Transportation Research Part C Emerging Technologies)
++- Spatiotemporal Recurrent Convolutional Networks for Traffic Prediction in Transportation Networks (2017, Sensors)
++- BotSniffer: Detecting Botnet Command and Control Channels in Network Traffic (2008, Journal of Bioresource Management)
++
++Filter notes for phase 2 (hand-written after reading the flagged sample
++and the raw top-30):
++
++1. **Ambiguous seed phrases, not "network traffic", are the biggest
++   contaminant.** The raw top-cited list is dominated by mega-cited
++   off-field papers caught by phrase overlap: `cell transmission model`
++   pulls cell/molecular biology (Ferroptosis, COVID pneumonia, MOLSCRIPT,
++   QUANTUM ESPRESSO — "cell"), `three-phase traffic theory` pulls
++   generic "three-phase" physics/software (SciPy, 5G), `stop-and-go
++   waves` pulls medical guidelines (arterial hypertension),
++   `macroscopic fundamental diagram` pulls physics simulation tools
++   (LAMMPS, phonon calculations). Title/venue heuristics can't fix this
++   cleanly; the OpenAlex **topic** field can — a 5-topic whitelist
++   (`ON_TOPIC_TOPICS` in harvest.py) already separates 5,248 plausible
++   works and puts LWR 1955, Richards 1956, CTM, Gipps, Treiber in the
++   top 10 by citations.
++2. **The network/data-traffic heuristic has heavy false positives.**
++   Of the 664 flagged works, many are squarely on-topic: Daganzo's
++   "The cell transmission model, part II: Network traffic" means *road*
++   networks, and "data" matches trajectory/NGSIM/sensor-data papers.
++   Genuine contamination in the sample: Internet traffic engineering,
++   packet-switched gateways, botnet detection, IEEE Comms Mag pieces.
++   Phase 2 should filter on topic + venue, not title regex.
++3. **Adjacent-field bleed to decide on deliberately:** evacuation/crowd
++   dynamics (582 works), VANETs (195), and a large recent blob of
++   graph-neural-network traffic *forecasting* papers (a different field
++   from traffic-flow theory despite the shared vocabulary).
++4. **Garbage records exist and need exclusion rules:** a blank-title
++   DROPS record with a corrupted 50,423 citation count; a duplicate of
++   the 2010 "Enhanced intelligent driver model" paper dated 1928;
++   HTML tags in some titles (`<b>lmerTest</b>`); venue mis-mappings
++   (transportation papers listed under "Medical Entomology and
++   Zoology"); 800 works with no venue, 664 with no DOI, 2 with no title.
++
++## Known gaps and API quirks for phase 2
++
++- **Pre-1960 anchors are missing from the pull.** Greenshields 1935
++  ("A Study of Traffic Capacity"), Wardrop 1952, Pipes 1953, and
++  Newell's 1961 car-following paper did not surface at all — thin
++  OpenAlex coverage of those venues/eras, and relevance search ranks
++  them below 600 modern results. Phase 2 should anchor the graph by
++  fetching known classics directly (by DOI/OpenAlex id), not via search.
++- **`referenced_works` coverage is era-dependent:** ~62% of 1960s works,
++  78% of 1980s, 91% of 2000s, 94% of 2020s have outgoing citation lists.
++  Citation edges *into* the classics will be incomplete; main-path
++  analysis must tolerate sparse old references (or backfill from
++  `cited_by_api_url` reverse lookups).
++- **Dedup hazard:** OpenAlex contains near-duplicate records with
++  corrupted years (observed: the 2010 "Enhanced intelligent driver
++  model" paper also exists as a 1928 record). Phase 2 dedup should key
++  on DOI where present.
++- No `select=` field was rejected; all 12 requested fields came back on
++  every page. `mailto` polite pool was used (repo `git config
++  user.email`). No rate-limit or 5xx retries were triggered across the
++  42 requests.
+diff --git a/analysis/lit-lineage/research/phase-2.md b/analysis/lit-lineage/research/phase-2.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..cf515aefb668f7a928d843ba2c68a1cdfe11536b
+--- /dev/null
++++ b/analysis/lit-lineage/research/phase-2.md
+@@ -0,0 +1,322 @@
++# Phase 2 — from corpus to lineage graph
++
++Inputs: `data/works.jsonl` (7,264 works, phase 1). Pipeline:
++`scripts/filter.py` → `scripts/anchors.py` → `scripts/analyze.py` →
++`scripts/export_csv.py`. Outputs: `data/corpus.jsonl` (5,466 works),
++`data/traffic_lineage.json`, `data/coauthorship.json`,
++`data/nodes.csv`, `data/edges.csv`.
++
++## 1. Filter design and keep/drop stats
++
++First-pull showed the seed-query contamination comes from ambiguous
++phrases ("cell transmission model" → cell biology, "three-phase" →
++power/5G, "stop-and-go waves" → medical), and that title heuristics
++have bad false positives ("The cell transmission model, part II:
++Network traffic" is about *road* networks). So the filter keys on
++OpenAlex's own annotations: a work is kept iff it carries at least one
++allowlisted traffic **topic** (7 display names) or **keyword** (28
++display names) — the lists are explicit in `filter.py`
++(`TRAFFIC_TOPICS`, `TRAFFIC_KEYWORDS`), built by inspecting the actual
++values in works.jsonl and sampling borderline cases.
++
++Deliberate boundary calls:
++
++- **Excluded topics**: Evacuation and Crowd Dynamics (pedestrian
++  dynamics is a separate lineage), VANETs and Network Traffic and
++  Congestion Control (comms networks), Air Traffic Management.
++- **Mislabeled-but-ours keywords included**: "Traffic flow (computer
++  networking)" is OpenAlex's generic traffic-flow keyword — of the 91
++  works carrying it with no traffic topic, only ~5 are genuine
++  networking papers ("Traffic theory and the Internet"), the rest are
++  road-traffic classics. "Intersection (aeronautics)" = road
++  intersections; "SIGNAL (programming language)" = traffic signals
++  (~1 false positive in 17).
++- **Garbage handling**: blank-title records dropped (one carries a
++  corrupted 50,423 citation count); HTML stripped from titles
++  (`<b>lmerTest</b>`); cited_by_count > 25,000 dropped as implausible
++  for this corpus (only removes SciPy/QUANTUM ESPRESSO, which the
++  topic filter would drop anyway); dedup by DOI, then by normalized
++  title — the title pass catches the 1928-dated duplicate of the 2010
++  "Enhanced intelligent driver model" paper, which carries no DOI.
++
++Result:
++
++| action | works |
++|---|---|
++| read | 7,264 |
++| dropped: blank title | 2 |
++| dropped: corrupt citation count | 2 |
++| dropped: duplicate (same DOI) | 8 |
++| dropped: duplicate (same normalized title) | 186 |
++| dropped: no traffic topic/keyword signal | 1,609 |
++| **kept** | **5,457** |
++
++Audit of the 243 dropped works that have "traffic" in the title but no
++signal: mostly genuine contamination (packet-switched gateways, organ
++trade, network anomaly detection) plus some real losses with empty
++OpenAlex annotations ("An Introduction to Traffic Flow Theory", 1965 —
++a Foote/Gerlough-era piece; "Jamming transition in the traffic-flow
++model with two-level crossings", 1993). Precision over recall: we lose
++a few dozen real traffic papers that carry no topics/keywords at all.
++Acceptable for a lineage graph; noted as a known gap.
++
++Kept by decade: 1950s 6 · 1960s 42 · 1970s 58 · 1980s 73 · 1990s 297 ·
++2000s 1,125 · 2010s 2,566 · 2020s 1,288.
++
++## 2. Anchor hunt
++
++Pre-1960 roots were fetched directly from the API (`scripts/anchors.py`,
++DOI where known, else title search; raw responses cached in
++`data/raw/anchors/`). **12 of 15 found**, flagged `anchor: true` and
++merged into the corpus (5,457 → 5,466 works):
++
++| anchor | status | year | refs | cited by |
++|---|---|---|---|---|
++| Greenshields, A Study of Traffic Capacity | fetched (search) | 1935 | 0 | 1,113 |
++| Wardrop, Some Theoretical Aspects of Road Traffic Research | fetched (search) | 1952 | 0 | 2,329 |
++| Pipes, An Operational Analysis of Traffic Dynamics | fetched (DOI) | 1953 | 10 | 1,298 |
++| Lighthill & Whitham, On kinematic waves II | already in corpus | 1955 | 9 | 4,627 |
++| Richards, Shock Waves on the Highway | already in corpus | 1956 | 1 | 3,631 |
++| Chandler, Herman & Montroll, Studies in Car Following | fetched (DOI) | 1958 | 3 | 1,454 |
++| Herman et al., Analysis of Stability in Car Following | fetched (DOI) | 1959 | 2 | 764 |
++| Newell, Nonlinear Effects in the Dynamics of Car Following | fetched (DOI) | 1961 | 15 | 1,106 |
++| Gazis, Herman & Rothery, Nonlinear Follow-the-Leader Models | fetched (search; DOI 10.1287/opre.9.4.499 404s) | 1961 | 14 | 1,516 |
++| Gipps, A behavioural car-following model | already in corpus | 1981 | 6 | 2,339 |
++| Payne, Models of Freeway Traffic and Control (FREFLO) | fetched (search) | 1971 | 0 | 875 |
++| Whitham, Linear and Nonlinear Waves | fetched (search; OpenAlex dates it 1975) | 1974 | 0 | 7,121 |
++
++**Missed (not in OpenAlex at all)** — probed with alternate search
++strings, no plausible record exists:
++
++- **Reuschel 1950**, *Fahrzeugbewegungen in der Kolonne*
++  (Österreichisches Ingenieur-Archiv) — the Austrian car-following
++  priority claim. Absent from the index.
++- **Edie 1963**, *Discussion of Traffic Stream Measurements and
++  Definitions* (conference paper, weak index coverage of that venue).
++- **Underwood 1961**, *Speed, volume, and density relationships* (Yale
++  Bureau of Highway Traffic report — grey literature).
++
++**Reference coverage of anchors is the expected weak point**: 4 of 12
++(Greenshields, Wardrop, Payne, Whitham) have *no* `referenced_works`
++in OpenAlex, and Richards has exactly 1. Edges *into* the classics
++from later works are well covered (Richards has 920 in-corpus
++citations); edges *out of* them are not. Consequence for the main
++path: it cannot flow through nodes whose outgoing arcs are missing, so
++the early spine is decided by which classics have any reference lists
++at all (Chandler 1958, Pipes 1953, Newell 1961).
++
++## 3. Graph shape
++
++- Citation edges (both ends in-corpus): **49,973**.
++- Reference resolution: 50,001 of 191,886 corpus references
++  (**26.1%**) point at other in-corpus works — stable ~21–28% per
++  decade from the 1970s on; the corpus is a bounded relevance pull, so
++  most references leave the corpus. The in-corpus graph is the
++  backbone of the field, not the full citation web.
++- 409 arcs (0.8%) point "forward" in (year, id) order — same-year
++  mutual citations and OpenAlex year noise — dropped to make the graph
++  a DAG for main-path analysis.
++
++| decade | nodes | in-corpus edges | edges/node |
++|---|---|---|---|
++| 1930s | 1 | 0 | 0.0 |
++| 1950s | 10 | 6 | 0.6 |
++| 1960s | 44 | 98 | 2.2 |
++| 1970s | 60 | 108 | 1.8 |
++| 1980s | 73 | 200 | 2.7 |
++| 1990s | 297 | 1,036 | 3.5 |
++| 2000s | 1,125 | 6,003 | 5.3 |
++| 2010s | 2,566 | 25,034 | 9.8 |
++| 2020s | 1,288 | 17,481 | 13.6 |
++
++Top in-corpus in-degree (the `hub` tag, top 25): Richards 1956 (920),
++Lighthill–Whitham 1955 (908), CTM I 1994 (590), Kerner & Rehborn 2000
++(564), CTM II 1995 (420), FVD model 2001 (397), Gipps 1981 (382),
++Gazis et al. 1961 (320), Newell 1961 (305), Chandler 1958 (295),
++generalized force model 1998 (290), Pipes 1953 (261), Newell
++simplified kinematic waves 1993 (233), Brackstone & McDonald 1999
++(231), Daganzo & Geroliminis 2008 MFD (229).
++
++## 4. Main path
++
++Method: Search Path Count traversal weights (Hummon & Doreian) on the
++DAG — arc u→v gets (# source→u paths) × (# v→sink paths), computed in
++one topological pass each way — then Batagelj's key-route extraction:
++start from the maximum-SPC arc, walk to a source and to a sink along
++max-weight arcs. 52 works, oldest first:
++
++```
++1958  Chandler, Herman & Montroll — Traffic Dynamics: Studies in Car Following
++1959  Herman et al. — Traffic Dynamics: Analysis of Stability in Car Following
++1959  Car-Following Theory of Steady-State Traffic Flow
++1961  Newell — Nonlinear Effects in the Dynamics of Car Following
++1988  Traffic Flow for the Morning Commute
++1990  What does the entropy condition mean in traffic flow theory?
++1995  Daganzo — The cell transmission model, part II: Network traffic
++1995  A finite difference approximation of the kinematic wave model of traffic
++1996  Derivation and empirical validation of a refined traffic flow model
++1997  Modeling and simulation of multilane traffic flow
++1998  Two-lane traffic rules for cellular automata: A systematic approach
++1999  Macroscopic dynamics of multilane traffic
++2000  Kerner & Rehborn — Congested traffic states in empirical observations...
++2001  Complexity of Synchronized Flow and Related Problems for Basic Assumptions
++2002  Single-vehicle data of highway traffic: Microscopic description...
++2002  Helbing — The physics of traffic jams (review)
++2003  Microscopic theory of spatial-temporal congested traffic patterns
++2004  Spatial–temporal patterns at an isolated on-ramp (cellular automaton)
++2005  Microscopic Three-phase Traffic Theory and Its Applications
++2007  Empirical Features of Congested Traffic States and Their Implications
++2008  Asymmetric Microscopic Driving Behavior Theory
++2009  Understanding Stop-and-go Traffic in View of Asymmetric Traffic Theory
++2011  Hysteresis Phenomena of a Macroscopic Fundamental Diagram in Freeway Networks
++2012  The effect of variability of urban systems characteristics (MFD)
++2012  Optimal Perimeter Control for Two Urban Regions With MFDs
++2012  On the spatial partitioning of urban transportation networks
++2013  Cooperative traffic control of a mixed network with two urban regions
++2013  Estimating MFDs in simple networks with route choice
++2014  Macroscopic Fundamental Diagrams: A cross-comparison of estimation methods
++2014  Robust perimeter control design for an urban region
++2015  Dynamics of heterogeneity in urban networks: aggregated traffic modeling
++2016  Clustering of heterogeneous networks with directional flows
++2016  Enhancing model-based feedback perimeter control with data-driven online...
++2017  Macroscopic urban dynamics: Analytical and numerical comparisons
++2017  Modeling the dynamics of congestion in large urban networks (MFD)
++2018  Introducing a Re-Sampling Methodology for the Estimation of Empirical MFDs
++2018  A functional form with a physical meaning for the MFD
++2019  Approximative Network Partitioning for MFDs from Stationary Sensor Data
++2019  On the modeling of passenger mobility for stochastic bi-modal corridors
++2019  Understanding traffic capacity of urban networks
++2020  Evaluation of analytical approximation methods for the MFD
++2021  Disentangling the city traffic rhythms: A longitudinal analysis of MFDs
++2021  Macroscopic network-level traffic models: Bridging fifty years...
++2022  Data fusion for estimating MFDs in large-scale networks
++2022  Parameter estimation of the MFD: A maximum likelihood approach
++2022  A macroscopic dynamic network loading model using variational theory
++2022  Alpha-fair large-scale urban network control: perimeter control
++2023  Scalable multi-region perimeter metering control for urban networks
++2023  Leveraging reinforcement learning for dynamic traffic control: A survey
++2024  Spatial-temporal graph convolution network model with traffic fundamental...
++2024  Koopman theory meets graph convolutional network
++2025  Physics-informed deep operator network for traffic state estimation
++```
++
++How this matches the expectation (Greenshields → LWR/Richards →
++car-following → CTM → MFD):
++
++- **Got**: car-following school (GM, 1958–61) → CTM/Daganzo (1995) →
++  ... → MFD/perimeter-control era (2011–2025). The skeleton is right.
++- **Missing from the path**: Greenshields, Wardrop, LWR, Richards.
++  Not because they lack influence (Richards and LWR are the top two
++  hubs) but because SPC needs *outgoing* arcs and the 1950s records
++  have almost none (Richards: 1 reference). The key route therefore
++  starts at Chandler 1958, the oldest well-referenced node. This is
++  the documented coverage limitation doing exactly what was predicted
++  in first-pull.md. For the viz we should draw the anchor layer
++  manually on top of the computed path.
++- **Surprise**: the 2000–2009 segment is dominated by the Kerner
++  three-phase school and its critics (synchronized flow, asymmetric
++  driving behavior), and the 1996–1999 segment by the Helbing/Dresden
++  gas-kinetic line — not by IDM (2000) or Gipps descendants. SPC
++  follows raw citation mass; Kerner's school cites itself densely and
++  sits between the car-following giants and the present. Honest
++  reading: the main path says where the *bulk* of citation traffic
++  flows, which is not the same as the canonical textbook narrative.
++  Both stories are worth telling in the video — this tension is a
++  feature.
++- Also notable: the path enters the MFD era through freeway-network
++  hysteresis (2011) and never touches traffic assignment — assignment
++  is a separate branch of the tree (Wardrop → Beckmann → ...), thin
++  here because our seed queries under-weight it.
++
++## 5. Co-authorship clusters
++
++Author-pair weights = co-authored in-corpus works; communities =
++connected components at weight ≥ 4 (deterministic; threshold 2 gives
++one 1,006-author blob, 3 still a 258-author giant, 4 splits into
++recognizable schools, 5 fragments too far). 511 edges, 96 clusters.
++Top 10 by size:
++
++| size | school (most-cited members) |
++|---|---|
++| 54 | Delft/Laval control line — Bart van Arem, Markos Papageorgiou, Yibing Wang, Jorge Laval, Piet Bovy |
++| 39 | Dresden — Martin Treiber, Dirk Helbing, Zuojin Zhu, Qing-Song Wu, Arne Kesting |
++| 28 | MFD/perimeter control — Nikolas Geroliminis, Jack Haddad, Mohsen Ramezani, Jie Sun, Anastasios Kouvelas |
++| 26 | Work/Seibold traffic-estimation line — Daniel Work, Benjamin Seibold, Jonathan Sprinkle, Rahul Bhadani, Matt Bunting |
++| 11 | Kerner/Duisburg — Boris Kerner, Michael Schreckenberg, Andreas Schadschneider, Ludger Santen, Sergey Klenov |
++| 10 | MIT/choice-modeling — Haris Koutsopoulos, Charisma Choudhury, Moshe Ben-Akiva, Tomer Toledo, Constantinos Antoniou |
++| 10 | Ningbo car-following — Hongxia Ge, Shubing Dai, Rongjun Cheng, Siuming Lo, Jufeng Wang |
++| 9 | Cranfield AV — Xiaoxiang Na, Zhongxu Hu, Yang Xing, Chen Lv, Chao Huang |
++| 8 | Berkeley/Daganzo — Carlos Daganzo, Byung-Wook Wie, Terry Friesz, Roger Tobin, Vikash Gayah |
++| 7 | Northwestern dynamic assignment — Hani Mahmassani, R. Jayakrishnan, Samer Hamdar, Alireza Talebpour, Meead Saberi |
++
++The schools map cleanly onto the subfields, and the main path's
++2000s block is exactly the Dresden and Kerner/Duisburg clusters.
++Caveat: threshold-4 components favor tight, long-running groups;
++big-name loners and one-off collaborations vanish.
++
++## 6. Subfields
++
++Each work is bucketed by the first matching rule in
++`analyze.py:SUBFIELD_RULES`, applied to its OpenAlex topics+keywords.
++Order matters (most specific first); the mapping is documented in the
++code. Known approximations: "network / MFD" keys on the keyword
++"Diagram" — OpenAlex's mangled form of "fundamental diagram" (180 of
++264 MFD-titled works carry it); macroscopic rules precede microscopic
++so CTM and three-phase CA papers land in macroscopic despite often
++carrying the "Microscopic traffic flow model" keyword; "other" is
++mostly generic traffic-engineering work with only broad signals
++("Traffic congestion", "Transport engineering").
++
++| works | subfield |
++|---|---|
++| 1,917 | other |
++| 1,007 | car-following / microscopic |
++| 947 | macroscopic flow |
++| 580 | ML prediction |
++| 361 | simulation tools |
++| 285 | network / MFD |
++| 211 | traffic assignment |
++| 158 | signal control |
++
++## 7. Dataset
++
++`data/traffic_lineage.json` — 5,466 nodes (id, label, authors, year,
++venue, cited_by_count, subfield, tags ∈ {anchor, main-path, hub},
++note left empty for hand-curation) and 49,973 `cites` edges with
++`on_main_path` flags (51 path arcs). `data/coauthorship.json` —
++separate author-pair edge list (511 edges, cluster ids) so the tree
++viz stays clean. `data/nodes.csv` / `data/edges.csv` — flat exports
++via `scripts/export_csv.py`.
++
++## 8. What's missing / next decisions
++
++- **Pruning for legibility.** 50k edges is not drawable. Candidates:
++  show only edges into hub/anchor/main-path nodes; or per-node top-k
++  in-corpus citations by target in-degree; or SPC-weight thresholding
++  (we already compute the weights — exporting them per edge is a
++  one-line change and gives a principled slider for edge density).
++  Decision needed before any viz work.
++- **Hand-drawn root layer.** The computed main path starts at 1958.
++  Greenshields 1935 → Wardrop 1952 → LWR 1955/Richards 1956 must be
++  asserted manually (documented influence, absent outgoing refs). The
++  `note` field is the place to justify each asserted edge.
++- **Missing anchors**: Reuschel 1950, Edie 1963, Underwood 1961 are
++  not in OpenAlex. If the video wants them, they become hand-added
++  nodes with provenance noted — same mechanism as the root layer.
++- **Contested-first candidates for the video**: (a) first car-following
++  model — Reuschel 1950 vs Pipes 1953 vs Chandler–Herman–Montroll
++  1958: the graph has Pipes (261 in-corpus citations) and Chandler
++  (295) but not Reuschel, which *is itself the story* (priority went
++  to the indexed, English-language, OR-journal papers); (b) first
++  fundamental diagram — Greenshields 1935 vs Underwood 1961 (absent)
++  vs Edie's measurement definitions (absent); (c) kinematic-wave
++  priority — Lighthill–Whitham vs Richards (the dataset shows them
++  effectively tied: 908 vs 920 in-corpus citations); (d) MFD —
++  Godfrey 1969 vs Daganzo 2007/2008 rediscovery (Godfrey not in
++  corpus — check).
++- **Coverage backfill option**: 26% reference resolution is decent but
++  era-skewed; a bounded `cited_by` reverse-lookup pass for the top
++  hubs would thicken the pre-1990 tree cheaply.
++- **Encoding bug upstream**: one OpenAlex record ships mojibake
++  ("...based on âSn...", a 2016 MFD paper). Left as-is (source data);
++  fix at presentation time if the node survives pruning.
+diff --git a/analysis/lit-lineage/research/phase-3-plan.md b/analysis/lit-lineage/research/phase-3-plan.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..b06bfa44780f501ed2883f848334df99097996c2
+--- /dev/null
++++ b/analysis/lit-lineage/research/phase-3-plan.md
+@@ -0,0 +1,98 @@
++# Phase 3 plan — interactive lineage tree + video
++
++Inputs (phase 2): `data/traffic_lineage.json` (5,466 nodes / 49,973
++`cites` edges, SPC main path of 52 works flagged), `data/coauthorship.json`
++(511 author-pair edges, 96 school clusters). Reference implementation:
++the sibling `sci-fi-lineage` project (337-line D3 `web/main.js`, static,
++no build; Manim scenes for the video).
++
++Deliverables: (a) an interactive lineage tree published on the
++traffic-sim site, linked from the splash page's analysis row (the
++"coming soon" card); (b) Manim scenes for a Math vs Vibes short.
++
++## 1. Curation layer (hand edits, kept separate from generated data)
++
++`data/` is gitignored (root `.gitignore` convention), and generated
++files get overwritten by the pipeline — so hand curation lives in a
++tracked file: `curation/edits.yaml` (or JSON), applied by a new
++`scripts/curate.py` as the LAST pipeline step:
++
++- **Asserted root layer**: Greenshields 1935 → Wardrop 1952 → LWR 1955
++  / Richards 1956 → Chandler 1958. Documented influence, but OpenAlex
++  has no outgoing refs for these records (phase-2 §2), so no computed
++  edge can exist. Each asserted edge carries a `note` with the receipt.
++- **Missing nodes**: Reuschel 1950, Edie 1963, Underwood 1961, Godfrey
++  1969 — hand-added with `provenance: hand` (phase-2 §8; their absence
++  from the index is itself a video beat).
++- **Contested-first flags**: `disputed: true` pairs, mirroring the
++  sci-fi project's dashed-red edges — (a) first car-following:
++  Reuschel vs Pipes vs Chandler–Herman–Montroll; (b) first fundamental
++  diagram: Greenshields vs Underwood vs Edie; (c) kinematic-wave
++  priority: LWR vs Richards (908 vs 920 in-corpus citations — a tie);
++  (d) MFD: Godfrey 1969 vs Daganzo 2007/08 rediscovery.
++- **One-line notes** for the ~50 video-relevant nodes (the `note`
++  field exists and is empty).
++
++## 2. Pruning for legibility (the open decision)
++
++50k edges is not drawable; 5.5k nodes is not browsable. Plan:
++
++1. Export SPC weights per edge (one-line change in `analyze.py` — the
++   weights are already computed) → principled density slider.
++2. Default view: anchors + main path + hubs (top in-degree) + asserted
++   roots ≈ 150–300 nodes — the "spine" the video also uses.
++3. Everything else reachable by interaction: click a node → ego network
++   (in/out citations, capped by SPC weight); subfield filter reveals
++   that field's local hubs.
++
++Decision needed before viz work: the default-view node budget and
++whether the slider is SPC-weight or per-node top-k. Leaning SPC —
++it's computed, principled, and gives the video a defensible "why these
++edges" answer.
++
++## 3. Web viz
++
++`analysis/lit-lineage/web/` — static, no build, D3 from CDN, cloned
++from sci-fi-lineage's `web/` and adapted:
++
++- x = publication year (piecewise scale, 1935→2026), y = layout force;
++  node size = cited_by_count; color = subfield (8 buckets from
++  `analyze.py:SUBFIELD_RULES`).
++- Edge rendering: main-path edges emphasized; `disputed` edges dashed
++  red; a "spine only / full ego" density toggle.
++- Hover tooltip (title, authors, venue, citation count, note);
++  click-to-isolate ego lineage; search box; subfield/school filters.
++- A second view (or overlay) for the co-authorship schools from
++  `coauthorship.json` — cluster hulls labeled with the school names
++  from phase-2 §5.
++- Publishing: static files, so the cheapest path is copying the bundle
++  into the deployed site (demosrv serves `viz/dist` — either add the
++  lineage page as a fourth vite input, or serve it as a plain static
++  directory). Decide at build time; splash card already reserves the
++  slot. The dataset JSON it loads (~1–2 MB pruned) ships with the
++  bundle, not via git.
++
++## 4. Video (Manim)
++
++`analysis/lit-lineage/manim/`, mirroring sci-fi-lineage's scenes
++(manim toolchain in a local venv, gitignored, install notes in README):
++
++- `LineageBuild` — the tree grows node-by-node chronologically along
++  the main path + asserted roots, running year counter. The Kerner
++  2000s block is the "citation mass ≠ textbook canon" beat (phase-2 §4)
++  — the graph insists on a story the textbooks don't lead with; that's
++  the math-vs-vibes thesis on camera.
++- `ContestedBeats` — the four contested-crown cards from §1.
++- `SchoolsMap` (stretch) — co-authorship clusters assembling as
++  constellations: Dresden, Duisburg, Berkeley, Geroliminis MFD.
++
++## 5. Open questions (for review)
++
++1. SPC-weight slider vs per-node top-k for the default view (§2)?
++2. Is the asserted-root mechanism (curation file, receipts in `note`)
++   the right way to handle index gaps, or should we backfill via
++   `cited_by` reverse-lookups first (phase-2 §8 option)?
++3. Dataset distribution: pruned JSON ships inside the web bundle
++   (regenerable, gitignored) — any objection to keeping it out of git?
++4. Video framing: lean into "the index itself is biased" (Reuschel
++   absent, Kerner over-weighted) as the second act?
+diff --git a/analysis/lit-lineage/scripts/analyze.py b/analysis/lit-lineage/scripts/analyze.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fd133f6a8d5b468fe6f05527e84ff20230718c46
+--- /dev/null
++++ b/analysis/lit-lineage/scripts/analyze.py
+@@ -0,0 +1,362 @@
++#!/usr/bin/env python3
++"""analyze.py — build the traffic-flow lineage graph from the corpus.
++
++Reads data/corpus.jsonl (filtered + anchors) and produces:
++
++  - citation graph: edge A->B when A's referenced_works contain B and
++    both are in-corpus. References out of corpus are counted but not
++    drawn.
++  - main path: standard citation-network main-path analysis (Hummon &
++    Doreian; Batagelj 2003). Arc traversal weights are Search Path
++    Counts (SPC): for arc u->v, (# paths from any source to u) x
++    (# paths from v to any sink). The key-route main path starts from
++    the maximum-SPC arc and extends both ways along max-weight arcs.
++    The graph is made acyclic first by ordering nodes (year, id) and
++    dropping the rare "backward" arcs (same-year mutual citations,
++    OpenAlex year noise).
++  - co-authorship network: author-pair edge weights = co-authored
++    in-corpus works; communities = connected components of the graph
++    thresholded at MIN_COAUTH weight (simple, deterministic).
++  - subfields: each work is bucketed by the first matching rule in
++    SUBFIELD_RULES, applied to its OpenAlex topics + keywords. The
++    mapping is explicit and documented below; order matters (most
++    specific first). Notable approximations: "network / MFD" keys on
++    the keyword "Diagram", OpenAlex's mangled form of "fundamental
++    diagram"; macroscopic rules come before microscopic so CTM and
++    three-phase CA papers land in macroscopic despite often carrying
++    the "Microscopic traffic flow model" keyword.
++
++Outputs:
++  data/traffic_lineage.json  nodes (label, authors, year, venue,
++                             cited_by_count, subfield, tags, note) +
++                             citation edges with on_main_path flags
++  data/coauthorship.json     separate author-pair edge list + clusters
++  stdout                     stats for research/phase-2.md
++
++usage: analyze.py
++"""
++import json
++import os
++import sys
++from collections import defaultdict, deque
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++CORPUS_PATH = os.path.join(ROOT, "data", "corpus.jsonl")
++LINEAGE_PATH = os.path.join(ROOT, "data", "traffic_lineage.json")
++COAUTH_PATH = os.path.join(ROOT, "data", "coauthorship.json")
++
++HUB_TOP_N = 25        # tag this many highest-in-degree works as hubs
++MIN_COAUTH = 4        # co-authorship edges below this weight are dropped
++LABEL_LEN = 60
++
++# Subfield buckets, first matching rule wins. Each rule is a set of
++# OpenAlex topic/keyword display names (see module docstring).
++SUBFIELD_RULES = [
++    ("ML prediction", {
++        "Machine learning", "Deep learning", "Artificial neural network",
++        "Reinforcement learning", "Convolutional neural network",
++    }),
++    ("macroscopic flow", {
++        "Kinematic wave", "Traffic wave", "Cell Transmission Model",
++        "Three-phase traffic theory",
++        "Traffic congestion reconstruction with Kerner's three-phase theory",
++        "Traffic equations", "Shock wave", "Jamming", "Density wave theory",
++    }),
++    ("car-following / microscopic", {
++        "Microscopic traffic flow model", "Headway", "Cruise control",
++        "Cooperative Adaptive Cruise Control", "Platoon",
++        "Advanced driver assistance systems",
++        # topic-level:
++        "Autonomous Vehicle Technology and Safety",
++    }),
++    ("network / MFD", {
++        "Diagram",   # OpenAlex's mangled "fundamental diagram" keyword
++    }),
++    ("traffic assignment", {
++        "Variational inequality", "Traffic network", "Flow network",
++    }),
++    ("simulation tools", {
++        "Traffic simulation", "Microsimulation", "VisSim",
++    }),
++    ("signal control", {
++        "SIGNAL (programming language)", "Intersection (aeronautics)",
++        "Advanced Traffic Management System",
++    }),
++]
++SUBFIELD_OTHER = "other"
++
++
++def subfield(work: dict) -> str:
++    signals = set(work["topics"]) | set(work["keywords"])
++    for name, keys in SUBFIELD_RULES:
++        if signals & keys:
++            return name
++    return SUBFIELD_OTHER
++
++
++def label(title: str) -> str:
++    return title if len(title) <= LABEL_LEN else title[:LABEL_LEN - 1] + "…"
++
++
++def build_graph(corpus: list):
++    """Citation edges A->B (A cites B), both in-corpus. Returns
++    (edges, out_adj, in_deg, n_refs, n_resolved)."""
++    ids = {w["id"] for w in corpus}
++    edges = set()
++    n_refs = n_resolved = 0
++    for w in corpus:
++        for ref in w["referenced_works"]:
++            n_refs += 1
++            if ref in ids:
++                n_resolved += 1
++                if ref != w["id"]:
++                    edges.add((w["id"], ref))
++    out_adj = defaultdict(list)
++    in_deg = defaultdict(int)
++    for a, b in edges:
++        out_adj[a].append(b)
++        in_deg[b] += 1
++    return edges, out_adj, in_deg, n_refs, n_resolved
++
++
++def dagify(edges: list, order_key) -> list:
++    """Keep only arcs pointing strictly backward in (year, id) order —
++    a citation graph should be a DAG; this drops the ~1% of arcs that
++    aren't (same-year mutual citations, OpenAlex year noise)."""
++    keep = [(a, b) for a, b in edges if order_key(a) > order_key(b)]
++    return keep
++
++
++def topo_order(nodes: list, edges: list):
++    """Kahn's algorithm; edges point citing->cited (new -> old), so the
++    result runs newest-first. Assumes dagify already ran."""
++    out_adj = defaultdict(list)
++    indeg = {n: 0 for n in nodes}
++    for a, b in edges:
++        out_adj[a].append(b)
++        indeg[b] += 1
++    queue = deque(sorted(n for n in nodes if indeg[n] == 0))
++    order = []
++    while queue:
++        u = queue.popleft()
++        order.append(u)
++        for v in sorted(out_adj[u]):
++            indeg[v] -= 1
++            if indeg[v] == 0:
++                queue.append(v)
++    if len(order) != len(nodes):
++        raise RuntimeError("graph not acyclic after dagify")
++    return order, out_adj
++
++
++def spc_weights(nodes: list, edges: list, order: list, out_adj: dict):
++    """Search Path Count per arc: fp[u] * bp[v]. Python ints are
++    arbitrary precision — path counts explode combinatorially and that
++    is fine."""
++    in_adj = defaultdict(list)
++    for a, b in edges:
++        in_adj[b].append(a)
++    fp = {}
++    for u in order:                     # newest -> oldest
++        fp[u] = (1 if not in_adj[u] else 0) + sum(fp[p] for p in in_adj[u])
++    bp = {}
++    for u in reversed(order):           # oldest -> newest
++        bp[u] = (1 if not out_adj[u] else 0) + sum(bp[w] for w in out_adj[u])
++    return {(a, b): fp[a] * bp[b] for a, b in edges}
++
++
++def key_route(weights: dict, out_adj: dict):
++    """Batagelj's key-route main path: from the max-SPC arc, walk to a
++    source along max-weight in-arcs and to a sink along max-weight
++    out-arcs. Returns the path newest-first."""
++    in_adj = defaultdict(list)
++    for a, b in weights:
++        in_adj[b].append(a)
++    (a, b), _ = max(weights.items(), key=lambda kv: (kv[1], kv[0]))
++    head = [a]
++    while in_adj[head[-1]]:
++        u = head[-1]
++        nxt = max(in_adj[u], key=lambda p: (weights[(p, u)], p))
++        head.append(nxt)
++    tail = [b]
++    while out_adj[tail[-1]]:
++        u = tail[-1]
++        cands = [v for v in out_adj[u] if (u, v) in weights]
++        if not cands:
++            break
++        tail.append(max(cands, key=lambda v: (weights[(u, v)], v)))
++    # head was built oldest->newest (a is the older end); reverse it so
++    # the whole path runs newest-first like tail does.
++    return head[::-1] + tail
++
++
++def coauthorship(corpus: list, author_cites: dict):
++    """Author-pair weights over the corpus; communities = connected
++    components at weight >= MIN_COAUTH. Deterministic throughout."""
++    pair_w = defaultdict(int)
++    for w in corpus:
++        aids = sorted({a["id"] for a in w["authors"] if a["id"]})
++        for i in range(len(aids)):
++            for j in range(i + 1, len(aids)):
++                pair_w[(aids[i], aids[j])] += 1
++    adj = defaultdict(set)
++    weight = {}
++    for (a, b), n in pair_w.items():
++        if n >= MIN_COAUTH:
++            adj[a].add(b)
++            adj[b].add(a)
++            weight[(a, b)] = n
++    seen, clusters = set(), []
++    for start in sorted(adj):
++        if start in seen:
++            continue
++        comp, stack = [], [start]
++        seen.add(start)
++        while stack:
++            u = stack.pop()
++            comp.append(u)
++            for v in sorted(adj[u]):
++                if v not in seen:
++                    seen.add(v)
++                    stack.append(v)
++        clusters.append(sorted(comp))
++    clusters.sort(key=lambda c: (-len(c), c))
++    cluster_of = {}
++    for i, c in enumerate(clusters):
++        for a in c:
++            cluster_of[a] = i
++    return weight, clusters, cluster_of
++
++
++def main() -> None:
++    corpus = [json.loads(line) for line in open(CORPUS_PATH)]
++    by_id = {w["id"]: w for w in corpus}
++    print(f"corpus: {len(corpus)} works")
++
++    # --- citation graph -------------------------------------------------
++    edges_all, out_adj_all, in_deg, n_refs, n_resolved = build_graph(corpus)
++    print(f"citation edges (in-corpus): {len(edges_all)}")
++    print(f"references resolving in-corpus: {n_resolved}/{n_refs} "
++          f"({100 * n_resolved / max(1, n_refs):.1f}%)")
++
++    order_key = lambda wid: (by_id[wid]["year"] or 0, wid)
++    edges = dagify(sorted(edges_all), order_key)
++    print(f"backward arcs dropped for DAG: {len(edges_all) - len(edges)}")
++    order, out_adj = topo_order(sorted(by_id), edges)
++
++    # per-decade shape
++    dec_nodes = defaultdict(int)
++    dec_edges = defaultdict(int)
++    for w in corpus:
++        if w["year"]:
++            dec_nodes[w["year"] // 10 * 10] += 1
++    for a, _ in edges_all:
++        if by_id[a]["year"]:
++            dec_edges[by_id[a]["year"] // 10 * 10] += 1
++    print("\ndecade | nodes | in-corpus edges | edges/node")
++    for d in sorted(dec_nodes):
++        print(f"  {d}s | {dec_nodes[d]:>5} | {dec_edges[d]:>6} | "
++              f"{dec_edges[d] / dec_nodes[d]:.2f}")
++
++    # --- main path ------------------------------------------------------
++    weights = spc_weights(sorted(by_id), edges, order, out_adj)
++    path = key_route(weights, out_adj)
++    path_edges = set(zip(path, path[1:]))
++    print(f"\nkey-route main path ({len(path)} works, oldest first):")
++    for wid in reversed(path):
++        w = by_id[wid]
++        print(f"  {w['year']}  {w['title'][:72]}")
++
++    # --- co-authorship --------------------------------------------------
++    author_name = {}
++    author_cites = defaultdict(int)
++    for w in corpus:
++        for a in w["authors"]:
++            if a["id"]:
++                author_name[a["id"]] = a["name"]
++                author_cites[a["id"]] = max(author_cites[a["id"]],
++                                            w["cited_by_count"])
++    pair_w, clusters, cluster_of = coauthorship(corpus, author_cites)
++    print(f"\nco-authorship: {len(pair_w)} pairs at weight >= {MIN_COAUTH}, "
++          f"{len(clusters)} clusters")
++    print("top clusters (size, most-cited authors):")
++    for c in clusters[:10]:
++        top = sorted(c, key=lambda a: (-author_cites[a], a))[:5]
++        names = ", ".join(f"{author_name[a]} ({author_cites[a]})"
++                          for a in top)
++        print(f"  {len(c):>4} authors: {names}")
++
++    # --- subfields ------------------------------------------------------
++    for w in corpus:
++        w["subfield"] = subfield(w)
++    sub_counts = defaultdict(int)
++    for w in corpus:
++        sub_counts[w["subfield"]] += 1
++    print("\nsubfield distribution:")
++    for name, n in sorted(sub_counts.items(), key=lambda kv: -kv[1]):
++        print(f"  {n:>5}  {name}")
++
++    # --- tags + dataset -------------------------------------------------
++    hubs = {wid for wid, _ in sorted(in_deg.items(), key=lambda kv: -kv[1])
++            [:HUB_TOP_N]}
++    nodes = []
++    for w in corpus:
++        tags = []
++        if w.get("anchor"):
++            tags.append("anchor")
++        if w["id"] in set(path):
++            tags.append("main-path")
++        if w["id"] in hubs:
++            tags.append("hub")
++        nodes.append({
++            "id": w["id"].rsplit("/", 1)[1],
++            "label": label(w["title"]),
++            "authors": [a["name"] for a in w["authors"]],
++            "year": w["year"],
++            "venue": w["venue"],
++            "cited_by_count": w["cited_by_count"],
++            "subfield": w["subfield"],
++            "tags": tags,
++            "note": "",
++        })
++    lineage = {
++        "meta": {
++            "source": "OpenAlex (CC0), corpus filtered from "
++                      "analysis/lit-lineage/data/works.jsonl",
++            "works": len(corpus),
++            "citation_edges": len(edges_all),
++            "main_path_works": len(path),
++        },
++        "nodes": nodes,
++        "edges": [
++            {"source": a.rsplit("/", 1)[1], "target": b.rsplit("/", 1)[1],
++             "type": "cites", "on_main_path": (a, b) in path_edges}
++            for a, b in sorted(edges_all)
++        ],
++    }
++    with open(LINEAGE_PATH, "w") as f:
++        json.dump(lineage, f, indent=1)
++    print(f"\nwrote {len(nodes)} nodes, {len(lineage['edges'])} edges "
++          f"-> {LINEAGE_PATH}")
++
++    coauth = {
++        "meta": {"min_weight": MIN_COAUTH, "pairs": len(pair_w),
++                 "clusters": len(clusters)},
++        "authors": {aid.rsplit("/", 1)[1]: {
++            "name": author_name[aid],
++            "max_cited_by": author_cites[aid],
++            "cluster": cluster_of.get(aid)}
++            for aid in sorted(author_name)},
++        "edges": [
++            {"source": a.rsplit("/", 1)[1], "target": b.rsplit("/", 1)[1],
++             "type": "coauthor", "weight": n}
++            for (a, b), n in sorted(pair_w.items())
++        ],
++    }
++    with open(COAUTH_PATH, "w") as f:
++        json.dump(coauth, f, indent=1)
++    print(f"wrote {len(pair_w)} co-authorship edges -> {COAUTH_PATH}")
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/analysis/lit-lineage/scripts/anchors.py b/analysis/lit-lineage/scripts/anchors.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..45e98f2c748b81b72d0c76a818d65e471e10f875
+--- /dev/null
++++ b/analysis/lit-lineage/scripts/anchors.py
+@@ -0,0 +1,222 @@
++#!/usr/bin/env python3
++"""anchors.py — fetch pre-1960 (and other missing) classics into the corpus.
++
++Relevance-ranked search never surfaces the field's roots (thin OpenAlex
++coverage of 1930s-60s venues, 600 modern hits outrank them), so the
++known classics are fetched directly: by DOI where one is known, else by
++title search with the best title/year match taken. Raw responses are
++cached under data/raw/anchors/ so re-runs are cheap and auditable.
++
++Anchors already present in the corpus (LWR 1955, Richards 1956, Gipps
++1981 surfaced in the harvest) are matched in place by DOI/normalized
++title and just flagged. Everything found is marked `anchor: true` —
++these become the root nodes of the lineage tree.
++
++usage: anchors.py [--refresh]
++  reads  data/corpus.jsonl
++  writes data/corpus.jsonl   (anchors merged in, flagged)
++  caches data/raw/anchors/<slug>-{doi,search}.json
++"""
++import argparse
++import difflib
++import json
++import os
++import sys
++import urllib.error
++import urllib.parse
++
++from harvest import fetch, mailto, normalize
++
++API = "https://api.openalex.org/works"
++MAX_YEAR_DRIFT = 5      # accept a title match only within +-5 years
++MIN_TITLE_RATIO = 0.75  # difflib ratio on normalized titles
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++CORPUS_PATH = os.path.join(ROOT, "data", "corpus.jsonl")
++CACHE_DIR = os.path.join(ROOT, "data", "raw", "anchors")
++
++# The classic-era roots to hunt. doi=None means no DOI is known (venue
++# too old); those go through title search. DOIs given here are the
++# publisher DOIs; a 404 falls back to title search too.
++ANCHORS = [
++    {"slug": "greenshields-1935", "year": 1935, "doi": None,
++     "title": "A Study of Traffic Capacity",
++     "note": "Highway Research Board proceedings"},
++    {"slug": "wardrop-1952", "year": 1952, "doi": None,
++     "title": "Some Theoretical Aspects of Road Traffic Research",
++     "note": "ICE proceedings"},
++    {"slug": "reuschel-1950", "year": 1950, "doi": None,
++     "title": "Fahrzeugbewegungen in der Kolonne",
++     "note": "Oesterreichisches Ingenieur-Archiv (German)"},
++    {"slug": "pipes-1953", "year": 1953, "doi": "10.1063/1.1721265",
++     "title": "An Operational Analysis of Traffic Dynamics",
++     "note": "Journal of Applied Physics"},
++    {"slug": "lighthill-whitham-1955", "year": 1955,
++     "doi": "10.1098/rspa.1955.0089",
++     "title": "On kinematic waves II. A theory of traffic flow on long "
++              "crowded roads", "note": "Proc. Royal Society A"},
++    {"slug": "richards-1956", "year": 1956, "doi": "10.1287/opre.4.1.42",
++     "title": "Shock Waves on the Highway", "note": "Operations Research"},
++    {"slug": "chandler-1958", "year": 1958, "doi": "10.1287/opre.6.2.165",
++     "title": "Traffic Dynamics: Studies in Car Following",
++     "note": "Operations Research"},
++    {"slug": "herman-1959", "year": 1959, "doi": "10.1287/opre.7.1.86",
++     "title": "Traffic Dynamics: Analysis of Stability in Car Following",
++     "note": "Operations Research"},
++    {"slug": "newell-1961", "year": 1961, "doi": "10.1287/opre.9.2.209",
++     "title": "Nonlinear Effects in the Dynamics of Car Following",
++     "note": "Operations Research"},
++    {"slug": "edie-1963", "year": 1963, "doi": None,
++     "title": "Discussion of Traffic Stream Measurements and Definitions",
++     "note": "Proc. 2nd Int. Symp. Theory of Traffic Flow"},
++    {"slug": "gazis-1961", "year": 1961, "doi": "10.1287/opre.9.4.499",
++     "title": "Nonlinear follow-the-leader models of traffic flow",
++     "note": "Operations Research (GM research labs)"},
++    {"slug": "underwood-1961", "year": 1961, "doi": None,
++     "title": "Speed, volume, and density relationships",
++     "note": "Yale Bureau of Highway Traffic report"},
++    {"slug": "gipps-1981", "year": 1981, "doi": "10.1016/0191-2615(81)90037-0",
++     "title": "A behavioural car-following model for computer simulation",
++     "note": "Transportation Research B"},
++    {"slug": "payne-1971", "year": 1971, "doi": None,
++     "title": "Models of freeway traffic and control",
++     "note": "Simulation Councils proceedings (FREFLO)"},
++    {"slug": "whitham-1974", "year": 1974, "doi": None,
++     "title": "Linear and Nonlinear Waves", "note": "Wiley monograph"},
++]
++
++
++def norm(s: str) -> str:
++    return "".join(c for c in (s or "").lower() if c.isalnum())
++
++
++def cached(name: str, url: str, refresh: bool) -> dict:
++    path = os.path.join(CACHE_DIR, name)
++    if os.path.exists(path) and not refresh:
++        with open(path) as f:
++            return json.load(f)
++    try:
++        data = fetch(url)
++    except urllib.error.HTTPError as e:
++        if e.code == 404:
++            data = {"_not_found": True}
++        else:
++            raise
++    with open(path, "w") as f:
++        json.dump(data, f)
++    return data
++
++
++def pick(results: list, anchor: dict) -> dict:
++    """Best title/year match among search results, or None."""
++    best, best_score = None, 0.0
++    for w in results:
++        ratio = difflib.SequenceMatcher(
++            None, norm(w.get("title")), norm(anchor["title"])).ratio()
++        drift = abs((w.get("publication_year") or 0) - anchor["year"])
++        if ratio >= MIN_TITLE_RATIO and drift <= MAX_YEAR_DRIFT:
++            score = ratio - drift * 0.01
++            if score > best_score:
++                best, best_score = w, score
++    return best
++
++
++def find_in_corpus(corpus: list, anchor: dict) -> dict:
++    # A DOI-bearing anchor is matched in-corpus only by exact DOI — a
++    # fuzzy title hit must not suppress the DOI fetch ("Analysis of
++    # Stability in Car Following" 1959 is a near-title of "Studies in
++    # Car Following" 1958 and would shadow it).
++    if anchor["doi"]:
++        doi = f"https://doi.org/{anchor['doi']}"
++        for w in corpus:
++            if w["doi"] == doi:
++                return w
++        return None
++    best, best_ratio = None, 0.0
++    for w in corpus:
++        ratio = difflib.SequenceMatcher(
++            None, norm(w["title"]), norm(anchor["title"])).ratio()
++        if ratio > best_ratio:
++            best, best_ratio = w, ratio
++    if best_ratio >= MIN_TITLE_RATIO and best and \
++            abs((best["year"] or 0) - anchor["year"]) <= MAX_YEAR_DRIFT:
++        return best
++    return None
++
++
++def hunt(anchor: dict, params: dict, refresh: bool) -> dict:
++    """Fetch one anchor from the API; returns a raw work or None."""
++    if anchor["doi"]:
++        url = f"{API}/doi:{anchor['doi']}"
++        data = cached(f"{anchor['slug']}-doi.json", url, refresh)
++        if not data.get("_not_found"):
++            return data
++    q = dict(params, search=anchor["title"], **{"per-page": 5})
++    url = API + "?" + urllib.parse.urlencode(q)
++    data = cached(f"{anchor['slug']}-search.json", url, refresh)
++    return pick(data.get("results", []), anchor)
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    ap.add_argument("--refresh", action="store_true",
++                    help="ignore the anchors cache and re-fetch")
++    args = ap.parse_args()
++
++    os.makedirs(CACHE_DIR, exist_ok=True)
++    params = {}
++    m = mailto()
++    if m:
++        params["mailto"] = m
++        print(f"polite pool: mailto={m}")
++
++    corpus = [json.loads(line) for line in open(CORPUS_PATH)]
++    by_id = {w["id"]: w for w in corpus}
++    found, missed = [], []
++    for a in ANCHORS:
++        hit = find_in_corpus(corpus, a)
++        if hit:
++            hit["anchor"] = True
++            found.append((a, hit, "already in corpus"))
++            continue
++        raw = hunt(a, params, args.refresh)
++        if raw is None:
++            missed.append(a)
++            print(f"  MISS {a['slug']}: {a['title']} ({a['year']})")
++            continue
++        w = normalize(raw)
++        if w["id"] in by_id:      # fetched but already present
++            w = by_id[w["id"]]
++        else:
++            corpus.append(w)
++            by_id[w["id"]] = w
++        w["anchor"] = True
++        w.setdefault("matched_queries", [])
++        w["traffic_signals"] = ["anchor (classic fetched directly)"]
++        found.append((a, w, "fetched"))
++
++    corpus.sort(key=lambda w: ((w["year"] or 9999), w["id"]))
++    with open(CORPUS_PATH, "w") as f:
++        for w in corpus:
++            f.write(json.dumps(w) + "\n")
++
++    print(f"\nanchors found: {len(found)} of {len(ANCHORS)}")
++    print("| anchor | how | OpenAlex match | year | refs | cited by |")
++    print("|---|---|---|---|---|---|")
++    for a, w, how in found:
++        print(f"| {a['slug']} | {how} | {w['title'][:45]} | {w['year']} "
++              f"| {len(w['referenced_works'])} | {w['cited_by_count']} |")
++    if missed:
++        print("\nmissed:")
++        for a in missed:
++            print(f"  - {a['slug']}: {a['title']} ({a['year']}, {a['note']})")
++    no_refs = [w["title"] for _, w, _ in found if not w["referenced_works"]]
++    if no_refs:
++        print(f"\nanchors with NO referenced_works in OpenAlex: {len(no_refs)}")
++        for t in no_refs:
++            print(f"  - {t[:70]}")
++    print(f"wrote {len(corpus)} works -> {CORPUS_PATH}")
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/analysis/lit-lineage/scripts/export_csv.py b/analysis/lit-lineage/scripts/export_csv.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..91613c7ea7d93ca36ecd3a6b99bac3e9d7937de7
+--- /dev/null
++++ b/analysis/lit-lineage/scripts/export_csv.py
+@@ -0,0 +1,48 @@
++#!/usr/bin/env python3
++"""export_csv.py — flat CSV exports of the lineage dataset.
++
++Mirrors the sci-fi-lineage project's export: the JSON dataset is the
++source of truth, the CSVs are generated for spreadsheet / Gephi-style
++consumers.
++
++usage: export_csv.py
++  reads  data/traffic_lineage.json
++  writes data/nodes.csv, data/edges.csv
++"""
++import csv
++import json
++import os
++import sys
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++LINEAGE_PATH = os.path.join(ROOT, "data", "traffic_lineage.json")
++NODES_PATH = os.path.join(ROOT, "data", "nodes.csv")
++EDGES_PATH = os.path.join(ROOT, "data", "edges.csv")
++
++
++def main() -> None:
++    with open(LINEAGE_PATH) as f:
++        data = json.load(f)
++
++    with open(NODES_PATH, "w", newline="") as f:
++        w = csv.writer(f)
++        w.writerow(["id", "label", "authors", "year", "venue",
++                    "cited_by_count", "subfield", "tags", "note"])
++        for n in data["nodes"]:
++            w.writerow([n["id"], n["label"], "; ".join(n["authors"]),
++                        n["year"], n["venue"] or "", n["cited_by_count"],
++                        n["subfield"], ";".join(n["tags"]), n["note"]])
++
++    with open(EDGES_PATH, "w", newline="") as f:
++        w = csv.writer(f)
++        w.writerow(["source", "target", "type", "on_main_path"])
++        for e in data["edges"]:
++            w.writerow([e["source"], e["target"], e["type"],
++                        int(e["on_main_path"])])
++
++    print(f"wrote {len(data['nodes'])} nodes -> {NODES_PATH}")
++    print(f"wrote {len(data['edges'])} edges -> {EDGES_PATH}")
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/analysis/lit-lineage/scripts/filter.py b/analysis/lit-lineage/scripts/filter.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..760e7088b7f0459e95570865b7cd593ca9a05404
+--- /dev/null
++++ b/analysis/lit-lineage/scripts/filter.py
+@@ -0,0 +1,200 @@
++#!/usr/bin/env python3
++"""filter.py — turn the raw harvest into a clean on-topic corpus.
++
++The seed queries caught off-field work through ambiguous phrases
++("cell transmission model" -> cell biology, "three-phase" -> power/5G,
++"stop-and-go waves" -> medical papers; see research/first-pull.md).
++Title heuristics have bad false positives (Daganzo's "Network traffic"
++means *road* networks), so the filter keys on OpenAlex's own topic and
++keyword annotations instead: a work is kept iff it carries at least one
++allowlisted road-traffic topic or keyword. The allowlists below are
++explicit and were built by inspecting the actual values in
++data/works.jsonl.
++
++Garbage handling (cases documented in first-pull.md):
++  - blank-title records are dropped (one carries a corrupted 50k
++    citation count);
++  - HTML tags are stripped from titles (<b>lmerTest</b> et al.);
++  - works are deduplicated by DOI, then by normalized title — catches
++    near-duplicate records with corrupted years (a 1928-dated duplicate
++    of the 2010 "Enhanced intelligent driver model" paper has no DOI);
++  - cited_by_count above MAX_CITATIONS is implausible for this corpus
++    and the record is dropped (catches the corrupted 50k-count record;
++    the only real works it removes — SciPy, QUANTUM ESPRESSO — are
++    off-topic and the topic filter would drop them anyway).
++
++usage: filter.py
++  reads  data/works.jsonl
++  writes data/corpus.jsonl   (works that pass, keep/drop stats on stdout)
++"""
++import json
++import os
++import re
++import sys
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++WORKS_PATH = os.path.join(ROOT, "data", "works.jsonl")
++CORPUS_PATH = os.path.join(ROOT, "data", "corpus.jsonl")
++
++MAX_CITATIONS = 25000   # above this the count is assumed corrupted
++
++# OpenAlex topics that mark a work as road-traffic research. Extends
++# harvest.py's ON_TOPIC_TOPICS with two more road-vehicle topics.
++# Deliberately NOT allowlisted: "Evacuation and Crowd Dynamics"
++# (pedestrian dynamics is a separate lineage), "Vehicular Ad Hoc
++# Networks (VANETs)" and "Network Traffic and Congestion Control"
++# (comms networks), "Air Traffic Management and Optimization".
++TRAFFIC_TOPICS = {
++    "Traffic control and management",
++    "Transportation Planning and Optimization",
++    "Traffic Prediction and Management Techniques",
++    "Traffic and Road Safety",
++    "Urban Transport and Accessibility",
++    "Transportation and Mobility Innovations",
++    "Autonomous Vehicle Technology and Safety",
++}
++
++# OpenAlex keywords that mark a work as road-traffic research. Several
++# are OpenAlex-mislabeled but de-facto road-traffic terms (checked by
++# sampling the works carrying them):
++#   "Traffic flow (computer networking)"  OpenAlex's generic traffic-flow
++#       keyword; pulls a handful of genuine networking papers (~5 of 91
++#       works that carry it with no traffic topic) but mostly classics.
++#   "Intersection (aeronautics)"          road intersections.
++#   "SIGNAL (programming language)"       traffic signals (~1 FP in 17).
++TRAFFIC_KEYWORDS = {
++    "Traffic flow (computer networking)",
++    "Transport engineering",
++    "Traffic congestion",
++    "Traffic generation model",
++    "Traffic simulation",
++    "Microscopic traffic flow model",
++    "Traffic congestion reconstruction with Kerner's three-phase theory",
++    "Three-phase traffic theory",
++    "Cell Transmission Model",
++    "Traffic wave",
++    "Kinematic wave",
++    "Traffic model",
++    "Traffic optimization",
++    "Traffic equations",
++    "Microsimulation",
++    "Intelligent transportation system",
++    "Floating car data",
++    "Headway",
++    "Platoon",
++    "Cruise control",
++    "Cooperative Adaptive Cruise Control",
++    "Advanced driver assistance systems",
++    "Automotive engineering",
++    "Travel time",
++    "Highway Capacity Manual",
++    "Highway engineering",
++    "Highway system",
++    "Intersection (aeronautics)",
++    "SIGNAL (programming language)",
++    "Public transport",
++}
++
++TAG_RE = re.compile(r"<[^>]+>")
++WS_RE = re.compile(r"\s+")
++NORM_RE = re.compile(r"[^a-z0-9]+")
++
++
++def clean_title(title: str) -> str:
++    return WS_RE.sub(" ", TAG_RE.sub("", title or "")).strip()
++
++
++def norm_title(title: str) -> str:
++    return NORM_RE.sub("", title.lower())
++
++
++def rank(work: dict) -> tuple:
++    """Dedup preference: real records beat corrupted near-duplicates."""
++    return (bool(work["doi"]), bool(work["referenced_works"]),
++            work["cited_by_count"], len(work["authors"]))
++
++
++def traffic_signals(work: dict) -> list:
++    """The allowlisted topic/keyword signals a work carries (may be [])."""
++    return sorted((TRAFFIC_TOPICS & set(work["topics"]))
++                  | (TRAFFIC_KEYWORDS & set(work["keywords"])))
++
++
++def main() -> None:
++    works = [json.loads(line) for line in open(WORKS_PATH)]
++    dropped = {"blank title": 0, "corrupt citation count": 0,
++               "duplicate (same DOI)": 0, "duplicate (same title)": 0,
++               "no traffic topic/keyword signal": 0}
++
++    # Clean titles, drop garbage.
++    clean = []
++    for w in works:
++        w["title"] = clean_title(w["title"])
++        if not w["title"]:
++            dropped["blank title"] += 1
++            continue
++        if w["cited_by_count"] > MAX_CITATIONS:
++            dropped["corrupt citation count"] += 1
++            continue
++        clean.append(w)
++
++    # Dedup: by DOI where present, then by normalized title (catches
++    # corrupted-year near-duplicates that carry no DOI).
++    best = {}
++    for w in clean:
++        key = ("doi", w["doi"]) if w["doi"] else ("id", w["id"])
++        if key in best:
++            dropped["duplicate (same DOI)"] += 1
++            if rank(w) > rank(best[key]):
++                best[key] = w
++        else:
++            best[key] = w
++    by_title = {}
++    for w in best.values():
++        key = norm_title(w["title"])
++        if key in by_title:
++            dropped["duplicate (same title)"] += 1
++            if rank(w) > rank(by_title[key]):
++                by_title[key] = w
++        else:
++            by_title[key] = w
++
++    # Topic/keyword filter.
++    corpus = []
++    for w in by_title.values():
++        signals = traffic_signals(w)
++        if not signals:
++            dropped["no traffic topic/keyword signal"] += 1
++            continue
++        w["traffic_signals"] = signals
++        corpus.append(w)
++    corpus.sort(key=lambda w: ((w["year"] or 9999), w["id"]))
++
++    with open(CORPUS_PATH, "w") as f:
++        for w in corpus:
++            f.write(json.dumps(w) + "\n")
++
++    kept_by_decade = {}
++    for w in corpus:
++        if w["year"]:
++            dec = (w["year"] // 10) * 10
++            kept_by_decade[dec] = kept_by_decade.get(dec, 0) + 1
++
++    print(f"read {len(works)} works from {WORKS_PATH}")
++    for why, n in dropped.items():
++        print(f"  dropped {n:>5}  {why}")
++    print(f"  kept    {len(corpus):>5}  -> {CORPUS_PATH}")
++    print("kept by decade: " + ", ".join(f"{d}s:{n}" for d, n in
++                                         sorted(kept_by_decade.items())))
++    # Sample of dropped works that *look* traffic-ish, for audit.
++    suspicious = [w for w in works
++                  if w["title"] and "traffic" in w["title"].lower()
++                  and not traffic_signals(w)]
++    print(f"audit: {len(suspicious)} dropped works have 'traffic' in the "
++          f"title but no signal (sample):")
++    for w in suspicious[:8]:
++        print(f"  - {w['title'][:75]} ({w['year']})")
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/analysis/lit-lineage/scripts/harvest.py b/analysis/lit-lineage/scripts/harvest.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..149615d76ca3b603e4672cc4968d1191be9865bf
+--- /dev/null
++++ b/analysis/lit-lineage/scripts/harvest.py
+@@ -0,0 +1,331 @@
++#!/usr/bin/env python3
++"""harvest.py — bounded first pull of traffic-flow literature from OpenAlex.
++
++OpenAlex (https://api.openalex.org) is a free CC0 catalog of scholarly works:
++no auth, ~10 req/s, cursor pagination. We run a fixed list of seed search
++phrases covering the subfields of traffic-flow analysis we want represented
++(LWR, car-following, MFD, three-phase, IDM, ...), pull a few
++relevance-ranked pages per phrase, and cache every raw page verbatim under
++data/raw/ so re-runs are cheap and the pull is auditable.
++
++Outputs:
++  data/raw/<slug>-p<n>.json  raw API pages, one file per query+page
++  data/works.jsonl           deduplicated works table (normalized subset of
++                             fields + which seed queries matched each work)
++  research/first-pull.md     corpus summary: counts, decade histogram,
++                             top-cited works, topic distribution, and a
++                             sample of likely off-topic catches for the
++                             phase-2 filter design.
++
++usage: harvest.py [--max-pages N] [--refresh]
++  --max-pages N  pages per seed query, 200 works/page (default 3)
++  --refresh      ignore the raw cache and re-fetch every page
++"""
++import argparse
++import json
++import os
++import re
++import subprocess
++import sys
++import time
++import urllib.error
++import urllib.parse
++import urllib.request
++
++API = "https://api.openalex.org/works"
++PER_PAGE = 200            # API max
++REQUEST_GAP = 0.15        # seconds between requests; limit is ~10 req/s
++RETRIES = 4               # per page, on 429/5xx
++
++# Fields we keep. If the API rejects one (select validation changes
++# occasionally), it is dropped at runtime and the run continues.
++SELECT = ["id", "doi", "title", "publication_year", "authorships",
++          "primary_location", "cited_by_count", "referenced_works",
++          "topics", "keywords", "type", "open_access"]
++
++SEED_QUERIES = [
++    "traffic flow theory",
++    "car-following model",
++    "Lighthill Whitham Richards",
++    "kinematic wave traffic",
++    "fundamental diagram traffic flow",
++    "cell transmission model",
++    "macroscopic fundamental diagram",
++    "microscopic traffic simulation",
++    "traffic assignment",
++    "three-phase traffic theory",
++    "intelligent driver model",
++    "lane changing model traffic",
++    "stop-and-go waves",
++    "traffic state estimation",
++]
++
++# Titles matching this are probably about networks/comms, not roads —
++# used only to surface a sample for the "boundaries observed" note.
++OFFTOPIC_RE = re.compile(
++    r"(network|data|internet|web|packet|computer|telecommunication|wireless|5g|ip)"
++    r".{0,40}traffic|traffic.{0,40}(network|data|internet|packet)", re.I)
++
++# OpenAlex topics that mark a work as genuinely ours. Used for the
++# "on-topic top 30" — the raw top-cited list is drowned by mega-cited
++# off-field papers the ambiguous seed phrases catch ("cell transmission
++# model" matches cell biology, "three-phase" matches power/fluids, ...).
++ON_TOPIC_TOPICS = {
++    "Traffic control and management",
++    "Transportation Planning and Optimization",
++    "Traffic Prediction and Management Techniques",
++    "Traffic and Road Safety",
++    "Urban Transport and Accessibility",
++}
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++RAW_DIR = os.path.join(ROOT, "data", "raw")
++WORKS_PATH = os.path.join(ROOT, "data", "works.jsonl")
++SUMMARY_PATH = os.path.join(ROOT, "research", "first-pull.md")
++
++
++def slug(phrase: str) -> str:
++    return re.sub(r"[^a-z0-9]+", "-", phrase.lower()).strip("-")
++
++
++def mailto() -> str:
++    """Polite-pool address: the repo's git user.email, if set."""
++    try:
++        out = subprocess.run(["git", "config", "user.email"],
++                             capture_output=True, text=True, timeout=5)
++        return out.stdout.strip()
++    except Exception:
++        return ""
++
++
++def fetch(url: str, tries: int = RETRIES) -> dict:
++    """GET JSON with polite backoff on 429/5xx; raise on anything else."""
++    for attempt in range(tries):
++        time.sleep(REQUEST_GAP)
++        try:
++            with urllib.request.urlopen(url, timeout=60) as r:
++                return json.load(r)
++        except urllib.error.HTTPError as e:
++            if e.code in (429,) or 500 <= e.code < 600:
++                if attempt < tries - 1:
++                    time.sleep(2 ** attempt)
++                    continue
++            raise
++    raise RuntimeError("unreachable")
++
++
++def fetch_works_page(query: str, cursor: str, params: dict) -> dict:
++    """One /works page. Drops rejected select fields on HTTP 403 and
++    retries, so a schema change costs a field, not the run."""
++    q = dict(params, search=query, cursor=cursor)
++    while True:
++        url = API + "?" + urllib.parse.urlencode(q)
++        try:
++            return fetch(url)
++        except urllib.error.HTTPError as e:
++            body = e.read().decode("utf-8", "replace") if e.fp else ""
++            dropped = [f for f in q.get("select", "").split(",") if f and f in body]
++            if e.code in (400, 403) and dropped:
++                q["select"] = ",".join(
++                    f for f in q["select"].split(",") if f not in dropped)
++                print(f"  select: dropping rejected field(s): {', '.join(dropped)}",
++                      file=sys.stderr)
++                continue
++            raise
++
++
++def normalize(work: dict) -> dict:
++    src = (work.get("primary_location") or {}).get("source") or {}
++    return {
++        "id": work.get("id"),
++        "doi": work.get("doi"),
++        "title": work.get("title"),
++        "year": work.get("publication_year"),
++        "type": work.get("type"),
++        "authors": [{"id": (a.get("author") or {}).get("id"),
++                     "name": (a.get("author") or {}).get("display_name")}
++                    for a in work.get("authorships", [])],
++        "venue": src.get("display_name"),
++        "cited_by_count": work.get("cited_by_count", 0),
++        "referenced_works": work.get("referenced_works") or [],
++        "topics": [t.get("display_name") for t in work.get("topics", [])],
++        "fields": sorted({(t.get("field") or {}).get("display_name")
++                          for t in work.get("topics", [])} - {None}),
++        "keywords": [k.get("display_name") for k in work.get("keywords", [])],
++        "open_access": (work.get("open_access") or {}).get("is_oa"),
++    }
++
++
++def harvest(query: str, max_pages: int, params: dict, refresh: bool) -> list:
++    """Pull up to max_pages for one seed query; returns normalized works.
++    Cached raw pages are reused unless refresh is set."""
++    tag = slug(query)
++    works = []
++    cursor = "*"
++    for page in range(1, max_pages + 1):
++        cache = os.path.join(RAW_DIR, f"{tag}-p{page}.json")
++        if os.path.exists(cache) and not refresh:
++            with open(cache) as f:
++                data = json.load(f)
++        else:
++            data = fetch_works_page(query, cursor, params)
++            with open(cache, "w") as f:
++                json.dump(data, f)
++        results = data.get("results", [])
++        works.extend(normalize(w) for w in results)
++        cursor = (data.get("meta") or {}).get("next_cursor")
++        if not cursor or not results:
++            break
++    return works
++
++
++def decade_hist(works: list) -> dict:
++    hist = {}
++    for w in works:
++        if w["year"]:
++            hist[(w["year"] // 10) * 10] = hist.get((w["year"] // 10) * 10, 0) + 1
++    return dict(sorted(hist.items()))
++
++
++def top_counts(works: list, key: str, n: int) -> list:
++    counts = {}
++    for w in works:
++        for v in w[key]:
++            counts[v] = counts.get(v, 0) + 1
++    return sorted(counts.items(), key=lambda kv: -kv[1])[:n]
++
++
++def bar(count: int, scale: int) -> str:
++    return "#" * max(1, count // scale)
++
++
++def write_summary(works: list, per_query: dict, max_pages: int) -> None:
++    lines = []
++    add = lines.append
++    years = [w["year"] for w in works if w["year"]]
++    add("# First pull — OpenAlex traffic-flow corpus")
++    add("")
++    add(f"Seed queries: {len(SEED_QUERIES)}, up to {max_pages} pages "
++        f"({max_pages * PER_PAGE} works) each, relevance-ranked. "
++        f"Raw pages cached in `data/raw/`; merged table in `data/works.jsonl`.")
++    add("")
++    add(f"**Unique works: {len(works)}** "
++        f"(year range {min(years)}–{max(years)}).")
++    add("")
++    add("## Per-query counts (unique works contributed)")
++    add("")
++    add("| seed query | works | unique to this query |")
++    add("|---|---|---|")
++    for q in SEED_QUERIES:
++        ids = per_query.get(q, [])
++        only = sum(1 for w in works if w["matched_queries"] == [q])
++        add(f"| {q} | {len(ids)} | {only} |")
++    add("")
++    add("## Publication-decade histogram")
++    add("")
++    hist = decade_hist(works)
++    scale = max(1, max(hist.values()) // 40)
++    add("```")
++    for dec, n in hist.items():
++        add(f"{dec}s  {n:>5}  {bar(n, scale)}")
++    add("```")
++    add("")
++    add("## Top 30 works by citation count (unfiltered)")
++    add("")
++    add("Raw relevance pulls catch mega-cited off-field papers — this table "
++        "documents that contamination; see the filtered table below.")
++    add("")
++    add("| # | title | year | venue | cited by |")
++    add("|---|---|---|---|---|")
++    for i, w in enumerate(sorted(works, key=lambda w: -w["cited_by_count"])[:30], 1):
++        title = (w["title"] or "").replace("|", "\\|")
++        add(f"| {i} | {title} | {w['year']} | {w['venue']} | {w['cited_by_count']} |")
++    add("")
++    add("## Top 30 on-topic works by citation count")
++    add("")
++    add(f"Filtered to works tagged with a traffic OpenAlex topic "
++        f"({len(ON_TOPIC_TOPICS)} topics, see harvest.py `ON_TOPIC_TOPICS`). "
++        "This is where the classics should surface.")
++    add("")
++    add("| # | title | year | venue | cited by |")
++    add("|---|---|---|---|---|")
++    on_topic = [w for w in works if ON_TOPIC_TOPICS & set(w["topics"])]
++    add(f"On-topic works: **{len(on_topic)}** of {len(works)}.")
++    add("")
++    for i, w in enumerate(sorted(on_topic, key=lambda w: -w["cited_by_count"])[:30], 1):
++        title = (w["title"] or "").replace("|", "\\|")
++        add(f"| {i} | {title} | {w['year']} | {w['venue']} | {w['cited_by_count']} |")
++    add("")
++    add("## Topics and keywords (top 25 each)")
++    add("")
++    add("OpenAlex topic | works")
++    add("|---|---")
++    for name, n in top_counts(works, "topics", 25):
++        add(f"{name} | {n}")
++    add("")
++    add("OpenAlex keyword | works")
++    add("|---|---")
++    for name, n in top_counts(works, "keywords", 25):
++        add(f"{name} | {n}")
++    add("")
++    add("## Boundaries observed")
++    add("")
++    off = [w for w in works if w["title"] and OFFTOPIC_RE.search(w["title"])]
++    add(f"Heuristic title scan flags **{len(off)} works** as probably about "
++        "network/data traffic rather than road traffic (title matches "
++        "`(network|data|internet|packet|...)…traffic`). Sample:")
++    add("")
++    for w in off[:40]:
++        add(f"- {w['title']} ({w['year']}, {w['venue']})")
++    add("")
++    add("<!-- Hand-written filter notes for phase 2 go here, based on "
++        "reading the sample above. -->")
++    add("")
++    with open(SUMMARY_PATH, "w") as f:
++        f.write("\n".join(lines))
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    ap.add_argument("--max-pages", type=int, default=3,
++                    help="pages per seed query (default 3)")
++    ap.add_argument("--refresh", action="store_true",
++                    help="ignore the raw cache and re-fetch")
++    args = ap.parse_args()
++
++    os.makedirs(RAW_DIR, exist_ok=True)
++    params = {"per-page": PER_PAGE, "select": ",".join(SELECT)}
++    m = mailto()
++    if m:
++        params["mailto"] = m
++        print(f"polite pool: mailto={m}")
++
++    works_by_id = {}
++    per_query = {}
++    for q in SEED_QUERIES:
++        try:
++            got = harvest(q, args.max_pages, params, args.refresh)
++        except Exception as e:
++            print(f"ERROR query {q!r}: {e} — continuing", file=sys.stderr)
++            continue
++        per_query[q] = [w["id"] for w in got]
++        for w in got:
++            works_by_id.setdefault(w["id"], w).setdefault("matched_queries", [])
++            if q not in works_by_id[w["id"]]["matched_queries"]:
++                works_by_id[w["id"]]["matched_queries"].append(q)
++        print(f"{q!r}: {len(got)} works ({len(works_by_id)} unique so far)")
++
++    works = list(works_by_id.values())
++    for w in works:
++        w["matched_queries"].sort()
++    with open(WORKS_PATH, "w") as f:
++        for w in works:
++            f.write(json.dumps(w) + "\n")
++    print(f"wrote {len(works)} unique works -> {WORKS_PATH}")
++
++    write_summary(works, per_query, args.max_pages)
++    print(f"wrote summary -> {SUMMARY_PATH}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/deploy/README.md b/deploy/README.md
+index f4637cdd1bc16b05910c5ddedf5d704223210fba..5d4ae539006380b4003b1416f74e6ff20cd542fb 100644
+--- a/deploy/README.md
++++ b/deploy/README.md
+@@ -4,6 +4,10 @@ Target: GKE cluster `carbon-dev` (project `roaring-bots`, us-central1),
+ behind the existing GCE Ingress. One pod, one replica, forever — demosrv
+ supervises a single active run; horizontal scaling is meaningless here.
+ 
++Routing: `/` serves the splash landing page (`viz/splash.html` →
++`dist/splash.html`); the demos menu stays at `/demos.html` and the map app
++at `/app/` (all from the built viz in `/srv/viz`).
++
+ ## GO-LIVE PRECONDITIONS — do not `kubectl apply` the Ingress until these land
+ 
+ 1. **Broker auth on the engine ws plane** (ADR-0020 §go-live): the embedded
+diff --git a/engine/cmd/demosrv/main.go b/engine/cmd/demosrv/main.go
+index 49afafd6255418ee434f4eb0c18bc73e2010850e..612ee83fe936a5917fd6e4bb78b4e78a015f5c43 100644
+--- a/engine/cmd/demosrv/main.go
++++ b/engine/cmd/demosrv/main.go
+@@ -1,5 +1,6 @@
+-// demosrv is the local demo launcher: ONE Go process that serves the demo
+-// menu page and the built viz (viz/dist), and spawns/kills engine children
++// demosrv is the local demo launcher: ONE Go process that serves the splash
++// landing page (at /), the demo menu page (/demos.html) and the built viz
++// (viz/dist), and spawns/kills engine children
+ // on demand — `serve` for live demos, `replay` (the VCR driver) for
+ // recorded runs. It is localhost process orchestration in the spirit
+ // of `pnpm dev` — plain HTTP to the browser, NO NATS here (ADR-0002 covers
+@@ -53,7 +54,7 @@ import (
+ func main() {
+ 	addr := flag.String("addr", "127.0.0.1:8900", "listen address for the menu + orchestration API")
+ 	demosPath := flag.String("demos", "data/scenarios/demos.json", "demos registry (repo-root-relative paths inside)")
+-	vizDir := flag.String("viz", "viz/dist", "built viz to serve (cd viz && pnpm build): demos.html (menu) + index.html (map app)")
++	vizDir := flag.String("viz", "viz/dist", "built viz to serve (cd viz && pnpm build): splash.html (landing, at /) + demos.html (menu) + index.html (map app)")
+ 	netcacheDir := flag.String("netcache", "data/networks/.geojson-cache", "per-demo network GeoJSON cache")
+ 	overlayDir := flag.String("overlaydir", "data/networks/overlays", "static overlay GeoJSON directory (zones/boundaries, WGS84) — a missing dir just 404s /overlay/*")
+ 	wsAddr := flag.String("ws", "127.0.0.1:8443", "engine WebSocket listen address for spawned runs; override when another process holds 8443 (clients are told via /api/demos + start URLs)")
+@@ -182,8 +183,8 @@ func main() {
+ 		hs.Close()
+ 	}()
+ 
+-	if _, err := os.Stat(filepath.Join(*vizDir, "demos.html")); err != nil {
+-		log.Printf("demosrv: warning: %s/demos.html not found — build the viz first (cd viz && pnpm build)", *vizDir)
++	if _, err := os.Stat(filepath.Join(*vizDir, "splash.html")); err != nil {
++		log.Printf("demosrv: warning: %s/splash.html not found — build the viz first (cd viz && pnpm build)", *vizDir)
+ 	}
+ 	// Bind BEFORE announcing and BEFORE autostart: with -autostart the demo
+ 	// spawn must follow the listener actually being up (a pod whose port
+@@ -393,7 +394,7 @@ func (s *server) signalShutdown() {
+ 
+ func (s *server) routes() *http.ServeMux {
+ 	mux := http.NewServeMux()
+-	mux.HandleFunc("GET /{$}", s.handleMenu)
++	mux.HandleFunc("GET /{$}", s.handleSplash)
+ 	mux.HandleFunc("GET /app", func(w http.ResponseWriter, r *http.Request) {
+ 		http.Redirect(w, r, "/app/", http.StatusMovedPermanently)
+ 	})
+@@ -437,9 +438,11 @@ func writeErr(w http.ResponseWriter, code int, err error) {
+ 	writeJSON(w, code, map[string]string{"error": err.Error()})
+ }
+ 
+-// handleMenu serves the built menu page (viz/demos.html → dist/demos.html).
+-func (s *server) handleMenu(w http.ResponseWriter, r *http.Request) {
+-	http.ServeFile(w, r, filepath.Join(s.viz, "demos.html"))
++// handleSplash serves the built landing page (viz/splash.html →
++// dist/splash.html) at /. The demos menu keeps its own URL — /demos.html
++// falls through to the static FileServer below.
++func (s *server) handleSplash(w http.ResponseWriter, r *http.Request) {
++	http.ServeFile(w, r, filepath.Join(s.viz, "splash.html"))
+ }
+ 
+ // handleApp serves the built map app; the run/network selection rides in
+diff --git a/viz/splash.html b/viz/splash.html
+new file mode 100644
+index 0000000000000000000000000000000000000000..a2b137758ec44123e9deae486c7b2688dcc70978
+--- /dev/null
++++ b/viz/splash.html
+@@ -0,0 +1,231 @@
++<!doctype html>
++<html lang="en">
++  <head>
++    <meta charset="utf-8" />
++    <meta name="viewport" content="width=device-width, initial-scale=1" />
++    <title>traffic-sim — open-source traffic simulation</title>
++    <style>
++      /* splash page — same palette as the map app and demos.html via the
++         same CSS variables (theme.ts THEMES.navy values as :root defaults;
++         this page follows the localStorage theme via the toggle, copied
++         verbatim from demos.html). */
++      :root {
++        --t-bg: #0e1d5c;
++        --t-text: #d6e1ff;
++        --t-text-bright: #eaf0ff;
++        --t-text-dim: #9fb2e8;
++        --t-accent: #7e9dff;
++        --t-card-bg: rgba(18, 40, 129, 0.45);
++        --t-card-bg-hover: rgba(18, 40, 129, 0.75);
++        --t-card-border: #2e5bff;
++        --t-chip-border: rgba(126, 157, 255, 0.5);
++      }
++      html, body { margin: 0; min-height: 100%; background: var(--t-bg); }
++      body {
++        font: 14px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
++        color: var(--t-text);
++        padding: 64px 24px 48px;
++      }
++      a { color: inherit; text-decoration: none; }
++      .wrap { max-width: 1080px; margin: 0 auto; }
++      header h1 { font-size: 30px; letter-spacing: 0.04em; margin: 0; color: var(--t-text-bright); }
++      header h1 .accent { color: var(--t-accent); }
++      header .pitch { margin: 10px 0 0; color: var(--t-text-dim); font-size: 13px; max-width: 640px; }
++      #notice {
++        max-width: 1080px; margin: 24px auto 0; display: none;
++        border: 1px solid #e5484d; border-radius: 6px; padding: 8px 12px;
++        color: #ffb4b6; font-size: 12px; white-space: pre-wrap;
++      }
++      section { margin-top: 40px; }
++      section > h2 {
++        margin: 0 0 14px; font-size: 12px; font-weight: normal;
++        letter-spacing: 0.12em; text-transform: uppercase; color: var(--t-text-dim);
++      }
++      /* Featured CTA — one big card, same chrome as the demos.html cards. */
++      #featured {
++        display: block; cursor: pointer;
++        background: var(--t-card-bg);
++        border: 1px solid var(--t-card-border); border-radius: 8px;
++        padding: 24px 26px 20px;
++        transition: border-color 0.15s, background 0.15s, transform 0.15s;
++      }
++      #featured:hover { border-color: var(--t-accent); background: var(--t-card-bg-hover); transform: translateY(-1px); }
++      #featured.running { border-color: #1e9e6a; }
++      #featured h3 { margin: 0; font-size: 19px; color: var(--t-text-bright); }
++      #featured .blurb { margin: 8px 0 14px; color: var(--t-text-dim); font-size: 12px; max-width: 640px; }
++      #featured .cta { color: var(--t-accent); font-size: 13px; letter-spacing: 0.04em; }
++      .tags { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
++      .chip {
++        font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
++        color: var(--t-accent); border: 1px solid var(--t-chip-border);
++        border-radius: 999px; padding: 2px 9px;
++      }
++      .chip.soon { color: #e8b43a; border-color: rgba(232, 180, 58, 0.55); }
++      .badge {
++        float: right;
++        font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
++        color: #1e9e6a;
++      }
++      .badge::before { content: "●"; margin-right: 5px; }
++      .grid {
++        display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px;
++      }
++      .card {
++        display: block;
++        background: var(--t-card-bg);
++        border: 1px solid var(--t-card-border); border-radius: 8px;
++        padding: 16px 18px 14px;
++        transition: border-color 0.15s, background 0.15s, transform 0.15s;
++      }
++      .card:hover { border-color: var(--t-accent); background: var(--t-card-bg-hover); transform: translateY(-1px); }
++      .card h3 { margin: 0; font-size: 14px; color: var(--t-text-bright); }
++      .card .blurb { margin: 8px 0 0; color: var(--t-text-dim); font-size: 12px; }
++      .card .tags { margin-bottom: 10px; }
++      #browse {
++        display: inline-block; margin-top: 4px;
++        color: var(--t-accent); font-size: 13px; letter-spacing: 0.04em;
++        border: 1px solid var(--t-card-border); border-radius: 6px;
++        padding: 10px 18px;
++        transition: border-color 0.15s, background 0.15s;
++      }
++      #browse:hover { border-color: var(--t-accent); background: var(--t-card-bg); }
++      footer {
++        max-width: 1080px; margin: 56px auto 0; padding-top: 16px;
++        border-top: 1px solid var(--t-card-border);
++        color: var(--t-text-dim); font-size: 11px;
++      }
++      footer a { color: var(--t-accent); }
++      /* Theme toggle — identical markup/behavior to demos.html. */
++      #theme-toggle {
++        position: fixed; top: 14px; right: 16px; z-index: 2;
++        font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
++        letter-spacing: 0.08em;
++        color: var(--t-text);
++        background: var(--t-card-bg);
++        border: 1px solid var(--t-card-border); border-radius: 4px;
++        padding: 4px 10px; cursor: pointer;
++      }
++      #theme-toggle:hover { border-color: var(--t-accent); }
++    </style>
++  </head>
++  <body>
++    <button id="theme-toggle" type="button" title="theme — click to switch">NAVY</button>
++    <header class="wrap">
++      <h1>traffic-sim <span class="accent">//</span></h1>
++      <p class="pitch">An open-source traffic simulation engine — real road networks, replayable scenarios, decision-grade congestion metrics.</p>
++    </header>
++    <div id="notice"></div>
++
++    <section class="wrap">
++      <h2>Featured demo</h2>
++      <!-- The LA card is wired by splash.ts: click starts the LA run via
++           demosrv (or deep-links into it when already live) — the same
++           URLs the demos.html card builds (viz/src/demos-core.ts). -->
++      <a id="featured" href="#">
++        <span class="badge" id="featured-badge" hidden>running</span>
++        <h3>Los Angeles — full basin</h3>
++        <p class="blurb">Full-city Overpass import (33.70,-118.75 → 34.35,-117.60; 1.38M lanes — the sprawl is the story.) Demand-free; spawner-driven smoke runs.</p>
++        <div class="tags">
++          <span class="chip">urban</span>
++          <span class="chip">city-scale</span>
++          <span class="chip">los-angeles</span>
++        </div>
++        <span class="cta" id="featured-cta">launch live demo →</span>
++      </a>
++    </section>
++
++    <section class="wrap">
++      <h2>Analysis &amp; write-ups</h2>
++      <!-- docs/show and docs/kb are not served by the deploy (demosrv only
++           serves the built viz), so these link to the repo on GitHub. -->
++      <div class="grid">
++        <a class="card" href="https://github.com/eanderson4/traffic-sim/blob/main/docs/show/chi-loop-options.md" target="_blank" rel="noopener">
++          <h3>Chicago — the Loop and the expressways</h3>
++          <p class="blurb">Paired-seed A/B runs over downtown Chicago plus the Kennedy, Dan Ryan, Eisenhower, Stevenson and Lake Shore Drive — which upgrade actually fixes it.</p>
++        </a>
++        <a class="card" href="https://github.com/eanderson4/traffic-sim/blob/main/docs/show/cbd-options.md" target="_blank" rel="noopener">
++          <h3>Chicago Loop CBD</h3>
++          <p class="blurb">The downtown grid alone: 1,057 signals in 208 lane-km. Two nothings that make the best something in the dataset.</p>
++        </a>
++        <a class="card" href="https://github.com/eanderson4/traffic-sim/blob/main/docs/show/kennedy-options.md" target="_blank" rel="noopener">
++          <h3>Kennedy corridor</h3>
++          <p class="blurb">One expressway and its ramp terminals — where a peak-hour freight ban beats laying concrete.</p>
++        </a>
++        <a class="card" href="https://github.com/eanderson4/traffic-sim/blob/main/docs/show/audit.md" target="_blank" rel="noopener">
++          <h3>Audit — what these results can and cannot carry</h3>
++          <p class="blurb">Every headline number re-derived from the saved reports. Three claims did not survive. Read before quoting any of the above.</p>
++        </a>
++        <a class="card" href="https://github.com/eanderson4/traffic-sim/blob/main/docs/kb/articles/business-domains/simulator-landscape.md" target="_blank" rel="noopener">
++          <h3>Simulator landscape</h3>
++          <p class="blurb">SUMO, MATSim, CARLA and nine more — a survey of 12 simulators in five camps, and the quadrant none of them covers.</p>
++        </a>
++        <!-- Deliberately NOT a link: analysis/lit-lineage is local-only so
++             far (not yet pushed to GitHub) — a repo URL would 404. -->
++        <div class="card">
++          <h3>Traffic literature lineage</h3>
++          <div class="tags"><span class="chip soon">in progress — coming soon</span></div>
++          <p class="blurb">A citation graph of traffic-flow research: who published what, who cites whom, and how the field's main ideas descend from one another.</p>
++        </div>
++      </div>
++    </section>
++
++    <section class="wrap">
++      <h2>More</h2>
++      <a id="browse" href="/demos.html">browse all demos →</a>
++    </section>
++
++    <footer>
++      traffic-sim is open source —
++      <a href="https://github.com/eanderson4/traffic-sim" target="_blank" rel="noopener">github.com/eanderson4/traffic-sim</a>
++    </footer>
++
++    <script>
++      // Theme toggle — copied verbatim from demos.html: two palettes for
++      // this page's CSS vars, persisted to localStorage "viz-theme" so the
++      // map app (src/config.ts resolveThemeName) inherits the choice.
++      (function () {
++        var KEY = "viz-theme";
++        var PALETTES = {
++          navy: {
++            "--t-bg": "#0e1d5c",
++            "--t-text": "#d6e1ff",
++            "--t-text-bright": "#eaf0ff",
++            "--t-text-dim": "#9fb2e8",
++            "--t-accent": "#7e9dff",
++            "--t-card-bg": "rgba(18, 40, 129, 0.45)",
++            "--t-card-bg-hover": "rgba(18, 40, 129, 0.75)",
++            "--t-card-border": "#2e5bff",
++            "--t-chip-border": "rgba(126, 157, 255, 0.5)"
++          },
++          paper: {
++            "--t-bg": "#fafafa",
++            "--t-text": "#26262b",
++            "--t-text-bright": "#111113",
++            "--t-text-dim": "#6e6e76",
++            "--t-accent": "#2563eb",
++            "--t-card-bg": "#ffffff",
++            "--t-card-bg-hover": "#f0f0f2",
++            "--t-card-border": "#e5e5e8",
++            "--t-chip-border": "rgba(37, 99, 235, 0.5)"
++          }
++        };
++        var btn = document.getElementById("theme-toggle");
++        function apply(name) {
++          var palette = PALETTES[name] || PALETTES.navy;
++          for (var k in palette) document.documentElement.style.setProperty(k, palette[k]);
++          btn.textContent = name.toUpperCase();
++          btn.dataset.theme = name;
++        }
++        var stored = null;
++        try { stored = localStorage.getItem(KEY); } catch (e) { /* private mode */ }
++        apply(stored === "paper" ? "paper" : "navy");
++        btn.addEventListener("click", function () {
++          var next = btn.dataset.theme === "navy" ? "paper" : "navy";
++          try { localStorage.setItem(KEY, next); } catch (e) { /* private mode */ }
++          apply(next);
++        });
++      })();
++    </script>
++    <script type="module" src="/src/splash.ts"></script>
++  </body>
++</html>
+diff --git a/viz/src/splash.ts b/viz/src/splash.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..f6e4e3862dbb4a8a66ae335ec43c05ffc7c66df1
+--- /dev/null
++++ b/viz/src/splash.ts
+@@ -0,0 +1,95 @@
++// splash.ts — controller for the landing page (splash.html): wires the ONE
++// featured card to the LA demo exactly like the demos.html card for it —
++// already-running deep-links straight into the map via deepLinkURL,
++// otherwise a POST to startPath spawns the run and navigates on the {url}
++// response (demos-core.ts; demosrv builds the same shapes). Everything else
++// on the page is static.
++
++import { deepLinkURL, startPath, type DemoInfo, type RunStatus } from "./demos-core.ts";
++
++const LA: DemoInfo = {
++  id: "la",
++  title: "Los Angeles — full basin",
++  blurb: "",
++  tags: [],
++  scenarioDir: "",
++  run: "la",
++  kind: "demo",
++};
++
++function must(id: string): HTMLElement {
++  const el = document.getElementById(id);
++  if (!(el instanceof HTMLElement)) throw new Error(`splash: #${id} missing from splash.html`);
++  return el;
++}
++const featured = must("featured");
++const badge = must("featured-badge");
++const cta = must("featured-cta");
++const notice = must("notice");
++
++let status: RunStatus = { active: null, pid: 0 };
++let engineWs: string | undefined; // /api/demos "ws" — engine port this demosrv spawns to
++let starting = false;
++
++async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
++  const resp = await fetch(url, init);
++  if (!resp.ok) {
++    const body = await resp.text().catch(() => "");
++    throw new Error(`${init?.method ?? "GET"} ${url} → ${resp.status} ${body}`.trim());
++  }
++  return (await resp.json()) as T;
++}
++
++function showError(err: unknown): void {
++  const msg = err instanceof Error ? err.message : String(err);
++  notice.textContent =
++    msg +
++    "\nThe featured demo may not be the live run right now — see what is running on the demos page (/demos.html).";
++  notice.style.display = "block";
++}
++
++function render(): void {
++  const running = status.active === LA.id;
++  featured.classList.toggle("running", running);
++  badge.hidden = !running;
++  cta.textContent = starting ? "starting…" : running ? "watch it live →" : "launch live demo →";
++}
++
++// activate mirrors the demos.html card click for LA (demos.ts): the running
++// card deep-links without a start round-trip; otherwise the start POST
++// spawns serve and the response carries the map URL.
++async function activate(): Promise<void> {
++  if (starting) return;
++  if (status.active === LA.id) {
++    location.href = deepLinkURL(LA, engineWs, status.run);
++    return;
++  }
++  starting = true;
++  render();
++  try {
++    const resp = await fetchJSON<{ url: string }>(startPath(LA), { method: "POST" });
++    location.href = resp.url;
++  } catch (err) {
++    starting = false;
++    showError(err);
++    render();
++  }
++}
++
++async function main(): Promise<void> {
++  featured.addEventListener("click", (ev) => {
++    ev.preventDefault(); // the href="#" is a button affordance, not a link
++    void activate();
++  });
++  try {
++    const reg = await fetchJSON<{ ws?: string }>("/api/demos");
++    engineWs = reg.ws;
++    status = await fetchJSON<RunStatus>("/api/status");
++  } catch {
++    // No demosrv behind the page (static preview): the card stays clickable
++    // and activation surfaces the real error in the notice box.
++  }
++  render();
++}
++
++main().catch(showError);
+diff --git a/viz/vite.config.ts b/viz/vite.config.ts
+index bf1d6a75f66574a02fd68897dd265f7b88444a14..0edefbc6e2516943e7627a332ff37fbd9f48799f 100644
+--- a/viz/vite.config.ts
++++ b/viz/vite.config.ts
+@@ -1,5 +1,6 @@
+-// vite.config.ts — the viz is a TWO-PAGE build (M-demo launcher): index.html
+-// is the live map app, demos.html the demosrv menu page. ADR-0003 stands
++// vite.config.ts — the viz is a THREE-PAGE build (M-demo launcher): splash.html
++// is the landing page (served at / by demosrv), index.html the live map app,
++// demos.html the demos menu. ADR-0003 stands
+ // (vanilla TS, no framework) — this file only declares the multi-page
+ // inputs; everything else stays vite defaults.
+ 
+@@ -12,6 +13,7 @@ export default defineConfig({
+       input: {
+         app: fileURLToPath(new URL("index.html", import.meta.url)),
+         demos: fileURLToPath(new URL("demos.html", import.meta.url)),
++        splash: fileURLToPath(new URL("splash.html", import.meta.url)),
+       },
+     },
+   },
