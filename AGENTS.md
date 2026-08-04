@@ -60,6 +60,16 @@ Rules for anyone (human or agent) working in this repo.
   this stage "too early to need this" is a valid triage outcome, and
   hardening against hypotheticals is a reject-by-default. One review
   round per commit, not a fix-and-re-review loop for polish.
+  Addendum (2026-08-04, after ADR-0037 M1 took 9 rounds): a *blocker* is
+  a defect reachable in normal operation — wrong simulation behavior,
+  determinism/replay breakage, record-plane corruption, or a contract
+  promise a well-behaved client can trip. Findings that require corrupt
+  or hand-crafted payloads, configs we don't run, direct kernel callers
+  bypassing the wire, or deliberate contract misuse are defer-by-default
+  even when a reviewer labels them "blocker" — record them and move on.
+  Every fix, however small, invalidates the stamp and buys a full
+  re-review round plus its fresh tranche of findings; that loop does not
+  converge on its own, so the committer has to end it.
 - `/external-review <scope>` — the deeper milestone round (all three
   models incl. Gemini, richer brief, ADR-level design questions). Run it
   after every ADR-implementing milestone, before anything durable binds

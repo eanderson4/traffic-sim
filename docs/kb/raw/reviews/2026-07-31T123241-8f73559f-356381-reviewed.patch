@@ -1,0 +1,13 @@
+diff --git a/engine/cmd/demosrv/geojson_test.go b/engine/cmd/demosrv/geojson_test.go
+index 7689d25c6e819ae0d5ff87b52486413d8130bed2..e7cd7e02885649b1d087cdcbf6ea1e2141f97d80 100644
+--- a/engine/cmd/demosrv/geojson_test.go
++++ b/engine/cmd/demosrv/geojson_test.go
+@@ -21,7 +21,7 @@ import (
+ func TestNetCacheContentKeyed(t *testing.T) {
+ 	scenA := writeScenarioDir(t)          // dt 0.05
+ 	scenB := writeScenarioDirDt(t, "0.1") // manifest-only change (dt), SAME network bytes
+-	scenC := writeScenarioDirLanes(t, 7) // different network bytes entirely
++	scenC := writeScenarioDirLanes(t, 7)  // different network bytes entirely
+ 	c := &netCache{dir: t.TempDir()}
+ 
+ 	pA1, err := c.path("rec1", scenA)

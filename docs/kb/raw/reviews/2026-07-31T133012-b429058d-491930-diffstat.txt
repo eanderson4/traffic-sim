@@ -1,0 +1,22 @@
+ contracts/asyncapi.yaml                            | 161 +++--
+ docs/kb/INDEX.md                                   |   2 +-
+ .../kb/decisions/ADR-0006-nats-message-contract.md |  23 +
+ .../decisions/ADR-0037-runtime-signal-control.md   | 120 +++-
+ engine/engine.go                                   |  57 +-
+ engine/fixture_signalctl_test.go                   | 151 +++++
+ engine/keyframe.go                                 | 202 +++++-
+ engine/natsio/bake.go                              |   6 +
+ engine/natsio/contract.go                          |  62 +-
+ engine/natsio/logcursor.go                         |  13 +-
+ engine/natsio/player.go                            |   6 +
+ engine/natsio/recorder.go                          |  24 +
+ engine/natsio/replay.go                            |  51 +-
+ engine/natsio/run.go                               |  24 +
+ engine/natsio/server.go                            |  15 +-
+ engine/natsio/signal_verb_test.go                  | 292 +++++++++
+ engine/natsio/verb.go                              | 102 ++-
+ engine/replay.go                                   |  21 +-
+ engine/sigctl.go                                   | 285 +++++++++
+ engine/sigctl_test.go                              | 695 +++++++++++++++++++++
+ engine/signal.go                                   | 114 +++-
+ 21 files changed, 2281 insertions(+), 145 deletions(-)

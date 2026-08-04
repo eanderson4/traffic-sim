@@ -1,0 +1,3255 @@
+diff --git a/contracts/asyncapi.yaml b/contracts/asyncapi.yaml
+index 563a882ce2c5baba6aa60914ed5659f816cf08cf..5f9352409704400f86703b416616a39ad69a2ea1 100644
+--- a/contracts/asyncapi.yaml
++++ b/contracts/asyncapi.yaml
+@@ -28,7 +28,7 @@ asyncapi: 3.0.0
+ 
+ info:
+   title: traffic-sim engine contract
+-  version: 2.6.0
++  version: 2.7.0
+   description: |
+     The engine's NATS surface per ADR-0006 (planes, taxonomy, pipelines) and
+     ADR-0008 (the engine↔controller contract — M4, schema_version 2):
+@@ -116,6 +116,27 @@ info:
+     Skew is covered by HelloReply capability advertisement (`intent_encodings`,
+     additive) with v2 fallback — see the ctlIntent channel's migration note.
+ 
++    **ADR-0037 changes (additive; info version 2.7.0):** runtime signal
++    control, milestone 1. The director verb channel gains a second verb
++    kind, `signal_set`: command a signal program onto one of its phases
++    for a bounded hold (payload: signal program id, phase index, optional
++    hold_ticks — default one program cycle, clamped to the engine's
++    starvation bound). Same channel, same four properties as `spawn`
++    (request/reply, request-id idempotency, applied_tick logging on
++    `ts.{run}.log.verb`, verbatim replay re-enqueue); the logged record
++    is told apart by an omitted-when-spawn `verb` discriminator (any
++    OTHER discriminator value is a hard decode error on every reader),
++    so every pre-ADR-0037 recording decodes unchanged. A held phase past
++    its bound LAPSES — the fixed-time program resumes and the lapse is a
++    `signal_lapse` event on `ts.{run}.log.event` (signal, phase, hold
++    span, request id), never silent. Keyframes grow TSKF v7, written only
++    while an override is
++    held (a run without signal verbs keeps the v6-and-below bytes
++    exactly); v7 gives the TSKF header flags word its first bit to mark
++    the v6 adaptive-routing state (per-vehicle dwell clock AND lane
++    section) as present, which the version number alone
++    expressed through v6.
++
+ servers:
+   embedded:
+     host: in-process
+@@ -351,20 +372,37 @@ channels:
+   ctlVerb:
+     address: ts.{run}.ctl.verb.{controller_id}
+     description: |
+-      Director verbs (ADR-0008 §5; ADR-0006 2026-07-20 M10 addendum),
+-      request/reply, JSON. The sender must hold the director grant. v1
+-      implements verb "spawn": origin lane id (a network origin, or any
+-      lane when offset_m > 0), vehicle-type name (resolved against the
+-      scenario type list), earliest_tick (not-before, sim ticks), and the
+-      optional ADR-0021 pair destination + offset_m. Every verb carries a
++      Director verbs (ADR-0008 §5; ADR-0006 2026-07-20 M10 addendum;
++      ADR-0037), request/reply, JSON. The sender must hold the director
++      grant. v1 implements two verb kinds. "spawn": origin lane id (a
++      network origin, or any lane when offset_m > 0), vehicle-type name
++      (resolved against the scenario type list), earliest_tick
++      (not-before, sim ticks), and the optional ADR-0021 pair destination
++      + offset_m. "signal_set" (ADR-0037): signal program id, commanded
++      phase index, and an optional hold_ticks — the hold is relative to
++      the applied tick, defaults to one program cycle (the natural
++      bounded quantum), and is CLAMPED to the engine's starvation bound
++      (300 sim-seconds, compiled onto the run's tick grid — 3000 ticks at
++      the validated 100 ms tick); the override takes
++      effect at the next tick boundary and lapses — loudly logged — back
++      to the fixed-time program when the hold ends. The resume follows the
++      schedule from the lapse tick: one cycle after the command began the
++      schedule is back at the phase that was active WHEN THE COMMAND
++      BEGAN, which is not necessarily the COMMANDED phase, so a lapse can
++      jump from the held phase to an unrelated schedule phase (the
++      engine's clearance window covers the transition). Every verb carries a
+       director-assigned request_id — the engine remembers the reply per id
+       for the run's lifetime, so a retried verb (reconnect, publish retry,
+       director failover) gets the same answer with duplicate: true and
+-      NEVER double-spawns. Request/reply (not fire-and-forget like raw
++      NEVER double-applies. Request/reply (not fire-and-forget like raw
+       intents) because the director paces its schedule on accept/reject.
+       Validation rejections (unknown origin, lane not a spawn origin,
+       unknown type, unknown destination, offset past the lane end,
+-      unsupported verb) carry a reason; accepted verbs take
++      unknown signal program, phase out of range, an omitted phase —
++      presence-checked so omission cannot silently command phase 0 — an
++      over-long request_id — 65535 bytes, the keyframe codec's u16
++      length-prefix limit — unsupported verb)
++      carry a reason; accepted verbs take
+       effect at the next tick boundary and are logged on
+       ts.{run}.log.verb. Blocked origins hold-and-retry (bounded, 600
+       ticks past earliest_tick) with the Spawner's own clearance and
+@@ -529,15 +567,23 @@ channels:
+   logEvent:
+     address: ts.{run}.log.event
+     description: |
+-      Control-plane events on the record plane (ADR-0008 §6): pause and
+-      resume, as JSON. Pause gates the tick loop when available claim
++      Control-plane and rail events on the record plane: pause and
++      resume (ADR-0008 §6), and signal_lapse (ADR-0037), as JSON. Pause
++      gates the tick loop when available claim
+       capacity < demand (unclaimed vehicles) for T consecutive ticks
+       (default 5); resume fires on capacity recovery — or on the
+       pause-gate escape (ADR-0008 §6, 2026-07-24 clarification): after
+       PauseEscapeAfter of persistent deficit the engine resumes anyway on
+       hold-last, so an escape resume is identifiable by demand >
+-      available. These are dead-time
+-      metadata: they carry no world state, the replayer ignores them, and
++      available. A signal_lapse fires when a commanded phase hold reaches
++      its bound and the signal returns to its fixed-time program — the
++      starvation rail; the event carries the signal id, held phase, the
++      hold's [since, until) span, and the commanding verb's request_id, so
++      a recording contains the evidence the rail fired. These are
++      dead-time
++      metadata: they carry no world state, the replayer ignores them (a
++      lapse is re-derived from keyframed state at a fixed tick, not
++      re-applied from the record), and
+       tick determinism is unaffected — the CRC chain is contiguous across
+       a pause.
+     parameters:
+@@ -551,15 +597,22 @@ channels:
+     address: ts.{run}.log.verb
+     description: |
+       Accepted director verbs on the record plane (ADR-0006 2026-07-20
+-      M10 addendum), one JSON message per verb, written in the tick's log
+-      batch after the arbitrated intents, stamped with the verb's
+-      applied_tick (the tick it entered the kernel's injection queue).
+-      Replay re-enqueues verbs at their recorded ticks; the kernel's
++      M10 addendum; ADR-0037), one JSON message per verb, written in the
++      tick's log batch after the arbitrated intents, stamped with the
++      verb's applied_tick (the tick it entered the kernel). Spawn verbs
++      first, then signal_set verbs, each kind in application order.
++      Replay re-enqueues verbs at their recorded ticks: the kernel's
+       deterministic hold-and-retry injection reproduces the identical
+       spawn ticks and vehicle streams — the demand sampler never re-runs
+-      (scenario-format §3). Rejected or duplicate verbs are NOT recorded:
+-      the log reflects exactly what the engine accepted, and dedup makes
+-      the accepted-set canonical.
++      (scenario-format §3) — and the override table re-takes the recorded
++      commanded phase for the recorded hold (ADR-0037). The payload's
++      `verb` discriminator ("signal_set" or omitted = spawn) tells the
++      kinds apart; a pre-ADR-0037 recording carries no discriminator and
++      decodes as all-spawn, unchanged, and an UNKNOWN discriminator is a
++      hard decode error on every reader — a newer engine's verb kind must
++      fail replay loudly, never decode as the wrong command. Rejected or
++      duplicate verbs are NOT recorded: the log reflects exactly what the
++      engine accepted, and dedup makes the accepted-set canonical.
+     parameters:
+       run: { $ref: '#/components/parameters/runId' }
+     messages:
+@@ -633,7 +686,7 @@ operations:
+     action: receive
+     channel: { $ref: '#/channels/ctlHeartbeat' }
+   directorVerbs:
+-    title: Engine ↔ director verbs (spawn; accept/reject, request-id idempotent)
++    title: Engine ↔ director verbs (spawn, signal_set; accept/reject, request-id idempotent)
+     action: receive
+     channel: { $ref: '#/channels/ctlVerb' }
+   publishObservations:
+@@ -824,7 +877,7 @@ components:
+ 
+     VerbRequest:
+       name: verbRequest
+-      title: 'Director verb (v1 spawn; request_id is the idempotency key)'
++      title: 'Director verb (v1: spawn, signal_set; request_id is the idempotency key)'
+       headers: { $ref: '#/components/schemas/SchemaHeaders' }
+       payload:
+         schemaFormat: application/schema+json;version=draft-07
+@@ -911,7 +964,7 @@ components:
+ 
+     Keyframe:
+       name: keyframe
+-      title: Full-state keyframe (engine.MarshalState bytes, TSKF v2–v6 by run state and params)
++      title: Full-state keyframe (engine.MarshalState bytes, TSKF v2–v7 by run state and params)
+       summary: |
+         Complete dynamic state: tick, rolling CRC, next vehicle id, every
+         vehicle (id, lane, type, s, v, f, cooldown, RNG words + draw count,
+@@ -924,9 +977,13 @@ components:
+         (ADR-0021); v5 appends per-vehicle stuckTicks/stopDone while any
+         such timer or duty is live (ADR-0034); v6 — written ONLY while
+         Params.AdaptiveRouting is on — appends per-vehicle laneEntryTick
+-        and a per-lane ttEMA/ttSnap section (ADR-0036). Each higher
++        and a per-lane ttEMA/ttSnap section (ADR-0036); v7 — written ONLY
++        while a commanded signal override is held — appends the override
++        table and gives the header flags word its first bit (whether the
++        v6 lane section is present, which the version number expressed
++        through v6 — ADR-0037). Each higher
+         version is state-gated, so a run with no qualifying state marshals
+-        byte-identical to a lower one; readers accept v2–v6, and a v6
++        byte-identical to a lower one; readers accept v2–v7, and a v6
+         payload into a flag-off spec is rejected loudly). A keyframe larger
+         than the recorder's KeyframeChunkMax (default 768 KiB) is split
+         into consecutive chunk messages (ADR-0015); reassembled bytes are
+@@ -1288,9 +1345,9 @@ components:
+       type: string
+       format: binary
+       description: |
+-        Magic "TSKF", versions 2–6 (state- and params-gated; readers accept
++        Magic "TSKF", versions 2–7 (state- and params-gated; readers accept
+         the whole line, v6 only from runs with Params.AdaptiveRouting on —
+-        ADR-0036); canonical layout documented in engine/keyframe.go.
++        ADR-0036; v7 only while a signal_set override is held — ADR-0037); canonical layout documented in engine/keyframe.go.
+         Contains the full CRC-covered state plus raw RNG words, spawner
+         demand state, and (since v2) the persistent controller axes (cruise
+         setpoint, held turn, signals, route), so RestoreState resumes the
+@@ -1384,23 +1441,27 @@ components:
+           description: 'ADDITIVE (ADR-0026 M4 addendum): every intent wire encoding this engine accepts on ctlIntent — ["v2","tsib"] from asyncapi 2.5.0 onward, OMITTED by pre-TSIB engines (JSON consumers ignore unknown fields both directions). A batch-capable controller SHOULD fall back to per-vehicle v2 when tsib is not advertised; the default driver does exactly that (one log line, session-scoped).'
+ 
+     VerbRequestView:
+-      title: Director verb request (ADR-0008 §5; M10)
++      title: Director verb request (ADR-0008 §5; M10; ADR-0037)
+       type: object
+-      required: [verb, request_id, origin, vtype, earliest_tick]
++      required: [verb, request_id]
+       properties:
+         verb:
+           type: string
+-          enum: [spawn]
+-          description: 'v1 implements spawn only; despawn/teleport/trigger (the remaining OpenSCENARIO verbs) land additively on this same channel — unknown verbs are rejected, never silently ignored.'
++          enum: [spawn, signal_set]
++          description: 'v1 implements spawn and signal_set (ADR-0037); despawn/teleport/trigger (the remaining OpenSCENARIO verbs) land additively on this same channel — unknown verbs are rejected, never silently ignored. The kind selects which of the remaining fields apply: spawn REQUIRES origin/vtype (earliest_tick, destination, offset_m optional), signal_set REQUIRES signal and phase (hold_ticks optional; phase is presence-checked — see its field); the other kind''s fields are ignored.'
+         request_id:
+           type: string
+           minLength: 1
+-          description: 'Director-assigned idempotency key: unique per intended spawn for the run. The engine remembers the reply per id; a retry answers duplicate: true and never double-spawns. Deterministic ids (e.g. f{flow}-{ordinal}) make director failover invisible.'
+-        origin: { type: string, description: 'Origin lane id. Must be a network ORIGIN lane unless offset_m > 0, which admits any lane (ADR-0021 interior injection).' }
+-        vtype: { type: string, description: 'Vehicle-type name, resolved against the scenario type list (rejected if unknown).' }
+-        earliest_tick: { type: integer, minimum: 0, description: 'Not-before sim tick (ADR-0005 tick clock; 0 = as soon as applied). A blocked origin holds-and-retries from this tick, bounded at 600 ticks.' }
+-        destination: { type: string, description: 'OPTIONAL (ADR-0021). Route destination lane id, applied as the vehicle Route axis at injection: the kernel routes toward it and ENDS the trip at its end (arrival despawn). Rejected if it is not a lane of the network. Omitted = unrouted, the pre-ADR-0021 shape.' }
+-        offset_m: { type: number, minimum: 0, description: 'OPTIONAL (ADR-0021). Injection position along the origin lane in meters. Omitted/0 = portal semantics and the origin must be a network origin. Positive = interior injection (a mid-block garage): admits any lane, must be < the lane length, and is additionally clearance-checked BEHIND — an entry that would be rear-ended is denied and held as demand.' }
++          maxLength: 65535
++          description: 'Director-assigned idempotency key: unique per intended verb for the run. The engine remembers the reply per id; a retry answers duplicate: true and never double-applies. Deterministic ids (e.g. f{flow}-{ordinal}) make director failover invisible. Bounded at 65535 BYTES: the TSKF keyframe codec length-prefixes it with a u16 (director queue since v3, signal overrides since v7), and an over-long id would corrupt the keyframe — the contract boundary rejects it.'
++        origin: { type: string, description: 'spawn. Origin lane id. Must be a network ORIGIN lane unless offset_m > 0, which admits any lane (ADR-0021 interior injection).' }
++        vtype: { type: string, description: 'spawn. Vehicle-type name, resolved against the scenario type list (rejected if unknown).' }
++        earliest_tick: { type: integer, minimum: 0, description: 'spawn. Not-before sim tick (ADR-0005 tick clock; 0 = as soon as applied). A blocked origin holds-and-retries from this tick, bounded at 600 ticks.' }
++        destination: { type: string, description: 'spawn, OPTIONAL (ADR-0021). Route destination lane id, applied as the vehicle Route axis at injection: the kernel routes toward it and ENDS the trip at its end (arrival despawn). Rejected if it is not a lane of the network. Omitted = unrouted, the pre-ADR-0021 shape.' }
++        offset_m: { type: number, minimum: 0, description: 'spawn, OPTIONAL (ADR-0021). Injection position along the origin lane in meters. Omitted/0 = portal semantics and the origin must be a network origin. Positive = interior injection (a mid-block garage): admits any lane, must be < the lane length, and is additionally clearance-checked BEHIND — an entry that would be rear-ended is denied and held as demand.' }
++        signal: { type: string, description: 'signal_set (ADR-0037). Signal program id (the network file''s tlLogic id, published in the ts.{run}.state.sig table). Rejected if unknown.' }
++        phase: { type: integer, minimum: 0, description: 'signal_set (ADR-0037), REQUIRED for that kind (conditional requirement, documented per-kind in the file''s established style — the schema''s required list is the shared [verb, request_id]). Commanded phase index into the program''s phase list; out of range is rejected. PRESENCE is checked: an omitted phase is rejected ("missing phase") rather than defaulting — JSON cannot distinguish omission from 0, and an accidental default would silently command phase 0, so phase 0 must be written explicitly. Ignored by spawn (never serialized there). The program shows that phase''s state string for the whole hold; enforcement (stop-line discipline, clearance, box checks, permissive yield) is unchanged — a held green never means enter a box you cannot exit.' }
++        hold_ticks: { type: integer, minimum: 0, description: 'signal_set (ADR-0037), OPTIONAL. Hold length in sim ticks, relative to the applied tick. Omitted/0 = one cycle of the commanded program — the natural bounded quantum, NOT a seamless resume: the fixed-time program resumes at whatever phase the schedule is in at the lapse tick (one cycle after the command began, that is the phase the schedule was in WHEN THE COMMAND BEGAN, not necessarily the commanded one); the clearance window covers the transition. Values past the starvation bound (300 sim-seconds, compiled onto the run''s tick grid) are CLAMPED, not rejected — the logged verb carries the effective hold in ticks. When the hold ends the lapse is logged, never silent.' }
+ 
+     VerbReplyView:
+       title: Director verb reply
+@@ -1411,21 +1472,26 @@ components:
+         verb: { type: string }
+         request_id: { type: string, description: 'Echoed even on parse-level and not-attached rejections.' }
+         duplicate: { type: boolean, description: 'true = this request_id was seen before; the ORIGINAL reply is replayed and nothing re-queued.' }
+-        reason: { type: string, description: '"not attached" | "verb requires the director grant" | "unsupported verb" | "missing request_id" | validation message (unknown origin lane / not a spawn origin / unknown vehicle type / unknown destination lane / offset past the end of lane).' }
++        reason: { type: string, description: '"not attached" | "verb requires the director grant" | "unsupported verb" | "missing request_id" | "request_id too long" (> 65535 bytes — the keyframe codec''s u16 length-prefix limit) | "missing phase" (signal_set presence-checks it) | validation message (unknown origin lane / not a spawn origin / unknown vehicle type / unknown destination lane / offset past the end of lane / unknown signal program / phase out of range).' }
+ 
+     LoggedVerbView:
+       title: Recorded director verb (ts.{run}.log.verb payload)
+       type: object
+-      required: [tick, request_id, origin, vtype, type_idx, earliest_tick]
++      required: [tick, request_id]
+       properties:
+-        tick: { type: integer, minimum: 0, description: 'applied_tick — the tick the verb entered the injection queue; replay re-enqueues here.' }
++        tick: { type: integer, minimum: 0, description: 'applied_tick — the tick the verb entered the kernel; replay re-enqueues here.' }
+         request_id: { type: string }
+-        destination: { type: string, description: 'OPTIONAL (ADR-0021), omitted when unrouted — so a recording of portal-only demand is byte-identical to a pre-ADR-0021 one.' }
+-        offset_m: { type: number, minimum: 0, description: 'OPTIONAL (ADR-0021), omitted when zero (see destination).' }
+-        origin: { type: string, description: 'Origin lane id; replay re-resolves it against the run spec (deterministic).' }
+-        vtype: { type: string }
+-        type_idx: { type: integer, minimum: 0, description: 'Resolved scenario type index (auditability).' }
+-        earliest_tick: { type: integer, minimum: 0 }
++        verb: { type: string, enum: [signal_set], description: 'OPTIONAL kind discriminator (ADR-0037): "signal_set" marks a signal command (carries signal/signal_idx/phase/hold_ticks); ABSENT = spawn (carries origin/vtype/type_idx/earliest_tick and the optional ADR-0021 pair — every pre-ADR-0037 recording, and any spawn-only one, is byte-identical to the pre-ADR-0037 shape). ANY OTHER VALUE IS A HARD DECODE ERROR: readers reject the record loudly — replay, the player, bake, and the log cursor all fail — rather than re-enqueue a future engine''s verb kind as the wrong command. A new kind is a contract event: extend this enum and the readers in the same reviewed change.' }
++        destination: { type: string, description: 'spawn, OPTIONAL (ADR-0021), omitted when unrouted — so a recording of portal-only demand is byte-identical to a pre-ADR-0021 one.' }
++        offset_m: { type: number, minimum: 0, description: 'spawn, OPTIONAL (ADR-0021), omitted when zero (see destination).' }
++        origin: { type: string, description: 'spawn. Origin lane id; replay re-resolves it against the run spec (deterministic).' }
++        vtype: { type: string, description: 'spawn. Vehicle-type name.' }
++        type_idx: { type: integer, minimum: 0, description: 'spawn. Resolved scenario type index (auditability).' }
++        earliest_tick: { type: integer, minimum: 0, description: 'spawn. Not-before tick as requested.' }
++        signal: { type: string, description: 'signal_set (ADR-0037). Signal program id; replay re-resolves it against the run spec (deterministic).' }
++        signal_idx: { type: integer, minimum: 0, description: 'signal_set (ADR-0037). Resolved Network.Signals index (auditability, same argument as type_idx).' }
++        phase: { type: integer, minimum: 0, description: 'signal_set (ADR-0037). Commanded phase index.' }
++        hold_ticks: { type: integer, minimum: 0, description: 'signal_set (ADR-0037). The EFFECTIVE hold — default applied, clamped to the starvation bound at acceptance — so the record shows exactly what the engine enforced.' }
+         run: { type: string }
+         tick: { type: integer, minimum: 0, description: Tick at attach (the contract's clock reference). }
+         reason: { type: string, description: Reject reason when accepted = false. }
+@@ -1534,7 +1600,7 @@ components:
+       type: object
+       required: [type, tick]
+       properties:
+-        type: { type: string, enum: [claim, release, unclaimed, pause, resume] }
++        type: { type: string, enum: [claim, release, unclaimed, pause, resume, signal_lapse] }
+         tick: { type: integer, minimum: 0 }
+         controller_id: { type: string }
+         vehicle_ids:
+@@ -1543,6 +1609,11 @@ components:
+         reason: { type: string, enum: [spawn, release, disconnect], description: unclaimed events only }
+         demand: { type: integer, minimum: 0, description: 'pause/resume: unclaimed vehicles at the gate' }
+         available: { type: integer, minimum: 0, description: 'pause/resume: spare claim capacity across attached drive controllers' }
++        signal: { type: string, description: 'signal_lapse (ADR-0037, record plane only — ts.{run}.log.event): the signal program id whose commanded hold lapsed' }
++        phase: { type: integer, minimum: 0, description: 'signal_lapse: the held phase index that lapsed (0 is legitimate — the field is omitted only on other event types)' }
++        since: { type: integer, minimum: 0, description: 'signal_lapse: tick the hold was applied' }
++        until: { type: integer, minimum: 0, description: 'signal_lapse: tick the fixed-time program resumed (= since + effective hold_ticks)' }
++        request_id: { type: string, description: 'signal_lapse: the verb that commanded the lapsed hold' }
+ 
+     IntrospectRequestView:
+       title: Introspection query — a JSON view of the reference-policy context
+diff --git a/docs/kb/INDEX.md b/docs/kb/INDEX.md
+index 098eca8ec257a169834de6970931a01bbb00268a..d0b2b77f8efb8b43ecbe271b396297a5afc8795a 100644
+--- a/docs/kb/INDEX.md
++++ b/docs/kb/INDEX.md
+@@ -125,7 +125,7 @@ links its source synthesis for traceability.
+ - [ ] [ADR-0035](decisions/ADR-0035-batched-intent-log.md) — PROPOSED: the record plane wrote ONE JetStream message per applied intent, i.e. one per vehicle per tick at 10 Hz, and ADR-0026's TSIB batching stopped at that boundary by explicit scope note — the driver sends one ~150 KB batch per tick and the recorder re-explodes it into ~3,500 messages, re-paying exactly the framing the batch eliminated. Measured on the shipped chihalf recording: an 8 MiB stream block holds 34,794 intent messages over 10 ticks, ~230 B per message for a 61 B fixed record, and the whole 90-minute run is 48 GiB (~120 GiB across `data/recordings/`). Decision: TSLB v1 on a NEW subject `ts.{run}.log.intents` carrying one tick's records byte-identical to the per-message payloads they replace (one shared record codec, so the migration is checkable by construction), split by byte budget with no chunk index because stream order already IS application order; plus S2 storage compression on the stream, measured 6.2x gzip-3 / 7.2x zstd-3 on a real block. Per-record density (hoisting the repeated applied_tick and controller name, as TSIB does) is REJECTED on measurement: those bytes are what the compressor eats. Both default on, both revertible by flag (`-log-batch`, `-store-compress`). **Does not fix the harder wall, which is RAM**: a 54,000-tick run was OOM-killed at tick 38,200 on a 123 GB machine because the engine's in-memory intent log retains ~225M structs, and `-intent-log=false` is a requirement at that horizon rather than a tuning knob
+ 
+ - [x] [ADR-0036](decisions/ADR-0036-congestion-adaptive-routing.md) — ACCEPTED, **default ON since 2026-07-31** (addendum): congestion-adaptive routing. Static all-or-nothing routing gives vehicles no way to spread around a jam; measured on chi-loop-urban seed 42 the network dead-stops by minute 65 and never recovers. Per-lane travel-time EMA from dwell samples (capped at StrandAfterS, floored at free flow, strands included), frozen per 60 s epoch into keyframed `ttSnap` weights; next-hop tables recompute per epoch, unmetered and always current-epoch, hysteresis against the STATIC free-flow table (realized mixed-chain cost, margin max(30 s, 15 %)), constructive acyclicity. Every table is a pure function of (frozen weights, network) — bit-exact across mid-run restore, no hysteresis history to keyframe. Keyframe v6 (flag-gated; flag-off byte-identical); adaptive state folds into the CRC. Six review rounds: hysteresis-history replay violation, serve-stale metering, cycle-via-stale-static-hop, first-use bypass, and the RunMeta/TSKF contract notes all caught and fixed pre-commit. **Validation (2026-07-31): two-regime.** On survivable demand (seeds 1000–1003) adaptive wins everywhere — +22.7 % mean speed, +24 % completions, p=0.0006, d=7.77. **Measured limit: on the seed-42 6 h drain at ~2x sustained oversaturation adaptive does NOT prevent the dead-stop (786 vs 766 completions, dead from ~min 90 both ways) — there is nowhere to divert TO; rerouting spreads congestion, it does not create capacity.** Scenario manifests opt back to the static baseline (the docs/show arms were measured on it) with `adaptive_routing: false`.
+-- [x] [ADR-0037](decisions/ADR-0037-runtime-signal-control.md) — ACCEPTED, milestone 1 implemented 2026-07-31 (channel + engine + rails; the reference controller is milestone 2): runtime signal control as a director VERB (`signal_set` on the existing verb channel — idempotency, applied_tick logging, replay re-enqueue by construction) replacing `sigState`'s fixed-time derivation through one seam (`sigPhaseAt`) — enforcement (`sigGate`, clearance, permissive yield, box checks) untouched. Commands carry a bounded hold (default one cycle; explicit holds CLAMP at 3000 ticks, the StrandAfterS horizon) after which the fixed-time program resumes and the lapse is a logged event, never silent — an unrailed phase can starve a movement for good and ADR-0034's escape deliberately does not rescue that. Keyframe TSKF v7 written only while an override is held (no-verb runs byte-identical; v7 gives the header flags word its first bit for the v6 lane section's presence, which the version number expressed through v6); the override folds into the CRC only while non-empty. Motivation: the retime brackets (greens x0.66 = +1.6 % speed, x1.25 = −5.3 %) prove timing is a first-order network lever, and the seed-42 dead-stop is the condition real engineers meter against
++- [x] [ADR-0037](decisions/ADR-0037-runtime-signal-control.md) — ACCEPTED, milestone 1 implemented 2026-07-31 (channel + engine + rails; the reference controller is milestone 2): runtime signal control as a director VERB (`signal_set` on the existing verb channel — idempotency, applied_tick logging, replay re-enqueue by construction) replacing `sigState`'s fixed-time derivation through one seam (`sigPhaseAt`) — enforcement (`sigGate`, clearance, permissive yield, box checks) untouched. Commands carry a bounded hold (default one cycle — the natural bounded quantum, NOT a seamless resume: the schedule resumes from the lapse tick at whatever phase it is then in; explicit holds CLAMP at 300 sim-seconds, the StrandAfterS horizon, dt-compiled) after which the fixed-time program resumes and the lapse is a logged event, never silent — an unrailed phase can starve a movement for good and ADR-0034's escape deliberately does not rescue that. Keyframe TSKF v7 written only while an override is held (no-verb runs byte-identical; v7 gives the header flags word its first bit for the v6 lane section's presence, which the version number expressed through v6); the override folds into the CRC only while non-empty. Motivation: the retime brackets (greens x0.66 = +1.6 % speed, x1.25 = −5.3 %) prove timing is a first-order network lever, and the seed-42 dead-stop is the condition real engineers meter against
+ 
+ ---
+ *Last distilled: 2026-07-17 | 18 articles from 56 raw research files*
+diff --git a/docs/kb/decisions/ADR-0006-nats-message-contract.md b/docs/kb/decisions/ADR-0006-nats-message-contract.md
+index 4a3f07e8c7537c134089e463740c2debe5754947..618be932a173e395e3b432e6a776b714e73696c1 100644
+--- a/docs/kb/decisions/ADR-0006-nats-message-contract.md
++++ b/docs/kb/decisions/ADR-0006-nats-message-contract.md
+@@ -448,3 +448,26 @@ versions untouched. What changes is how the kernel resolves it.
+ - Versioning note: same formal supersession as 2026-07-24 — contract
+   versions version the wire, not the world model; engine behavior fixes
+   change trajectories without versioning the contract.
++
++## Addendum (2026-07-31, ADR-0037 milestone 1: the `signal_set` verb)
++
++Additive, same formal shape as the M10 verb addendum: the director verb
++channel `ts.{run}.ctl.verb.{controller_id}` gains a second verb kind,
++`signal_set` (payload: signal program id, commanded phase index, optional
++hold_ticks — default one program cycle, clamped to the engine's starvation
++bound of 300 sim-seconds, compiled onto the run's tick grid — 3000 ticks
++at the validated 100 ms tick). Same subject, same request/reply with request-id
++idempotency, same record-plane logging on `ts.{run}.log.verb` — the logged
++payload grows an omitted-when-spawn `verb` discriminator plus the signal
++fields, so every pre-ADR-0037 recording decodes unchanged (all-spawn), and
++replay re-enqueues both kinds at their recorded applied ticks. A held
++phase past its bound LAPSES back to the fixed-time program — a
++`signal_lapse` event on `ts.{run}.log.event` (the pause/resume idiom:
++derived dead-time metadata the replayer ignores and re-derives), never
++silent. Keyframes grow TSKF v7 (written only while an
++override is held; v7 gives the TSKF header flags word its first bit,
++marking the v6 adaptive-routing state — per-vehicle dwell clock AND lane
++section — as present, which the version number alone
++expressed through v6). Contract versions version the wire: schema_version
++stays 2, asyncapi goes to 2.7.0. Details and verification:
++[ADR-0037](ADR-0037-runtime-signal-control.md).
+diff --git a/docs/kb/decisions/ADR-0037-runtime-signal-control.md b/docs/kb/decisions/ADR-0037-runtime-signal-control.md
+index 3d61202f4a34f979f5f83f253e636b22f615f62e..73e9113b63261e946255ba95a985c67b5f0fc149 100644
+--- a/docs/kb/decisions/ADR-0037-runtime-signal-control.md
++++ b/docs/kb/decisions/ADR-0037-runtime-signal-control.md
+@@ -1,7 +1,8 @@
+ # ADR-0037: Runtime signal control — design sketch (deferred implementation)
+ 
+-- **Status:** PROPOSED — design only, implementation deferred to its own
+-  milestone.
++- **Status:** ACCEPTED — milestone 1 implemented 2026-07-31 (verb channel,
++  engine override derivation, starvation rails, TSKF v7). The controller
++  side (reference actuated client) remains milestone 2, per the design.
+ - **Date:** 2026-07-30
+ - **Amends:** ADR-0011 (signals), ADR-0006 §4 (contract: one new verb or
+   intent class) when implemented.
+@@ -80,3 +81,131 @@ network-level adaptive control is a research program of its own.
+ - Contract versioning: new verb kind on an existing subject family —
+   additive, same formal-supersession line as the 2026-07-24 addenda, but
+   the asyncapi addition and the ADR land in the same reviewed commit.
++
++## Addendum (2026-07-31, milestone 1 implementation notes)
++
++Implemented as designed: the `signal_set` director verb, the engine-side
++commanded-state derivation, and the starvation rails. Where the design
++left latitude, the implementation chose:
++
++- **Verb granularity: per-phase with a hold DURATION, not an absolute
++  hold-until tick.** The payload is `{signal, phase, hold_ticks}`; the
++  hold runs from the verb's applied tick, which the record fixes, so a
++  duration needs no clock agreement between controller and run and
++  replays verbatim. `hold_ticks` omitted/0 means one cycle of the
++  commanded program — the natural bounded quantum of the program's own
++  making, NOT a seamless resume: one cycle after the command began, the
++  fixed-time schedule is back at the phase that was active WHEN THE
++  COMMAND BEGAN, which is not necessarily the COMMANDED phase, so a lapse
++  can jump from the held phase to an unrelated schedule phase; the
++  resume follows the schedule from the lapse tick and the clearance
++  retention covers the transition (an earlier draft of this note claimed
++  the default was seamless — wrong, caught in review). Whole-program
++  switches and per-approach states remain unbuilt, per the design's lean.
++- **Over-long holds CLAMP, not reject.** The bound is
++  `engine.SignalHoldMaxSeconds` = 300 sim-seconds (the gridlock escape's
++  own `StrandAfterS` horizon: a hold past it would starve a movement
++  longer than the model will stay silently stopped anywhere else),
++  compiled onto the run's tick grid at acceptance
++  (`signalHoldMaxTicks`, the routeEpochTicks dt-derivation idiom — 3000
++  ticks at the validated 100 ms tick). The rail exists to bound a wedged
++  controller's blast radius automatically; a rejection would depend on the
++  controller reading its reply. The record plane logs the EFFECTIVE hold
++  in ticks, so what was enforced is on the record.
++- **One derivation point.** `sigPhaseAt` (engine/signal.go) is the single
++  place commanded control enters: all three enforcement predicates
++  (`sigState`, `sigPermissive`, `sigInClearance`) read the phase in force
++  through it, so a hold changes WHICH state string is read and nothing
++  about enforcement — `sigGate`, the clearance window, the box checks, and
++  the permissive-yield model are untouched. With an empty override table
++  `sigPhaseAt` reduces to the fixed-time `phaseAtElapsed` and the byte
++  stream is the pre-ADR-0037 one. An ended hold is RETAINED for the
++  program's clearance window (not enforced) so `sigInClearance`'s
++  onset−1 lookback is still answered for the ticks the hold covered — for
++  BOTH ways a hold ends: lapse at the bound, and supersession by a newer
++  verb, whose entry keeps its phase with `until` truncated to the
++  replacement tick (round-2 review: the first cut dropped a superseded
++  entry, so a held amber replaced by red could miss clearance and a held
++  green replaced by red could inherit a spurious one from the unrelated
++  schedule). The table is therefore a short chronological history per
++  program, not a single slot.
++- **The clearance window opens at the DISPLAYED transition, lapse
++  included** (round-3 review). Round 2 made supersession correct because
++  the replacement supplies a fresh onset; lapse had the symmetric bug —
++  `sigInClearance` measured the window from the fixed schedule's
++  historical phase onset, which may be long past at the moment the light
++  actually changed. A held amber lapsing into an already-red schedule got
++  its clearance shortened or skipped (could stop a legally committed
++  vehicle); a held green lapsing onto a schedule whose red began before
++  the hold could inherit a spurious clearance from the schedule's earlier
++  amber. The fix computes a DISPLAYED onset (`sigSpanOnset` +
++  `sigDisplayedOnset`, signal.go): an override's applied tick while held,
++  the LATER of the fixed onset and the most recent override end after a
++  lapse, with contiguous same-phase spans merged (a lapse back into the
++  held phase is no display change). The no-override path reduces to
++  `phaseAtElapsed` exactly — every pre-existing fixture CRC is untouched.
++- **Contract-boundary hardening** (round-4 review). Two wire-validation
++  gaps closed in `handleVerb`, both covering every verb kind at the one
++  shared checkpoint. (1) `request_id` is bounded at 65,535 BYTES: the
++  TSKF codec length-prefixes it with a u16 (the director spawn queue
++  since v3, the override table since v7), so an over-long id would have
++  marshaled a truncated length next to the full string and made the
++  keyframe unreadable — the spawn path shared the exposure, and the
++  single shared check now covers both. (2) `phase` is presence-checked
++  for signal_set: the request field is a `*int` because JSON cannot
++  distinguish omission from phase 0, and an accidental default would
++  silently command phase 0 — omitted is rejected ("missing phase"),
++  explicit 0 works. Spawn verbs are byte-identical (phase is never
++  serialized there).
++- **The resume point needs no state** (the open question, verified): the
++  fixed-time program is a pure function of the tick, so a lapse is just
++  the override table stopping answering. Lapses are EVENTS
++  (`Engine.LapsedSignals`, per-tick): the run loop edge-logs each one AND
++  records it on `ts.{run}.log.event` as a `signal_lapse` ContractEvent
++  (signal, phase, [since, until), request id) — the pause/resume
++  precedent: dead-time metadata the replayer ignores and re-derives from
++  keyframed state — so a recording contains the evidence the rail fired
++  (round-2 review: the first cut logged to process stderr only).
++- **Grant: the director grant.** Signal commands ride the director verb
++  plane as designed; a controller holding only the (previously stub)
++  signal grant is rejected, same as for spawn. What the signal grant
++  becomes is milestone-2 contract work.
++- **Keyframe: TSKF v7, lowest-version rule.** The override table (program
++  index, phase, since, until, request id — network Signals order, each
++  program's history chronological) is appended after the director section
++  and written ONLY while an override is held (or in clearance retention);
++  a run without signal verbs marshals
++  byte-identical to before. v7 also gives the header flags word its first
++  bit (`keyframeFlagAdaptive`): through v6 the ADR-0036 lane section's
++  presence rode the version number (v6 was written only flag-on); at v7 a
++  flag-OFF run can hold an override, so presence needed an explicit bit.
++  The per-vehicle `laneEntryTick` rides the same condition as the lane
++  section (round-2 review: the first cut wrote it at every v7, so a
++  flag-off→flag-on restore would have imported dwell clocks from a run
++  with no ttEMA — now a payload without the adaptive state seeds every
++  dwell clock at the restore tick, v7-flag-off included, exactly the
++  ADR-0036 "no evidence yet" migration).
++  Versions ≤ 6 read exactly as before. The rolling CRC folds the override
++  (behavior fields only — the request id is audit trail) LAST, and only
++  while the table is non-empty.
++- **Contract: asyncapi 2.7.0, additive.** The logged verb carries an
++  omitted-when-spawn `verb` discriminator, so every pre-ADR-0037
++  recording decodes unchanged (all-spawn); replay, the player, bake, and
++  the log cursor all re-enqueue both kinds.
++- **Deliberately not in milestone 1:** the reference actuated controller
++  (milestone 2); any `ttEMA` poke (the design's first guess — let the
++  dwell samples speak — stands); and state-plane publication of held
++  phases. `ts.{run}.state.sig` publishes the program TABLE and clients
++  derive light states from the tick, so a held phase is not reflected in
++  what a viz client derives — a display-only gap, owned by milestone 2's
++  client work (the record plane and CRCs are exact regardless).
++- **Verified:** verb accept/reject/idempotency over the wire; two
++  identical verb-scheduled runs CRC-identical; keyframe restore mid-hold
++  continues CRC-exact through the lapse, both routing-flag regimes; a
++  no-verb run marshals at the pre-change version (v2 flag-off, v6
++  flag-on); a held red past its bound lapses (logged) and the fixed-time
++  program resumes at the tick-correct phase; a held green still cannot
++  enter a blocked box; the scripted proof fixture (hold one approach red
++  → its queue grows, the cross movement flows → lapse → the queue
++  discharges) passes; replay/player/bake reproduce a signal-verb run
++  CRC-exact from the record, including a seek onto a mid-hold keyframe.
+diff --git a/engine/engine.go b/engine/engine.go
+index c0791b78f2b6c7c73c74266ae28cb71f485e18ff..80e05449c6c27a1ceff776bbdd73088303fff554 100644
+--- a/engine/engine.go
++++ b/engine/engine.go
+@@ -172,6 +172,19 @@ type Engine struct {
+ 	interiorInj   []InteriorInjection // ADR-0021 mid-lane injections of the last Step (derived, per-tick)
+ 	SpawnLog      []TickedSpawn       // every accepted directive, in application order
+ 
++	// Commanded signal overrides (ADR-0037, sigctl.go). sigOv maps a program
++	// id to its override history (oldest→newest, last in force; ended holds
++	// are retained for the clearance window) — the map is lookup only,
++	// NEVER iterated (ADR-0005); every per-tick use walks Net.Signals in
++	// network order. The table is behavior-deciding state: keyframed (TSKF
++	// v7) and folded into the CRC, both only while non-empty, so a run
++	// without signal verbs keeps the pre-ADR-0037 byte stream exactly.
++	sigOv      map[string][]sigOverride // program id → override history (lookup only)
++	sigNew     []TickedSignal           // buffered signal directives, applied next boundary
++	appliedSig []TickedSignal           // took effect during the last Step (reused)
++	sigLapses  []SigLapse               // holds that reached their bound in the last Step (reused)
++	SigLog     []TickedSignal           // every accepted signal directive, in application order
++
+ 	// Director spawn-outcome tallies. Derived observability only — never
+ 	// serialized, never in the CRC, so they cannot affect replay. They exist
+ 	// because expiry (director.go's DirectorSpawnHoldTicks) drops demand
+@@ -228,12 +241,14 @@ type Engine struct {
+ 
+ 	Stats Stats
+ 
+-	// RestoreNotice is set by RestoreState when a pre-v6 (static-routing)
+-	// keyframe is restored into a flag-ON spec — the ADR-0036 migration
+-	// path, which since the default flip also fires on a plain -state-in of
+-	// an old static keyframe. The sim core cannot log (ADR-0005: no wall
+-	// clock inside it), so this is deterministic state; edge callers
+-	// (natsio replay/bake/player) surface it. Never serialized, never CRC'd.
++	// RestoreNotice is set by RestoreState when a keyframe without
++	// adaptive-routing lane state (a pre-v6 static-routing payload, or a
++	// flag-off v7 one) is restored into a flag-ON spec — the ADR-0036
++	// migration path, which since the default flip also fires on a plain
++	// -state-in of an old static keyframe. The sim core cannot log
++	// (ADR-0005: no wall clock inside it), so this is deterministic state;
++	// edge callers (natsio replay/bake/player) surface it. Never
++	// serialized, never CRC'd.
+ 	RestoreNotice string
+ }
+ 
+@@ -397,7 +412,8 @@ func (e *Engine) CRC() uint64 { return e.crc }
+ //     this tick
+ //  1. events: deterministic spawner, then director spawn directives
+ //     (ADR-0005: events fire before the sweep; the director queue's fixed
+-//     point is documented in director.go)
++//     point is documented in director.go), then commanded signal overrides
++//     (ADR-0037: apply, lapse, sweep — sigctl.go)
+ //  2. intents: buffered controller intents applied in deterministic order
+ //     (ADR-0006 §4), recorded in the arbitrated log
+ //  3. IDM acceleration per vehicle from a consistent snapshot (intent
+@@ -445,6 +461,7 @@ func (e *Engine) Step() {
+ 		e.spawner.step(e)
+ 	}
+ 	e.stepDirectorSpawns()
++	e.stepSignalOverrides()
+ 	e.applyIntents()
+ 	e.rebuildOccupancy()
+ 	e.computeAccels()
+@@ -1075,5 +1092,31 @@ func (e *Engine) computeCRC() uint64 {
+ 			u(v.laneEntryTick)
+ 		}
+ 	}
++	// Commanded signal overrides (ADR-0037): a held command decides the
++	// light state, so a replay that diverges in it must diverge in the CRC
++	// the same tick — the ADR-0036 fold's own argument. Folded LAST (the
++	// byte stream above is untouched) and only while the table is non-empty,
++	// so a run that never receives a signal verb keeps the pre-ADR-0037
++	// stream bit-identical. Iteration is over the network's program list in
++	// network order, each program's history in chronological order (the
++	// table is lookup-only); ended holds still in clearance retention are
++	// folded too — they still answer sigInClearance's lookback. The
++	// behavior-deciding fields only: the request id is audit trail and
++	// stays out.
++	if len(e.sigOv) > 0 {
++		n := 0
++		for _, p := range e.Net.Signals {
++			n += len(e.sigOv[p.ID])
++		}
++		u(uint64(n))
++		for i, p := range e.Net.Signals {
++			for _, ov := range e.sigOv[p.ID] {
++				u(uint64(i))
++				u(uint64(ov.phase))
++				u(ov.since)
++				u(ov.until)
++			}
++		}
++	}
+ 	return h.Sum64()
+ }
+diff --git a/engine/fixture_signalctl_test.go b/engine/fixture_signalctl_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..a191f5fa28db1cec7cf5fe018eda4d79258b8c5f
+--- /dev/null
++++ b/engine/fixture_signalctl_test.go
+@@ -0,0 +1,151 @@
++package engine
++
++import (
++	"testing"
++)
++
++// fixture_signalctl_test.go — the ADR-0037 milestone-1 proof fixture: no
++// controller (that is milestone 2), just the kernel verb driven by script.
++// On the two-approach junction of sig2NetFile the test holds one
++// approach RED through what would have been its green window and asserts
++// the three properties the design promises: the held approach's queue
++// GROWS (the command really starves the movement), the cross movement
++// FLOWS (the commanded phase serves it the whole hold), and when the hold
++// lapses at its bound the fixed-time program resumes and the queue
++// DISCHARGES. The enforcement invariants ride along: zero collisions, and
++// the held approach sees red compliance (no uncommitted crossings — the
++// signal-4way fixture's criterion (a), which the override path inherits
++// unchanged).
++//
++// Calibration note: discharge from a standing queue through one box runs
++// at ~7.5 s/veh in this model (accel-limited crawl from rest, the same
++// serialized band the signal-4way fixture documents), so the program is
++// asymmetric — 45 s "Gr" / 15 s "rG" — to give the starved approach the
++// green share its post-lapse drain needs.
++
++// TestFixtureSignalHoldStarve: see the file comment. The 600-tick cycle
++// gives A green [0,450) of each [0,600); the verb holds phase 1 — A red,
++// B green — from tick 5 for 900 ticks, i.e. STRAIGHT THROUGH A's
++// fixed-time green [600,1050). A's demand (300 veh/h) queues; B's flows.
++// Measured on this fixture (seed 1): queue 1 → 8 over the hold, 6
++// cross-movement crossings during it, 47 crossings and a queue of 3 after
++// the lapse. Assertions carry margin around those numbers; the run is
++// deterministic, so they cannot flake — they can only catch a behavior
++// change.
++func TestFixtureSignalHoldStarve(t *testing.T) {
++	nf := sig2NetFile([]NetSignalPhase{{45.0, "Gr"}, {15.0, "rG"}})
++	spec := sigSpec(t, nf, 6000)
++	spec.Scen = Scenario{SpawnRates: map[string]float64{"nA_0": 300, "nB_0": 300}}
++	e, err := NewEngine(spec)
++	if err != nil {
++		t.Fatal(err)
++	}
++	nA := laneOf(t, e, "nA_0")
++	iA := laneOf(t, e, "iJ_0")
++	iB := laneOf(t, e, "iJ_1")
++
++	for e.Tick < 4 {
++		e.Step()
++	}
++	// Hold A red from tick 5 through tick 904 (until is exclusive): one and
++	// a half cycles, past the point where the fixed-time program would have
++	// served A — the starvation the rail exists to bound.
++	if err := e.EnqueueSignal(SignalDirective{RequestID: "hold-A-red", Signal: "J", Phase: 1, HoldTicks: 900}); err != nil {
++		t.Fatal(err)
++	}
++
++	type prevState struct {
++		lane *Lane
++		s, v float64
++	}
++	prev := map[uint64]prevState{}
++	queueAt100, queueAtLapse := -1, -1
++	bCrossDuringHold, aCrossAfterLapse := 0, 0
++	lapseSeenAt := uint64(0)
++	uncommittedRed := 0
++
++	for e.Tick < spec.Ticks {
++		e.Step()
++		assertNoNaN(t, e)
++
++		if e.Tick == 100 {
++			queueAt100 = queueOn(e, nA)
++		}
++		if lp := e.LapsedSignals(); len(lp) > 0 {
++			if len(lp) != 1 || lp[0].Until != 905 || e.Tick != 905 {
++				t.Fatalf("tick %d: lapse = %+v, want the single hold lapsing at 905", e.Tick, lp)
++			}
++			lapseSeenAt = e.Tick
++			queueAtLapse = queueOn(e, nA)
++		}
++
++		// The hold must be IN FORCE during A's fixed-time green: at tick
++		// 700 the schedule shows A green (phase 0, [600,1050)); the
++		// override shows red.
++		if e.Tick == 700 {
++			if st := e.sigState(iA); st != SigRed {
++				t.Fatalf("tick 700: held approach shows %v during its fixed-time green, want red", st)
++			}
++			if st := e.sigState(iB); st != SigGreen {
++				t.Fatalf("tick 700: cross movement shows %v, want green for the whole hold", st)
++			}
++		}
++
++		for _, v := range e.Vehicles() {
++			p, seen := prev[v.ID]
++			cur := v.Lane
++			prev[v.ID] = prevState{cur, v.S, v.V}
++			if !seen || p.lane == cur {
++				continue
++			}
++			// Stop-line crossings into the two internal lanes.
++			if cur == iB && e.Tick >= 5 && e.Tick < 905 {
++				bCrossDuringHold++
++			}
++			if cur == iA {
++				if e.Tick >= 905 {
++					aCrossAfterLapse++
++				} else if e.Tick >= 5 {
++					// A crossing during the hold is legal only if the
++					// vehicle was physically committed (v² > 2·d·B at the
++					// previous tick — the fixture's criterion (a)).
++					d := p.lane.Length - p.s
++					if p.v*p.v <= 2*d*v.Type.B {
++						uncommittedRed++
++					}
++				}
++			}
++		}
++	}
++
++	if lapseSeenAt != 905 {
++		t.Fatalf("no lapse event at 905 (saw %d) — the rail did not fire", lapseSeenAt)
++	}
++	// The queue grew under the hold (measured 1 → 8).
++	if queueAt100 > 2 || queueAtLapse < 5 {
++		t.Errorf("held approach did not starve as expected: queue %d at tick 100, %d at the lapse (want ≤ 2 → ≥ 5)",
++			queueAt100, queueAtLapse)
++	}
++	// The cross movement flowed through the whole hold (measured 6).
++	if bCrossDuringHold < 5 {
++		t.Errorf("cross movement starved too: %d crossings during the hold, want ≥ 5", bCrossDuringHold)
++	}
++	// Red compliance on the held approach: zero uncommitted crossings.
++	if uncommittedRed != 0 {
++		t.Errorf("%d uncommitted crossings of the held red, want 0", uncommittedRed)
++	}
++	// The lapse resumes the fixed-time program mid-window — A is green from
++	// the lapse tick (905 sits in phase 0, [600,1050)) — and the queue
++	// discharges (measured: 47 crossings, queue 8 → 3).
++	if aCrossAfterLapse < 20 {
++		t.Errorf("held approach did not discharge after the lapse: %d crossings, want ≥ 20", aCrossAfterLapse)
++	}
++	if end := queueOn(e, nA); end > queueAtLapse/2 {
++		t.Errorf("queue did not drain after the lapse: %d at lapse, %d at run end", queueAtLapse, end)
++	}
++	if e.Stats.Collisions != 0 {
++		t.Errorf("%d collision observations, want 0 (by section %v)", e.Stats.Collisions, e.Stats.CollisionsBySection)
++	}
++	t.Logf("queue %d@100 → %d@lapse → %d@end; B crossings during hold %d; A crossings after lapse %d",
++		queueAt100, queueAtLapse, queueOn(e, nA), bCrossDuringHold, aCrossAfterLapse)
++}
+diff --git a/engine/keyframe.go b/engine/keyframe.go
+index f2c6eebb21e00b6d61e5e22674e09a5ee7609515..80dfd876b0cd66b8848b48c1bd82902c4469e444 100644
+--- a/engine/keyframe.go
++++ b/engine/keyframe.go
+@@ -31,14 +31,28 @@ import (
+ //	v5 only (written solely while some vehicle has a running stuck timer or
+ //	a discharged stop duty), appended to each vehicle record:
+ //	  stuckTicks u64 | stopDone u8
+-//	v6 only (written solely while Params.AdaptiveRouting is on), appended to
+-//	each vehicle record after the v5 fields:
++//	v6 only (written solely while Params.AdaptiveRouting is on — from v7
++//	  this and the lane section ride the flags word instead, so a flag-off
++//	  v7 omits them), appended to each vehicle record after the v5 fields:
+ //	  laneEntryTick u64
+ //	v6 only, a lane section between the spawner and director sections:
+ //	  nLanes u32 | per lane (network order): ttEMA f64 | ttSnap f64
+ //	v3 only (written solely while the director queue is non-empty):
+ //	  nDirectives u32 | per directive: tick u64 | laneIdx u32 | typeIdx u32 |
+ //	  earliestTick u64 | reqIDLen u16 | reqID bytes
++//	v7 only (written solely while a commanded signal override is held or
++//	within its clearance retention, ADR-0037), after the director section:
++//	  nOverrides u32 | per override (network Signals order, each program's
++//	  history chronological — a program id may repeat when a superseded
++//	  hold is still in retention):
++//	    signalIdx u32 | phase u32 | since u64 | until u64 (exclusive) |
++//	    reqIDLen u16 | reqID bytes
++//	v7 also gives the header flags word its first bit: flagAdaptiveSection
++//	marks the adaptive-routing state (per-vehicle laneEntryTick AND the
++//	lane section) as present. v6 implies it (v6 was only ever written
++//	flag-on); at v7 the two states are independent — a flag-off run
++//	can hold an override — so presence can no longer ride the version
++//	number.
+ //
+ // Payloads run ≥92 B/vehicle measured (engine/BENCHMARKS.md); past the
+ // broker's 1 MiB max_payload (~10.9k vehicles) the record plane chunks the
+@@ -105,7 +119,36 @@ const (
+ 	// must survive a restore exactly. ttEMA is float64, no quantization.
+ 	// The next-hop tables and epoch stamps are NOT here: they are derived
+ 	// state, recomputed identically from tick and keyframed state.
+-	keyframeVersion = 6
++	//
++	// v7 (ADR-0037, written ONLY while the commanded-signal-override table
++	// is non-empty — a held phase is state that decides what vehicles do,
++	// and a seek that loses it diverges; an empty table marshals
++	// byte-identical to v6-or-below as applicable) appends after the
++	// director section:
++	//
++	//	nOverrides u32 | per override (network Signals order, each
++	//	  program's history chronological — a program id may repeat while
++	//	  a superseded hold is still in clearance retention):
++	//	  signalIdx u32 | phase u32 | since u64 | until u64 | reqIDLen u16 |
++	//	  reqID bytes
++	//
++	// until is the exclusive end of the hold; the fixed-time program's
++	// resume point is derived from the tick (phaseAt), so no further state
++	// rides along. v7 also defines the header flags word's first bit
++	// (keyframeFlagAdaptive): whether the ADR-0036 adaptive-routing state —
++	// the per-vehicle laneEntryTick AND the lane section — is present. At
++	// v6 presence was implied by the version itself (v6 was written only by
++	// flag-on engines); at v7 a flag-OFF run can carry overrides, so the
++	// version number alone no longer says whether that state follows, and
++	// a flag-off run has no ttEMA for the dwell clocks to refer to — they
++	// are simply not keyframed, and a restore into a flag-ON spec seeds
++	// them at the restore tick exactly like a pre-v6 payload. Versions ≤ 6
++	// always wrote flags = 0, and readers treat a v≤6 payload exactly as
++	// before.
++	keyframeVersion = 7
++	// keyframeSignalVersion is the version the ADR-0037 commanded signal
++	// override table needs.
++	keyframeSignalVersion = 7
+ 	// keyframeAdaptiveVersion is the version the ADR-0036 adaptive-routing
+ 	// state (laneEntryTick, ttEMA) needs.
+ 	keyframeAdaptiveVersion = 6
+@@ -120,6 +163,11 @@ const (
+ 	// keyframeMinVersion is the oldest readable version (v2 recordings
+ 	// predate the director path; their queue is empty by definition).
+ 	keyframeMinVersion = 2
++	// keyframeFlagAdaptive (header flags bit 0, defined at v7): the v6
++	// adaptive-routing state (per-vehicle laneEntryTick and the per-lane
++	// travel-time section) is present. Always 0 in versions ≤ 6,
++	// where presence is implied by the version (v6 ⇔ present).
++	keyframeFlagAdaptive = 1
+ )
+ 
+ // MarshalState serializes the engine's complete dynamic state at the
+@@ -153,8 +201,31 @@ func (e *Engine) MarshalState() ([]byte, error) {
+ 	if e.Params.AdaptiveRouting {
+ 		version = keyframeAdaptiveVersion
+ 	}
++	// Commanded signal overrides (ADR-0037) need v7 while any is held (or
++	// within its clearance retention): the held phase decides what vehicles
++	// do. An empty table never reaches this and keeps the v6-and-below
++	// bytes exactly.
++	if len(e.sigOv) > 0 {
++		version = keyframeSignalVersion
++	}
++	// The flags word is 0 through v6; from v7 it carries whether the v6
++	// lane section follows (keyframeFlagAdaptive), because at v7 the
++	// version number alone no longer implies it (a flag-off run can hold an
++	// override). Writer and reader share the one condition. The
++	// adaptive-routing state — the per-vehicle dwell clock AND the lane
++	// section — rides that single condition too: a flag-off run has no
++	// ttEMA, so its dwell clocks are not state worth keyframing, and a
++	// restore whose payload lacks them seeds every clock at the restore
++	// tick (the ADR-0036 migration's "no evidence yet"), v7-flag-off
++	// included. Through v6 the condition reduces to the version check the
++	// format always used (v6 ⇔ flag on), so those bytes are unchanged.
++	adaptiveState := version >= keyframeAdaptiveVersion && e.Params.AdaptiveRouting
++	var flags uint16
++	if version >= keyframeSignalVersion && e.Params.AdaptiveRouting {
++		flags = keyframeFlagAdaptive
++	}
+ 	w.u16(version)
+-	w.u16(0)
++	w.u16(flags)
+ 	w.u64(e.Tick)
+ 	w.u64(e.crc)
+ 	w.u64(e.nextID)
+@@ -204,7 +275,7 @@ func (e *Engine) MarshalState() ([]byte, error) {
+ 				w.u8(0)
+ 			}
+ 		}
+-		if version >= keyframeAdaptiveVersion {
++		if adaptiveState {
+ 			w.u64(v.laneEntryTick) // ADR-0036 dwell clock
+ 		}
+ 	}
+@@ -227,11 +298,14 @@ func (e *Engine) MarshalState() ([]byte, error) {
+ 	// TSKF v6 (ADR-0036): the per-lane travel-time EMAs and their
+ 	// epoch-frozen routing snapshots, in network order. Placed between the
+ 	// spawner and director sections — the reader is gated on the same
+-	// version condition, so the two never disagree. ttSnap is keyframed
++	// condition, so the two never disagree. ttSnap is keyframed
+ 	// for the same reason ttEMA is: it decides what vehicles do, and a
+ 	// table rebuilt after a restore must be the table the live engine was
+-	// serving.
+-	if version >= keyframeAdaptiveVersion {
++	// serving. The condition is version-AND-flag rather than version alone
++	// because at v7 (ADR-0037) a flag-off run reaches v6+ without carrying
++	// this state; for v6 itself the flag is always on, so the v6 bytes are
++	// unchanged.
++	if adaptiveState {
+ 		w.u32(uint32(len(e.Net.Lanes)))
+ 		for _, l := range e.Net.Lanes {
+ 			w.f64(l.ttEMA)
+@@ -265,6 +339,33 @@ func (e *Engine) MarshalState() ([]byte, error) {
+ 			}
+ 		}
+ 	}
++	// TSKF v7 (ADR-0037): the commanded signal override table — every
++	// program's HISTORY, including ended holds still in clearance retention
++	// (they still answer sigInClearance's lookback) — in network Signals
++	// order, each program's entries chronological (the table itself is
++	// lookup-only, ADR-0005). Gated on
++	// the VERSION, same writer/reader shared-condition rule as the director
++	// section above; version ≥ 7 implies a non-empty table, so the count is
++	// never 0 in practice but is written explicitly regardless. An override
++	// is state that decides what vehicles do: a seek that lost it would
++	// resume the fixed-time program mid-hold and diverge.
++	if version >= keyframeSignalVersion {
++		n := 0
++		for _, p := range e.Net.Signals {
++			n += len(e.sigOv[p.ID])
++		}
++		w.u32(uint32(n))
++		for i, p := range e.Net.Signals {
++			for _, ov := range e.sigOv[p.ID] {
++				w.u32(uint32(i))
++				w.u32(uint32(ov.phase))
++				w.u64(ov.since)
++				w.u64(ov.until)
++				w.u16(uint16(len(ov.requestID)))
++				w.bytes([]byte(ov.requestID))
++			}
++		}
++	}
+ 	return w.buf, nil
+ }
+ 
+@@ -290,7 +391,14 @@ func restoreState(spec RunSpec, data []byte, checkNet func(*Network) error) (*En
+ 	if ver < keyframeMinVersion || ver > keyframeVersion {
+ 		return nil, fmt.Errorf("keyframe: unsupported version %d", ver)
+ 	}
+-	r.u16() // flags
++	flags := r.u16()
++	// The v6 lane section's presence rode the version number through v6
++	// (v6 was written only by flag-on engines); from v7 it rides the flags
++	// word, because a flag-off run can carry ADR-0037 overrides at v7. The
++	// two formulations coincide at every version ≤ 6, where flags is
++	// always 0.
++	hasLaneSection := ver == keyframeAdaptiveVersion ||
++		(ver >= keyframeSignalVersion && flags&keyframeFlagAdaptive != 0)
+ 	tick := r.u64()
+ 	crc := r.u64()
+ 	nextID := r.u64()
+@@ -306,19 +414,20 @@ func restoreState(spec RunSpec, data []byte, checkNet func(*Network) error) (*En
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	// A v6 payload is written only by a flag-ON engine (ADR-0036); reading
+-	// one into a flag-OFF spec would silently drop the travel-time state
+-	// the run's routing depends on. Refuse the mismatch loudly instead.
+-	if ver >= keyframeAdaptiveVersion && !e.Params.AdaptiveRouting {
++	// A payload carrying the ADR-0036 lane section is written only by a
++	// flag-ON engine; reading one into a flag-OFF spec would silently drop
++	// the travel-time state the run's routing depends on. Refuse the
++	// mismatch loudly instead.
++	if hasLaneSection && !e.Params.AdaptiveRouting {
+ 		return nil, fmt.Errorf("keyframe: v%d payload carries adaptive-routing state but the spec has AdaptiveRouting off", ver)
+ 	}
+ 	// The reverse direction is the designed migration path (ADR-0036: a
+-	// pre-v6 payload into a flag-ON spec seeds every dwell clock at the
+-	// restore tick), but since the default flipped ON it also fires on a
+-	// plain -state-in of an old static keyframe — record it for the edge
+-	// caller to surface (the sim core cannot log, ADR-0005).
+-	if ver < keyframeAdaptiveVersion && e.Params.AdaptiveRouting {
+-		e.RestoreNotice = fmt.Sprintf("keyframe: pre-v%d (static-routing) payload restored into an adaptive-routing spec — routing switches regime at this restore; pin adaptive_routing: false to continue bit-exactly", keyframeAdaptiveVersion)
++	// payload without the lane section into a flag-ON spec seeds every
++	// dwell clock at the restore tick), but since the default flipped ON it
++	// also fires on a plain -state-in of an old static keyframe — record it
++	// for the edge caller to surface (the sim core cannot log, ADR-0005).
++	if !hasLaneSection && e.Params.AdaptiveRouting {
++		e.RestoreNotice = fmt.Sprintf("keyframe: v%d payload without adaptive-routing lane state restored into an adaptive-routing spec — routing switches regime at this restore; pin adaptive_routing: false to continue bit-exactly", ver)
+ 	}
+ 	if checkNet != nil {
+ 		if err := checkNet(e.Net); err != nil {
+@@ -368,12 +477,16 @@ func restoreState(spec RunSpec, data []byte, checkNet func(*Network) error) (*En
+ 			stuckTicks = r.u64() // ADR-0034
+ 			stopDone = r.u8() != 0
+ 		}
+-		// A pre-v6 keyframe carries no dwell clock. Restoring one into a
+-		// flag-ON spec with laneEntryTick = 0 would make every vehicle's
+-		// first departure a capped run-long poison sample; starting the
+-		// clock at the restore tick is the honest "no evidence yet".
++		// A payload without the adaptive-routing state carries no dwell
++		// clock. Restoring one into a flag-ON spec with laneEntryTick = 0
++		// would make every vehicle's first departure a capped run-long
++		// poison sample; starting the clock at the restore tick is the
++		// honest "no evidence yet". This covers pre-v6 payloads AND
++		// v7-flag-off ones (a flag-off run has no ttEMA, so its dwell
++		// clocks are not keyframed — writer and reader share the
++		// hasLaneSection condition).
+ 		laneEntryTick := tick
+-		if ver >= keyframeAdaptiveVersion {
++		if hasLaneSection {
+ 			laneEntryTick = r.u64() // ADR-0036 dwell clock
+ 		}
+ 		if r.err != nil {
+@@ -428,10 +541,11 @@ func restoreState(spec RunSpec, data []byte, checkNet func(*Network) error) (*En
+ 	}
+ 	// TSKF v6 (ADR-0036): the per-lane travel-time EMAs, in network order,
+ 	// between the spawner and director sections — writer and reader are
+-	// gated on the same version condition, so the two never disagree. The
++	// gated on the same condition (hasLaneSection: the version through v6,
++	// the flags word from v7), so the two never disagree. The
+ 	// count must equal the lane count of the network the spec built, or
+ 	// this keyframe pairs with the wrong spec.
+-	if ver >= keyframeAdaptiveVersion {
++	if hasLaneSection {
+ 		nLanes := r.u32()
+ 		if r.err != nil {
+ 			return nil, fmt.Errorf("keyframe: lane count: %w", r.err)
+@@ -484,6 +598,42 @@ func restoreState(spec RunSpec, data []byte, checkNet func(*Network) error) (*En
+ 			e.dirQueue = append(e.dirQueue, d)
+ 		}
+ 	}
++	if ver >= keyframeSignalVersion {
++		// Commanded signal overrides (ADR-0037) resume with the table — a
++		// held phase is what the vehicles around the signal are reacting
++		// to, so a seek that dropped it would resume the fixed-time program
++		// mid-hold and diverge from the recorded CRCs. Same count-check
++		// discipline as the director queue above: a short read must not
++		// restore silently as "no overrides".
++		n := r.u32()
++		if r.err != nil {
++			return nil, fmt.Errorf("keyframe: signal override count: %w", r.err)
++		}
++		for i := uint32(0); i < n; i++ {
++			sigIdx := r.u32()
++			phase := r.u32()
++			since := r.u64()
++			until := r.u64()
++			reqID := string(r.bytesN(int(r.u16())))
++			if r.err != nil {
++				return nil, fmt.Errorf("keyframe: signal override %d: %w", i, r.err)
++			}
++			if int(sigIdx) >= len(e.Net.Signals) {
++				return nil, fmt.Errorf("keyframe: signal override %d: program index %d out of range", i, sigIdx)
++			}
++			p := e.Net.Signals[sigIdx]
++			if int(phase) >= len(p.Phases) {
++				return nil, fmt.Errorf("keyframe: signal override %d: phase %d out of range (program %s has %d)", i, phase, p.ID, len(p.Phases))
++			}
++			if until <= since {
++				return nil, fmt.Errorf("keyframe: signal override %d: empty hold [%d, %d)", i, since, until)
++			}
++			if e.sigOv == nil {
++				e.sigOv = map[string][]sigOverride{}
++			}
++			e.sigOv[p.ID] = append(e.sigOv[p.ID], sigOverride{phase: int(phase), since: since, until: until, requestID: reqID})
++		}
++	}
+ 	if len(r.buf) != 0 {
+ 		return nil, fmt.Errorf("keyframe: %d trailing bytes", len(r.buf))
+ 	}
+diff --git a/engine/natsio/bake.go b/engine/natsio/bake.go
+index 5743d8b012cc7100bf8551a8dd27192e88cdf0ec..5ef5fb1773169e5efc7cc2069bf71e41c17f26c2 100644
+--- a/engine/natsio/bake.go
++++ b/engine/natsio/bake.go
+@@ -187,6 +187,12 @@ func (b *BakeSource) Run(sink BakeSink) error {
+ 					b.run, d.RequestID, next, err)
+ 			}
+ 		}
++		for _, d := range rec.sverbs {
++			if err := e.EnqueueSignal(d); err != nil {
++				return fmt.Errorf("bake of run %q aborted: signal verb %q at tick %d rejected (%v) — record and spec disagree",
++					b.run, d.RequestID, next, err)
++			}
++		}
+ 		e.Step()
+ 		if rec.hasCRC && e.CRC() != rec.crc {
+ 			return fmt.Errorf("bake of run %q aborted: CRC divergence at tick %d: crc %016x, logged %016x",
+diff --git a/engine/natsio/contract.go b/engine/natsio/contract.go
+index 36d09420abfafdab923a9a3959a876e23fcf7090..b699d9e02f2168975ee8d5b37c2e2cef47baf227 100644
+--- a/engine/natsio/contract.go
++++ b/engine/natsio/contract.go
+@@ -208,13 +208,22 @@ type ReleaseRequest struct {
+ // ContractEvent is the JSON payload of every contract event feed message
+ // (ts.{run}.ctl.events.*) and of record-plane events (ts.{run}.log.event).
+ type ContractEvent struct {
+-	Type         string   `json:"type"` // claim | release | unclaimed | pause | resume
++	Type         string   `json:"type"` // claim | release | unclaimed | pause | resume | signal_lapse
+ 	Tick         uint64   `json:"tick"`
+ 	ControllerID string   `json:"controller_id,omitempty"`
+ 	VehicleIDs   []uint64 `json:"vehicle_ids,omitempty"`
+ 	Reason       string   `json:"reason,omitempty"` // spawn | release | disconnect
+ 	Demand       int      `json:"demand,omitempty"`
+ 	Available    int      `json:"available,omitempty"`
++	// The signal_lapse fields (ADR-0037: a held phase reached its bound and
++	// the fixed-time program resumed), present only on that type. Phase is
++	// a pointer because phase 0 is a legitimate phase index — omitempty on
++	// a plain int would silently drop it.
++	Signal    string `json:"signal,omitempty"`     // signal program id
++	Phase     *int   `json:"phase,omitempty"`      // the held phase that lapsed
++	Since     uint64 `json:"since,omitempty"`      // tick the hold was applied
++	Until     uint64 `json:"until,omitempty"`      // tick the fixed-time program resumed
++	RequestID string `json:"request_id,omitempty"` // the verb that commanded the lapsed hold
+ }
+ 
+ // Event types and reasons.
+@@ -224,6 +233,13 @@ const (
+ 	EventUnclaimed = "unclaimed"
+ 	EventPause     = "pause"
+ 	EventResume    = "resume"
++	// EventSignalLapse is the ADR-0037 starvation rail firing: a commanded
++	// phase hold reached its bound and the signal returned to its
++	// fixed-time program. Record-plane only (ts.{run}.log.event) — it is
++	// derived from keyframed state at a fixed tick, so replay re-derives
++	// it; like pause/resume it is dead-time metadata the replayer does not
++	// re-apply.
++	EventSignalLapse = "signal_lapse"
+ 
+ 	ReasonSpawn      = "spawn"
+ 	ReasonRelease    = "release"
+@@ -721,12 +737,13 @@ func (c *Contract) handleRelease(e *engine.Engine, r ctlReq) {
+ }
+ 
+ // handleVerb answers one director verb (ts.{run}.ctl.verb.{id},
+-// request/reply). The director grant is required; v1 implements "spawn".
+-// Dedup is by the director-assigned request_id: the first-seen reply is
+-// remembered and replayed (Duplicate set) for any retry, so a retried verb
+-// never double-spawns. Accepted verbs are validated and buffered by the
+-// kernel (engine.EnqueueSpawn) and take effect at the next tick boundary;
+-// the record plane logs them with that applied_tick.
++// request/reply). The director grant is required; v1 implements "spawn"
++// and "signal_set" (ADR-0037). Dedup is by the director-assigned
++// request_id: the first-seen reply is remembered and replayed (Duplicate
++// set) for any retry, so a retried verb never double-applies. Accepted
++// verbs are validated and buffered by the kernel (engine.EnqueueSpawn /
++// engine.EnqueueSignal) and take effect at the next tick boundary; the
++// record plane logs them with that applied_tick.
+ func (c *Contract) handleVerb(e *engine.Engine, r ctlReq) {
+ 	var reply VerbReply
+ 	defer func() {
+@@ -753,27 +770,52 @@ func (c *Contract) handleVerb(e *engine.Engine, r ctlReq) {
+ 		reply.Reason = "verb requires the director grant"
+ 		return
+ 	}
+-	if req.Verb != "spawn" {
+-		reply.Reason = fmt.Sprintf("unsupported verb %q (v1: spawn)", req.Verb)
++	if req.Verb != "spawn" && req.Verb != "signal_set" {
++		reply.Reason = fmt.Sprintf("unsupported verb %q (v1: spawn, signal_set)", req.Verb)
+ 		return
+ 	}
+ 	if req.RequestID == "" {
+ 		reply.Reason = "missing request_id"
+ 		return
+ 	}
++	// The idempotency key is length-prefixed with a u16 in the keyframe
++	// codec (director queue since TSKF v3, signal overrides since v7):
++	// an over-long id would corrupt the keyframe — reject it here, one
++	// shared check for every verb kind, measured in BYTES.
++	if len(req.RequestID) > maxRequestIDBytes {
++		reply.Reason = fmt.Sprintf("request_id too long: %d bytes, want ≤ %d (keyframe codec limit)", len(req.RequestID), maxRequestIDBytes)
++		return
++	}
+ 	if prev, dup := c.verbs[req.RequestID]; dup {
+ 		reply = prev
+ 		reply.Duplicate = true
+ 		return
+ 	}
+-	err := e.EnqueueSpawn(engine.SpawnDirective{
+-		RequestID:    req.RequestID,
+-		Origin:       req.Origin,
+-		TypeName:     req.VType,
+-		EarliestTick: req.EarliestTick,
+-		Destination:  req.Destination,
+-		OffsetM:      req.OffsetM,
+-	})
++	var err error
++	switch req.Verb {
++	case "spawn":
++		err = e.EnqueueSpawn(engine.SpawnDirective{
++			RequestID:    req.RequestID,
++			Origin:       req.Origin,
++			TypeName:     req.VType,
++			EarliestTick: req.EarliestTick,
++			Destination:  req.Destination,
++			OffsetM:      req.OffsetM,
++		})
++	case "signal_set":
++		if req.Phase == nil {
++			// Presence, not value: an omitted phase must not silently
++			// command phase 0.
++			err = fmt.Errorf("missing phase: signal_set commands a phase index (phase 0 must be written explicitly)")
++		} else {
++			err = e.EnqueueSignal(engine.SignalDirective{
++				RequestID: req.RequestID,
++				Signal:    req.Signal,
++				Phase:     *req.Phase,
++				HoldTicks: req.HoldTicks,
++			})
++		}
++	}
+ 	if err != nil {
+ 		reply.Reason = err.Error()
+ 	} else {
+diff --git a/engine/natsio/logcursor.go b/engine/natsio/logcursor.go
+index e39a03f7eb9cb6b59e0afa7ac77a0fe845092a7a..f0f4941bb9249b750c62099127124157cfe901f0 100644
+--- a/engine/natsio/logcursor.go
++++ b/engine/natsio/logcursor.go
+@@ -66,6 +66,7 @@ type tickRecords struct {
+ 	tick    uint64
+ 	intents []engine.KeyedIntent
+ 	verbs   []engine.SpawnDirective
++	sverbs  []engine.SignalDirective // ADR-0037 signal_set verbs
+ 	crc     uint64
+ 	hasCRC  bool
+ }
+@@ -93,11 +94,19 @@ func (r *tickRecords) add(m *nats.Msg, run string) error {
+ 			r.intents = append(r.intents, k.KeyedIntent)
+ 		}
+ 	case SubjectLogVerb(run):
+-		s, err := decodeLoggedVerb(m.Data)
++		lv, isSignal, err := decodeLoggedVerbKind(m.Data)
+ 		if err != nil {
+ 			return err
+ 		}
+-		r.verbs = append(r.verbs, s.SpawnDirective)
++		if isSignal {
++			r.sverbs = append(r.sverbs, lv.toSignal().SignalDirective)
++		} else {
++			s, err := decodeLoggedVerb(m.Data)
++			if err != nil {
++				return err
++			}
++			r.verbs = append(r.verbs, s.SpawnDirective)
++		}
+ 	case SubjectLogCRC(run):
+ 		crc, err := decodeLoggedCRC(m.Data)
+ 		if err != nil {
+diff --git a/engine/natsio/player.go b/engine/natsio/player.go
+index a52034e10802dca2680b0d07ec30fd2b8fdc274a..e6cfff6b713ca6bc7739c3e615e5a8ff69b92a8a 100644
+--- a/engine/natsio/player.go
++++ b/engine/natsio/player.go
+@@ -459,6 +459,12 @@ func (p *Player) stepTick(countErrs bool) error {
+ 				fmt.Sprintf("verb %q at tick %d rejected (%v) — record and spec disagree", d.RequestID, next, err))
+ 		}
+ 	}
++	for _, d := range rec.sverbs {
++		if err := p.e.EnqueueSignal(d); err != nil {
++			p.reportDivergence(countErrs, &p.verbErrs,
++				fmt.Sprintf("signal verb %q at tick %d rejected (%v) — record and spec disagree", d.RequestID, next, err))
++		}
++	}
+ 	p.e.Step()
+ 	if rec.hasCRC && p.e.CRC() != rec.crc {
+ 		p.reportDivergence(countErrs, &p.crcErrs,
+diff --git a/engine/natsio/recorder.go b/engine/natsio/recorder.go
+index 294fff7ee27fd0120b71393eafcd119012c9975c..ace08a27e1f92e2e081c6f148a012712906ae75f 100644
+--- a/engine/natsio/recorder.go
++++ b/engine/natsio/recorder.go
+@@ -213,6 +213,14 @@ func (r *Recorder) LogTick(e *engine.Engine) error {
+ 			return err
+ 		}
+ 	}
++	// Signal verbs (ADR-0037) follow the spawn verbs within the tick's
++	// batch, in application order; the two kinds share the subject and are
++	// told apart by the payload's verb discriminator.
++	for _, s := range e.AppliedSignals() {
++		if err := r.logSignalVerb(s); err != nil {
++			return err
++		}
++	}
+ 	if tick%r.cfg.KeyframeEvery == 0 {
+ 		if err := r.logKeyframe(e); err != nil {
+ 			return err
+@@ -456,6 +464,22 @@ func (r *Recorder) logVerb(s engine.TickedSpawn) error {
+ 	return nil
+ }
+ 
++// logSignalVerb appends one accepted signal_set directive to the record —
++// the same subject, shape, and replay contract as logVerb (ADR-0037):
++// replay re-enqueues the command at its recorded applied_tick and the
++// kernel's override table takes the identical state.
++func (r *Recorder) logSignalVerb(s engine.TickedSignal) error {
++	data, err := encodeLoggedSignalVerb(s)
++	if err != nil {
++		return err
++	}
++	if err := r.publish(SubjectLogVerb(r.run), s.Tick, data, 0, 0); err != nil {
++		return err
++	}
++	r.VerbsWritten++
++	return nil
++}
++
+ func (r *Recorder) logKeyframe(e *engine.Engine) error {
+ 	data, err := e.MarshalState()
+ 	if err != nil {
+diff --git a/engine/natsio/replay.go b/engine/natsio/replay.go
+index 7cab28ca92b66c9b3bb384d0427069a7ac7512db..0f3c72e0ada85aded381086a50c2459aa23efbab 100644
+--- a/engine/natsio/replay.go
++++ b/engine/natsio/replay.go
+@@ -23,14 +23,15 @@ import (
+ 
+ // ReplayReport summarizes a verified replay.
+ type ReplayReport struct {
+-	Run             string
+-	KeyframeTick    uint64 // keyframe the seek landed on
+-	KeyframeSeq     uint64 // its stream sequence
+-	ToTick          uint64 // last re-simulated tick
+-	IntentsReplayed int
+-	VerbsReplayed   int // director spawn directives re-enqueued
+-	CRCsVerified    int
+-	FinalCRC        uint64 // rolling CRC at ToTick
++	Run              string
++	KeyframeTick     uint64 // keyframe the seek landed on
++	KeyframeSeq      uint64 // its stream sequence
++	ToTick           uint64 // last re-simulated tick
++	IntentsReplayed  int
++	VerbsReplayed    int // director spawn directives re-enqueued
++	SigVerbsReplayed int // signal_set directives re-enqueued (ADR-0037)
++	CRCsVerified     int
++	FinalCRC         uint64 // rolling CRC at ToTick
+ }
+ 
+ // RunRecord is the materialized record plane of a run: the in-memory RunLog
+@@ -72,11 +73,19 @@ func MaterializeRunRecord(js nats.JetStreamContext, meta *RunMeta) (*RunRecord,
+ 			}
+ 			rec.Log.Intents = append(rec.Log.Intents, ks...)
+ 		case SubjectLogVerb(run):
+-			s, err := decodeLoggedVerb(m.Data)
++			lv, isSignal, err := decodeLoggedVerbKind(m.Data)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+-			rec.Log.Spawns = append(rec.Log.Spawns, s)
++			if isSignal {
++				rec.Log.Signals = append(rec.Log.Signals, lv.toSignal())
++			} else {
++				s, err := decodeLoggedVerb(m.Data)
++				if err != nil {
++					return nil, err
++				}
++				rec.Log.Spawns = append(rec.Log.Spawns, s)
++			}
+ 		case SubjectLogCRC(run):
+ 			crc, err := decodeLoggedCRC(m.Data)
+ 			if err != nil {
+@@ -143,6 +152,13 @@ func ReplayFromStream(js nats.JetStreamContext, meta *RunMeta, target uint64) (*
+ 			}
+ 			rep.VerbsReplayed++
+ 		}
++		for _, d := range idx.sverbs[next] {
++			// Same argument as the spawn verbs above (ADR-0037).
++			if err := e.EnqueueSignal(d); err != nil {
++				return nil, fmt.Errorf("replay signal verb %q at tick %d: %w", d.RequestID, next, err)
++			}
++			rep.SigVerbsReplayed++
++		}
+ 		e.Step()
+ 		if want, ok := idx.crcs[next]; ok {
+ 			if e.CRC() != want {
+@@ -166,6 +182,7 @@ func ReplayFromStream(js nats.JetStreamContext, meta *RunMeta, target uint64) (*
+ type logIndex struct {
+ 	intents   map[uint64][]engine.KeyedIntent
+ 	verbs     map[uint64][]engine.SpawnDirective
++	sverbs    map[uint64][]engine.SignalDirective // ADR-0037 signal_set verbs
+ 	crcs      map[uint64]uint64
+ 	keyframes []uint64 // keyframe ticks, stream order (for cadence derivation)
+ 	lastTick  uint64   // highest tick header seen on any message
+@@ -178,6 +195,7 @@ func indexLogMsgs(msgs []*nats.Msg, run string) (*logIndex, error) {
+ 	idx := &logIndex{
+ 		intents: map[uint64][]engine.KeyedIntent{},
+ 		verbs:   map[uint64][]engine.SpawnDirective{},
++		sverbs:  map[uint64][]engine.SignalDirective{},
+ 		crcs:    map[uint64]uint64{},
+ 	}
+ 	for _, m := range msgs {
+@@ -208,11 +226,20 @@ func indexLogMsgs(msgs []*nats.Msg, run string) (*logIndex, error) {
+ 				idx.intents[k.Tick] = append(idx.intents[k.Tick], k.KeyedIntent)
+ 			}
+ 		case SubjectLogVerb(run):
+-			s, err := decodeLoggedVerb(m.Data)
++			lv, isSignal, err := decodeLoggedVerbKind(m.Data)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+-			idx.verbs[s.Tick] = append(idx.verbs[s.Tick], s.SpawnDirective)
++			if isSignal {
++				s := lv.toSignal()
++				idx.sverbs[s.Tick] = append(idx.sverbs[s.Tick], s.SignalDirective)
++			} else {
++				s, err := decodeLoggedVerb(m.Data)
++				if err != nil {
++					return nil, err
++				}
++				idx.verbs[s.Tick] = append(idx.verbs[s.Tick], s.SpawnDirective)
++			}
+ 		case SubjectLogCRC(run):
+ 			crc, err := decodeLoggedCRC(m.Data)
+ 			if err != nil {
+diff --git a/engine/natsio/run.go b/engine/natsio/run.go
+index b3189ca2898635e6d6a8beef3859deb7b7feb857..2dd90417b667e537494efaec0700fe0fab4add4a 100644
+--- a/engine/natsio/run.go
++++ b/engine/natsio/run.go
+@@ -1,6 +1,7 @@
+ package natsio
+ 
+ import (
++	"encoding/json"
+ 	"fmt"
+ 	"log"
+ 	"time"
+@@ -227,6 +228,29 @@ func RunLive(nc *nats.Conn, js nats.JetStreamContext, run string, spec engine.Ru
+ 			e.EnqueueIntent(k)
+ 		}
+ 		e.Step()
++		// The starvation rail firing (ADR-0037) is an operator-visible
++		// event, never a silent fallback: a held phase reached its bound and
++		// the signal is back on its fixed-time program. Two surfaces, same
++		// event: the record plane (ts.{run}.log.event — a RECORDING must
++		// contain the evidence; the pause/resume events are the precedent,
++		// and like them the lapse is dead-time metadata the replayer
++		// re-derives from keyframed state rather than re-applying) and the
++		// process log (the sim core cannot log, so the edge does). A failed
++		// record write aborts the run loudly (ADR-0006 §4, emitPause's
++		// contract).
++		for _, lp := range e.LapsedSignals() {
++			phase := lp.Phase
++			data, _ := json.Marshal(ContractEvent{
++				Type: EventSignalLapse, Tick: e.Tick,
++				Signal: lp.Signal, Phase: &phase, Since: lp.Since, Until: lp.Until,
++				RequestID: lp.RequestID,
++			})
++			if err := rec.LogEvent(e.Tick, data); err != nil {
++				return finish(fmt.Errorf("record signal_lapse event at tick %d: %w", e.Tick, err))
++			}
++			log.Printf("run %s: signal %s phase %d hold LAPSED at tick %d (held [%d, %d), verb %q) — fixed-time program resumed (ADR-0037 starvation rail)",
++				run, lp.Signal, lp.Phase, e.Tick, lp.Since, lp.Until, lp.RequestID)
++		}
+ 		if contractCfg.Observer != nil {
+ 			contractCfg.Observer.Observe(e)
+ 		}
+diff --git a/engine/natsio/server.go b/engine/natsio/server.go
+index 0d628349ea54a7fdbf0892bb622aedf6d0665ea1..bcb001567f31fa8a32ed43e52558f1f32c03da25 100644
+--- a/engine/natsio/server.go
++++ b/engine/natsio/server.go
+@@ -142,10 +142,11 @@ func SubjectCtlHeartbeat(run, ctl string) string {
+ }
+ func SubjectCtlHeartbeatAll(run string) string { return Namespace + "." + run + ".ctl.heartbeat.>" }
+ 
+-// Director verbs (ADR-0008 §5; ADR-0006 2026-07-20 M10 addendum):
++// Director verbs (ADR-0008 §5; ADR-0006 2026-07-20 M10 addendum; ADR-0037):
+ // ts.{run}.ctl.verb.{controller_id} — request/reply, requires the director
+-// grant. v1 verb vocabulary: spawn (despawn/teleport/trigger land with
+-// later milestones; unknown verbs are rejected, not silently ignored).
++// grant. v1 verb vocabulary: spawn, signal_set (despawn/teleport/trigger
++// land with later milestones; unknown verbs are rejected, not silently
++// ignored).
+ func SubjectCtlVerb(run, ctl string) string {
+ 	return Namespace + "." + run + ".ctl.verb." + ctl
+ }
+@@ -186,9 +187,11 @@ func SubjectLogEvent(run string) string    { return Namespace + "." + run + ".lo
+ func SubjectLogAll(run string) string      { return Namespace + "." + run + ".log.>" }
+ 
+ // SubjectLogVerb is the record-plane director-verb subject:
+-// ts.{run}.log.verb — accepted spawn directives, one per message, stamped
+-// with their applied_tick (replay re-enqueues from these; the demand
+-// sampler never re-runs, ADR-0006 M10 addendum).
++// ts.{run}.log.verb — accepted spawn and signal_set (ADR-0037) directives,
++// one per message, stamped with their applied_tick (replay re-enqueues from
++// these; the demand sampler never re-runs, ADR-0006 M10 addendum). The two
++// kinds are told apart by the payload's verb discriminator; a pre-ADR-0037
++// recording carries no discriminator and decodes as all-spawn.
+ func SubjectLogVerb(run string) string { return Namespace + "." + run + ".log.verb" }
+ 
+ // StreamName is the per-run log stream (ADR-0006 §5: one log stream per
+diff --git a/engine/natsio/signal_verb_test.go b/engine/natsio/signal_verb_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..2a04f017f1311cc9338ec8b8785760c2f2a3223b
+--- /dev/null
++++ b/engine/natsio/signal_verb_test.go
+@@ -0,0 +1,410 @@
++package natsio
++
++import (
++	"encoding/json"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/nats-io/nats.go"
++	"traffic-sim/engine"
++)
++
++// signal_verb_test.go — the ADR-0037 milestone-1 acceptance test: the
++// signal_set verb rides the same channel as spawn (ts.{run}.ctl.verb.{id},
++// request/reply, director grant, request-id idempotency), is logged on
++// ts.{run}.log.verb with its applied_tick, and replay from the JetStream
++// record reproduces the run bit-identically — including a seek that lands
++// on a keyframe taken WHILE a phase is held (TSKF v7 restores the
++// override). The network is the signal-4way fixture crop; the verb holds
++// its central junction's program on a phase that is red for the
++// instrumented approach.
++
++// sig4Spec is a short live-run spec over the signal-4way crop.
++func sig4Spec(ticks uint64) engine.RunSpec {
++	return engine.RunSpec{
++		Net:    engine.NetSpec{Kind: "file", Path: "../testdata/signal-4way/network.json"},
++		Scen:   engine.Scenario{SpawnRatePerLaneHour: 600},
++		Params: engine.DefaultParams(),
++		Seed:   7,
++		Ticks:  ticks,
++	}
++}
++
++// sendVerbRaw issues one verb request/reply with an explicitly given
++// request — for the cases the typed helpers cannot express (an omitted
++// phase, an over-long request id).
++func sendVerbRaw(nc *nats.Conn, run, ctl string, vreq VerbRequest) verbResult {
++	req, _ := json.Marshal(vreq)
++	res := verbResult{id: vreq.RequestID}
++	msg, err := nc.Request(SubjectCtlVerb(run, ctl), req, 2*time.Second)
++	if err != nil {
++		res.reason = "no reply: " + err.Error()
++		return res
++	}
++	var rep VerbReply
++	if err := json.Unmarshal(msg.Data, &rep); err != nil {
++		res.reason = "bad reply: " + err.Error()
++		return res
++	}
++	res.accepted, res.dup, res.reason = rep.Accepted, rep.Duplicate, rep.Reason
++	return res
++}
++
++// sendSignalVerb issues one signal_set verb request/reply.
++func sendSignalVerb(nc *nats.Conn, run, ctl, id, signal string, phase int, hold uint64) verbResult {
++	return sendVerbRaw(nc, run, ctl, VerbRequest{
++		Verb: "signal_set", RequestID: id, Signal: signal, Phase: &phase, HoldTicks: hold,
++	})
++}
++
++// TestLoggedVerbKinds pins the record-plane verb codec: both known kinds
++// round-trip through the logged form, and an UNKNOWN kind discriminator
++// (a recording written by a newer engine carrying a future verb kind) is
++// a hard decode error on every reader — never a silent decode as spawn,
++// which would re-enqueue the wrong command and call it replay.
++func TestLoggedVerbKinds(t *testing.T) {
++	// Spawn round-trip: no discriminator — the pre-ADR-0037 byte shape.
++	spawn := engine.TickedSpawn{
++		Tick: 7, TypeIdx: 1,
++		SpawnDirective: engine.SpawnDirective{
++			RequestID: "r1", Origin: "A0", TypeName: "car", EarliestTick: 3,
++		},
++	}
++	data, err := encodeLoggedVerb(spawn)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if strings.Contains(string(data), "verb") {
++		t.Fatalf("spawn record carries a discriminator: %s", data)
++	}
++	lv, isSignal, err := decodeLoggedVerbKind(data)
++	if err != nil || isSignal {
++		t.Fatalf("spawn decode: isSignal=%v err=%v", isSignal, err)
++	}
++	if lv.Verb != "" {
++		t.Fatalf("spawn discriminator = %q, want empty", lv.Verb)
++	}
++	got, err := decodeLoggedVerb(data)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got != spawn {
++		t.Errorf("spawn round-trip = %+v, want %+v", got, spawn)
++	}
++
++	// signal_set round-trip: discriminator + signal fields.
++	sig := engine.TickedSignal{
++		Tick: 9, SignalIdx: 2,
++		SignalDirective: engine.SignalDirective{
++			RequestID: "s1", Signal: "42430333", Phase: 2, HoldTicks: 150,
++		},
++	}
++	data, err = encodeLoggedSignalVerb(sig)
++	if err != nil {
++		t.Fatal(err)
++	}
++	lv, isSignal, err = decodeLoggedVerbKind(data)
++	if err != nil || !isSignal {
++		t.Fatalf("signal decode: isSignal=%v err=%v", isSignal, err)
++	}
++	if got := lv.toSignal(); got != sig {
++		t.Errorf("signal round-trip = %+v, want %+v", got, sig)
++	}
++
++	// Unknown kind: hard error at the decoder AND at a replay reader.
++	bad := []byte(`{"tick":5,"request_id":"x","verb":"teleport","origin":"A0","vtype":"car"}`)
++	if _, _, err := decodeLoggedVerbKind(bad); err == nil ||
++		!strings.Contains(err.Error(), "unknown verb kind") {
++		t.Fatalf("unknown kind: err = %v, want a loud rejection", err)
++	}
++	var rec tickRecords
++	m := &nats.Msg{Subject: SubjectLogVerb("run"), Data: bad}
++	if err := rec.add(m, "run"); err == nil || !strings.Contains(err.Error(), "unknown verb kind") {
++		t.Fatalf("reader: err = %v, want the unknown kind to fail loudly", err)
++	}
++	if len(rec.verbs) != 0 || len(rec.sverbs) != 0 {
++		t.Fatalf("reader queued a rejected record: %+v", rec)
++	}
++}
++
++// TestSignalVerbValidation pins the contract-boundary validation of
++// signal_set (round-4 review): the request_id is length-prefixed with a
++// u16 in the TSKF codec (director queue v3, signal overrides v7), so an
++// over-long id is rejected where it enters — 65,535 bytes exactly is
++// accepted and its keyframe round-trips a restore — and an omitted phase
++// is rejected rather than silently commanding phase 0 (JSON cannot tell
++// omission from 0, so presence is checked).
++func TestSignalVerbValidation(t *testing.T) {
++	srv := NewTestServer(t)
++	nc, js := srv.JetStream(t)
++	spec := sig4Spec(200)
++	run := "sv2"
++	const prog = "42430333"
++
++	longOK := strings.Repeat("x", maxRequestIDBytes)
++	longBad := strings.Repeat("y", maxRequestIDBytes+1)
++
++	results := make(chan verbResult, 8)
++	dirConn := srv.Connect(t)
++	go func() {
++		ctl := directorClient(t, dirConn, run, []string{"director"}, 0)
++		plan := map[uint64]bool{}
++		_, err := dirConn.Subscribe(SubjectStateSnap(run), func(m *nats.Msg) {
++			f, err := ParseFrame(m.Data)
++			if err != nil || plan[f.Tick] {
++				return
++			}
++			var r verbResult
++			switch f.Tick {
++			case 5: // boundary value: exactly the codec limit — accepted
++				r = sendSignalVerb(dirConn, run, ctl, longOK, prog, 2, 150)
++			case 15: // one byte past — rejected at the contract boundary
++				r = sendSignalVerb(dirConn, run, ctl, longBad, prog, 2, 100)
++			case 25: // omitted phase — must not silently command phase 0
++				r = sendVerbRaw(dirConn, run, ctl, VerbRequest{Verb: "signal_set", RequestID: "s-nophase", Signal: prog, HoldTicks: 40})
++			case 35: // explicit phase 0 — accepted and applied as phase 0
++				r = sendSignalVerb(dirConn, run, ctl, "s-p0", prog, 0, 30)
++			case 45: // spawn without phase — unaffected (phase is a signal_set field)
++				r = sendVerb(dirConn, run, ctl, "sp1", "spawn", "n167922072_1_0", "car", 0)
++			default:
++				return
++			}
++			plan[f.Tick] = true
++			results <- r
++		})
++		if err != nil {
++			t.Errorf("director subscribe: %v", err)
++		}
++	}()
++
++	lr, err := RunLive(nc, js, run, spec, RecorderConfig{KeyframeEvery: 20, CRCEvery: 1},
++		ContractConfig{PaceFloor: time.Millisecond})
++	if err != nil {
++		t.Fatalf("RunLive: %v", err)
++	}
++	e := lr.Engine
++	close(results)
++
++	reasons := map[string]verbResult{}
++	for r := range results {
++		reasons[r.id] = r
++	}
++	if r := reasons[longOK]; !r.accepted {
++		t.Errorf("65535-byte request_id: rejected (%s), want accepted (the codec's exact bound)", r.reason)
++	}
++	if r := reasons[longBad]; r.accepted || !strings.Contains(r.reason, "too long") {
++		t.Errorf("65536-byte request_id: %+v, want rejection naming the length", r)
++	}
++	if r := reasons["s-nophase"]; r.accepted || !strings.Contains(r.reason, "missing phase") {
++		t.Errorf("omitted phase: %+v, want rejection (phase 0 must be explicit)", r)
++	}
++	if r := reasons["s-p0"]; !r.accepted {
++		t.Errorf("explicit phase 0: rejected (%s), want accepted", r.reason)
++	}
++	if r := reasons["sp1"]; !r.accepted {
++		t.Errorf("spawn without phase: rejected (%s), want unaffected", r.reason)
++	}
++
++	// Engine state: two accepted signal verbs — the boundary-length id
++	// holding phase 2, then the explicit phase 0 superseding it.
++	if len(e.SigLog) != 2 {
++		t.Fatalf("signal log %d, want 2 (%+v)", len(e.SigLog), e.SigLog)
++	}
++	if e.SigLog[0].RequestID != longOK || e.SigLog[0].Phase != 2 {
++		t.Errorf("first directive = %+v, want the 65535-byte id on phase 2", e.SigLog[0])
++	}
++	if e.SigLog[1].RequestID != "s-p0" || e.SigLog[1].Phase != 0 {
++		t.Errorf("second directive = %+v, want s-p0 phase 0 (explicit zero applied)", e.SigLog[1])
++	}
++
++	// The keyframe round-trip with the boundary-length id: s1's hold
++	// (~[6,156)) is superseded by s-p0 (~[36,66)) and retained for
++	// clearance, so the keyframes at 20/40/60 carry the 65,535-byte
++	// request id in the v7 override section; a seek onto one must decode
++	// it and re-simulate CRC-exact.
++	meta, err := lr.Registry.Meta(run)
++	if err != nil {
++		t.Fatalf("registry meta: %v", err)
++	}
++	rep, err := ReplayFromStream(js, meta, 45)
++	if err != nil {
++		t.Fatalf("ReplayFromStream(45) — keyframe carrying the boundary-length id: %v", err)
++	}
++	if rep.FinalCRC != e.CRCs[44] {
++		t.Fatalf("replay crc %016x, live %016x", rep.FinalCRC, e.CRCs[44])
++	}
++	if rep.KeyframeTick != 40 {
++		t.Fatalf("seek landed on keyframe@%d, want 40 (mid-hold, v7 with the long id)", rep.KeyframeTick)
++	}
++}
++
++func TestSignalVerbRecordReplay(t *testing.T) {
++	srv := NewTestServer(t)
++	nc, js := srv.JetStream(t)
++	spec := sig4Spec(300)
++	run := "sv1"
++
++	// Program "42430333" is the fixture's central junction (39/6/39/6 over
++	// 14 links); phase 2 is red for the instrumented approach's link 10.
++	const prog = "42430333"
++
++	// The director drives its verb plan off snapshot ticks, exactly like
++	// the spawn-verb acceptance test.
++	results := make(chan verbResult, 8)
++	dirConn := srv.Connect(t)
++	go func() {
++		ctl := directorClient(t, dirConn, run, []string{"director"}, 0)
++		plan := map[uint64]bool{}
++		_, err := dirConn.Subscribe(SubjectStateSnap(run), func(m *nats.Msg) {
++			f, err := ParseFrame(m.Data)
++			if err != nil || plan[f.Tick] {
++				return
++			}
++			var r verbResult
++			switch f.Tick {
++			case 5: // hold phase 2 for 150 ticks — lapses mid-run, loudly
++				r = sendSignalVerb(dirConn, run, ctl, "s1", prog, 2, 150)
++			case 15: // retry of s1: dedup must answer, not re-apply
++				r = sendSignalVerb(dirConn, run, ctl, "s1", prog, 2, 150)
++			case 25: // unknown signal program
++				r = sendSignalVerb(dirConn, run, ctl, "s2", "nope", 0, 100)
++			case 35: // phase index out of range (the program has 4)
++				r = sendSignalVerb(dirConn, run, ctl, "s3", prog, 4, 100)
++			default:
++				return
++			}
++			plan[f.Tick] = true
++			results <- r
++		})
++		if err != nil {
++			t.Errorf("director subscribe: %v", err)
++		}
++	}()
++
++	// A SIGNAL-grant controller (not director): the verb plane is the
++	// director grant's, so its signal_set must be rejected — the same
++	// not-a-director rejection the spawn test pins, and deliberately NOT
++	// the drive grant (an attached drive controller arms the pause gate).
++	drvResults := make(chan verbResult, 1)
++	drvConn := srv.Connect(t)
++	go func() {
++		ctl := directorClient(t, drvConn, run, []string{"signal"}, 0)
++		drvResults <- sendSignalVerb(drvConn, run, ctl, "sig1", prog, 0, 100)
++	}()
++
++	lr, err := RunLive(nc, js, run, spec, RecorderConfig{KeyframeEvery: 50, CRCEvery: 1},
++		ContractConfig{PaceFloor: time.Millisecond})
++	if err != nil {
++		t.Fatalf("RunLive: %v", err)
++	}
++	e := lr.Engine
++	close(results)
++	close(drvResults)
++
++	// --- Wire-level assertions: accept/reject/dedup/grant.
++	var accepted, rejected, dups int
++	reasons := map[string]string{}
++	for r := range results {
++		switch {
++		case r.dup:
++			dups++
++			if !r.accepted {
++				t.Errorf("duplicate of an accepted verb not idempotent: %+v", r)
++			}
++		case r.accepted:
++			accepted++
++		default:
++			rejected++
++			reasons[r.id] = r.reason
++		}
++	}
++	if accepted != 1 || dups != 1 || rejected != 2 {
++		t.Fatalf("verb outcomes: accepted=%d dups=%d rejected=%d (want 1/1/2)", accepted, dups, rejected)
++	}
++	for id, want := range map[string]string{
++		"s2": "unknown signal program", "s3": "out of range",
++	} {
++		if !strings.Contains(reasons[id], want) {
++			t.Errorf("%s: reason %q, want %q", id, reasons[id], want)
++		}
++	}
++	if r := <-drvResults; r.accepted || !strings.Contains(r.reason, "director grant") {
++		t.Fatalf("signal-grant controller verb: %+v, want grant rejection", r)
++	}
++
++	// --- Engine/record state: exactly the one first-seen accepted verb.
++	if len(e.SigLog) != 1 || lr.Recorder.VerbsWritten != 1 {
++		t.Fatalf("signal log %d, verbs written %d — want 1/1", len(e.SigLog), lr.Recorder.VerbsWritten)
++	}
++	if got := e.SigLog[0]; got.Signal != prog || got.Phase != 2 || got.HoldTicks != 150 {
++		t.Fatalf("logged directive = %+v, want %s phase 2 hold 150", got, prog)
++	}
++
++	// --- THE acceptance test: replay from the JetStream record reproduces
++	// the run bit-identically. The hold spans roughly ticks 6–156, so the
++	// keyframes at 50/100/150 are mid-hold (TSKF v7): target 175 seeks one
++	// of them and re-simulates THROUGH the lapse, and target 49 re-enqueues
++	// the verb itself from ts.{run}.log.verb.
++	meta, err := lr.Registry.Meta(run)
++	if err != nil {
++		t.Fatalf("registry meta: %v", err)
++	}
++	sawVerbs := false
++	for _, target := range []uint64{49, 175, 299, 300} {
++		rep, err := ReplayFromStream(js, meta, target)
++		if err != nil {
++			t.Fatalf("ReplayFromStream(%d): %v", target, err)
++		}
++		if rep.FinalCRC != e.CRCs[target-1] {
++			t.Fatalf("target %d: replay crc %016x, live %016x", target, rep.FinalCRC, e.CRCs[target-1])
++		}
++		if target != 300 && rep.CRCsVerified == 0 {
++			t.Fatalf("target %d: no CRCs verified — replay landed on a keyframe and proved nothing", target)
++		}
++		if rep.SigVerbsReplayed > 0 {
++			sawVerbs = true
++		}
++		t.Logf("target %d: keyframe@%d, %d intents, %d spawn verbs, %d signal verbs, %d CRCs verified, final %016x",
++			target, rep.KeyframeTick, rep.IntentsReplayed, rep.VerbsReplayed, rep.SigVerbsReplayed, rep.CRCsVerified, rep.FinalCRC)
++	}
++	if !sawVerbs {
++		t.Fatal("no replay target re-enqueued a signal verb — the verb path is untested")
++	}
++
++	// The materialized record feeds the in-memory replay oracle identically.
++	rec, err := MaterializeRunRecord(js, meta)
++	if err != nil {
++		t.Fatalf("MaterializeRunRecord: %v", err)
++	}
++	if len(rec.Log.Signals) != 1 {
++		t.Fatalf("materialized record holds %d signal directives, want 1", len(rec.Log.Signals))
++	}
++	if _, err := engine.Replay(rec.Log); err != nil {
++		t.Fatalf("in-memory replay of the record: %v", err)
++	}
++
++	// The starvation rail is ON THE RECORD (ADR-0037: a lapse is a logged
++	// event, never a silent fallback): exactly one signal_lapse event, at
++	// the bound tick, carrying the hold's identity. The absolute ticks are
++	// taken from the recorded directive (the verb's applied tick is
++	// request/reply timing, not pinned); the SPAN is the contract.
++	var lapses []ContractEvent
++	for _, evt := range rec.Events {
++		if evt.Type == EventSignalLapse {
++			lapses = append(lapses, evt)
++		}
++	}
++	if len(lapses) != 1 {
++		t.Fatalf("record holds %d signal_lapse events, want exactly 1", len(lapses))
++	}
++	lp := lapses[0]
++	applied := e.SigLog[0]
++	if lp.Signal != prog || lp.Phase == nil || *lp.Phase != 2 || lp.RequestID != "s1" {
++		t.Errorf("lapse event identity = %+v, want %s phase 2 verb s1", lp, prog)
++	}
++	if lp.Since != applied.Tick || lp.Until != applied.Tick+150 || lp.Tick != lp.Until {
++		t.Errorf("lapse event span = [%d, %d) fired at %d, want [%d, %d) at %d",
++			lp.Since, lp.Until, lp.Tick, applied.Tick, applied.Tick+150, applied.Tick+150)
++	}
++}
+diff --git a/engine/natsio/verb.go b/engine/natsio/verb.go
+index e2f10cd386bf5c0b8f2f036af2ce52efaf2d083d..7fb994b4b6403cfd5d38fb0205db67e144675735 100644
+--- a/engine/natsio/verb.go
++++ b/engine/natsio/verb.go
+@@ -2,18 +2,19 @@ package natsio
+ 
+ import (
+ 	"encoding/json"
++	"fmt"
+ 
+ 	"traffic-sim/engine"
+ )
+ 
+-// verb.go — the director spawn verb (ADR-0008 §5 director role;
+-// scenario-format §3 runtime demand director; ADR-0006 2026-07-20 M10
+-// addendum). The control-plane shape follows the existing request/reply
+-// patterns (hello/claim): a director NEEDS the accept/reject answer — it
+-// paces its own schedule and must learn of validation rejections — so
+-// fire-and-forget (like raw intents) was rejected. JSON payloads match the
+-// control plane's low-rate administrative style (the binary frames are for
+-// the per-tick hot paths).
++// verb.go — the director verbs (ADR-0008 §5 director role; scenario-format
++// §3 runtime demand director; ADR-0006 2026-07-20 M10 addendum; ADR-0037
++// runtime signal control). The control-plane shape follows the existing
++// request/reply patterns (hello/claim): a director NEEDS the accept/reject
++// answer — it paces its own schedule and must learn of validation
++// rejections — so fire-and-forget (like raw intents) was rejected. JSON
++// payloads match the control plane's low-rate administrative style (the
++// binary frames are for the per-tick hot paths).
+ //
+ // Idempotency: the director assigns every verb a unique request_id; the
+ // engine remembers the reply per request_id for the run's lifetime, so a
+@@ -30,9 +31,12 @@ import (
+ // VerbRequest is the payload of ts.{run}.ctl.verb.{controller_id}. v1
+ // implements verb "spawn" only; the field exists so despawn/teleport/
+ // trigger (ADR-0008 §5's remaining OpenSCENARIO verbs) land additively on
+-// the same channel instead of forking subjects per verb.
++// the same channel instead of forking subjects per verb. ADR-0037 adds the
++// second kind, "signal_set", on the same channel and the same four
++// properties (request/reply, request-id idempotency, applied_tick logging,
++// verbatim replay re-enqueue).
+ type VerbRequest struct {
+-	Verb         string `json:"verb"` // spawn
++	Verb         string `json:"verb"` // spawn | signal_set
+ 	RequestID    string `json:"request_id"`
+ 	Origin       string `json:"origin"`        // origin lane id (a network origin, unless offset_m > 0)
+ 	VType        string `json:"vtype"`         // scenario vehicle-type name
+@@ -46,8 +50,31 @@ type VerbRequest struct {
+ 	// Omitted/zero is portal semantics; positive is the interior-origin
+ 	// opt-in (ADR-0021).
+ 	OffsetM float64 `json:"offset_m,omitempty"`
++	// The signal_set fields (ADR-0037), all omitempty: a spawn-only verb is
++	// byte-identical to the pre-ADR-0037 shape. Signal is the signal
++	// program id (the network file's tlLogic id), HoldTicks the requested
++	// hold from the applied tick (0 = one cycle of the program; clamped to
++	// the dt-compiled engine.SignalHoldMaxSeconds bound — the starvation
++	// rail). Phase is the commanded phase index and is a POINTER because
++	// JSON cannot distinguish an omitted phase from phase 0 — and an
++	// accidentally omitted one silently commanding phase 0 is exactly the
++	// kind of quiet wrong this channel exists to refuse: handleVerb
++	// presence-checks it for signal_set. It is ignored by spawn (never
++	// serialized there), exactly as the spawn fields are ignored by
++	// signal_set.
++	Signal    string `json:"signal,omitempty"`
++	Phase     *int   `json:"phase,omitempty"`
++	HoldTicks uint64 `json:"hold_ticks,omitempty"`
+ }
+ 
++// maxRequestIDBytes bounds the director-assigned idempotency key. The TSKF
++// keyframe codec length-prefixes it with a u16 — the director spawn queue
++// since v3, the signal override table since v7 — so an id longer than
++// 65535 BYTES would marshal a truncated length next to the full string and
++// make the keyframe unreadable. Enforced at the contract boundary
++// (handleVerb), one shared check covering every verb kind.
++const maxRequestIDBytes = 65535
++
+ // VerbReply is the engine's answer. A duplicate request_id replays the
+ // original reply with Duplicate set — idempotent success/failure, never a
+ // second spawn.
+@@ -62,7 +89,10 @@ type VerbReply struct {
+ // loggedVerb is the record-plane payload (JSON, like log.event — verbs are
+ // low-rate administrative traffic). TypeIdx is the resolved scenario type
+ // index (auditability; replay re-resolves Origin/VType against the spec,
+-// which is deterministic by construction).
++// which is deterministic by construction). The signal_set fields
++// (ADR-0037) are all omitempty and the Verb discriminator is omitted for
++// spawn: a recording of spawn-only demand is byte-identical to a
++// pre-ADR-0037 one, so replay of every existing recording is unaffected.
+ type loggedVerb struct {
+ 	Tick         uint64 `json:"tick"`
+ 	RequestID    string `json:"request_id"`
+@@ -75,6 +105,16 @@ type loggedVerb struct {
+ 	// recording is unaffected.
+ 	Destination string  `json:"destination,omitempty"`
+ 	OffsetM     float64 `json:"offset_m,omitempty"`
++	// ADR-0037: Verb is "signal_set" for a signal command, empty (omitted)
++	// for spawn. SignalIdx is the resolved Network.Signals index (same
++	// auditability argument as TypeIdx); HoldTicks is the EFFECTIVE hold —
++	// defaults applied, clamped to the starvation bound at acceptance — so
++	// the record shows exactly what the engine enforced.
++	Verb      string `json:"verb,omitempty"`
++	Signal    string `json:"signal,omitempty"`
++	SignalIdx int    `json:"signal_idx,omitempty"`
++	Phase     int    `json:"phase,omitempty"`
++	HoldTicks uint64 `json:"hold_ticks,omitempty"`
+ }
+ 
+ func encodeLoggedVerb(s engine.TickedSpawn) ([]byte, error) {
+@@ -90,6 +130,21 @@ func encodeLoggedVerb(s engine.TickedSpawn) ([]byte, error) {
+ 	})
+ }
+ 
++// encodeLoggedSignalVerb is the signal_set twin of encodeLoggedVerb
++// (ADR-0037): same subject, same batch position, the discriminator field
++// set.
++func encodeLoggedSignalVerb(s engine.TickedSignal) ([]byte, error) {
++	return json.Marshal(loggedVerb{
++		Tick:      s.Tick,
++		RequestID: s.RequestID,
++		Verb:      "signal_set",
++		Signal:    s.Signal,
++		SignalIdx: s.SignalIdx,
++		Phase:     s.Phase,
++		HoldTicks: s.HoldTicks,
++	})
++}
++
+ func decodeLoggedVerb(data []byte) (engine.TickedSpawn, error) {
+ 	var lv loggedVerb
+ 	if err := json.Unmarshal(data, &lv); err != nil {
+@@ -108,3 +163,41 @@ func decodeLoggedVerb(data []byte) (engine.TickedSpawn, error) {
+ 		},
+ 	}, nil
+ }
++
++// decodeLoggedVerbKind parses one logged verb and reports its kind: a
++// signal_set record (ADR-0037) or a spawn record (absent discriminator —
++// every pre-ADR-0037 recording). Readers dispatch on the kind; the spawn
++// decoder above keeps its exact old shape for the spawn branch. An
++// UNKNOWN discriminator is a hard decode error, never a fallback to
++// spawn: a recording written by a newer engine carrying a future verb
++// kind must fail replay loudly rather than be silently re-enqueued as
++// the wrong command.
++func decodeLoggedVerbKind(data []byte) (lv loggedVerb, isSignal bool, err error) {
++	if err := json.Unmarshal(data, &lv); err != nil {
++		return loggedVerb{}, false, err
++	}
++	switch lv.Verb {
++	case "":
++		return lv, false, nil
++	case "signal_set":
++		return lv, true, nil
++	default:
++		return loggedVerb{}, false, fmt.Errorf("logged verb %q: unknown verb kind %q (record written by a newer engine?)", lv.RequestID, lv.Verb)
++	}
++}
++
++// toSignal converts a decoded signal_set record to the kernel shape.
++// Replay re-resolves Signal against the spec inside EnqueueSignal, exactly
++// like the spawn path re-resolves Origin/VType.
++func (lv loggedVerb) toSignal() engine.TickedSignal {
++	return engine.TickedSignal{
++		Tick:      lv.Tick,
++		SignalIdx: lv.SignalIdx,
++		SignalDirective: engine.SignalDirective{
++			RequestID: lv.RequestID,
++			Signal:    lv.Signal,
++			Phase:     lv.Phase,
++			HoldTicks: lv.HoldTicks,
++		},
++	}
++}
+diff --git a/engine/replay.go b/engine/replay.go
+index a510b7c3a9ba33a1615f3cfa8dd54c8c75720708..3bea902b5577d2b0a564ab110c9222507a96a446 100644
+--- a/engine/replay.go
++++ b/engine/replay.go
+@@ -27,6 +27,10 @@ type RunLog struct {
+ 	Spec    RunSpec
+ 	Intents []TickedIntent // applied intents, chronological (Tick ascending)
+ 	Spawns  []TickedSpawn  // accepted director directives, chronological
++	// Signals holds the accepted signal_set directives, chronological
++	// (ADR-0037). Additive: a run without signal verbs carries a nil slice,
++	// exactly as before.
++	Signals []TickedSignal
+ 	CRCs    []uint64
+ }
+ 
+@@ -40,7 +44,7 @@ func Run(spec RunSpec) (*Engine, *RunLog, error) {
+ 	for e.Tick < spec.Ticks {
+ 		e.Step()
+ 	}
+-	return e, &RunLog{Spec: spec, Intents: e.IntentLog, Spawns: e.SpawnLog, CRCs: e.CRCs}, nil
++	return e, &RunLog{Spec: spec, Intents: e.IntentLog, Spawns: e.SpawnLog, Signals: e.SigLog, CRCs: e.CRCs}, nil
+ }
+ 
+ // Replay re-executes a recorded run from its spec and arbitrated intent log
+@@ -53,7 +57,7 @@ func Replay(log *RunLog) (*RunLog, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	ii, si := 0, 0
++	ii, si, gi := 0, 0, 0
+ 	for e.Tick < log.Spec.Ticks {
+ 		for ii < len(log.Intents) && log.Intents[ii].Tick <= e.Tick+1 {
+ 			if log.Intents[ii].Tick == e.Tick+1 {
+@@ -70,9 +74,20 @@ func Replay(log *RunLog) (*RunLog, error) {
+ 			}
+ 			si++
+ 		}
++		for gi < len(log.Signals) && log.Signals[gi].Tick <= e.Tick+1 {
++			if log.Signals[gi].Tick == e.Tick+1 {
++				// Validated when first accepted; re-resolution against the
++				// same spec is deterministic and cannot newly fail.
++				if err := e.EnqueueSignal(log.Signals[gi].SignalDirective); err != nil {
++					return nil, fmt.Errorf("replay signal verb %q at tick %d: %w",
++						log.Signals[gi].RequestID, log.Signals[gi].Tick, err)
++				}
++			}
++			gi++
++		}
+ 		e.Step()
+ 	}
+-	relog := &RunLog{Spec: log.Spec, Intents: e.IntentLog, Spawns: e.SpawnLog, CRCs: e.CRCs}
++	relog := &RunLog{Spec: log.Spec, Intents: e.IntentLog, Spawns: e.SpawnLog, Signals: e.SigLog, CRCs: e.CRCs}
+ 	if len(relog.CRCs) != len(log.CRCs) {
+ 		return nil, fmt.Errorf("replay produced %d CRCs, log has %d", len(relog.CRCs), len(log.CRCs))
+ 	}
+diff --git a/engine/sigctl.go b/engine/sigctl.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..59ad8f73c6c38f708259c2ec5f679abb8ca17054
+--- /dev/null
++++ b/engine/sigctl.go
+@@ -0,0 +1,285 @@
++package engine
++
++import (
++	"fmt"
++	"math"
++)
++
++// sigctl.go — runtime signal control (ADR-0037, milestone 1): the kernel
++// side of the signal_set director verb. A verb commands one signal program
++// onto one of its compiled phases for a bounded hold; while the hold is in
++// force the program's per-approach state derives from the COMMANDED phase
++// instead of the fixed-time schedule (sigPhaseAt, signal.go), and when the
++// hold lapses the fixed-time derivation resumes — the underlying program
++// never stopped being a pure function of the tick, so the resume point
++// needs no state of its own.
++//
++// The channel properties come from the verb machinery (engine/natsio
++// verb.go), not from anything here: request/reply, request-id idempotency,
++// applied_tick stamping, logging on ts.{run}.log.verb, and verbatim
++// re-enqueue by replay. What the kernel adds is the part that makes this
++// more than "a verb": the starvation rails. An unrailed phase command can
++// starve a movement for good — a red that never lifts — and ADR-0034's
++// gridlock escape deliberately does not rescue that case (a vehicle held
++// at a red stop line is not box-blocked, so it never strands). Every
++// command therefore carries a maximum hold: the default is one cycle of
++// the commanded program — the natural bounded quantum of that program's
++// own making — and an explicit hold is clamped to the dt-compiled
++// SignalHoldMaxSeconds bound (signalHoldMaxTicks). A hold that reaches its
++// bound LAPSES: enforcement returns to the fixed-time program at whatever
++// phase the schedule is in AT THE LAPSE TICK — note that one cycle after
++// the command began the schedule is back at the phase that was active WHEN
++// THE COMMAND BEGAN, which is not necessarily the COMMANDED phase, so a
++// lapse can jump from the held phase to an unrelated schedule phase; the
++// clearance retention below covers the transition — and the lapse is an
++// event (SigLapses), never a silent fallback.
++//
++// Determinism (ADR-0005): the override table is keyed lookup only — never
++// iterated; every per-tick use (state derivation, lapse detection,
++// retention sweep, the CRC fold) walks the network's program list in
++// network order, and the effect of a verb is fixed by its recorded
++// applied_tick. The table is behavior-deciding state, so it is keyframed
++// (TSKF v7) and folded into the rolling CRC — both CONDITIONAL on the
++// table being non-empty, so a run that never receives a signal verb keeps
++// the pre-ADR-0037 byte stream exactly.
++//
++// Enforcement is untouched by design: sigGate, the clearance window, the
++// permissive-yield model, and the ADR-0010 box checks all read the state
++// through the same three predicates as before. A controller can hold red
++// or extend green; it can never make green mean "enter a box you cannot
++// exit".
++
++// SignalHoldMaxSeconds bounds the hold a signal_set verb may command, in
++// SIM seconds: 300, the gridlock escape's own horizon (Params.StrandAfterS
++// default) — a hold past it would starve a movement for longer than the
++// model will stay silently stopped anywhere else. A verb asking for more
++// is CLAMPED to the bound, not rejected — the rail exists to bound the
++// blast radius of a wedged controller, and a clamp applies the bound
++// automatically where a rejection would depend on the controller reading
++// its reply. The record plane logs the EFFECTIVE hold in ticks, so what
++// was applied is on the record (asyncapi LoggedVerbView).
++const SignalHoldMaxSeconds = 300.0
++
++// signalHoldMaxTicks compiles the hold bound onto the run's tick grid.
++// dt is a scenario parameter (ADR-0005), never a constant baked into a
++// tick count: at a non-default dt a fixed 3000-tick bound would no longer
++// be 300 sim-seconds. Same dt-derived-constant idiom as routeEpochTicks
++// (engine.go initAdaptiveRouting); computed per call — it is one division
++// on a verb path that fires a handful of times per run.
++func (e *Engine) signalHoldMaxTicks() uint64 {
++	dt := e.Params.Dt
++	if dt <= 0 { // validated upstream; never divide by a bad tick
++		dt = 0.1
++	}
++	return max(1, uint64(math.Round(SignalHoldMaxSeconds/dt)))
++}
++
++// SignalDirective is the kernel form of a signal_set verb: which program,
++// which of its phases to hold, and for how long. RequestID is the
++// director-assigned idempotency key (dedup lives in the contract layer;
++// the kernel carries it for the record, exactly like SpawnDirective).
++// HoldTicks is relative to the applied tick — a duration, not an absolute
++// tick, so a controller needs no clock agreement with the run; 0 asks for
++// the default (one cycle of the commanded program). EnqueueSignal stores
++// the EFFECTIVE hold (defaults applied, clamped to the dt-compiled
++// SignalHoldMaxSeconds bound), so the buffered directive and the record
++// are already the bounded command.
++type SignalDirective struct {
++	RequestID string // director-assigned idempotency key
++	Signal    string // signal program id (the network file's tlLogic id)
++	Phase     int    // commanded phase index into the program's phase list
++	HoldTicks uint64 // requested hold from the applied tick; 0 = one program cycle
++}
++
++// TickedSignal is an accepted signal directive with its resolution and
++// applied_tick (parallel to TickedSpawn). It is the record-plane shape:
++// replay re-enqueues the directive at Tick and the override table takes
++// the identical state.
++type TickedSignal struct {
++	Tick      uint64 // tick the engine accepted the directive (applied_tick)
++	SignalIdx int    // resolved index into Network.Signals
++	SignalDirective
++}
++
++// sigOverride is one held command: the program shows Phase's state string
++// for every tick in [Since, Until) — Until is EXCLUSIVE, so the hold spans
++// exactly HoldTicks ticks and the fixed-time program resumes at Until.
++// An entry is RETAINED for the program's clearance window past Until (not
++// enforced, but visible to sigPhaseAt's lookback): sigInClearance reads
++// the phase in force at onset−1, and a hold that ended inside the window
++// must still answer for the ticks it covered. That applies to BOTH ways a
++// hold ends — lapse at its bound, and SUPERSESSION by a newer verb, whose
++// entry keeps the phase it held with Until truncated to the replacement
++// tick: a held amber replaced by a commanded red is an amber→red
++// transition (clearance applies) whatever the fixed schedule was doing,
++// and a held green replaced by red is green→red (no clearance) even if
++// the schedule happened to be amber at onset−1. requestID is audit trail
++// only — it decides nothing, so the CRC does not fold it (the keyframe
++// carries it for record fidelity).
++type sigOverride struct {
++	phase     int
++	since     uint64 // applied_tick; hold starts here
++	until     uint64 // exclusive: first tick this entry no longer governs
++	requestID string
++}
++
++// SigLapse records one held phase reaching its bound during the last Step:
++// the hold ended and the fixed-time program resumed. This is the starvation
++// rail firing — a controller that meant to hold longer has lost the signal —
++// so it is surfaced, never silent: the sim core cannot log (ADR-0005), the
++// run loop edge-logs every lapse, and tests/assertions read the slice.
++// Derived per-tick state — never serialized, not in the CRC (the lapse tick
++// is a pure function of the keyframed override), reused by the next Step
++// exactly like AppliedSpawns.
++type SigLapse struct {
++	Signal    string // program id
++	Phase     int    // the held phase that lapsed
++	Since     uint64 // tick the hold was applied
++	Until     uint64 // tick the fixed-time program resumed (= Since + HoldTicks)
++	RequestID string // the verb that commanded the lapsed hold
++}
++
++// EnqueueSignal validates a signal_set directive and buffers it for
++// application at the next tick boundary. An unknown signal program id or a
++// phase index outside the program's phase list is rejected with a reason
++// and the run is unaffected; a hold past the bound is clamped (the
++// default, HoldTicks == 0, is one cycle of the commanded program — the
++// natural bounded quantum; the resume still follows the fixed-time
++// schedule from the lapse tick, which is back at the phase the schedule
++// was in WHEN THE COMMAND BEGAN, not necessarily the commanded one).
++// Like EnqueueSpawn, it must be called only from the goroutine that owns
++// the engine, between Steps.
++func (e *Engine) EnqueueSignal(d SignalDirective) error {
++	idx := -1
++	for i, p := range e.Net.Signals {
++		if p.ID == d.Signal {
++			idx = i
++			break
++		}
++	}
++	if idx < 0 {
++		return fmt.Errorf("unknown signal program %q", d.Signal)
++	}
++	p := e.Net.Signals[idx]
++	if d.Phase < 0 || d.Phase >= len(p.Phases) {
++		return fmt.Errorf("signal program %q has %d phases; phase %d out of range", d.Signal, len(p.Phases), d.Phase)
++	}
++	hold := d.HoldTicks
++	if hold == 0 {
++		hold = p.cycle
++	}
++	if bound := e.signalHoldMaxTicks(); hold > bound {
++		hold = bound
++	}
++	for _, q := range e.sigNew {
++		if q.RequestID == d.RequestID {
++			return fmt.Errorf("duplicate signal request id %q (already buffered for this boundary)", d.RequestID)
++		}
++	}
++	e.sigNew = append(e.sigNew, TickedSignal{
++		SignalIdx: idx,
++		SignalDirective: SignalDirective{
++			RequestID: d.RequestID,
++			Signal:    d.Signal,
++			Phase:     d.Phase,
++			HoldTicks: hold,
++		},
++	})
++	return nil
++}
++
++// AppliedSignals returns the signal directives that took effect during the
++// last Step (stamped with their applied_tick and effective hold) — the
++// record plane logs exactly these. The slice is reused by the next Step.
++func (e *Engine) AppliedSignals() []TickedSignal { return e.appliedSig }
++
++// LapsedSignals returns the holds that reached their bound during the last
++// Step (the starvation rail firing). The slice is reused by the next Step.
++func (e *Engine) LapsedSignals() []SigLapse { return e.sigLapses }
++
++// stepSignalOverrides runs the commanded-override bookkeeping at the events
++// phase of Step, after the director spawn queue: newly buffered directives
++// are stamped with the current tick and installed in the override table,
++// then lapsed and expired holds are swept. The table maps a program id to
++// its override HISTORY (oldest→newest; the last entry is the one in
++// force): a new verb SUPERSEDES the signal's current override — the
++// outgoing entry's Until truncates to the replacement tick and it is
++// retained for the clearance window exactly like a lapsed one, because
++// sigInClearance's onset−1 lookback must be answered with the phase that
++// was actually in force (see sigOverride). All iteration is over the
++// network's program list in network order and slices in chronological
++// order (the map itself is lookup-only, ADR-0005), so lapse detection and
++// retention are as deterministic as the derivation they feed.
++func (e *Engine) stepSignalOverrides() {
++	e.appliedSig = e.appliedSig[:0]
++	e.sigLapses = e.sigLapses[:0]
++	if len(e.sigNew) > 0 {
++		if e.sigOv == nil {
++			e.sigOv = map[string][]sigOverride{}
++		}
++		for _, d := range e.sigNew {
++			d.Tick = e.Tick
++			p := e.Net.Signals[d.SignalIdx]
++			h := e.sigOv[p.ID]
++			if n := len(h); n > 0 {
++				// Supersede, don't discard. An entry truncated to an empty
++				// interval governed no tick at all (two verbs for one
++				// signal in the same boundary): drop it instead.
++				if h[n-1].until > e.Tick {
++					h[n-1].until = e.Tick
++				}
++				if h[n-1].until <= h[n-1].since {
++					h = h[:n-1]
++				}
++			}
++			e.sigOv[p.ID] = append(h, sigOverride{
++				phase:     d.Phase,
++				since:     e.Tick,
++				until:     e.Tick + d.HoldTicks,
++				requestID: d.RequestID,
++			})
++			e.appliedSig = append(e.appliedSig, d)
++			e.SigLog = append(e.SigLog, d)
++		}
++		e.sigNew = e.sigNew[:0]
++	}
++	if len(e.sigOv) == 0 {
++		return
++	}
++	for _, p := range e.Net.Signals {
++		h, ok := e.sigOv[p.ID]
++		if !ok {
++			continue
++		}
++		// The lapse is a pure function of the keyframed state (Until) of the
++		// CURRENT (newest) entry — a superseded entry ended by replacement,
++		// not by reaching its bound, so it fires no lapse event (the
++		// superseding verb is itself on the record). The event fires on
++		// exactly this tick in the live run, in replay, and after a
++		// mid-hold keyframe restore alike.
++		if last := h[len(h)-1]; e.Tick == last.until {
++			e.sigLapses = append(e.sigLapses, SigLapse{
++				Signal: p.ID, Phase: last.phase, Since: last.since, Until: last.until,
++				RequestID: last.requestID,
++			})
++		}
++		// Retention past Until covers sigPhaseAt's clearance lookback (see
++		// sigOverride): the deepest tick sigInClearance can read at T is
++		// T−clearance−1, so an entry must answer while that reaches into
++		// its held interval — through T == Until+clearance. Past it the
++		// entry decides nothing and leaves the table — and with an empty
++		// table the CRC fold and the keyframe version drop back to the
++		// pre-ADR-0037 shape.
++		kept := h[:0]
++		for _, ov := range h {
++			if e.Tick <= ov.until+p.clearance {
++				kept = append(kept, ov)
++			}
++		}
++		if len(kept) == 0 {
++			delete(e.sigOv, p.ID)
++		} else {
++			e.sigOv[p.ID] = kept
++		}
++	}
++}
+diff --git a/engine/sigctl_test.go b/engine/sigctl_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..5f95c8450359f084446772d5e509136bf7669e09
+--- /dev/null
++++ b/engine/sigctl_test.go
+@@ -0,0 +1,695 @@
++package engine
++
++import (
++	"strings"
++	"testing"
++)
++
++// sigctl_test.go — kernel side of runtime signal control (ADR-0037,
++// milestone 1): the signal_set verb's validation and rails, the override
++// derivation in sigState, determinism under a verb schedule, keyframe
++// restore bit-exactness across a held phase, the keyframe version floor
++// (no-verb runs marshal exactly as before), and the guarantee that a held
++// green still cannot enter a blocked box. Fixtures reuse signal_test.go's
++// compiled-NetFile idiom (sigNetFile/sigSpec); the two-approach junction
++// below is the smallest network with a movement to starve and a cross
++// movement to keep flowing.
++
++// sig2NetFile is a signalized junction J with two independent movements:
++// approach nA_0 feeds internal lane iJ_0 (link 0) draining to exit nX_0,
++// approach nB_0 feeds iJ_1 (link 1) draining to nY_0. No shared exits and
++// no declared foes: the fixture is about queues and holds, not conflicts.
++func sig2NetFile(phases []NetSignalPhase) *NetFile {
++	link0, link1 := 0, 1
++	return &NetFile{
++		Version: 1,
++		Name:    "sig2",
++		Lanes: []NetLane{
++			{ID: "nA_0", Section: "A", Length: 300, SpeedLimit: 13.89, Origin: true, Successors: []string{"iJ_0"}},
++			{ID: "iJ_0", Section: "j:J", Length: 10, SpeedLimit: 13.89, Internal: true, Junction: "J", TL: "J", TLLink: &link0, Successors: []string{"nX_0"}},
++			{ID: "nX_0", Section: "X", Length: 200, SpeedLimit: 13.89, Exit: true},
++			{ID: "nB_0", Section: "B", Length: 300, SpeedLimit: 13.89, Origin: true, Successors: []string{"iJ_1"}},
++			{ID: "iJ_1", Section: "j:J", Length: 10, SpeedLimit: 13.89, Internal: true, Junction: "J", TL: "J", TLLink: &link1, Successors: []string{"nY_0"}},
++			{ID: "nY_0", Section: "Y", Length: 200, SpeedLimit: 13.89, Exit: true},
++		},
++		Signals: []NetSignal{{ID: "J", Junction: "J", Offset: 0, Phases: phases}},
++	}
++}
++
++// laneOf is shared test plumbing (defined alongside the other fixtures);
++// queueOn counts the vehicles standing or rolling on one lane.
++func queueOn(e *Engine, lane *Lane) int {
++	n := 0
++	for _, v := range e.Vehicles() {
++		if v.Lane == lane {
++			n++
++		}
++	}
++	return n
++}
++
++// TestSignalSetValidation: the verb's accept/reject surface — unknown
++// program, phase out of range, the default hold (one cycle), the clamp at
++// the starvation bound, and same-boundary request-id dedup.
++func TestSignalSetValidation(t *testing.T) {
++	nf := sigNetFile([]NetSignalPhase{{1.0, "G"}, {0.3, "y"}, {0.7, "r"}}, 0) // cycle 20 ticks
++	e, err := NewEngine(sigSpec(t, nf, 10))
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if err := e.EnqueueSignal(SignalDirective{RequestID: "x", Signal: "nope", Phase: 0}); err == nil ||
++		!strings.Contains(err.Error(), "unknown signal program") {
++		t.Errorf("unknown program: err = %v", err)
++	}
++	if err := e.EnqueueSignal(SignalDirective{RequestID: "x", Signal: "J", Phase: 3}); err == nil ||
++		!strings.Contains(err.Error(), "out of range") {
++		t.Errorf("phase past the list: err = %v", err)
++	}
++	if err := e.EnqueueSignal(SignalDirective{RequestID: "x", Signal: "J", Phase: -1}); err == nil ||
++		!strings.Contains(err.Error(), "out of range") {
++		t.Errorf("negative phase: err = %v", err)
++	}
++
++	// Default hold: one cycle of the commanded program (20 ticks here).
++	if err := e.EnqueueSignal(SignalDirective{RequestID: "d", Signal: "J", Phase: 2}); err != nil {
++		t.Fatalf("default-hold verb: %v", err)
++	}
++	// Same-boundary duplicate request id rejects (the contract layer dedups
++	// first; this is the kernel's own backstop, EnqueueSpawn's precedent).
++	if err := e.EnqueueSignal(SignalDirective{RequestID: "d", Signal: "J", Phase: 1}); err == nil ||
++		!strings.Contains(err.Error(), "duplicate signal request id") {
++		t.Errorf("same-boundary duplicate: err = %v", err)
++	}
++	// A hold past the bound is clamped, not rejected.
++	if err := e.EnqueueSignal(SignalDirective{RequestID: "c", Signal: "J", Phase: 1, HoldTicks: 1 << 40}); err != nil {
++		t.Fatalf("clamped verb: %v", err)
++	}
++	e.Step()
++	applied := e.AppliedSignals()
++	if len(applied) != 2 {
++		t.Fatalf("%d directives applied, want 2", len(applied))
++	}
++	if applied[0].Tick != 1 || applied[0].HoldTicks != 20 {
++		t.Errorf("default hold: applied tick %d hold %d, want tick 1 hold 20 (one cycle)",
++			applied[0].Tick, applied[0].HoldTicks)
++	}
++	// The clamp bound is SIM seconds compiled onto the run's tick grid:
++	// 300 s at this spec's dt (0.1) is 3000 ticks.
++	maxHold := e.signalHoldMaxTicks()
++	if maxHold != 3000 {
++		t.Fatalf("hold bound at dt 0.1 = %d ticks, want 3000 (300 s)", maxHold)
++	}
++	if applied[1].HoldTicks != maxHold {
++		t.Errorf("clamped hold = %d, want %d", applied[1].HoldTicks, maxHold)
++	}
++	// Two live verbs for the same signal in one boundary: the last wins
++	// (wholesale replacement — and the empty-interval loser is dropped,
++	// having governed no tick), here the clamped phase-1 hold.
++	hist, ok := e.sigOv["J"]
++	if !ok || len(hist) != 1 {
++		t.Fatalf("override history = %v, want exactly one entry (the same-boundary loser governed no tick)", hist)
++	}
++	ov := hist[0]
++	if ov.phase != 1 || ov.since != 1 || ov.until != 1+maxHold {
++		t.Errorf("override = {phase %d, [%d, %d)}, want {phase 1, [1, %d)}",
++			ov.phase, ov.since, ov.until, 1+maxHold)
++	}
++
++	// The bound tracks dt: at dt 0.25 the same 300 sim-seconds is 1200
++	// ticks, and the clamp follows.
++	spec25 := sigSpec(t, nf, 10)
++	spec25.Params.Dt = 0.25
++	e25, err := NewEngine(spec25)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := e25.signalHoldMaxTicks(); got != 1200 {
++		t.Fatalf("hold bound at dt 0.25 = %d ticks, want 1200 (300 s)", got)
++	}
++	if err := e25.EnqueueSignal(SignalDirective{RequestID: "c", Signal: "J", Phase: 0, HoldTicks: 1 << 40}); err != nil {
++		t.Fatal(err)
++	}
++	e25.Step()
++	if got := e25.AppliedSignals()[0].HoldTicks; got != 1200 {
++		t.Errorf("dt 0.25: clamped hold = %d ticks, want 1200", got)
++	}
++}
++
++// TestSignalSetOverridesState: a commanded phase replaces the fixed-time
++// derivation for exactly the hold's span — including through a fixed-time
++// phase change that never shows — and the lapse returns the program to the
++// fixed-time schedule at the tick the schedule itself dictates.
++func TestSignalSetOverridesState(t *testing.T) {
++	// Green [0,100), amber [100,130), red [130,200), wrapping.
++	nf := sigNetFile([]NetSignalPhase{{10.0, "G"}, {3.0, "y"}, {7.0, "r"}}, 0)
++	e, err := NewEngine(sigSpec(t, nf, 0))
++	if err != nil {
++		t.Fatal(err)
++	}
++	l := e.Net.LaneByID("iJ_0")
++
++	// Hold RED from tick 1 for 150 ticks — straight through the fixed-time
++	// green [0,100) of the first full cycle — lapsing at 151, where the
++	// schedule itself sits in red [130,200): the light stays red across the
++	// lapse, so the EVENT is the proof the rail fired.
++	if err := e.EnqueueSignal(SignalDirective{RequestID: "h1", Signal: "J", Phase: 2, HoldTicks: 150}); err != nil {
++		t.Fatal(err)
++	}
++	for e.Tick < 250 {
++		e.Step()
++		switch {
++		case e.Tick >= 1 && e.Tick <= 150:
++			if st := e.sigState(l); st != SigRed {
++				t.Fatalf("tick %d: state %v during hold, want red", e.Tick, st)
++			}
++		case e.Tick == 151:
++			// Lapse: the fixed-time program resumes wherever the tick puts
++			// it — red here, so no visible change; the EVENT is the proof.
++			lapses := e.LapsedSignals()
++			if len(lapses) != 1 || lapses[0].Signal != "J" || lapses[0].Phase != 2 ||
++				lapses[0].Since != 1 || lapses[0].Until != 151 || lapses[0].RequestID != "h1" {
++				t.Fatalf("lapse event = %+v, want one J/phase-2/[1,151)/h1 lapse", lapses)
++			}
++		default:
++			if len(e.LapsedSignals()) != 0 {
++				t.Fatalf("tick %d: unexpected lapse %+v", e.Tick, e.LapsedSignals())
++			}
++		}
++	}
++	// Post-lapse the derivation is the schedule's again: tick 250 is 50
++	// ticks into cycle 2's green [200,300).
++	if st := e.sigState(l); st != SigGreen {
++		t.Errorf("tick %d: state %v after lapse, want green (fixed-time resumed)", e.Tick, st)
++	}
++}
++
++// TestSignalSetDeterminism: two runs with the same verb schedule produce
++// identical per-tick CRCs — the verb's effect is fixed by its applied
++// tick, nothing else — and re-derive the identical lapse events (the
++// record-plane signal_lapse is emitted from exactly these).
++func TestSignalSetDeterminism(t *testing.T) {
++	nf := sig2NetFile([]NetSignalPhase{{30.0, "Gr"}, {30.0, "rG"}})
++	run := func() ([]uint64, []SigLapse) {
++		spec := sigSpec(t, nf, 1200)
++		spec.Scen = Scenario{SpawnRates: map[string]float64{"nA_0": 900, "nB_0": 600}}
++		e, err := NewEngine(spec)
++		if err != nil {
++			t.Fatal(err)
++		}
++		var lapses []SigLapse
++		for e.Tick < spec.Ticks {
++			switch e.Tick {
++			case 4: // applies at tick 5
++				if err := e.EnqueueSignal(SignalDirective{RequestID: "h1", Signal: "J", Phase: 1, HoldTicks: 500}); err != nil {
++					t.Fatal(err)
++				}
++			case 700: // a second command (default hold), applies at 701
++				if err := e.EnqueueSignal(SignalDirective{RequestID: "h2", Signal: "J", Phase: 0}); err != nil {
++					t.Fatal(err)
++				}
++			}
++			e.Step()
++			lapses = append(lapses, e.LapsedSignals()...)
++			assertNoNaN(t, e)
++		}
++		if e.Stats.Collisions != 0 {
++			t.Fatalf("%d collision observations, want 0", e.Stats.Collisions)
++		}
++		return e.CRCs, lapses
++	}
++	a, la := run()
++	b, lb := run()
++	if len(a) != len(b) {
++		t.Fatalf("crc counts %d vs %d", len(a), len(b))
++	}
++	for i := range a {
++		if a[i] != b[i] {
++			t.Fatalf("same schedule diverged at tick %d: crc %016x vs %016x", i+1, a[i], b[i])
++		}
++	}
++	if len(la) != 1 || la[0].Until != 505 { // h1's bound: applied 5 + 500
++		t.Fatalf("lapses = %+v, want the single h1 hold lapsing at 505", la)
++	}
++	if len(la) != len(lb) {
++		t.Fatalf("lapse counts %d vs %d", len(la), len(lb))
++	}
++	for i := range la {
++		if la[i] != lb[i] {
++			t.Fatalf("lapse %d re-derived differently: %+v vs %+v", i, la[i], lb[i])
++		}
++	}
++}
++
++// TestSignalSetKeyframeResume: a keyframe taken mid-hold restores the
++// override bit-exactly (TSKF v7) — the continued run matches the
++// uninterrupted one's CRCs, across the lapse and after. Both flag regimes:
++// a flag-off run holding an override marshals v7 WITHOUT the v6 lane
++// section (the flags word carries presence now), and restores flag-off.
++func TestSignalSetKeyframeResume(t *testing.T) {
++	nf := sig2NetFile([]NetSignalPhase{{30.0, "Gr"}, {30.0, "rG"}})
++	for _, adaptive := range []bool{true, false} {
++		spec := sigSpec(t, nf, 1200)
++		spec.Scen = Scenario{SpawnRates: map[string]float64{"nA_0": 900, "nB_0": 600}}
++		spec.Params.AdaptiveRouting = adaptive
++
++		full, err := NewEngine(spec)
++		if err != nil {
++			t.Fatal(err)
++		}
++		for full.Tick < 4 {
++			full.Step()
++		}
++		if err := full.EnqueueSignal(SignalDirective{RequestID: "h1", Signal: "J", Phase: 1, HoldTicks: 500}); err != nil {
++			t.Fatal(err)
++		}
++		for full.Tick < 250 { // mid-hold (hold spans [5, 505))
++			full.Step()
++		}
++		kf, err := full.MarshalState()
++		if err != nil {
++			t.Fatalf("MarshalState: %v", err)
++		}
++		if ver := keyframeVersionOf(kf); ver != keyframeSignalVersion {
++			t.Fatalf("adaptive=%v: mid-hold keyframe is v%d, want v%d", adaptive, ver, keyframeSignalVersion)
++		}
++		for full.Tick < spec.Ticks {
++			full.Step()
++		}
++
++		restored, err := RestoreState(spec, kf)
++		if err != nil {
++			t.Fatalf("adaptive=%v: RestoreState: %v", adaptive, err)
++		}
++		if got := len(restored.sigOv); got != 1 {
++			t.Fatalf("adaptive=%v: restored with %d overrides, want 1", adaptive, got)
++		}
++		for restored.Tick < spec.Ticks {
++			restored.Step()
++		}
++		if len(restored.CRCs) != len(full.CRCs[250:]) {
++			t.Fatalf("adaptive=%v: restored run has %d CRCs, want %d", adaptive, len(restored.CRCs), len(full.CRCs[250:]))
++		}
++		for i := range restored.CRCs {
++			if restored.CRCs[i] != full.CRCs[250+i] {
++				t.Fatalf("adaptive=%v: post-restore divergence at tick %d: crc %016x, want %016x",
++					adaptive, 251+i, restored.CRCs[i], full.CRCs[250+i])
++			}
++		}
++		// The hold lapsed at 505 in both; the table swept itself after the
++		// clearance retention, so a keyframe past that is back below v7.
++		kf2, err := full.MarshalState()
++		if err != nil {
++			t.Fatal(err)
++		}
++		if ver := keyframeVersionOf(kf2); ver >= keyframeSignalVersion {
++			t.Errorf("adaptive=%v: post-lapse keyframe is v%d, want below v%d (table empty)",
++				adaptive, ver, keyframeSignalVersion)
++		}
++	}
++}
++
++// TestSignalKeyframeVersionFloor: a run that never receives a signal verb
++// marshals at exactly the pre-ADR-0037 version for its state — v2 for a
++// plain flag-off fixture, v6 with adaptive routing on — and a held
++// override is the only thing that lifts a keyframe to v7.
++func TestSignalKeyframeVersionFloor(t *testing.T) {
++	nf := sig2NetFile([]NetSignalPhase{{30.0, "Gr"}, {30.0, "rG"}})
++
++	plain := sigSpec(t, nf, 50)
++	plain.Params.AdaptiveRouting = false
++	e, err := NewEngine(plain)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for e.Tick < 50 {
++		e.Step()
++	}
++	kf, err := e.MarshalState()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if ver := keyframeVersionOf(kf); ver != 2 {
++		t.Errorf("no-verb flag-off keyframe is v%d, want v2 (the pre-ADR-0037 bytes)", ver)
++	}
++
++	adaptive := sigSpec(t, nf, 50) // AdaptiveRouting on by default
++	ea, err := NewEngine(adaptive)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for ea.Tick < 50 {
++		ea.Step()
++	}
++	kfa, err := ea.MarshalState()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if ver := keyframeVersionOf(kfa); ver != keyframeAdaptiveVersion {
++		t.Errorf("no-verb flag-on keyframe is v%d, want v%d", ver, keyframeAdaptiveVersion)
++	}
++}
++
++// TestSignalSetLaneSectionGuard: a v7 payload written flag-ON carries the
++// adaptive lane section and must refuse a flag-OFF restore (the state the
++// run's routing depends on would be silently dropped); a v7 payload
++// written flag-OFF restores flag-ON through the migration notice, exactly
++// like a pre-v6 payload — and with the same dwell-clock seeding: the
++// flag-off run has no ttEMA, so its laneEntryTicks are not keyframed, and
++// the restore seeds every dwell clock at the restore tick ("no evidence
++// yet") rather than importing a pre-restore lane entry that would poison
++// the vehicle's first post-restore dwell sample.
++func TestSignalSetLaneSectionGuard(t *testing.T) {
++	nf := sig2NetFile([]NetSignalPhase{{30.0, "Gr"}, {30.0, "rG"}})
++	mid := func(spec RunSpec) []byte {
++		e, err := NewEngine(spec)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if err := e.EnqueueSignal(SignalDirective{RequestID: "h1", Signal: "J", Phase: 1, HoldTicks: 500}); err != nil {
++			t.Fatal(err)
++		}
++		for e.Tick < 100 {
++			e.Step()
++		}
++		if len(e.Vehicles()) == 0 {
++			t.Fatal("no vehicles live at the keyframe — the dwell-clock assertions are vacuous")
++		}
++		kf, err := e.MarshalState()
++		if err != nil {
++			t.Fatal(err)
++		}
++		if ver := keyframeVersionOf(kf); ver != keyframeSignalVersion {
++			t.Fatalf("mid-hold keyframe is v%d, want v%d", ver, keyframeSignalVersion)
++		}
++		return kf
++	}
++
++	on := sigSpec(t, nf, 0)
++	on.Scen = Scenario{SpawnRates: map[string]float64{"nA_0": 1200, "nB_0": 1200}}
++	off := sigSpec(t, nf, 0)
++	off.Scen = on.Scen
++	off.Params.AdaptiveRouting = false
++
++	if _, err := RestoreState(off, mid(on)); err == nil ||
++		!strings.Contains(err.Error(), "AdaptiveRouting off") {
++		t.Errorf("flag-on v7 into flag-off spec: err = %v, want refusal", err)
++	}
++	e2, err := RestoreState(on, mid(off))
++	if err != nil {
++		t.Fatalf("flag-off v7 into flag-on spec: %v (the ADR-0036 migration path)", err)
++	}
++	if e2.RestoreNotice == "" {
++		t.Error("flag-off v7 into flag-on spec: no RestoreNotice — the regime switch must be loud")
++	}
++	// The flag-off payload carried no dwell clocks: every vehicle's clock
++	// seeds at the restore tick, so its first post-restore dwell sample is
++	// bounded by the post-restore dwell — never a run-long poison sample
++	// from a pre-restore lane entry.
++	for _, v := range e2.Vehicles() {
++		if v.laneEntryTick != 100 {
++			t.Errorf("vehicle %d: laneEntryTick = %d after flag-off→flag-on restore, want the restore tick 100", v.ID, v.laneEntryTick)
++		}
++	}
++	// Control: the flag-ON payload DOES carry the clocks — a flag-on
++	// restore keeps the real (pre-restore) lane entries.
++	e3, err := RestoreState(on, mid(on))
++	if err != nil {
++		t.Fatalf("flag-on v7 into flag-on spec: %v", err)
++	}
++	kept := false
++	for _, v := range e3.Vehicles() {
++		if v.laneEntryTick < 100 {
++			kept = true
++			break
++		}
++	}
++	if !kept {
++		t.Error("flag-on restore seeded every dwell clock at the restore tick — the keyframed laneEntryTicks were dropped")
++	}
++}
++
++// TestSignalSetSupersedeClearanceAmber: a held AMBER superseded by a
++// commanded red is an amber→red transition — the clearance window must
++// apply, answered from the SUPERSEDED override's retained history, not
++// from the fixed schedule (which is mid-green here and would miss it).
++func TestSignalSetSupersedeClearanceAmber(t *testing.T) {
++	// Green [0,100), amber [100,130), red [130,200); clearance 30 ticks.
++	nf := sigNetFile([]NetSignalPhase{{10.0, "G"}, {3.0, "y"}, {7.0, "r"}}, 0)
++	e, err := NewEngine(sigSpec(t, nf, 0))
++	if err != nil {
++		t.Fatal(err)
++	}
++	l := e.Net.LaneByID("iJ_0")
++
++	for e.Tick < 4 {
++		e.Step()
++	}
++	// Hold AMBER from tick 5 — while the fixed schedule is green.
++	if err := e.EnqueueSignal(SignalDirective{RequestID: "hold-amber", Signal: "J", Phase: 1, HoldTicks: 100}); err != nil {
++		t.Fatal(err)
++	}
++	for e.Tick < 10 {
++		e.Step()
++	}
++	// Supersede with RED, applied at tick 11: the amber hold truncates to
++	// [5,11) and the red hold begins.
++	if err := e.EnqueueSignal(SignalDirective{RequestID: "hold-red", Signal: "J", Phase: 2, HoldTicks: 100}); err != nil {
++		t.Fatal(err)
++	}
++	e.Step() // tick 11: the red onset
++	if st := e.sigState(l); st != SigRed {
++		t.Fatalf("tick 11: state %v, want held red", st)
++	}
++	// The red began at 11 directly after a HELD amber — the clearance
++	// window must be open (the fixed schedule's green at onset−1 would
++	// have closed it).
++	if !e.sigInClearance(l) {
++		t.Fatal("tick 11: no clearance after held-amber→red — the superseded amber was dropped from the lookback")
++	}
++	// The superseded entry is retained through the clearance window, fires
++	// no lapse event (it ended by replacement, not by its bound)...
++	if len(e.sigOv["J"]) != 2 {
++		t.Fatalf("tick 11: history has %d entries, want 2 (superseded amber retained)", len(e.sigOv["J"]))
++	}
++	if len(e.LapsedSignals()) != 0 {
++		t.Fatalf("tick 11: lapse %+v for a superseded hold — replacement is not a lapse", e.LapsedSignals())
++	}
++	// ...is still visible mid-window...
++	for e.Tick < 20 {
++		e.Step()
++		if !e.sigInClearance(l) {
++			t.Fatalf("tick %d: clearance closed early (elapsed %d ≤ 30)", e.Tick, e.Tick-11)
++		}
++	}
++	// ...and lapses out of BOTH the window and the table on schedule:
++	// clearance ends 30 ticks after the onset, retention at Until+30 = 41.
++	for e.Tick < 45 {
++		e.Step()
++	}
++	if e.sigInClearance(l) {
++		t.Error("tick 45: clearance still open 34 ticks after the red onset")
++	}
++	if len(e.sigOv["J"]) != 1 {
++		t.Fatalf("tick 45: history has %d entries, want 1 (superseded amber swept past its retention)", len(e.sigOv["J"]))
++	}
++	if st := e.sigState(l); st != SigRed {
++		t.Errorf("tick 45: state %v, want still-held red", st)
++	}
++}
++
++// TestSignalSetSupersedeClearanceGreen: a held GREEN superseded by a
++// commanded red is a green→red transition — NO clearance, even though the
++// fixed schedule happens to be amber at onset−1 (which would grant a
++// spurious one if the lookback fell through to the schedule).
++func TestSignalSetSupersedeClearanceGreen(t *testing.T) {
++	// Green [0,100), amber [100,130), red [130,200).
++	nf := sigNetFile([]NetSignalPhase{{10.0, "G"}, {3.0, "y"}, {7.0, "r"}}, 0)
++	e, err := NewEngine(sigSpec(t, nf, 0))
++	if err != nil {
++		t.Fatal(err)
++	}
++	l := e.Net.LaneByID("iJ_0")
++
++	for e.Tick < 4 {
++		e.Step()
++	}
++	// Hold GREEN from tick 5, through the schedule's own amber [100,130).
++	if err := e.EnqueueSignal(SignalDirective{RequestID: "hold-green", Signal: "J", Phase: 0, HoldTicks: 200}); err != nil {
++		t.Fatal(err)
++	}
++	for e.Tick < 109 {
++		e.Step()
++	}
++	// Supersede with RED, applied at tick 110 — the fixed schedule is amber
++	// at 109, so a lookback that fell through to the schedule would open a
++	// spurious clearance window.
++	if err := e.EnqueueSignal(SignalDirective{RequestID: "hold-red", Signal: "J", Phase: 2, HoldTicks: 50}); err != nil {
++		t.Fatal(err)
++	}
++	e.Step() // tick 110: the red onset
++	if st := e.sigState(l); st != SigRed {
++		t.Fatalf("tick 110: state %v, want held red", st)
++	}
++	for e.Tick < 115 {
++		if e.sigInClearance(l) {
++			t.Fatalf("tick %d: spurious clearance after held-green→red — the lookback read the schedule's amber, not the held green", e.Tick)
++		}
++		e.Step()
++	}
++}
++
++// TestSignalSetLapseClearanceAmber: a held AMBER that lapses while the
++// fixed schedule is already red gets its FULL clearance window from the
++// lapse tick — the displayed amber→red transition happens at the override's
++// until, not at the schedule's historical red onset. The old path measured
++// the window from the schedule onset and closed it 20 ticks early, which
++// can stop a legally committed vehicle.
++func TestSignalSetLapseClearanceAmber(t *testing.T) {
++	// Green [0,100), amber [100,130), red [130,330); clearance 30 ticks.
++	nf := sigNetFile([]NetSignalPhase{{10.0, "G"}, {3.0, "y"}, {20.0, "r"}}, 0)
++	e, err := NewEngine(sigSpec(t, nf, 0))
++	if err != nil {
++		t.Fatal(err)
++	}
++	l := e.Net.LaneByID("iJ_0")
++
++	for e.Tick < 4 {
++		e.Step()
++	}
++	// Hold AMBER [5,150): it lapses at 150, where the fixed schedule has
++	// been red since 130 — the schedule's red onset is 20 ticks BEFORE the
++	// displayed transition.
++	if err := e.EnqueueSignal(SignalDirective{RequestID: "hold-amber", Signal: "J", Phase: 1, HoldTicks: 145}); err != nil {
++		t.Fatal(err)
++	}
++	for e.Tick < 200 {
++		e.Step()
++		switch {
++		case e.Tick >= 5 && e.Tick <= 149:
++			if st := e.sigState(l); st != SigAmber {
++				t.Fatalf("tick %d: state %v during the hold, want amber", e.Tick, st)
++			}
++		case e.Tick == 150:
++			// The lapse: display goes held-amber → schedule-red.
++			if st := e.sigState(l); st != SigRed {
++				t.Fatalf("tick 150: state %v after lapse, want red (fixed-time resumed)", st)
++			}
++			if len(e.LapsedSignals()) != 1 || e.LapsedSignals()[0].Until != 150 {
++				t.Fatalf("tick 150: lapse = %+v, want the amber hold lapsing at 150", e.LapsedSignals())
++			}
++			fallthrough
++		case e.Tick <= 180:
++			// The full window from the LAPSE tick (150..180): the schedule's
++			// red onset (130) must not shorten it — 165 and 180 are past the
++			// window the schedule's onset would give (closes at 160).
++			if !e.sigInClearance(l) {
++				t.Fatalf("tick %d: clearance closed — the window was measured from the schedule's red onset (130), not the lapse (150)", e.Tick)
++			}
++		case e.Tick == 181:
++			if e.sigInClearance(l) {
++				t.Fatal("tick 181: clearance still open 31 ticks after the displayed red onset")
++			}
++		}
++	}
++}
++
++// TestSignalSetLapseClearanceGreen: a held GREEN that lapses onto a
++// schedule whose red began BEFORE the hold started must NOT inherit
++// clearance from the schedule's earlier amber — the displayed transition
++// is green→red at the lapse tick, and the resumed red is absolute for
++// anything the wall can stop.
++func TestSignalSetLapseClearanceGreen(t *testing.T) {
++	// Green [0,100), amber [100,130), red [130,330); clearance 30 ticks.
++	nf := sigNetFile([]NetSignalPhase{{10.0, "G"}, {3.0, "y"}, {20.0, "r"}}, 0)
++	e, err := NewEngine(sigSpec(t, nf, 0))
++	if err != nil {
++		t.Fatal(err)
++	}
++	l := e.Net.LaneByID("iJ_0")
++
++	for e.Tick < 139 {
++		e.Step()
++	}
++	// Hold GREEN [140,151): the fixed schedule turned red at 130 — BEFORE
++	// the hold began — so at the lapse (151) the schedule's red onset is 21
++	// ticks old with its amber right behind it. A lookback that fell
++	// through to the schedule would open a spurious clearance window
++	// (elapsed 21 ≤ 30, prev = schedule amber).
++	if err := e.EnqueueSignal(SignalDirective{RequestID: "hold-green", Signal: "J", Phase: 0, HoldTicks: 11}); err != nil {
++		t.Fatal(err)
++	}
++	for e.Tick < 170 {
++		e.Step()
++		switch {
++		case e.Tick >= 140 && e.Tick <= 150:
++			if st := e.sigState(l); st != SigGreen {
++				t.Fatalf("tick %d: state %v during the hold, want green", e.Tick, st)
++			}
++		case e.Tick == 151:
++			if st := e.sigState(l); st != SigRed {
++				t.Fatalf("tick 151: state %v after lapse, want red (fixed-time resumed)", st)
++			}
++			if len(e.LapsedSignals()) != 1 || e.LapsedSignals()[0].Until != 151 {
++				t.Fatalf("tick 151: lapse = %+v, want the green hold lapsing at 151", e.LapsedSignals())
++			}
++			fallthrough
++		case e.Tick <= 160:
++			// Green→red at the lapse: NO clearance, even though the
++			// schedule's amber [100,130) sits within the window of its own
++			// red onset.
++			if e.sigInClearance(l) {
++				t.Fatalf("tick %d: spurious clearance after held-green→lapse — the window inherited the schedule's amber", e.Tick)
++			}
++		}
++	}
++}
++
++// TestSignalSetHeldGreenBoxBlocked: a controller can extend green, but
++// green never means enter a box you cannot exit — the ADR-0010 box checks
++// gate a held green exactly as they gate a scheduled one. The program here
++// is solid red; ONLY the verb makes the light green, so the verb is
++// load-bearing in both directions.
++func TestSignalSetHeldGreenBoxBlocked(t *testing.T) {
++	// The fixed-time program is solid red for the whole run (its sole green
++	// phase sits past the horizon at [6000,6010)); ONLY the verb makes the
++	// light green, so the verb is load-bearing in both directions.
++	nf := sigNetFile([]NetSignalPhase{{600.0, "r"}, {1.0, "G"}}, 0)
++	nf.Lanes[2] = NetLane{ID: "nX_0", Section: "X", Length: 8, SpeedLimit: 13.89, EndWall: true}
++	e, err := NewEngine(sigSpec(t, nf, 200))
++	if err != nil {
++		t.Fatal(err)
++	}
++	a := laneOf(t, e, "nA_0")
++	iJ0 := laneOf(t, e, "iJ_0")
++	ex := laneOf(t, e, "nX_0")
++	e.AddInitialVehicle(ex, 0, 8, 0, 1) // standing at the wall: 3 m of room < 5+2
++	v := e.AddInitialVehicle(a, 0, 150, 13.89, 1)
++
++	if err := e.EnqueueSignal(SignalDirective{RequestID: "g1", Signal: "J", Phase: 1, HoldTicks: 150}); err != nil {
++		t.Fatal(err)
++	}
++	sawGreen := false
++	for e.Tick < 200 {
++		e.Step()
++		assertNoNaN(t, e)
++		if e.Tick >= 1 && e.Tick <= 150 {
++			if st := e.sigState(iJ0); st != SigGreen {
++				t.Fatalf("tick %d: held phase shows %v, want green (the verb must be in force)", e.Tick, st)
++			}
++			sawGreen = true
++		}
++		if v.Lane == iJ0 {
++			t.Fatalf("tick %d: entered a box whose exit cannot receive it — held green or not", e.Tick)
++		}
++	}
++	if !sawGreen {
++		t.Fatal("the held green never showed — the verb did nothing")
++	}
++	if v.V != 0 {
++		t.Errorf("held vehicle did not brake to a stop (v=%.2f)", v.V)
++	}
++	if e.Stats.Collisions != 0 {
++		t.Errorf("%d collision observations, want 0", e.Stats.Collisions)
++	}
++}
+diff --git a/engine/signal.go b/engine/signal.go
+index f7f31939e92ec9f77c2827e3c2675ae246ebd6a7..54e803a267f7e79ec3fc9f75d21b799865360a39 100644
+--- a/engine/signal.go
++++ b/engine/signal.go
+@@ -37,6 +37,15 @@ import (
+ // algorithms (ADR-0008 §5): a later controller replaces the fixed-time
+ // derivation of the per-approach state (sigState) with commanded states —
+ // the enforcement path below is unchanged.
++//
++// ADR-0037 (milestone 1) builds exactly that seam: sigPhaseAt is the ONE
++// derivation point — a commanded override (sigctl.go) in force for a
++// program returns the commanded phase, anything else the fixed-time
++// schedule — and all three enforcement predicates (sigState, sigPermissive,
++// sigInClearance) read the phase in force through it, so a held command
++// changes WHICH state string is read and nothing about how states are
++// enforced. With no override held, sigPhaseAt IS phaseAtElapsed and the
++// byte stream is the pre-ADR-0037 one.
+ 
+ // SigState is the enforced light state of one signal-controlled approach.
+ type SigState int
+@@ -180,6 +189,28 @@ func mapSigChar(c byte) SigState {
+ 	return SigOff
+ }
+ 
++// sigPhaseAt returns the phase index in force for program p at the given
++// tick and how many ticks ago that phase began: the commanded phase while a
++// signal_set override covers the tick (ADR-0037 — [since, until), onset at
++// the applied tick), otherwise the fixed-time derivation. This is the
++// single point where commanded control enters enforcement; with an empty
++// override table it reduces to phaseAtElapsed exactly. Deterministic:
++// table lookup by program id, then a newest-first scan of that program's
++// short history — the entries' held intervals are disjoint (a superseded
++// entry's Until truncates to the replacement tick, sigctl.go), so at most
++// one covers any tick, including the onset−1 lookbacks into a just-ended
++// hold.
++func (e *Engine) sigPhaseAt(p *SignalProgram, tick uint64) (int, uint64) {
++	if h, ok := e.sigOv[p.ID]; ok {
++		for i := len(h) - 1; i >= 0; i-- {
++			if ov := h[i]; tick >= ov.since && tick < ov.until {
++				return ov.phase, tick - ov.since
++			}
++		}
++	}
++	return p.phaseAtElapsed(tick)
++}
++
+ // sigState returns the light state now in force for the approach served by
+ // the internal lane l (its program's current phase, its link's char).
+ func (e *Engine) sigState(l *Lane) SigState {
+@@ -187,7 +218,8 @@ func (e *Engine) sigState(l *Lane) SigState {
+ 	if p == nil || len(p.phaseTicks) == 0 {
+ 		return SigOff
+ 	}
+-	st := p.Phases[p.phaseAt(e.Tick)].State
++	idx, _ := e.sigPhaseAt(p, e.Tick)
++	st := p.Phases[idx].State
+ 	if l.LinkIdx >= len(st) {
+ 		return SigOff // link without a state char: uncontrolled
+ 	}
+@@ -224,7 +256,8 @@ func (e *Engine) sigPermissive(l *Lane) bool {
+ 	if p == nil || len(p.phaseTicks) == 0 {
+ 		return false
+ 	}
+-	st := p.Phases[p.phaseAt(e.Tick)].State
++	idx, _ := e.sigPhaseAt(p, e.Tick)
++	st := p.Phases[idx].State
+ 	if l.LinkIdx >= len(st) {
+ 		return false
+ 	}
+@@ -237,25 +270,84 @@ func (e *Engine) sigPermissive(l *Lane) bool {
+ // parameter (ADR-0005), never a constant.
+ const clearanceSeconds = 3.0
+ 
++// sigSpanOnset returns the displayed phase at tick x and the onset of the
++// displayed span containing it. While a hold covers x that is the
++// override's applied tick. Otherwise it is the LATER of the fixed-time
++// onset and the most recent override end ≤ x: a lapse (or a supersession)
++// moves the displayed transition to the override's boundary, because that
++// is when the light actually changed — the schedule's historical phase
++// onset may be long past by then, and measuring the clearance window from
++// it would shorten or skip the clearance of an amber held past it (and
++// the symmetric green case). With an empty override table this is
++// phaseAtElapsed's answer exactly.
++func (e *Engine) sigSpanOnset(p *SignalProgram, x uint64) (int, uint64) {
++	if h, ok := e.sigOv[p.ID]; ok {
++		// Newest first: entries are chronological with increasing Untils, so
++		// the first entry ending at or before x is the most recent override
++		// boundary — the lapse the display last followed.
++		for i := len(h) - 1; i >= 0; i-- {
++			ov := h[i]
++			if x >= ov.since && x < ov.until {
++				return ov.phase, ov.since
++			}
++			if ov.until <= x {
++				idx, elapsed := p.phaseAtElapsed(x)
++				if elapsed > x {
++					return idx, 0 // offset wrap before the program's first tick
++				}
++				if fixedOnset := x - elapsed; ov.until > fixedOnset {
++					return idx, ov.until
++				}
++				return idx, x - elapsed
++			}
++		}
++	}
++	idx, elapsed := p.phaseAtElapsed(x)
++	if elapsed > x {
++		return idx, 0
++	}
++	return idx, x - elapsed
++}
++
++// sigDisplayedOnset returns the phase in force at the given tick and the
++// tick the DISPLAY began showing it, merging contiguous spans that show
++// the SAME phase: a hold commanding the phase the display was already in —
++// or a lapse back into it — is no display change, and the displayed
++// transition is wherever the phase last actually changed. The walk is
++// bounded by the clearance window, the only consumer's lookback depth.
++func (e *Engine) sigDisplayedOnset(p *SignalProgram, tick uint64) (int, uint64) {
++	idx, onset := e.sigSpanOnset(p, tick)
++	for onset > 0 && tick-onset <= p.clearance {
++		prevIdx, prevOnset := e.sigSpanOnset(p, onset-1)
++		if prevIdx != idx {
++			break
++		}
++		onset = prevOnset
++	}
++	return idx, onset
++}
++
+ // sigInClearance reports whether the link's red phase began within the
+ // clearance window directly after an amber phase — a real amber→red
+ // transition (never at run start, and never for green→red programs).
+-// Stateless: derived from the program and the tick, so keyframe restore
+-// replays it bit-exactly (no latch to persist).
++// Derived from the program, the tick, and the (keyframed) override table:
++// the onset is the DISPLAYED onset (sigDisplayedOnset) — an override's
++// applied tick while held, the override's until at a lapse — and the phase
++// at onset−1 is read display-aware via sigPhaseAt, so a commanded hold is
++// answered for the ticks it covered and a lapse opens the window at the
++// moment the light actually changed. A keyframe restore replays the window
++// bit-exactly (no latch to persist).
+ func (e *Engine) sigInClearance(l *Lane) bool {
+ 	p := l.Signal
+ 	if p == nil {
+ 		return false
+ 	}
+-	_, elapsed := p.phaseAtElapsed(e.Tick)
+-	if elapsed > p.clearance || e.Tick < elapsed {
+-		return false
+-	}
+-	onset := e.Tick - elapsed
+-	if onset == 0 {
++	_, onset := e.sigDisplayedOnset(p, e.Tick)
++	if onset == 0 || e.Tick-onset > p.clearance {
+ 		return false
+ 	}
+-	prev := p.Phases[p.phaseAt(onset-1)].State
++	prevIdx, _ := e.sigPhaseAt(p, onset-1)
++	prev := p.Phases[prevIdx].State
+ 	if l.LinkIdx >= len(prev) {
+ 		return false
+ 	}

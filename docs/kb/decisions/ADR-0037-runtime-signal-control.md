@@ -357,10 +357,12 @@ left latitude, the implementation chose:
 - **Recorded and deferred from the round-8 review** (nits):
   `sigPhaseAt`'s elapsed return is dead at the sigState/sigPermissive
   call sites (only sigInClearance's onset walk consumes elapsed);
-  the two round-4 contract rejections (over-long request_id, missing
-  phase) fire BEFORE the dedup store, so their retries are not
-  reply-cached the way post-dedup validation rejections are (harmless —
-  the rejection is deterministic and cheap); the run.go lapse-event
+  of the two round-4 contract rejections, only the over-long
+  request_id check fires before the dedup store; the missing-phase
+  rejection is stored, so a retry of that id replays the cached
+  rejection with duplicate: true (harmless — reusing an id for a
+  corrected payload already violates the idempotency-key contract);
+  the run.go lapse-event
   `json.Marshal` error is deliberately unchecked (ContractEvent has no
   unmarshalable fields — same posture as the existing event
   marshals); and LoggedVerbView's per-kind required fields are documented
@@ -375,3 +377,29 @@ left latitude, the implementation chose:
   → its queue grows, the cross movement flows → lapse → the queue
   discharges) passes; replay/player/bake reproduce a signal-verb run
   CRC-exact from the record, including a seek onto a mid-hold keyframe.
+- **Recorded and deferred from the round-10 review** (committed in M1;
+  triaged under the AGENTS.md triage-bar addendum of 2026-08-04):
+  Sol's round-10 blocker — a same-boundary B-then-A verb pair lets the
+  final A inherit a fresh chainStart because chain ancestry is resolved
+  before the empty B interval is dropped, so repeated same-tick
+  multi-verb sequences can bypass the cumulative rail — is deferred:
+  no client exists today, the sequence is outside any controller we
+  plan to run, and the failure mode is a hold continuing as commanded
+  (not wrong simulation behavior, nondeterminism, or record
+  corruption); M2's controller must not rely on the rail covering it,
+  and the fix (resolve chain ancestry after dropping empty
+  intermediates) is queued for the M2 hardening pass. Also deferred:
+  a same-phase renewal one tick after each lapse starts a fresh chain
+  (Kimi question — adversarial-controller policy per the rail-scope
+  paragraph, like alternating phases); math.Round(300/dt) can overshoot
+  the 300-s bound by one grid step when dt does not divide 300 (Sol);
+  requestID is excluded from the CRC fold, so warm-restore
+  idempotency-state divergence is invisible to the determinism oracle
+  (Sol); signal_lapse fires at every hold end, not only rail-clamped
+  bounds — an M2 event-volume design input, since a per-cycle command
+  cadence would emit a per-cycle record event (Kimi); lapse surfacing
+  is confined to RunLive — engine.Run and the cmd harnesses never read
+  SigLapses (Kimi); and nits (markSignalVerbUnenforced's SigLog scan
+  lacks an early exit; ContractEvent Since/Until use omitempty while
+  Phase uses a pointer). Kimi's round-10 review found no blockers and
+  confirmed the earlier deferred lists match the shipped code.
