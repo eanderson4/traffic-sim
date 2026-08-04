@@ -1,13 +1,22 @@
-// splash.ts — controller for the landing page (splash.html): wires the ONE
-// featured card to the LA demo exactly like the demos.html card for it —
-// already-running deep-links straight into the map via deepLinkURL,
-// otherwise a POST to startPath spawns the run and navigates on the {url}
-// response (demos-core.ts; demosrv builds the same shapes). On the public
-// deployment the start POST is admin-gated (ADR-0020): a 401/403 flips the
-// card into a watch-only posture — the CTA routes to the demos menu instead
-// of dead-ending on an error. Everything else on the page is static.
+// splash.ts — controller for the landing page (splash.html). The featured
+// card is BAKED-FIRST (ADR-0023): when BAKED_FEATURED_URL names a published
+// baked replay, the CTA plays it entirely in the browser — no live run, no
+// admin gate, unlimited concurrent viewers. With it empty (no bake published
+// yet) the card falls back to the live-demosrv behavior: running deep-links
+// into the map via deepLinkURL, otherwise a POST to startPath spawns the run
+// (demos-core.ts); a 401/403 (public deploy, ADR-0020) or a registry without
+// the demo flips the card to watch-only and routes to /demos.html.
+// Everything else on the page is static.
 
 import { deepLinkURL, startPath, type DemoInfo, type RunStatus } from "./demos-core.ts";
+
+// Published baked replay URL (phantomjam.com viz + data.phantomjam.com
+// artifact: https://phantomjam.com/?bake=<absolute index.json URL> — the
+// ONLY camera control is the manifest's own frame fit; config.ts parses
+// no center/zoom params). Fill in when the featured bake is uploaded to
+// R2; empty = live-demosrv fallback.
+const BAKED_FEATURED_URL: string = "";
+const baked = BAKED_FEATURED_URL !== "";
 
 // Fallback entry for static previews (no demosrv behind the page); when the
 // registry answers, the live entry for id "la" replaces this wholesale.
@@ -63,22 +72,25 @@ function showError(err: unknown): void {
 }
 
 function render(): void {
-  const running = status.active === demo.id;
+  // Baked mode is fully static: no live-run badge, no registry notices.
+  const running = !baked && status.active === demo.id;
   featured.classList.toggle("running", running);
   badge.hidden = !running;
-  cta.textContent = starting
-    ? "starting…"
-    : running
-      ? "watch it live →"
-      : unregistered || gated
-        ? "browse the demos →"
-        : "launch live demo →";
+  cta.textContent = baked
+    ? "watch the replay →"
+    : starting
+      ? "starting…"
+      : running
+        ? "watch it live →"
+        : unregistered || gated
+          ? "browse the demos →"
+          : "launch live demo →";
 }
 
-// activate mirrors the demos.html card click for LA (demos.ts): the running
-// card deep-links without a start round-trip; otherwise the start POST
-// spawns serve and the response carries the map URL. Two soft landings:
-// unregistered or gated cards route to the demos menu instead of POSTing.
+// activate (live mode only — baked mode never attaches the handler): mirrors
+// the demos.html card click for LA (demos.ts): the running card deep-links
+// without a start round-trip; the start POST spawns serve and the response
+// carries the map URL; unregistered or gated cards route to the demos menu.
 async function activate(): Promise<void> {
   if (starting) return;
   if (status.active === demo.id) {
@@ -111,26 +123,33 @@ async function activate(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  featured.addEventListener("click", (ev) => {
-    ev.preventDefault(); // the href="#" is a button affordance, not a link
-    void activate();
-  });
-  try {
-    const reg = await fetchJSON<{ ws?: string; demos?: DemoInfo[] }>("/api/demos");
-    engineWs = reg.ws;
-    const entry = (reg.demos ?? []).find((d) => d.id === LA.id);
-    if (entry) {
-      demo = entry;
-    } else {
-      unregistered = true;
-      notice.classList.add("info");
-      notice.textContent = "The featured demo isn't in this deployment's registry — browse the demos page instead.";
-      notice.style.display = "block";
+  if (baked) {
+    // A real href, not a JS navigation: middle-click / open-in-new-tab /
+    // copy-link all work, and a JS failure can't dead-end the card. No
+    // live plane to consult — skip the registry/status fetches entirely.
+    featured.setAttribute("href", BAKED_FEATURED_URL);
+  } else {
+    featured.addEventListener("click", (ev) => {
+      ev.preventDefault(); // the href="#" is a button affordance, not a link
+      void activate();
+    });
+    try {
+      const reg = await fetchJSON<{ ws?: string; demos?: DemoInfo[] }>("/api/demos");
+      engineWs = reg.ws;
+      const entry = (reg.demos ?? []).find((d) => d.id === LA.id);
+      if (entry) {
+        demo = entry;
+      } else {
+        unregistered = true;
+        notice.classList.add("info");
+        notice.textContent = "The featured demo isn't in this deployment's registry — browse the demos page instead.";
+        notice.style.display = "block";
+      }
+      status = await fetchJSON<RunStatus>("/api/status");
+    } catch {
+      // No demosrv behind the page (static preview): the card stays clickable
+      // and activation surfaces the real error in the notice box.
     }
-    status = await fetchJSON<RunStatus>("/api/status");
-  } catch {
-    // No demosrv behind the page (static preview): the card stays clickable
-    // and activation surfaces the real error in the notice box.
   }
   render();
 }

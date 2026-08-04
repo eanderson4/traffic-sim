@@ -121,9 +121,12 @@
 
     <section class="wrap">
       <h2>Featured demo</h2>
-      <!-- The LA card is wired by splash.ts: click starts the LA run via
-           demosrv (or deep-links into it when already live) — the same
-           URLs the demos.html card builds (viz/src/demos-core.ts). -->
+      <!-- The featured card is wired by splash.ts, baked-first (ADR-0023):
+           with BAKED_FEATURED_URL set the click plays the published replay
+           in-browser; unset, it starts the LA run via demosrv (or deep-links
+           when already live) — the same URLs demos.html builds
+           (viz/src/demos-core.ts). The initial CTA label is replaced by
+           render() on load. -->
       <a id="featured" href="#">
         <span class="badge" id="featured-badge" hidden>running</span>
         <h3>Los Angeles — full basin</h3>

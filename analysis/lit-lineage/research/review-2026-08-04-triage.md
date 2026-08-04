@@ -87,3 +87,24 @@ Sol:
    our seed-query bias). Sol: the graph reflects OpenAlex coverage,
    metadata, and our choices — not an objective ranking; absence ≠
    proof of neglect.
+
+## Addendum — baked-first splash rounds (same day, later commits)
+
+Round 1 (`2026-08-04T143549-d2f46662-50589-*`): no blockers; both
+reviewers flagged baked mode still rendering live-run state (badge /
+registry notice contradicting the replay CTA) — fixed by skipping the
+registry/status fetches in baked mode. Round 2
+(`2026-08-04T144223-3b6d96f8-51646-*`): Sol clean; Fable no blockers,
+two should-fixes applied verbatim post-round (documented, no third
+round per the one-round bar): the comment's `&center=&zoom=` URL shape
+was wrong (`config.ts` never landed those params — camera comes from
+the manifest frame fit), and baked mode now sets a real `href` instead
+of `href="#"` + JS navigation.
+
+Open question parked from both rounds: publishing a bake currently
+means editing `BAKED_FEATURED_URL` in source → rebuild → review round,
+and ADR-0023's content-hash keys guarantee the URL changes every
+re-bake. Accepted as "too early" (no bake published yet); the escape
+hatch when publishing becomes routine is a `featured.json` on
+data.phantomjam.com (or a stable R2 alias key) the splash fetches, so
+publishing a bake stops being a code change.
