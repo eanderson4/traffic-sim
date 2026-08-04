@@ -28,6 +28,14 @@ import (
 //	per origin lane (spawner order):
 //	  laneIdx u32 | rate f64 | spawnTick u64 | pendID u64 | pendRngDraws u64 |
 //	  pendRngLen u8 | pend rng bytes
+//	v5 only (written solely while some vehicle has a running stuck timer or
+//	a discharged stop duty), appended to each vehicle record:
+//	  stuckTicks u64 | stopDone u8
+//	v6 only (written solely while Params.AdaptiveRouting is on), appended to
+//	each vehicle record after the v5 fields:
+//	  laneEntryTick u64
+//	v6 only, a lane section between the spawner and director sections:
+//	  nLanes u32 | per lane (network order): ttEMA f64 | ttSnap f64
 //	v3 only (written solely while the director queue is non-empty):
 //	  nDirectives u32 | per directive: tick u64 | laneIdx u32 | typeIdx u32 |
 //	  earliestTick u64 | reqIDLen u16 | reqID bytes
@@ -54,7 +62,58 @@ const (
 	// portal spawns still marshals byte-identical v3) appends per directive:
 	//
 	//	destLen u16 | dest bytes | offsetM f64
-	keyframeVersion = 4
+	// v5 appends two per-vehicle fields:
+	//
+	//	stuckTicks u64 | stopDone u8
+	//
+	// Written only when some vehicle needs one of them, so a state with no
+	// timer running and no stop-duty discharged still marshals
+	// byte-identical to v4.
+	//
+	// stuckTicks decides WHETHER A VEHICLE EXISTS: strandStuck removes one
+	// that reaches StrandAfterS. ReplayFromStream and Player.seek both
+	// restore from the latest keyframe at or before their target and then
+	// re-simulate forward verifying every logged CRC, so a timer reset to
+	// zero by the restore strands the vehicle StrandAfterS later than the
+	// recorded run did — and every tick between the two has a vehicle in one
+	// and not the other. That is a CRC divergence and a failed replay, not a
+	// rounding difference.
+	//
+	// stopDone is here for the same reason, arrived at the hard way. It was
+	// left out on the grounds that it is derived state whose worst case is
+	// "the vehicle stops twice" — but under ADR-0029's bit-exact criterion
+	// stopping twice IS the bug. A vehicle that has discharged its stop duty
+	// and is ALREADY MOVING toward the line restores with stopDone=false,
+	// cannot re-satisfy the `V == 0 && dist <= S0+1` test that sets it, and
+	// so must brake to a full stop a second time. That is a different
+	// trajectory from the run being continued. (A vehicle still standing at
+	// the line merely loses one tick — which is also not bit-exact.)
+	// Caught in review; the comment that used to justify the omission was
+	// the reason nobody looked twice.
+	//
+	// v6 (ADR-0036, written ONLY while Params.AdaptiveRouting is on — flag
+	// off keeps the v5/v4/v3 bytes exactly) appends one per-vehicle field
+	// after the v5 fields and a lane section between the spawner and
+	// director sections:
+	//
+	//	per vehicle: laneEntryTick u64
+	//	lanes: nLanes u32 | per lane (network order): ttEMA f64 | ttSnap f64
+	//
+	// Both decide what vehicles DO — the dwell clock feeds the travel-time
+	// samples, the travel times weight the epoch recompute — so both are
+	// keyframed on the stuckTicks precedent: anything that decides behavior
+	// must survive a restore exactly. ttEMA is float64, no quantization.
+	// The next-hop tables and epoch stamps are NOT here: they are derived
+	// state, recomputed identically from tick and keyframed state.
+	keyframeVersion = 6
+	// keyframeAdaptiveVersion is the version the ADR-0036 adaptive-routing
+	// state (laneEntryTick, ttEMA) needs.
+	keyframeAdaptiveVersion = 6
+	// keyframeStuckVersion is the version the stuck timer needs.
+	keyframeStuckVersion = 5
+	// keyframeDestVersion is the version a director queue entry carrying the
+	// ADR-0021 destination/offset fields needs.
+	keyframeDestVersion = 4
 	// keyframeQueueVersion is the version a non-empty director queue needs
 	// when none of its entries use the ADR-0021 fields.
 	keyframeQueueVersion = 3
@@ -73,10 +132,26 @@ func (e *Engine) MarshalState() ([]byte, error) {
 		version = keyframeQueueVersion
 		for _, d := range e.dirQueue {
 			if d.Destination != "" || d.OffsetM != 0 {
-				version = keyframeVersion
+				version = keyframeDestVersion
 				break
 			}
 		}
+	}
+	// Lowest version that can represent this state, same rule as above: a
+	// state with no timer running does not need v5 and stays byte-identical
+	// to what v4 wrote.
+	for _, v := range e.order {
+		if v.stuckTicks > 0 || v.stopDone {
+			version = keyframeStuckVersion
+			break
+		}
+	}
+	// Adaptive routing (ADR-0036) needs v6 unconditionally: ttEMA exists on
+	// every lane from the first tick, so there is no "nothing to record"
+	// state to stay below v6 with. Flag off never reaches this and keeps
+	// the v5/v4/v3 bytes exactly.
+	if e.Params.AdaptiveRouting {
+		version = keyframeAdaptiveVersion
 	}
 	w.u16(version)
 	w.u16(0)
@@ -121,6 +196,17 @@ func (e *Engine) MarshalState() ([]byte, error) {
 		w.u32(uint32(v.Signals))
 		w.u16(uint16(len(v.Route)))
 		w.bytes([]byte(v.Route))
+		if version >= keyframeStuckVersion {
+			w.u64(v.stuckTicks) // ADR-0034
+			if v.stopDone {
+				w.u8(1)
+			} else {
+				w.u8(0)
+			}
+		}
+		if version >= keyframeAdaptiveVersion {
+			w.u64(v.laneEntryTick) // ADR-0036 dwell clock
+		}
 	}
 	if e.spawner != nil {
 		for i := range e.spawner.origins {
@@ -138,10 +224,33 @@ func (e *Engine) MarshalState() ([]byte, error) {
 			w.bytes(rngBytes)
 		}
 	}
-	if len(e.dirQueue) > 0 {
-		// TSKF v3: pending director directives (seek must resume the
-		// injection queue bit-exactly; version stays 2 when empty).
-		w.u32(uint32(len(e.dirQueue)))
+	// TSKF v6 (ADR-0036): the per-lane travel-time EMAs and their
+	// epoch-frozen routing snapshots, in network order. Placed between the
+	// spawner and director sections — the reader is gated on the same
+	// version condition, so the two never disagree. ttSnap is keyframed
+	// for the same reason ttEMA is: it decides what vehicles do, and a
+	// table rebuilt after a restore must be the table the live engine was
+	// serving.
+	if version >= keyframeAdaptiveVersion {
+		w.u32(uint32(len(e.Net.Lanes)))
+		for _, l := range e.Net.Lanes {
+			w.f64(l.ttEMA)
+			w.f64(e.ttSnap[l.Index])
+		}
+	}
+	// TSKF v3+: pending director directives (seek must resume the injection
+	// queue bit-exactly). Gated on the VERSION, not on the queue being
+	// non-empty, because the reader is gated on the version — and since v5
+	// the two are no longer the same condition. A running stuck timer alone
+	// now lifts a state to v5, so a v5 state with an empty queue would leave
+	// the reader taking a count out of bytes that were never written: a short
+	// read that latches r.err, yields n = 0 by accident, and passes only
+	// because this is the last section and nothing re-checks r.err after it.
+	// Writing an explicit 0 keeps writer and reader on the same condition.
+	// v3 and v4 are unaffected — for them version >= 3 still implies a
+	// non-empty queue, so their bytes are unchanged.
+	if version >= keyframeQueueVersion {
+		w.u32(uint32(len(e.dirQueue))) // 0 when empty: writer and reader share one condition
 		for _, d := range e.dirQueue {
 			w.u64(d.Tick)
 			w.u32(uint32(d.LaneIdx))
@@ -149,7 +258,7 @@ func (e *Engine) MarshalState() ([]byte, error) {
 			w.u64(d.EarliestTick)
 			w.u16(uint16(len(d.RequestID)))
 			w.bytes([]byte(d.RequestID))
-			if version >= keyframeVersion {
+			if version >= keyframeDestVersion {
 				w.u16(uint16(len(d.Destination)))
 				w.bytes([]byte(d.Destination))
 				w.f64(d.OffsetM)
@@ -165,6 +274,14 @@ func (e *Engine) MarshalState() ([]byte, error) {
 // keyframe bytes. The spec must be the run's own spec; the keyframe does
 // not duplicate it (the record plane pairs them: run registry ↔ log stream).
 func RestoreState(spec RunSpec, data []byte) (*Engine, error) {
+	return restoreState(spec, data, nil)
+}
+
+// restoreState is RestoreState with an optional guard on the network the
+// spec builds, run after the network exists and BEFORE any keyframe bytes
+// are applied (warm start's network fingerprint — warmstart.go). A guard
+// that rejects yields an error and no engine.
+func restoreState(spec RunSpec, data []byte, checkNet func(*Network) error) (*Engine, error) {
 	r := &byteReader{buf: data}
 	if magic := r.u32(); magic != keyframeMagic {
 		return nil, fmt.Errorf("keyframe: bad magic %#08x", magic)
@@ -188,6 +305,25 @@ func RestoreState(spec RunSpec, data []byte) (*Engine, error) {
 	e, err := NewEngine(spec)
 	if err != nil {
 		return nil, err
+	}
+	// A v6 payload is written only by a flag-ON engine (ADR-0036); reading
+	// one into a flag-OFF spec would silently drop the travel-time state
+	// the run's routing depends on. Refuse the mismatch loudly instead.
+	if ver >= keyframeAdaptiveVersion && !e.Params.AdaptiveRouting {
+		return nil, fmt.Errorf("keyframe: v%d payload carries adaptive-routing state but the spec has AdaptiveRouting off", ver)
+	}
+	// The reverse direction is the designed migration path (ADR-0036: a
+	// pre-v6 payload into a flag-ON spec seeds every dwell clock at the
+	// restore tick), but since the default flipped ON it also fires on a
+	// plain -state-in of an old static keyframe — record it for the edge
+	// caller to surface (the sim core cannot log, ADR-0005).
+	if ver < keyframeAdaptiveVersion && e.Params.AdaptiveRouting {
+		e.RestoreNotice = fmt.Sprintf("keyframe: pre-v%d (static-routing) payload restored into an adaptive-routing spec — routing switches regime at this restore; pin adaptive_routing: false to continue bit-exactly", keyframeAdaptiveVersion)
+	}
+	if checkNet != nil {
+		if err := checkNet(e.Net); err != nil {
+			return nil, err
+		}
 	}
 	if int(nOrigins) != len(e.spawnerOrigins()) {
 		return nil, fmt.Errorf("keyframe: %d origins, spec builds %d", nOrigins, len(e.spawnerOrigins()))
@@ -226,6 +362,20 @@ func RestoreState(spec RunSpec, data []byte) (*Engine, error) {
 		heldTurn := int(int32(r.u32()))
 		signals := int(r.u32())
 		route := string(r.bytesN(int(r.u16())))
+		var stuckTicks uint64
+		var stopDone bool
+		if ver >= keyframeStuckVersion {
+			stuckTicks = r.u64() // ADR-0034
+			stopDone = r.u8() != 0
+		}
+		// A pre-v6 keyframe carries no dwell clock. Restoring one into a
+		// flag-ON spec with laneEntryTick = 0 would make every vehicle's
+		// first departure a capped run-long poison sample; starting the
+		// clock at the restore tick is the honest "no evidence yet".
+		laneEntryTick := tick
+		if ver >= keyframeAdaptiveVersion {
+			laneEntryTick = r.u64() // ADR-0036 dwell clock
+		}
 		if r.err != nil {
 			return nil, fmt.Errorf("keyframe: vehicle %d controller state: %w", i, r.err)
 		}
@@ -244,6 +394,11 @@ func RestoreState(spec RunSpec, data []byte) (*Engine, error) {
 			HeldTurn: heldTurn,
 			Signals:  signals,
 			Route:    route,
+
+			stuckTicks: stuckTicks,
+			stopDone:   stopDone,
+
+			laneEntryTick: laneEntryTick,
 		})
 	}
 	if e.spawner != nil {
@@ -271,11 +426,41 @@ func RestoreState(spec RunSpec, data []byte) (*Engine, error) {
 			st.pend = &Vehicle{ID: pendID, rng: stream}
 		}
 	}
+	// TSKF v6 (ADR-0036): the per-lane travel-time EMAs, in network order,
+	// between the spawner and director sections — writer and reader are
+	// gated on the same version condition, so the two never disagree. The
+	// count must equal the lane count of the network the spec built, or
+	// this keyframe pairs with the wrong spec.
+	if ver >= keyframeAdaptiveVersion {
+		nLanes := r.u32()
+		if r.err != nil {
+			return nil, fmt.Errorf("keyframe: lane count: %w", r.err)
+		}
+		if int(nLanes) != len(e.Net.Lanes) {
+			return nil, fmt.Errorf("keyframe: %d lanes, spec builds %d", nLanes, len(e.Net.Lanes))
+		}
+		for _, l := range e.Net.Lanes {
+			l.ttEMA = r.f64()
+			e.ttSnap[l.Index] = r.f64()
+		}
+		if r.err != nil {
+			return nil, fmt.Errorf("keyframe: lane section: %w", r.err)
+		}
+	}
 	if ver >= 3 {
 		// Pending director directives resume with the queue (their recorded
 		// applied ticks and request ids ride along so the CRC chain and any
 		// later keyframe stay bit-identical to the live run).
 		n := r.u32()
+		// Check the read BEFORE trusting n. A short read here returns 0,
+		// which is indistinguishable from a genuinely empty queue and would
+		// make a truncated or writer/reader-mismatched payload restore
+		// silently as "no pending directives" — the exact failure the v5
+		// version gate could have introduced, and one no later check catches
+		// because this is the last section in the payload.
+		if r.err != nil {
+			return nil, fmt.Errorf("keyframe: director queue count: %w", r.err)
+		}
 		for i := uint32(0); i < n; i++ {
 			d := TickedSpawn{
 				Tick:    r.u64(),
@@ -284,7 +469,7 @@ func RestoreState(spec RunSpec, data []byte) (*Engine, error) {
 			}
 			d.EarliestTick = r.u64()
 			d.RequestID = string(r.bytesN(int(r.u16())))
-			if ver >= keyframeVersion {
+			if ver >= keyframeDestVersion {
 				d.Destination = string(r.bytesN(int(r.u16())))
 				d.OffsetM = r.f64()
 			}

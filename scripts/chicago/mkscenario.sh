@@ -27,10 +27,15 @@ ND="$ROOT/data/networks/$NET"
 mkdir -p "$OUT/demand"
 ln -f "$ND/$NET.json" "$OUT/$NET.json" 2>/dev/null || cp "$ND/$NET.json" "$OUT/$NET.json"
 
+# dt is 0.1 s (ADR-0005), so the horizon in SECONDS is ticks/10 — passed so
+# mkod.py can refuse a demand program the run is too short to execute. The
+# 6,000-tick runs that "looked right" were 10 simulated minutes of a 3-hour
+# profile; without this the mismatch is invisible in every output.
 python3 "$ROOT/scripts/chicago/mkod.py" \
     --buildings "$ND/buildings.json" \
     --network "$ND/$NET.json" \
     --portals "$ND/portals.json" \
+    --horizon-s "$(echo "$TICKS" | awk '{printf "%.1f", $1 / 10}')" \
     --out "$OUT/demand/main.yaml" "$@"
 
 cat > "$OUT/scenario.yaml" <<EOF
@@ -44,6 +49,10 @@ types:
   - truck
 demand:
   - demand/main.yaml
+# Published on the static-routing baseline (docs/show); the engine default
+# is adaptive-on since 2026-07-31 (ADR-0036 addendum).
+params:
+  adaptive_routing: false
 EOF
 
 echo "[mkscenario] $OUT ready ($ID, $TICKS ticks)" >&2

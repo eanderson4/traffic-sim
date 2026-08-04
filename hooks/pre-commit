@@ -55,6 +55,7 @@ matching external-review stamp. Run the gate:
 
   scripts/external-review.sh            # Fable + Sol review the staged diff, then stamp it
   scripts/external-review.sh --gemini   # milestone rounds: include Gemini
+  scripts/external-review.sh --kimi     # Kimi K3 in Fable's slot when Fable is unavailable
 
 Fix what they find, re-stage, re-run, then commit. The stamp binds the
 reviewed tree to its base HEAD: stage first, and anything staged AFTER

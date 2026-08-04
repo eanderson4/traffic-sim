@@ -4,6 +4,9 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>traffic-sim viz</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="alternate icon" type="image/png" href="/favicon-32.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <style>
       /* M6 viz chrome — colors read from CSS variables; the :root defaults
          are the navy palette (theme.ts THEMES.navy) and main.ts overrides
@@ -164,6 +167,131 @@
       #replay .rp-line { margin-top: 4px; font-variant-numeric: tabular-nums; }
       #replay .rp-warn { color: #e5484d; font-weight: 700; }
       #replay .rp-hint { color: #e8b43a; }
+      /* Run statistics — renders a runreport.py --json document
+         (statspanel.ts, ADR-0030 schema v1). Interactive; top-left under
+         #status; hides unless a report loads. Dense on purpose: this is an
+         engineering diagnostic, so numbers are tabular and the two shares
+         (road vs travel) always sit on one scale. */
+      #stats {
+        top: 46px; left: 10px; pointer-events: auto; user-select: none;
+        width: 430px; max-width: calc(100vw - 20px); max-height: calc(100vh - 120px);
+        overflow-y: auto; white-space: normal; font-variant-numeric: tabular-nums;
+      }
+      #stats.sp-drop { outline: 2px dashed var(--t-hud-border); }
+      #stats .sp-toggle { display: flex; gap: 8px; font-weight: 700; letter-spacing: 0.08em; cursor: pointer; }
+      #stats .sp-src { margin-left: auto; max-width: 62%; font-weight: 400; letter-spacing: 0; color: var(--t-text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      #stats .sp-sec { margin-top: 9px; text-transform: uppercase; letter-spacing: 0.12em; font-size: 10px; color: var(--t-text-dim); }
+      #stats .sp-note { margin-top: 2px; font-size: 10px; line-height: 1.35; color: var(--t-text-dim); }
+      #stats .sp-row { display: flex; gap: 10px; font-size: 11px; margin-top: 2px; }
+      #stats .sp-row span:first-child { color: var(--t-text-dim); flex: none; min-width: 74px; }
+      #stats .sp-row span:last-child { margin-left: auto; text-align: right; }
+      #stats .sp-err { margin-top: 5px; color: #e5484d; }
+      #stats .sp-load { display: flex; align-items: center; gap: 5px; margin-top: 5px; }
+      #stats .sp-load input[type="text"] { flex: 1 1 auto; min-width: 0; padding: 1px 4px; color: var(--t-text); background: transparent; border: 1px solid rgba(46, 91, 255, 0.55); border-radius: 3px; font: inherit; }
+      #stats .sp-btn { flex: none; padding: 1px 8px; border: 1px solid rgba(46, 91, 255, 0.55); border-radius: 3px; cursor: pointer; }
+      #stats .sp-btn:hover { background: rgba(46, 91, 255, 0.25); }
+      /* Series key, shared by the distribution blocks and the curve. */
+      #stats .sp-key { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 8px; margin-top: 3px; font-size: 10px; color: var(--t-text-dim); }
+      #stats .sp-key i { display: inline-block; width: 10px; height: 4px; border-radius: 1px; }
+      /* One band row: label, the two bars stacked on a shared scale, and
+         the exact pair "% road / % travel". */
+      #stats .sp-band { display: flex; align-items: center; gap: 6px; margin-top: 2px; font-size: 11px; }
+      #stats .sp-band-l { flex: none; width: 54px; text-align: right; color: var(--t-text-dim); }
+      #stats .sp-band-v { flex: none; width: 82px; text-align: right; }
+      #stats .sp-bars { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+      #stats .sp-bar { height: 4px; border-radius: 1px; }
+      #stats .sp-road { background: #2e5bff; }
+      #stats .sp-vmt { background: #e8b43a; }
+      /* Tables scroll INSIDE their own box: seven nowrap columns are wider
+         than the panel on a long group name, and the panel itself scrolling
+         sideways would take every other block with it. */
+      #stats .sp-tw { overflow-x: auto; }
+      #stats table { width: 100%; border-collapse: collapse; margin-top: 3px; font-size: 10.5px; }
+      #stats th { padding: 1px 2px; text-align: right; white-space: nowrap; font-weight: 400; color: var(--t-text-dim); cursor: pointer; border-bottom: 1px solid rgba(46, 91, 255, 0.4); }
+      #stats th:hover { color: var(--t-text); }
+      #stats th.sp-sorted::after { content: " ▾"; }
+      #stats th.sp-sorted.sp-asc::after { content: " ▴"; }
+      #stats td { padding: 1px 2px; text-align: right; white-space: nowrap; }
+      #stats th:first-child, #stats td:first-child { text-align: left; }
+      #stats td.sp-lane { max-width: 128px; overflow: hidden; text-overflow: ellipsis; }
+      #stats tr.sp-click { cursor: pointer; }
+      #stats tr.sp-click:hover { background: rgba(46, 91, 255, 0.25); }
+      /* Curve: inline SVG built in statspanel.ts (ADR-0003 — no charting
+         library). Colors live here with the rest of the chrome literals;
+         the series classes are the only contract with the TS. */
+      #stats .sp-chart { display: block; width: 100%; height: auto; margin-top: 4px; }
+      #stats .sp-axis { fill: none; stroke: var(--t-text-dim); stroke-width: 0.6; }
+      #stats .sp-tick { fill: var(--t-text-dim); font-size: 7px; font-family: inherit; }
+      #stats .sp-grid { fill: none; stroke: var(--t-text-dim); stroke-width: 0.4; stroke-dasharray: 2 3; opacity: 0.45; }
+      #stats .sp-line { fill: none; stroke-width: 1.4; vector-effect: non-scaling-stroke; }
+      #stats .sp-s-speed { stroke: #2e5bff; }
+      #stats .sp-s-fw_speed { stroke: #1e9e6a; }
+      #stats .sp-s-pct_fwy_over_critical { stroke: #e5484d; stroke-dasharray: 3 2; }
+      #stats circle.sp-dot { stroke: none; }
+      #stats circle.sp-s-speed { fill: #2e5bff; }
+      #stats circle.sp-s-fw_speed { fill: #1e9e6a; }
+      #stats circle.sp-s-pct_fwy_over_critical { fill: #e5484d; }
+      #stats .sp-key i.sp-s-speed { background: #2e5bff; }
+      #stats .sp-key i.sp-s-fw_speed { background: #1e9e6a; }
+      #stats .sp-key i.sp-s-pct_fwy_over_critical { background: #e5484d; }
+      /* Flow — arrivals, departures and accumulation over the run
+         (flowpanel.ts). BOTTOM-LEFT: every other corner is taken (#stats
+         top-left, #legend top-right, #replay bottom-centre, MapLibre's
+         zoom control bottom-right), and this is the one panel read WHILE
+         watching the map, so it must not sit under another. Anchored to
+         the bottom so the charts grow UPWARD as the body expands —
+         top-anchoring would walk the readout off the corner. Hides unless
+         a flow document loads. */
+      #flow {
+        bottom: 10px; left: 10px; pointer-events: auto; user-select: none;
+        width: 300px; max-width: calc(100vw - 20px);
+        white-space: normal; font-variant-numeric: tabular-nums;
+        display: flex; flex-direction: column-reverse;
+      }
+      /* column-reverse puts the charts above the title/readout, so the
+         collapsed panel is a two-line strip in the corner and expanding it
+         does not move those two lines. (The body's own display is toggled
+         inline by flowpanel.ts, so it is not set here.) */
+      #flow .fp-toggle {
+        display: block; font: inherit; color: inherit; background: none; border: 0;
+        padding: 0; font-weight: 700; letter-spacing: 0.08em; cursor: pointer;
+      }
+      #flow .fp-toggle::before { content: "▸ "; }
+      #flow .fp-toggle.fp-open::before { content: "▾ "; }
+      /* The readout stays visible when the body is collapsed: during a demo
+         "4,089 in network · draining" is the whole point, and it should not
+         require the charts to be open. */
+      #flow .fp-readout { color: var(--t-text-dim); margin-top: 2px; }
+      #flow .fp-cards { display: flex; gap: 6px; margin: 6px 0 2px; }
+      #flow .fp-card { flex: 1 1 0; min-width: 0; }
+      #flow .fp-k { color: var(--t-text-dim); font-size: 9px; letter-spacing: 0.06em; text-transform: uppercase; }
+      #flow .fp-v { font-weight: 700; }
+      #flow .fp-sec {
+        margin-top: 7px; color: var(--t-text-dim);
+        font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase;
+      }
+      #flow .fp-svg { display: block; width: 100%; height: auto; overflow: visible; }
+      #flow .fp-grid { stroke: var(--t-hud-border); stroke-width: 0.5; fill: none; }
+      #flow .fp-tick { fill: var(--t-text-dim); font-size: 7px; }
+      #flow .fp-line { fill: none; stroke-width: 1.2; vector-effect: non-scaling-stroke; }
+      #flow .fp-fill { stroke: none; }
+      #flow .fp-now { stroke: var(--t-text); stroke-width: 1; vector-effect: non-scaling-stroke; }
+      #flow .fp-stop {
+        stroke: var(--t-text-dim); stroke-width: 0.6; stroke-dasharray: 2 2;
+        vector-effect: non-scaling-stroke;
+      }
+      #flow .fp-key { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 3px; color: var(--t-text-dim); font-size: 9px; }
+      #flow .fp-key i { width: 7px; height: 7px; border-radius: 1px; align-self: center; }
+      #flow .fp-note { color: var(--t-text-dim); font-size: 9px; margin-top: 2px; }
+      /* One colour per channel, shared by the line and its swatch: blue in,
+         green completed, red every exit incl. strandings, amber accumulation. */
+      #flow .fp-line.fp-s-arr, #flow .fp-key i.fp-s-arr { stroke: #5f8dff; background: #5f8dff; }
+      #flow .fp-line.fp-s-done, #flow .fp-key i.fp-s-done { stroke: #30a46c; background: #30a46c; }
+      #flow .fp-line.fp-s-out, #flow .fp-key i.fp-s-out { stroke: #e5484d; background: #e5484d; }
+      #flow .fp-line.fp-s-strand, #flow .fp-key i.fp-s-strand { stroke: #e5484d; background: #e5484d; }
+      #flow .fp-line.fp-s-net, #flow .fp-key i.fp-s-net { stroke: #e8b43a; background: #e8b43a; }
+      #flow .fp-fill.fp-s-arr { fill: #e8b43a; opacity: 0.10; }
+      #flow .fp-fill.fp-s-net { fill: #e8b43a; opacity: 0.16; }
     </style>
   </head>
   <body>
@@ -174,6 +302,8 @@
     <div id="legend" class="hud"></div>
     <div id="switcher" class="hud"></div>
     <div id="model" class="hud"></div>
+    <div id="stats" class="hud"></div>
+    <div id="flow" class="hud"></div>
     <div id="replay" class="hud"></div>
     <div id="loading"><div class="spin"></div><div id="loading-msg">loading…</div></div>
     <script type="module" src="/src/main.ts"></script>

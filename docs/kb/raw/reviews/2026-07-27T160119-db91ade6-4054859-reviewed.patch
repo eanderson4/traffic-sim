@@ -1,0 +1,765 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index 746953d727e3d5a2402d2ce488396c39511b878e..4d3a7edfd16494755d48b84008fd5767bce15eb0 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -51,6 +51,9 @@ Rules for anyone (human or agent) working in this repo.
+   review always covers what ships. The gate proves review *happened* —
+   triaging findings is the committer's job. Docs/KB-only commits pass
+   ungated. Escape hatch: `EXTERNAL_REVIEW_SKIP=1` (noisy on purpose).
++  When Fable is unavailable (quota, outage), `--kimi` substitutes Kimi K3
++  in its slot — still two model families, and the archive names whoever
++  actually reviewed (ADR-0013 addendum 2026-07-27).
+ - **Triage bar: blockers only, one round.** Fix blockers before
+   committing; record should-fixes in the commit message or KB and defer
+   them; ignore nits. Reviewers will always find one more edge case — at
+diff --git a/docs/kb/decisions/ADR-0013-external-review-gate.md b/docs/kb/decisions/ADR-0013-external-review-gate.md
+index a5c134ee6044cf3ddb346f5a2da759b016f1d87a..ace86abdf70e67656f402cb20dc5aff5f0aa5d69 100644
+--- a/docs/kb/decisions/ADR-0013-external-review-gate.md
++++ b/docs/kb/decisions/ADR-0013-external-review-gate.md
+@@ -116,3 +116,56 @@ letting it accrete in tooling.
+   policy), a reviewer CLI disappears (substitute a model family — keep
+   two families), or the gate starts rubber-stamping (strengthen the
+   completion marker into structured verdicts).
++
++## Addendum 2026-07-27: Kimi K3 as a substitute for Fable
++
++The "revisit when" clause above fired sooner than expected, and for a
++duller reason than a CLI disappearing: **Claude Fable hit a monthly spend
++limit** mid-session and every invocation returned `You've hit your
++monthly spend limit` instead of a review. The gate did exactly what §4
++asks — refused to stamp — which left finished, Sol-reviewed work
++uncommittable. A quota exhaustion is indistinguishable, from the gate's
++side, from the reviewer being gone.
++
++**Decision.** `scripts/external-review.sh --kimi` fills the non-OpenAI
++slot with **Kimi K3** (`kimi -m kimi-code/k3`). This is a *substitution*,
++not a third reviewer: the two-independent-families rule of §2 holds
++(Moonshot + OpenAI), and the round is still two reviews. The default
++remains Fable; the flag is for when Fable cannot answer.
++
++**The archive names the reviewer.** Kimi rounds land as
++`<runid>-kimi-k3.md`, never as `claude-fable.md`. A round covered by the
++substitute must not read, months later, as a round Fable saw — the
++archive is the only durable record of who reviewed what, and mislabelling
++it would be the one failure mode that survives everything else here.
++
++**Kimi gets a read-only checkout, not the live repo.** Fable is confined
++with `--allowedTools` to read-only tools. Kimi has no equivalent flag,
++and it is not theoretical: probed directly, `kimi -p` created a file
++without asking, with no approval prompt in non-interactive mode. So the
++substitute reviewer is pointed at `$work/tree`, a `git archive` checkout
++of the exact staged tree, `chmod -R a-w`. A write reflex fails with
++EACCES in the reviewer's own working directory instead of mutating the
++tree under review — and the drift check that follows would have caught a
++mutation of the *staged* tree anyway, but not one to unstaged files.
++
++This is a **guardrail, not a sandbox**, and the distinction is worth
++keeping honest: nothing stops a determined agent from writing to an
++absolute path elsewhere. It sits inside the same honest-actor boundary as
++the rest of the gate. A side benefit is that the substitute reviews the
++staged tree exactly, rather than the live working tree the other
++reviewers see — the drift the Consequences section lists as an accepted
++limitation does not apply to it.
++
++**Marker leniency.** The completion check now strips a leading indent and
++a leading `• ` before comparing against `REVIEW-COMPLETE`, because that
++is the kimi CLI's own rendering of a message rather than model output
++(kimi indents every line of its final block). Trailing-whitespace
++stripping was already there for the same reason. The fail-closed property
++of §4 is unchanged: substantive length plus the marker as the final
++nonblank line.
++
++**Revisit when:** Fable's quota resets (the default path needs no change
++— just stop passing `--kimi`), or a second reviewer needs the same
++treatment, at which point the slot should become a named list rather than
++a two-valued flag.
+diff --git a/hooks/pre-commit b/hooks/pre-commit
+index 929ee7eb5efc8f182035a3a1e477fe3d6f277b74..d7883c7bd135589fd32ac7b4dc4e31dffc882504 100755
+--- a/hooks/pre-commit
++++ b/hooks/pre-commit
+@@ -55,6 +55,7 @@ matching external-review stamp. Run the gate:
+ 
+   scripts/external-review.sh            # Fable + Sol review the staged diff, then stamp it
+   scripts/external-review.sh --gemini   # milestone rounds: include Gemini
++  scripts/external-review.sh --kimi     # Kimi K3 in Fable's slot when Fable is unavailable
+ 
+ Fix what they find, re-stage, re-run, then commit. The stamp binds the
+ reviewed tree to its base HEAD: stage first, and anything staged AFTER
+diff --git a/scripts/chicago/mkquiz.py b/scripts/chicago/mkquiz.py
+index ac03d9c816e197cfc0a01ca09519e937c27d4f64..8cd59e8e95e33214a043f25f9a1f73e60967f687 100755
+--- a/scripts/chicago/mkquiz.py
++++ b/scripts/chicago/mkquiz.py
+@@ -17,6 +17,7 @@ Self-contained by construction: no CDN, no fetch, no build step. The page
+ has to work on a laptop with flaky conference wifi.
+ """
+ import argparse
++import base64
+ import html
+ import json
+ import os
+@@ -141,7 +142,12 @@ border-color:var(--accent);font-weight:600}
+    changes size between the setup and the options reads as a different one. */
+ #setup{background:var(--card);border:1px solid var(--edge);border-radius:12px;
+ padding:1rem 1.2rem;margin:0 0 1rem;max-width:calc(50% - .5rem)}
+-#setup svg{display:block;width:100%;height:auto}
++#setup svg,#setup img{display:block;width:100%;height:auto}
++.lgnd{display:flex;flex-wrap:wrap;gap:.5rem .9rem;align-items:center;
++margin-top:.6rem;font-size:.78rem;color:var(--dim)}
++.lgnd .sw{display:inline-flex;align-items:center;gap:.3rem}
++.lgnd .sw i{width:.85rem;height:.85rem;border-radius:2px;display:inline-block}
++.lgnd-note{flex-basis:100%;color:var(--dim)}
+ @media (max-width:720px){#setup{max-width:none}}
+ /* Exactly two columns: four options auto-fitted at 1100px wrap 3+1, which
+    reads as a ranking rather than a set of equals. */
+@@ -361,14 +367,94 @@ Neither shape was arranged in advance — the measurement decided it.</p>
+ 
+ 
+ def diagram(root, key, option):
+-    """Inline SVG for one option, or "" when none was generated."""
++    """Inline artwork for one option, or "" when none was generated.
++
++    SVG first, then PNG as a data URI. The two authored pods draw as plan
++    views (mkoptiondiag.py), which are vector and tiny. The Chicago cut
++    cannot be: 55,555 lanes is 10-20 MB of SVG, and the page inlines what it
++    shows. Its setup slide is a rendered congestion map instead
++    (mkcongestionmap.py), ~150 KB of PNG, which base64 inlines to ~200 KB —
++    acceptable for a page that must open on conference wifi with no CDN and
++    no fetch, which an SVG of the same map would not be.
++    """
+     if not root:
+         return ""
+-    path = os.path.join(root, f"{key}__{option}.svg")
+-    if not os.path.exists(path):
+-        return ""
+-    with open(path) as f:
+-        return f.read().strip()
++    svg = os.path.join(root, f"{key}__{option}.svg")
++    if os.path.exists(svg):
++        with open(svg) as f:
++            return f.read().strip()
++    png = os.path.join(root, f"{key}__{option}.png")
++    if os.path.exists(png):
++        with open(png, "rb") as f:
++            b64 = base64.b64encode(f.read()).decode("ascii")
++        alt = (f"{key} network, every lane coloured by its measured speed as "
++               f"a share of its posted limit")
++        out = (f'<img src="data:image/png;base64,{b64}" '
++               f'alt="{html.escape(alt)}">')
++        # A colour map nobody can decode is decoration. The legend and the
++        # provenance ride WITH the picture, from the sidecar the generator
++        # writes — not retyped here, for the same reason no number is.
++        # A PNG with no readable sidecar is a build FAILURE, not a quiet
++        # downgrade to an uncaptioned image. Without it the page would show a
++        # colour map whose bands, measurement window and source run are all
++        # unknown — precisely the "drawing of an opinion" the generator's
++        # banner disclaims, and indistinguishable on screen from a good one.
++        try:
++            with open(png + ".json") as f:
++                prov = json.load(f)
++        except (OSError, ValueError) as exc:
++            sys.exit(f"mkquiz: {png} has no readable provenance sidecar "
++                     f"({png}.json: {exc}). Regenerate it with "
++                     f"scripts/show/mkcongestionmap.py, which writes the "
++                     f"sidecar alongside the image.")
++        if prov.get("lanes_with_traffic") == 0:
++            sys.exit(f"mkquiz: {png} was drawn from a window in which NO lane "
++                     f"carried traffic (sidecar lanes_with_traffic=0) — an "
++                     f"all-empty map reads as a quiet network. Regenerate it "
++                     f"against a window the run actually covers.")
++        swatches, lo = [], 0.0
++        for hi, rgb in prov.get("bands", []):
++            # Non-overlapping and half-open [lo, hi). "under 40%" was
++            # wrong in the other direction — it also contains the under-20%
++            # band, so two swatches claimed the same lane.
++            if hi > 1.0:
++                label = f"{lo:.0%}+"
++            elif lo == 0.0:
++                label = f"under {hi:.0%}"
++            else:
++                label = f"{lo:.0%}\u2013{hi:.0%}"
++            swatches.append(
++                f'<span class="sw"><i style="background:rgb({rgb[0]},{rgb[1]},'
++                f'{rgb[2]})"></i>{label}</span>')
++            lo = hi
++        e = prov.get("empty_rgb")
++        if e:
++            swatches.append(
++                f'<span class="sw"><i style="background:rgb({e[0]},{e[1]},'
++                f'{e[2]})"></i>no traffic</span>')
++        n = prov.get("lanes_with_traffic")
++        tot = prov.get("lanes_drawn")
++        note = "share of each lane\u2019s own posted speed limit"
++        # `is not None`: 0 is the case worth printing loudest, not the case
++        # to hide — though the guard above means it cannot reach here.
++        if n is not None and tot:
++            note += f" \u00b7 {n:,} of {tot:,} lanes carried traffic"
++        # `is not None`, not truthiness: warmup 0 is the case where saying
++        # so matters most, because the fill-up transient is then included.
++        eff = prov.get("first_interval_tick")
++        if eff is None:
++            eff = prov.get("warmup_tick")
++        if eff is not None:
++            note += f" \u00b7 measured from tick {eff:,}"
++        if prov.get("run_label"):
++            note += f" \u00b7 {prov['run_label']}"
++        cav = prov.get("note")
++        extra = (f'<span class="lgnd-note">{html.escape(cav)}</span>'
++                 if cav else "")
++        return (out + '<div class="lgnd">' + "".join(swatches) +
++                f'<span class="lgnd-note">{html.escape(note)}</span>'
++                + extra + '</div>')
++    return ""
+ 
+ 
+ def main():
+@@ -385,9 +471,14 @@ def main():
+                     help="filesystem root the baselines' /baked/... paths "
+                          "resolve against, for that existence check")
+     ap.add_argument("--diagrams", default="",
+-                    help="directory of mkoptiondiag.py SVGs, named "
+-                         "<scenario>__<option>.svg; missing ones are simply "
+-                         "omitted so a scenario can ship text-only")
++                    help="directory of artwork named "
++                         "<scenario>__<option>.svg (mkoptiondiag.py plan "
++                         "views) or <scenario>__<option>.png "
++                         "(mkcongestionmap.py rasters, inlined as data URIs "
++                         "with the legend and provenance from the sidecar "
++                         "<name>.png.json). SVG wins if both exist; missing "
++                         "artwork is simply omitted so a scenario can ship "
++                         "text-only")
+     args = ap.parse_args()
+ 
+     baselines = {}
+diff --git a/scripts/external-review.sh b/scripts/external-review.sh
+index fc4dc907f84f2a6c7adfb22af7599e499c308e9b..53b5724f54d11da9c75153a463763fef96cebace 100755
+--- a/scripts/external-review.sh
++++ b/scripts/external-review.sh
+@@ -8,6 +8,16 @@
+ # Usage:
+ #   scripts/external-review.sh            # review the staged diff
+ #   scripts/external-review.sh --gemini   # also run Gemini (milestone rounds)
++#   scripts/external-review.sh --kimi     # substitute Kimi K3 for Fable
++#
++# --kimi fills the non-OpenAI reviewer slot with Kimi K3 when Fable is
++# unavailable (ADR-0013 addendum 2026-07-27). It preserves the two-family
++# rule; it is a substitution, not a third reviewer, and the archive names
++# the model that actually reviewed. Kimi has no read-only tool mode — in
++# -p mode it creates files without asking — so it is pointed at a
++# read-only checkout of the STAGED tree instead of the live repo. That is
++# a guardrail, not a sandbox: it makes the reflexive write fail loudly in
++# the reviewer's own working directory rather than mutate the repo.
+ #
+ # The stamp binds the index tree hash AND the base HEAD, both captured
+ # BEFORE the reviewers run (byte-complete — covers binaries, renames,
+@@ -21,11 +31,15 @@ gitdir=$(git rev-parse --git-dir) # per-worktree; .git may be a file
+ cd "$root"
+ 
+ with_gemini=0
+-case "${1:-}" in
+-  "") ;;
+-  --gemini) with_gemini=1 ;;
+-  *) echo "usage: external-review.sh [--gemini]" >&2; exit 2 ;;
+-esac
++alt=fable # the non-OpenAI reviewer slot: fable | kimi
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --gemini) with_gemini=1 ;;
++    --kimi) alt=kimi ;;
++    *) echo "usage: external-review.sh [--gemini] [--kimi]" >&2; exit 2 ;;
++  esac
++  shift
++done
+ 
+ if git diff --cached --quiet; then
+   echo "external-review: nothing staged — stage the change under review first" >&2
+@@ -49,7 +63,10 @@ base=$(git rev-parse HEAD)
+ ts=$(date +%Y-%m-%dT%H%M%S)
+ work=$(mktemp -d /tmp/external-review-XXXXXX)
+ keep=0 # failure: keep the workdir for debugging
+-cleanup() { [ "$keep" = 0 ] && rm -rf "$work" || echo "external-review: artifacts kept in $work" >&2; }
++# chmod first: the --kimi tree is checked out read-only (dirs included),
++# and rm cannot unlink out of a directory it cannot write.
++cleanup() { chmod -R u+w "$work" 2>/dev/null || true
++            [ "$keep" = 0 ] && rm -rf "$work" || echo "external-review: artifacts kept in $work" >&2; }
+ trap cleanup EXIT
+ git -c core.quotePath=false diff --cached --binary --full-index --no-ext-diff > "$work/diff.patch"
+ git diff --cached --stat > "$work/diffstat.txt"
+@@ -66,6 +83,10 @@ The exact staged diff is at $work/diff.patch (stat: $work/diffstat.txt).
+ Read the diff first, then whatever repo files you need for context (the
+ patch — not the working tree — is what ships).
+ 
++Your working directory is either the repo itself or a read-only checkout
++of the staged tree; either way it shows the files under review and the
++patch is the authority. Do not attempt to modify anything.
++
+ Report findings cited file:line, ranked: blocker / should-fix / nit /
+ question. Focus: correctness bugs; determinism risks (Go map iteration in
+ sampled paths, non-associative float accumulation, wall clock, RNG
+@@ -77,9 +98,22 @@ EOF
+ 
+ echo "external-review: reviewing $(wc -l < "$work/diffstat.txt") stat lines of staged diff..."
+ 
+-timeout 900 claude -p --model fable --allowedTools "Read,Grep,Glob,Bash(git show:*),Bash(git log:*),Bash(git diff:*),Bash(cat:*),Bash(ls:*)" \
+-  < "$work/brief.md" > "$work/fable.md" 2> "$work/fable.err" &
+-pid_fable=$!
++if [ "$alt" = kimi ]; then
++  # Kimi has no --allowedTools equivalent and writes files unasked in -p
++  # mode, so it reviews a read-only checkout of the exact staged tree
++  # rather than the live repo: same content, and a write attempt fails
++  # with EACCES in its own cwd instead of touching the working tree.
++  # --add-dir grants read access to the patch, which lives outside it.
++  mkdir "$work/tree"
++  git archive --format=tar "$tree" | tar -x -C "$work/tree"
++  chmod -R a-w "$work/tree"
++  ( cd "$work/tree" && exec timeout 900 kimi -m kimi-code/k3 --add-dir "$work" \
++      -p "$(cat "$work/brief.md")" ) > "$work/kimi.md" 2> "$work/kimi.err" &
++else
++  timeout 900 claude -p --model fable --allowedTools "Read,Grep,Glob,Bash(git show:*),Bash(git log:*),Bash(git diff:*),Bash(cat:*),Bash(ls:*)" \
++    < "$work/brief.md" > "$work/fable.md" 2> "$work/fable.err" &
++fi
++pid_alt=$!
+ timeout 900 codex exec -m gpt-5.6-sol --sandbox read-only "$(cat "$work/brief.md")" \
+   > "$work/sol.md" 2> "$work/sol.err" &
+ pid_sol=$!
+@@ -89,18 +123,21 @@ if [ "$with_gemini" = 1 ]; then
+ fi
+ 
+ rc=0
+-wait $pid_fable || rc=1
++wait $pid_alt || rc=1
+ wait $pid_sol || rc=1
+ [ "$with_gemini" = 1 ] && { wait $pid_gemini || rc=1; }
+ 
+-reviewers="fable sol"
++reviewers="$alt sol"
+ [ "$with_gemini" = 1 ] && reviewers="$reviewers gemini"
+ for r in $reviewers; do
+   # Completion = substantive output AND the marker as the final nonblank
+   # line (ADR-0013 §4 fail-closed): a truncated review, an empty one, or
+   # output that merely QUOTED the brief's instruction must not pass.
++  # Leading indent and a leading "• " are stripped first: those are the
++  # CLI's own rendering of a message, not something the model wrote, and
++  # kimi indents every line of its final block.
+   if [ ! -s "$work/$r.md" ] || [ "$(wc -c < "$work/$r.md")" -lt 50 ] || \
+-     [ "$(awk '{sub(/[ \t\r]+$/,"")} NF{last=$0} END{print last}' "$work/$r.md")" != "REVIEW-COMPLETE" ]; then
++     [ "$(awk '{sub(/^[ \t]*(• )?/,""); sub(/[ \t\r]+$/,"")} NF{last=$0} END{print last}' "$work/$r.md")" != "REVIEW-COMPLETE" ]; then
+     echo "external-review: $r did not complete a review (missing terminal marker; see $work/$r.err) — NOT stamping" >&2
+     rc=1
+   fi
+@@ -121,7 +158,13 @@ fi
+ 
+ archive="$root/docs/kb/raw/reviews"
+ mkdir -p "$archive"
+-for f in diff.patch:reviewed.patch diffstat.txt:diffstat.txt brief.md:brief.md fable.md:claude-fable.md sol.md:gpt-5.6-sol.md; do
++# The archive names the model that actually reviewed — a round covered by
++# the substitute must not read later as a round Fable saw.
++case "$alt" in
++  fable) alt_dst=claude-fable.md ;;
++  kimi)  alt_dst=kimi-k3.md ;;
++esac
++for f in diff.patch:reviewed.patch diffstat.txt:diffstat.txt brief.md:brief.md "$alt.md:$alt_dst" sol.md:gpt-5.6-sol.md; do
+   src=${f%%:*}; dst=${f##*:}
+   cp "$work/$src" "$archive/$runid-$dst"
+ done
+@@ -132,7 +175,7 @@ keep=0 # archived and stamped: the workdir is disposable
+ 
+ echo "external-review: reviews + reviewed patch archived to docs/kb/raw/reviews/$runid-*; (base, tree) stamped."
+ echo "(Archive files are untracked — commit them separately; docs-only commits pass the gate.)"
+-echo "--- Fable ---"; cat "$work/fable.md"
++echo "--- ${alt} ---"; cat "$work/$alt.md"
+ echo "--- Sol ---"; cat "$work/sol.md"
+ if [ "$with_gemini" = 1 ]; then echo "--- Gemini ---"; cat "$work/gemini.md"; fi
+ echo "external-review: if the reviews are clean (or findings fixed AND re-staged AND re-run), commit now."
+diff --git a/scripts/show/build-quiz.sh b/scripts/show/build-quiz.sh
+index d1bf5c28d7a09723fd896184b6bf946451af0946..acf98be6dc6d55777c052a7c4e6b067bfe8b9917 100755
+--- a/scripts/show/build-quiz.sh
++++ b/scripts/show/build-quiz.sh
+@@ -45,10 +45,59 @@ python3 scripts/show/mkopenslide.py --pod bottleneck-town \
+     --peers data/pods/bottleneck-town/bypass-north \
+             data/pods/bottleneck-town/connector-south
+ 
+-# The big Chicago cut ships text-only: two of its four options are signal
+-# retimings, and a plan view of a 55,555-lane import at card size is a grey
+-# smear in which a widened Kennedy is invisible. mkquiz.py enforces
+-# all-or-none per scenario, so this is a choice rather than an omission.
++# The big Chicago cut gets no per-OPTION diagrams: two of its four options
++# are signal retimings, and a plan view of a 55,555-lane import at card size
++# is a grey smear in which a widened Kennedy is invisible. mkquiz.py enforces
++# all-or-none per scenario, so that is a choice rather than an omission.
++#
++# Its SETUP slide is a congestion map instead, and it must be regenerated
++# here rather than left lying in $DIAG. A stale PNG under the right filename
++# is indistinguishable from a fresh one, and the first version of this slide
++# was accidentally drawn from a DIFFERENT demand (freeway-scale 3.5) than the
++# numbers beside it — which is exactly the divergence the no-figure-in-two-
++# files rule exists to stop, in picture form.
++#
++# CHI_METRICS must name the -metrics-out of a run of THE SAME DEMAND AND
++# WINDOW the Chicago numbers came from. Not "the run they came from" — there
++# isn't one: the quiz table is 6 seeds x 12,000 ticks, so no single
++# recording is it. What must match is the scenario and the measured window;
++# the sidecar records the digest and label so a reader can check. REQUIRED, not optional, and not defaulted to a path inside data/
++# (which is gitignored): an unset variable used to mean "reuse whatever PNG
++# is lying in $DIAG", which reintroduces the divergence this exists to stop —
++# the quiz numbers regenerate while the map silently keeps describing an
++# older, or entirely different, demand. Fail closed instead, and say what to
++# pass. CHI_SKIP_MAP=1 is the deliberate opt-out (Chicago then ships
++# text-only, which mkquiz handles).
++if [ "${CHI_SKIP_MAP:-}" = "1" ]; then
++    echo "build-quiz: CHI_SKIP_MAP=1 — Chicago ships without a setup map" >&2
++    rm -f "$DIAG/chi-loop-urban__setup.png" "$DIAG/chi-loop-urban__setup.png.json"
++else
++    if [ -z "${CHI_METRICS:-}" ]; then
++        cat >&2 <<'MSG'
++build-quiz: CHI_METRICS is required.
++
++  It must be the -metrics-out file of the run the Chicago quiz numbers came
++  from, so the setup map and the numbers describe the same demand. Passing
++  the wrong run is how the map ended up drawn at freeway-scale 3.5 while the
++  table beside it was measured at the shipped scale.
++
++    CHI_METRICS=<run>.metrics.json scripts/show/build-quiz.sh
++    CHI_SKIP_MAP=1 scripts/show/build-quiz.sh    # text-only Chicago card
++MSG
++        exit 1
++    fi
++    [ -r "$CHI_METRICS" ] || {
++        echo "build-quiz: CHI_METRICS=$CHI_METRICS is not readable" >&2
++        exit 1
++    }
++    python3 scripts/show/mkcongestionmap.py \
++        --network data/networks/chi-loop-urban/chi-loop-urban.json \
++        --metrics "$CHI_METRICS" --warmup-tick "${CHI_WARMUP:-6000}" \
++        --run-label "${CHI_RUN_LABEL:-$(basename "$CHI_METRICS" .metrics.json)}" \
++        --note "${CHI_NOTE:-}" \
++        --width 1400 --out "$DIAG/chi-loop-urban__setup.png"
++fi
++
+ python3 scripts/chicago/mkquiz.py \
+     docs/show/quiz/merge-pod.json \
+     docs/show/quiz/bottleneck-town.json \
+diff --git a/scripts/show/mkcongestionmap.py b/scripts/show/mkcongestionmap.py
+new file mode 100755
+index 0000000000000000000000000000000000000000..48f3e5c5c1cfc156dc6915032d30dc344c6ce751
+--- /dev/null
++++ b/scripts/show/mkcongestionmap.py
+@@ -0,0 +1,319 @@
++#!/usr/bin/env python3
++"""Render a network as a congestion map: every lane coloured by how fast it
++actually ran, drawn from a run's own metrics.
++
++    mkcongestionmap.py --network <net.json> --metrics <metrics.json> \\
++        --out docs/show/img/chi-congestion.png [--warmup-tick N]
++
++WHY THIS EXISTS. The quiz shows a guest four options and asks which one
++helps. For the two authored pods a plan view answers "what am I looking at"
++instantly (mkoptiondiag.py). The Chicago cut had no equivalent, and it is
++the one scenario where the picture carries the argument: 55,555 lanes is not
++a diagram, it is a city, and the thing worth seeing is WHERE it is slow.
++
++DRAWN FROM THE RUN, NEVER HAND-COLOURED. The colour of every lane is its own
++Edie mean speed over the measurement window divided by its posted limit.
++Nothing here decides what "congested" looks like — the run does. A
++hand-tinted map of the Loop would be a drawing of an opinion.
++
++Edie's definition, per lane: sum of distance covered on that lane divided by
++sum of time spent on it, over the intervals after --warmup-tick. That is the
++only defensible way to average a speed over a space-time region, and it is
++the same definition the show's corridor tables use (corridorspeed.py).
++
++TWO DELIBERATE DIVERGENCES FROM corridorspeed.py, because a map is checked
++against those tables and a silent difference would be blamed on the traffic:
++this script drops `partial` intervals (ADR-0014 requires derived tooling to,
++and a truncated window skews a lane's colour) and refuses to sum across
++measurement sets (ADR-0014 permits overlapping sets; summing double-counts
++vehicle-time). corridorspeed.py does neither. The two agree exactly on a
++single-set file with no partials, which is what every current run emits, and
++diverge on anything else — corridorspeed.py is the one carrying the
++exposure. Fixing it there is tracked, not done here.
++
++Lanes with
++no traffic in the window are drawn in the "empty" colour rather than the
++free-flow one: an unused lane is not a fast lane, and colouring it green
++would paint most of a city extract green.
++
++RASTER, NOT SVG, AND THAT IS A SIZE DECISION. A 55k-lane SVG is 10-20 MB and
++the quiz page inlines its diagrams. A PNG of the same map is ~200 KB.
++
++DEPENDENCY NOTE (Pillow). AGENTS.md's "standard library first; justify
++dependencies" is written for the Go engine, but the spirit applies here, so:
++Pillow is the ONLY non-stdlib import in this file, nothing else in the repo
++depends on it, and it is confined to a presentation script that the engine,
++the contract and the A/B harness never import. Rasterising 55k polylines by
++hand into a PPM would avoid it and cost a few hundred lines of pixel-pushing
++that nobody would review carefully. The canonical build tolerates its
++absence: scripts/show/build-quiz.sh takes CHI_SKIP_MAP=1 and mkquiz.py ships
++the Chicago card text-only, so a checkout without Pillow still builds the
++page. If a second consumer ever appears, that is the point to pin it
++properly rather than now.
++
++The warmup cut is not cosmetic. A run starts from an empty network and
++fills; intervals from that period describe a road with nothing on it, so
++including them makes every lane look faster the shorter the run was. Quote
++the tick alongside the picture.
++"""
++import argparse
++import collections
++import hashlib
++import json
++import os
++import sys
++
++try:
++    from PIL import Image, ImageDraw
++except ImportError:
++    sys.exit("mkcongestionmap: needs Pillow (pip install Pillow)")
++
++# Ratio of actual speed to posted limit -> colour, as half-open bands
++# [previous, this). Deliberately coarse and ordered worst-first: the eye
++# should find the jams, not admire a gradient. Five bands because that is
++# about how many a viewer can hold at a glance; the boundaries are round
++# numbers, not calibrated thresholds, and nothing downstream keys off them.
++BANDS = [
++    (0.20, (176, 22, 26)),    # < 20% of limit — stopped
++    (0.40, (214, 78, 32)),    # crawling
++    (0.60, (232, 152, 42)),   # slow
++    (0.80, (206, 200, 62)),   # below limit but moving
++    (10.0, (72, 156, 92)),    # at or above limit
++]
++EMPTY = (48, 54, 62)          # no traffic in the window
++BG = (13, 17, 23)             # matches the quiz page --bg
++
++
++def lane_speeds(metrics_path, warmup_tick, set_id=None):
++    """lane id -> Edie mean speed (m/s) over intervals at/after warmup.
++
++    ONE measurement set only. ADR-0014 allows overlapping sets over the same
++    lanes with different windows; summing across them would count the same
++    vehicle-time twice and quietly bias the colour. If the file carries more
++    than one set the caller must name which, rather than getting a blend.
++
++    The warmup cut drops any interval whose begin_tick is before it, so the
++    effective start is the first interval boundary at or after --warmup-tick,
++    not the tick itself: an aggregate cannot be split after the fact.
++    """
++    with open(metrics_path) as f:
++        doc = json.load(f)
++    intervals = doc.get("intervals") or []
++    sets = {iv.get("set_id") for iv in intervals}
++    if not sets:
++        sys.exit(f"mkcongestionmap: {metrics_path} has no intervals — "
++                 f"the run wrote no measurements to draw")
++    named = sorted(x for x in sets if x)
++    if set_id is None:
++        if len(sets) > 1:
++            # len(sets), not len(named): an unset id is a distinct set for
++            # double-counting purposes even though it has no name to print.
++            sys.exit(f"mkcongestionmap: {metrics_path} carries {len(sets)} "
++                     f"measurement sets (named: {named}); pass --set to pick "
++                     f"one (summing them double-counts vehicle-time)")
++        set_id = next(iter(sets))
++    elif set_id not in sets:
++        sys.exit(f"mkcongestionmap: no set {set_id!r} in {metrics_path} "
++                 f"(has {named})")
++    acc = collections.defaultdict(lambda: [0.0, 0.0])
++    first_used = None
++    for iv in intervals:
++        if iv.get("set_id") != set_id:
++            continue
++        # ADR-0014: derived tooling drops PARTIAL intervals. A partial is a
++        # window the horizon cut short, so its sum_time is truncated while
++        # its sum_dist is whatever happened to be covered — including it
++        # makes a lane's colour depend on where the run stopped.
++        if iv.get("partial"):
++            continue
++        if iv.get("begin_tick", 0) < warmup_tick:
++            continue
++        lid = iv.get("lane_id")
++        if not lid:
++            continue
++        bt = iv.get("begin_tick", 0)
++        if first_used is None or bt < first_used:
++            first_used = bt
++        a = acc[lid]
++        a[0] += iv["sum_dist_m"]
++        a[1] += iv["sum_time_s"]
++    return ({lid: d / t for lid, (d, t) in acc.items() if t > 0},
++            set_id, first_used)
++
++
++def colour_for(speed_ms, limit_ms):
++    if limit_ms <= 0:
++        return EMPTY
++    r = speed_ms / limit_ms
++    for hi, rgb in BANDS:
++        if r < hi:
++            return rgb
++    return BANDS[-1][1]
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--network", required=True)
++    ap.add_argument("--metrics", required=True)
++    ap.add_argument("--out", required=True)
++    ap.add_argument("--warmup-tick", type=int, default=0,
++                    help="drop intervals BEGINNING before this tick; the cut "
++                         "lands on an interval boundary, not on the tick")
++    ap.add_argument("--set", dest="set_id", default=None,
++                    help="measurement set to read when the file has more "
++                         "than one (ADR-0014 allows overlapping sets)")
++    ap.add_argument("--width", type=int, default=1600)
++    ap.add_argument("--margin", type=int, default=12)
++    ap.add_argument("--note", default="",
++                    help="caveat to carry with the picture, e.g. the run's "
++                         "uncontrolled-coasting share. serve prints fidelity "
++                         "figures it does NOT write into -metrics-out, so "
++                         "they cannot be picked up automatically; a map that "
++                         "asserts how fast the city ran should disclose them "
++                         "rather than let the colours imply a clean run.")
++    ap.add_argument("--run-label", default="",
++                    help="human name for the run this map draws (scenario, "
++                         "seed, ticks). The metrics document carries no run "
++                         "identity of its own, so without this the sidecar "
++                         "can only offer a content hash.")
++    ap.add_argument("--min-limit", type=float, default=0.1,
++                    help="ignore lanes with a lower posted limit (m/s)")
++    args = ap.parse_args()
++
++    with open(args.network) as f:
++        net = json.load(f)
++    lanes = net["lanes"]
++    speeds, used_set, first_tick = lane_speeds(
++        args.metrics, args.warmup_tick, args.set_id)
++
++    # Bounds over ALL lane geometry, including lanes later skipped by
++    # --min-limit. Slightly looser framing than strictly necessary, and
++    # deliberately so: the frame then does not shift when the filter does,
++    # so two maps of the same network stay comparable.
++    xs, ys = [], []
++    for ln in lanes:
++        for x, y in ln.get("shape", ()):
++            xs.append(x)
++            ys.append(y)
++    if not xs:
++        sys.exit("mkcongestionmap: network has no lane geometry")
++    minx, maxx, miny, maxy = min(xs), max(xs), min(ys), max(ys)
++    span_x, span_y = maxx - minx, maxy - miny
++    if span_x <= 0 or span_y <= 0:
++        sys.exit("mkcongestionmap: degenerate network bounds")
++
++    W = args.width
++    H = max(1, int(round(W * span_y / span_x)))
++    img = Image.new("RGB", (W + 2 * args.margin, H + 2 * args.margin), BG)
++    dr = ImageDraw.Draw(img)
++    sx = W / span_x
++    sy = H / span_y
++
++    def project(p):
++        # y flips: metric frame is north-up, image rows run downward.
++        return (args.margin + (p[0] - minx) * sx,
++                args.margin + (maxy - p[1]) * sy)
++
++    # Draw the unmeasured network first so measured lanes sit on top of it —
++    # otherwise a busy arterial disappears under the empty side street that
++    # happens to be drawn later.
++    drawn = measured = 0
++    for pas in (False, True):
++        for ln in lanes:
++            shape = ln.get("shape") or ()
++            if len(shape) < 2:
++                continue
++            sp = speeds.get(ln["id"])
++            if (sp is not None) != pas:
++                continue
++            lim = ln.get("speedLimit", 0.0)
++            if lim < args.min_limit:
++                continue
++            col = EMPTY if sp is None else colour_for(sp, lim)
++            dr.line([project(p) for p in shape], fill=col, width=1)
++            drawn += 1
++            if sp is not None:
++                measured += 1
++
++    # FAIL CLOSED on a map with nothing on it. The realistic way to get here
++    # is a --warmup-tick at or past the run's last interval — e.g. the 6,000
++    # default applied to a 6,000-tick file — which yields an all-grey image
++    # that is indistinguishable on screen from a genuinely quiet network. An
++    # empty map under the right filename is the same failure as a stale one.
++    if measured == 0:
++        sys.exit(f"mkcongestionmap: no lane carried traffic at or after tick "
++                 f"{args.warmup_tick} in {args.metrics} (set {used_set!r}) — "
++                 f"every lane would draw empty. Check --warmup-tick against "
++                 f"the run's horizon; refusing to write a blank map.")
++
++    img.save(args.out)
++
++    # Provenance sidecar. A picture that asserts "this is how fast the city
++    # ran" has to be able to say WHICH run, or it is a drawing again — and
++    # the failure is silent, because a stale PNG under the right filename
++    # looks exactly like a fresh one. mkquiz.py reads this to caption the
++    # slide; anything else can diff it to notice drift.
++    # Repo-relative where possible: an absolute path leaks the local
++    # username into a checked-in file and, worse, names a directory that will
++    # not exist for whoever reads it. The digest is what actually identifies
++    # the run — the metrics document itself carries no seed, scenario hash or
++    # run id (engine/metricsjson.go), so a content hash is the only handle.
++    repo = os.path.dirname(os.path.dirname(os.path.dirname(
++        os.path.abspath(__file__))))
++
++    def rel(pth):
++        a = os.path.abspath(pth)
++        if a.startswith(repo + os.sep):
++            return os.path.relpath(a, repo)
++        # Outside the repo (a scratch dir, someone else's checkout): keep the
++        # basename only. The full path would name a directory the reader does
++        # not have AND leak the local username into a checked-in file, while
++        # adding nothing — metrics_sha256 and run_label are what identify the
++        # run.
++        return os.path.basename(a)
++
++    h = hashlib.sha256()
++    with open(args.metrics, "rb") as f:
++        for blk in iter(lambda: f.read(1 << 20), b""):
++            h.update(blk)
++    prov = {
++        "network": rel(args.network),
++        "metrics": rel(args.metrics),
++        "metrics_sha256": h.hexdigest(),
++        "metrics_bytes": os.path.getsize(args.metrics),
++        "run_label": args.run_label,
++        "note": args.note,
++        "set_id": used_set,
++        "warmup_tick": args.warmup_tick,
++        # What was actually measured. The cut lands on an interval boundary,
++        # so the requested tick and the effective one differ whenever the
++        # request falls mid-interval; captioning the request would overstate
++        # precision the aggregate does not have.
++        "first_interval_tick": first_tick,
++        "width": args.width,
++        "lanes_drawn": drawn,
++        "lanes_with_traffic": measured,
++        "bands": [[hi, list(rgb)] for hi, rgb in BANDS],
++        "empty_rgb": list(EMPTY),
++    }
++    with open(args.out + ".json", "w") as f:
++        json.dump(prov, f, indent=2, sort_keys=True)
++        f.write("\n")
++    print(f"[congestion] {drawn} lanes drawn, {measured} carried traffic "
++          f"after tick {args.warmup_tick} -> {args.out} "
++          f"({img.size[0]}x{img.size[1]})", file=sys.stderr)
++
++    # The legend belongs next to the picture wherever it is used, so print
++    # the bands rather than burning them into the raster at a fixed size.
++    lo = 0.0
++    parts = []
++    for hi, rgb in BANDS[:-1]:
++        parts.append(f"{lo:.0%}-{hi:.0%} {rgb}")
++        lo = hi
++    parts.append(f">={lo:.0%} {BANDS[-1][1]}")
++    print("bands (share of posted limit, half-open): " + ", ".join(parts)
++          + f", no traffic {EMPTY}")
++
++
++if __name__ == "__main__":
++    main()

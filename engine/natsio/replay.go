@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"strconv"
 	"strings"
@@ -61,6 +62,15 @@ func MaterializeRunRecord(js nats.JetStreamContext, meta *RunMeta) (*RunRecord, 
 				return nil, err
 			}
 			rec.Log.Intents = append(rec.Log.Intents, k)
+		case SubjectLogIntents(run):
+			// TSLB batch (ADR-0035): the same records the v2 path appends one
+			// at a time, in the same order, so stream order remains the
+			// application order (ADR-0006 §4).
+			ks, err := decodeTSLBMsg(m)
+			if err != nil {
+				return nil, err
+			}
+			rec.Log.Intents = append(rec.Log.Intents, ks...)
 		case SubjectLogVerb(run):
 			s, err := decodeLoggedVerb(m.Data)
 			if err != nil {
@@ -100,6 +110,9 @@ func ReplayFromStream(js nats.JetStreamContext, meta *RunMeta, target uint64) (*
 	e, err := engine.RestoreState(meta.Spec, kf.payload)
 	if err != nil {
 		return nil, fmt.Errorf("restore keyframe tick %d: %w", kf.tick, err)
+	}
+	if e.RestoreNotice != "" {
+		log.Print(e.RestoreNotice)
 	}
 
 	msgs, err := fetchFrom(js, stream, run, kf.seq+1)
@@ -182,6 +195,18 @@ func indexLogMsgs(msgs []*nats.Msg, run string) (*logIndex, error) {
 				return nil, err
 			}
 			idx.intents[k.Tick] = append(idx.intents[k.Tick], k.KeyedIntent)
+		case SubjectLogIntents(run):
+			ks, err := decodeTSLBMsg(m)
+			if err != nil {
+				return nil, err
+			}
+			// Keyed by each record's own tick, exactly as the v2 case is.
+			// decodeTSLBMsg has already refused a batch whose records
+			// disagree with its header tick, so a split tick reassembles in
+			// order.
+			for _, k := range ks {
+				idx.intents[k.Tick] = append(idx.intents[k.Tick], k.KeyedIntent)
+			}
 		case SubjectLogVerb(run):
 			s, err := decodeLoggedVerb(m.Data)
 			if err != nil {
@@ -393,12 +418,53 @@ func msgTick(m *nats.Msg) (uint64, error) {
 	return tick, nil
 }
 
-// decodeLoggedIntent parses the recorder's v2 intent payload (see
-// recorder.go for the layout and flag bits).
+// decodeTSLBMsg decodes one TSLB batch message and cross-checks it against
+// its NATS header: DecodeTSLB verifies the records against the batch's
+// PAYLOAD tick, but readers group and order by the HEADER tick (msgTick),
+// and nothing else ties the two together. A message whose header and
+// payload disagree would otherwise apply or index its records at the wrong
+// tick — every reader goes through here so the check cannot drift between
+// them.
+func decodeTSLBMsg(m *nats.Msg) ([]engine.TickedIntent, error) {
+	ks, err := DecodeTSLB(m.Data)
+	if err != nil {
+		return nil, err
+	}
+	htick, err := msgTick(m)
+	if err != nil {
+		return nil, err
+	}
+	for _, k := range ks {
+		if k.Tick != htick {
+			return nil, fmt.Errorf("TSLB record for tick %d in a message headed tick %d", k.Tick, htick)
+		}
+	}
+	return ks, nil
+}
+
+// decodeLoggedIntent parses one whole v2 intent message (see recorder.go for
+// the layout and flag bits). The payload must be consumed EXACTLY: a message
+// carrying one record and nothing else is the v2 contract, and trailing bytes
+// mean the payload is not what this decoder thinks it is.
 func decodeLoggedIntent(data []byte) (engine.TickedIntent, error) {
+	out, n, err := decodeLoggedIntentAt(data)
+	if err != nil {
+		return out, err
+	}
+	if n != len(data) {
+		return out, fmt.Errorf("logged intent: %d trailing bytes after the record", len(data)-n)
+	}
+	return out, nil
+}
+
+// decodeLoggedIntentAt parses the v2 record at the front of data and returns
+// it with the number of bytes it consumed, leaving anything after it alone.
+// Shared with the TSLB batch reader (ADR-0035) so both log forms decode
+// through one implementation — the records are byte-identical.
+func decodeLoggedIntentAt(data []byte) (engine.TickedIntent, int, error) {
 	var out engine.TickedIntent
 	if len(data) < 8+8+2 {
-		return out, fmt.Errorf("logged intent: %d bytes, too short", len(data))
+		return out, 0, fmt.Errorf("logged intent: %d bytes, too short", len(data))
 	}
 	out.Tick = binary.LittleEndian.Uint64(data[0:])
 	out.Seq = binary.LittleEndian.Uint64(data[8:])
@@ -406,7 +472,7 @@ func decodeLoggedIntent(data []byte) (engine.TickedIntent, error) {
 	rest := data[18:]
 	const fixed = 8 + 4 + 4 + 8 + 8 + 4 + 4 + 1 + 2 // through route_len
 	if len(rest) < ctlLen+fixed {
-		return out, fmt.Errorf("logged intent: %d payload bytes, want at least %d", len(data), 18+ctlLen+fixed)
+		return out, 0, fmt.Errorf("logged intent: %d payload bytes, want at least %d", len(data), 18+ctlLen+fixed)
 	}
 	out.Controller = string(rest[:ctlLen])
 	rest = rest[ctlLen:]
@@ -420,9 +486,11 @@ func decodeLoggedIntent(data []byte) (engine.TickedIntent, error) {
 	out.Grant = rest[40]
 	routeLen := int(binary.LittleEndian.Uint16(rest[41:]))
 	rest = rest[43:]
-	if len(rest) != routeLen {
-		return out, fmt.Errorf("logged intent: route_len %d, %d bytes remain", routeLen, len(rest))
+	if len(rest) < routeLen {
+		return out, 0, fmt.Errorf("logged intent: route_len %d, only %d bytes remain", routeLen, len(rest))
 	}
+	rest = rest[:routeLen]
+	used := 18 + ctlLen + fixed + routeLen
 	out.Intent.AccelSet = flags&intentFlagAccelSet != 0
 	out.Intent.SpeedSet = flags&intentFlagSpeedSet != 0
 	out.Intent.SignalSet = flags&intentFlagSignalSet != 0
@@ -433,7 +501,7 @@ func decodeLoggedIntent(data []byte) (engine.TickedIntent, error) {
 	}
 	out.Held = flags&logFlagHeld != 0
 	out.Superseded = flags&logFlagSuperseded != 0
-	return out, nil
+	return out, used, nil
 }
 
 func decodeLoggedCRC(data []byte) (uint64, error) {

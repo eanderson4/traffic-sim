@@ -327,6 +327,11 @@ func (e *Engine) PolicyContext(v *Vehicle) *PolicyCtx {
 // the ego. The follower's own leader is resolved with the ego excluded — for
 // the current-lane follower that is precisely the leader it keeps after the
 // ego departs; on other lanes the ego never leads the follower anyway.
+//
+// Excluded and perspective differ here, which is why this takes leaderAtFor:
+// the ego is what to skip, but the branch to look down is the FOLLOWER's
+// (ADR-0032). Reading the ego's route here would judge the follower by where
+// the ego is going.
 func (e *Engine) followerCtx(f *Vehicle, lane *Lane, ego *Vehicle, gap float64) FollowerCtx {
 	return FollowerCtx{
 		OK:          true,
@@ -339,7 +344,7 @@ func (e *Engine) followerCtx(f *Vehicle, lane *Lane, ego *Vehicle, gap float64) 
 		LaneLimit:   lane.SpeedLimit,
 		LaneLen:     lane.Length,
 		LaneEndWall: lane.EndWall,
-		Lead:        e.leaderAt(lane, f.S, ego),
+		Lead:        e.leaderAtFor(lane, f.S, ego, f),
 	}
 }
 

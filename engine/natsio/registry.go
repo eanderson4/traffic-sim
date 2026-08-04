@@ -69,14 +69,20 @@ func NewRegistry(js nats.JetStreamContext) (*Registry, error) {
 	return &Registry{kv: kv}, nil
 }
 
-// Start writes the initial {run}/meta (status running).
-func (r *Registry) Start(run string, spec engine.RunSpec) error {
+// Start writes the initial {run}/meta (status running). startedTick is the
+// tick the run BEGINS at — 0 for a cold run, the restored tick for a warm
+// start (ADR-0029). It used to be hard-coded 0, which published a false
+// start tick on the metadata plane for every warm-started run: the engine,
+// the attach hello and the initial keyframe all said one tick and the
+// registry said another. Callers pass e.Tick, which is authoritative for
+// both cases.
+func (r *Registry) Start(run string, spec engine.RunSpec, startedTick uint64) error {
 	meta := RunMeta{
 		RunID:       run,
 		Spec:        spec,
 		SchemaVer:   SchemaVersion,
 		Status:      StatusRunning,
-		StartedTick: 0,
+		StartedTick: startedTick,
 		CreatedUnix: time.Now().Unix(),
 	}
 	return r.putMeta(&meta)

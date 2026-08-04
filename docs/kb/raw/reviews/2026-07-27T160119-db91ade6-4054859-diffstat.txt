@@ -1,0 +1,8 @@
+ AGENTS.md                                          |   3 +
+ docs/kb/decisions/ADR-0013-external-review-gate.md |  53 ++++
+ hooks/pre-commit                                   |   1 +
+ scripts/chicago/mkquiz.py                          | 111 ++++++-
+ scripts/external-review.sh                         |  71 ++++-
+ scripts/show/build-quiz.sh                         |  57 +++-
+ scripts/show/mkcongestionmap.py                    | 319 +++++++++++++++++++++
+ 7 files changed, 587 insertions(+), 28 deletions(-)

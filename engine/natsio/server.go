@@ -79,8 +79,13 @@ const (
 	Namespace = "ts"
 	// SchemaVersion is the wire-format version stamped on every message
 	// header and negotiated in the attach hello. Version 2 (M4): the
-	// 4-axis intent frame, observation frames, contract events, and
-	// TSKF keyframe v2 (ADR-0008).
+	// 4-axis intent frame, observation frames, and contract events
+	// (ADR-0008).
+	//
+	// This does NOT track the TSKF keyframe version, which moves on its own
+	// (v5 as of ADR-0034) and is negotiated per payload by its own version
+	// byte, not by this header. The two were the same number at M4 and the
+	// comment used to say "TSKF keyframe v2", which has been wrong since v3.
 	SchemaVersion = 2
 )
 
@@ -164,7 +169,17 @@ func SubjectEventPause(run string) string { return Namespace + "." + run + ".ctl
 func SubjectDriveIntrospect(run string) string { return Namespace + "." + run + ".drive.introspect" }
 
 // Record-plane subjects (engine sole writer): ts.{run}.log.{intent,keyframe,crc,event,verb}.
-func SubjectLogIntent(run string) string   { return Namespace + "." + run + ".log.intent" }
+func SubjectLogIntent(run string) string { return Namespace + "." + run + ".log.intent" }
+
+// SubjectLogIntents carries TSLB batches: one tick's applied intents in one
+// message (ADR-0035). A NEW subject rather than a new payload shape on
+// log.intent, so old and new recordings are told apart by the subject the
+// broker already delivers instead of by sniffing a magic number that could
+// collide with a v2 record's leading applied_tick. Additive: SubjectLogAll
+// (ts.{run}.log.>) already captures it, so the stream config is unchanged,
+// and a v2 recording keeps replaying through the log.intent path untouched.
+func SubjectLogIntents(run string) string { return Namespace + "." + run + ".log.intents" }
+
 func SubjectLogKeyframe(run string) string { return Namespace + "." + run + ".log.keyframe" }
 func SubjectLogCRC(run string) string      { return Namespace + "." + run + ".log.crc" }
 func SubjectLogEvent(run string) string    { return Namespace + "." + run + ".log.event" }

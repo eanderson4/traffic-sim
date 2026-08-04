@@ -49,6 +49,11 @@ import (
 // is real physics, while the failure this guards against lost 84%.
 const demandDeliveryWarn = 0.95
 
+// natsMaxPayload is the embedded broker's per-message cap. Named because
+// two places depend on it: the server option below, and the end-of-run
+// diagnosis that derives the observation-frame ego ceiling from it.
+const natsMaxPayload = 4 << 20
+
 // coastWarn is the share of vehicle-ticks running with no controller intent
 // above which the run's physics are the controller's latency, not the
 // network's capacity. Deliberately low: hold-last already covers ordinary
@@ -86,7 +91,17 @@ func main() {
 		"longitudinal safety gate: max emergency deceleration (m/s²) the kernel "+
 			"applies to keep any vehicle out of its leader, capping every control "+
 			"path the way the right-of-way gate does; 0 disables it")
-	intentLog := flag.Bool("intent-log", true, "retain the engine's whole-run in-memory intent log; -intent-log=false drops it for long headless runs (the durable JetStream record and replay are unaffected — only the in-memory RunLog is lost)")
+	adaptiveRouting := flag.Bool("adaptive-routing", true,
+		"congestion-adaptive route resolution (ADR-0036, engine default ON), -netfile runs only: "+
+			"with -scenario the manifest's content-hashed adaptive_routing pin owns this and an explicit flag is rejected. "+
+			"Pass -adaptive-routing=false when warm-starting (-state-in) a pre-v6 static-routing state whose continuation must stay bit-exact")
+	stateOut := flag.String("state-out", "", "write the engine's full state to this file at -state-at, plus FILE.meta.json binding it to this network; the run CONTINUES after the dump (ADR-0029 phase 1)")
+	stateAt := flag.Uint64("state-at", 0, "tick at which -state-out writes the state file (required with -state-out, and only with it)")
+	stateIn := flag.String("state-in", "", "warm-start from a state file written by -state-out: the run begins at that state's tick with that state instead of an empty network at tick 0. -ticks stays ABSOLUTE, so a state at tick 20000 with -ticks 54000 simulates the remaining 34000. Refuses a state saved against a different network (lane fingerprint), and refuses a missing sidecar")
+	stateReseed := flag.Bool("state-reseed", false, "allow -state-in when the run's seed differs from the seed the state was saved under. Off by default: the continuation draws from the RUN's seed, so a mismatch splices two different deterministic programs. Set this when that is what you want (same state, different draws)")
+	intentLog := flag.Bool("intent-log", true, "retain the engine's whole-run in-memory intent log; -intent-log=false drops it for long headless runs (the durable JetStream record and replay are unaffected — only the in-memory RunLog is lost). A 54,000-tick chi-loop-urban run at ~5,900 vehicles is ~225M retained intents and was OOM-killed at tick 38,200 on a 123 GB machine, so this is a requirement at that horizon rather than a tuning knob")
+	logBatch := flag.Bool("log-batch", true, "record each tick's applied intents as ONE TSLB batch message on ts.{run}.log.intents (ADR-0035) instead of one message per intent on ts.{run}.log.intent. Off restores the pre-ADR-0035 record plane, for A/B measurement and for writing a recording an older reader can consume; replay reads either form")
+	storeCompress := flag.Bool("store-compress", true, "S2-compress the recording stream's file storage (ADR-0035). Storage-layer only: payloads and every reader are unchanged. Off if the write-side CPU cost ever matters more than the bytes")
 	flag.Parse()
 
 	if *scenarioDir != "" && *netfile != "" {
@@ -124,11 +139,13 @@ func main() {
 	if *scenarioDir != "" {
 		// The scenario owns network, demand, and the type list; the
 		// deliberate sweep overrides (-seed/-ticks) are the only flags
-		// allowed beside it.
+		// allowed beside it. adaptive_routing joins the owned set: it is
+		// part of the manifest's content hash (ADR-0012), so a CLI
+		// override would put two trajectories under one (hash, seed).
 		conflicting := []string{}
 		flag.Visit(func(f *flag.Flag) {
 			switch f.Name {
-			case "rate", "density", "types":
+			case "rate", "density", "types", "adaptive-routing":
 				conflicting = append(conflicting, "-"+f.Name)
 			}
 		})
@@ -202,6 +219,79 @@ func main() {
 	}
 	spec.Params.SafetyDecel = *safetyDecel
 
+	// Warm start and state dump (ADR-0029 phase 1). The state file is read
+	// here — before the broker, the store and the embedded clients — so a
+	// missing sidecar or a state from another network costs nothing but the
+	// message that says so.
+	stateAtSet := false
+	adaptiveSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "state-at" {
+			stateAtSet = true
+		}
+		if f.Name == "adaptive-routing" {
+			adaptiveSet = true
+		}
+	})
+	// Adaptive routing (ADR-0036; default ON since the 2026-07-31 flip).
+	// -netfile runs only: with -scenario the manifest owns the flag (it is
+	// content-hashed, ADR-0012) and an explicit -adaptive-routing is
+	// rejected above. -adaptive-routing=false is the netfile path's opt-out
+	// and the warm-start continuation pin for pre-v6 state files.
+	if adaptiveSet {
+		spec.Params.AdaptiveRouting = *adaptiveRouting
+	}
+	var initialState []byte
+	var initialMeta *engine.StateMeta
+	if *stateIn != "" {
+		data, meta, err := engine.LoadState(*stateIn)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "serve:", err)
+			os.Exit(1)
+		}
+		initialState, initialMeta = data, meta
+	}
+	startTick := uint64(0)
+	inSeed := uint64(0)
+	if initialMeta != nil {
+		startTick = initialMeta.Tick
+		inSeed = initialMeta.Seed
+	}
+	if err := validateStateFlags(stateFlags{
+		in: *stateIn, out: *stateOut, at: *stateAt, atSet: stateAtSet,
+		store: *store, metrics: *metricsOut, ticks: spec.Ticks, inTick: startTick,
+		inSeed: inSeed, seed: spec.Seed, reseed: *stateReseed,
+		demand: scen != nil && len(scen.Demands) > 0,
+		driver: *withDriver && *drivers > 0,
+	}); err != nil {
+		fmt.Fprintln(os.Stderr, "serve:", err)
+		os.Exit(2)
+	}
+	if *stateOut != "" {
+		// Probe the destination now. The dump ABORTS the run on failure
+		// (a run that was asked for a state file and silently produces
+		// none is the failure this flag exists to avoid), and discovering
+		// an unwritable path an hour in is the expensive way to learn it.
+		if err := probeWritable(*stateOut); err != nil {
+			fmt.Fprintf(os.Stderr, "serve: -state-out %s: %v\n", *stateOut, err)
+			os.Exit(1)
+		}
+	}
+	if initialMeta != nil {
+		fmt.Printf("serve: warm start from %s: tick %d, %d vehicles, seed %d, run %q, network %s\n",
+			*stateIn, initialMeta.Tick, initialMeta.Vehicles, initialMeta.Seed, initialMeta.Run, initialMeta.NetworkPath)
+		if initialMeta.Seed != spec.Seed {
+			// Reached only with -state-reseed: validateStateFlags rejects
+			// the mismatch otherwise. Say plainly what was opted into.
+			fmt.Printf("serve: NOTE -state-reseed: state was saved under seed %d, this run uses seed %d — the loaded history and the continuation come from different draws\n",
+				initialMeta.Seed, spec.Seed)
+		}
+		if initialMeta.ScenarioHash != "" && spec.Hash != "" && initialMeta.ScenarioHash != spec.Hash {
+			fmt.Printf("serve: NOTE state was saved under scenario hash %s, this run is %s — same network (the fingerprint passed), different scenario content\n",
+				initialMeta.ScenarioHash, spec.Hash)
+		}
+	}
+
 	abs, err := filepath.Abs(spec.Net.Path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "serve: network path %s: %v\n", spec.Net.Path, err)
@@ -268,7 +358,7 @@ func main() {
 		// is chunked on the wire, so this is headroom for big-fleet TSSF
 		// snapshots (~1.2 MB at 50k vehicles), NOT a design allowance. A
 		// pathological frame fails LOUD (the pubErrs logging).
-		MaxPayload: 4 << 20,
+		MaxPayload: natsMaxPayload,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "serve: nats-server:", err)
@@ -392,15 +482,22 @@ func main() {
 	var finalGated, finalOverlapped int
 	var finalCross int
 	var finalCrossBySec map[string]int
+	var finalObsErrs, finalObsWorst, finalObsBridge uint64
 	go func() {
 		// PaceFloor = one tick of wall time at -pace 1 (1× realtime); -pace N
 		// divides it by N, -pace 0 disables pacing entirely (batch mode).
-		cc := natsio.ContractConfig{PaceFloor: paceFloorDur, StartGate: startGate}
+		cc := natsio.ContractConfig{
+			PaceFloor: paceFloorDur, StartGate: startGate,
+			InitialState: initialState, InitialStateMeta: initialMeta,
+			StateDumpPath: *stateOut, StateDumpTick: *stateAt,
+		}
 		if mobs != nil {
 			cc.Observer = mobs
 		}
 		lr, err := natsio.RunLive(nc, js, *run, spec, natsio.RecorderConfig{
 			DropEngineIntentLog: !*intentLog,
+			UnbatchedIntentLog:  !*logBatch,
+			UncompressedStore:   !*storeCompress,
 		}, cc)
 		if err == nil && mobs != nil {
 			err = mobs.finish(lr.Engine, *metricsOut, spec.Ticks)
@@ -416,6 +513,11 @@ func main() {
 			finalVehTicks = lr.Engine.VehTicks
 			finalGated, finalOverlapped = lr.Engine.SafetyGated, lr.Engine.SafetyOverlapped
 			finalCross, finalCrossBySec = lr.Engine.CrossOverlaps, lr.Engine.CrossOverlapsBySection
+		}
+		if lr != nil && lr.Contract != nil {
+			finalObsErrs = lr.Contract.ObsErrs()
+			finalObsWorst = lr.Contract.ObsWorstOutage()
+			finalObsBridge = lr.Contract.ObsBridgeTicks()
 		}
 		runErr <- err
 	}()
@@ -453,7 +555,7 @@ func main() {
 	if scen != nil && len(scen.Demands) > 0 {
 		expected = append(expected, "demand director")
 		go func() {
-			barrier <- attachDirector(ns, *run, spec.Seed, scen.Demands)
+			barrier <- attachDirector(ns, *run, spec.Seed, startTick, scen.Demands)
 		}()
 	}
 	attached, err := waitBarrier(barrier, expected, runErr, *attachTimeout)
@@ -537,6 +639,33 @@ func main() {
 				}
 			}
 		}
+		// Observation-frame loss comes FIRST because it is the cause and the
+		// coasting line below is its effect: a controller that never received
+		// its frame emitted no intents, so its whole claimed fleet coasted.
+		//
+		// Two different lines, because the two cases have different verdicts.
+		// ADR-0008 §2 holds the last intent across (cadence−1) + HoldLastTicks
+		// ticks, so an outage no longer than that bridge is HEALED and the
+		// fleet stayed controlled — worth reporting, never worth voiding a run
+		// over. Only a longer consecutive streak actually blinds a controller,
+		// and only that line carries the "FAILED to publish" wording the bake
+		// gate (scripts/chicago/record-hero.sh) greps for.
+		if finalObsErrs > 0 && finalObsWorst <= finalObsBridge {
+			fmt.Printf("serve: note: %d observation frame(s) lost, worst consecutive run %d of a %d-tick hold-last bridge — absorbed, the fleet stayed controlled\n",
+				finalObsErrs, finalObsWorst, finalObsBridge)
+		}
+		if finalObsWorst > finalObsBridge {
+			fmt.Printf("serve: WARNING: %d observation frames FAILED to publish, worst consecutive run %d ticks vs a %d-tick hold-last bridge — a controller was blind past the bridge and its vehicles coasted with no car-following control; this is NOT traffic congestion\n",
+				finalObsErrs, finalObsWorst, finalObsBridge)
+			// Derived from the actual cap and the actual layout, not from
+			// remembered numbers: this line is operator guidance, and the
+			// figures it quotes decide whether someone reaches for -drivers
+			// or goes looking for a traffic explanation that does not exist.
+			perEgo := natsio.ObsEgoBytes(natsio.ObsFeaturePolicyCtx)
+			knee := natsio.ObsEgoCapacity(natsMaxPayload, natsio.ObsFeaturePolicyCtx, 24)
+			fmt.Printf("serve:   most likely the %d MiB broker payload cap: the frame carries every claimed ego in ONE message (%d B each plus its route), so it stops fitting near %d vehicles at a 24 B route. Split the fleet with -drivers N (keep -capacity/N comfortably under that).\n",
+				natsMaxPayload>>20, perEgo, knee)
+		}
 		// Coasting: the driver-side twin of demand expiry, and just as silent.
 		// A holdlast vehicle past its hold window gets no car-following term at
 		// all, so it holds speed into whatever is stopped ahead — the resulting
@@ -552,6 +681,47 @@ func main() {
 			if frac > coastWarn {
 				fmt.Printf("serve: WARNING: the driver could not keep up — %.1f%% of vehicle-ticks ran with no car-following control, which manufactures overlaps that are NOT traffic congestion\n",
 					100*frac)
+				// "Could not keep up" has at least three distinct causes and
+				// they need different fixes, so print what each replica
+				// actually held and what its subscriptions dropped rather than
+				// leaving the reader to guess:
+				//
+				//   capacity-bound  fleet ≈ its capacity -> raise -capacity
+				//   obs drops       drops on ctl.obs     -> the replica cannot
+				//                   process a frame per tick; add replicas
+				//                   with -drivers
+				//   snapshot drops  drops on state.snap  -> the CLAIM backstop
+				//                   is gone. Spawns are announced ONCE, so a
+				//                   vehicle that missed its announcement is
+				//                   never re-offered and the unclaimed pool
+				//                   grows without bound.
+				//
+				// The third is invisible in every other number serve prints:
+				// capacity looks fine, no frame failed to publish, and the
+				// fleet simply stops growing while the vehicle count climbs.
+				for _, out := range attached {
+					if out.drv == nil {
+						continue
+					}
+					drops := out.drv.SubDrops()
+					fmt.Printf("serve:   %-22s fleet %5d  last obs tick %d",
+						out.client, out.drv.FleetSize(), out.drv.LastObsTick())
+					if len(drops) == 0 {
+						fmt.Printf("  no subscription drops\n")
+						continue
+					}
+					fmt.Printf("\n")
+					// Sorted: the rest of this report is stable text that gets
+					// diffed between runs, and Go randomizes map iteration.
+					subjs := make([]string, 0, len(drops))
+					for subj := range drops {
+						subjs = append(subjs, subj)
+					}
+					sort.Strings(subjs)
+					for _, subj := range subjs {
+						fmt.Printf("serve:     DROPPED %d messages on %s\n", drops[subj], subj)
+					}
+				}
 			}
 		}
 		// Safety gate. Two numbers, and they answer different questions:
@@ -610,6 +780,34 @@ func main() {
 				}
 			}
 		}
+		// Strands are the gridlock indicator (ADR-0034): the kernel removed
+		// a vehicle that had been motionless for five minutes at a junction
+		// it could not enter. Nonzero means the network gridlocked, and the
+		// sections say where.
+		//
+		// OUTSIDE the despawn block on purpose. Nested under Despawned > 0
+		// it went silent on exactly the worst run there is — one where the
+		// network seizes early and every vehicle strands rather than
+		// arriving — which is the opposite of the "never silent" property
+		// this print exists to provide.
+		if st := finalStats; st.Stranded > 0 {
+			secs := make([]string, 0, len(st.StrandedBySection))
+			for k := range st.StrandedBySection {
+				secs = append(secs, k)
+			}
+			sort.Slice(secs, func(i, j int) bool {
+				a, b := st.StrandedBySection[secs[i]], st.StrandedBySection[secs[j]]
+				if a != b {
+					return a > b
+				}
+				return secs[i] < secs[j]
+			})
+			fmt.Printf("serve: GRIDLOCK: %d vehicles stranded (stopped >%.0f s at a blocked junction) over %d sections; worst:\n",
+				st.Stranded, spec.Params.StrandAfterS, len(secs))
+			for _, sec := range secs[:min(len(secs), 8)] {
+				fmt.Printf("serve:   %-40s %d\n", sec, st.StrandedBySection[sec])
+			}
+		}
 		if mobs != nil {
 			fmt.Printf("serve: wrote metrics to %s\n", *metricsOut)
 		}
@@ -637,12 +835,183 @@ func paceFloor(dt, pace float64) (time.Duration, error) {
 	return time.Duration(v), nil
 }
 
+// stateFlags is the -state-in/-state-out/-state-at surface, plus the run
+// facts the rules depend on (ticks, and the tick of the state named by
+// -state-in).
+type stateFlags struct {
+	in      string
+	out     string
+	at      uint64
+	atSet   bool
+	store   string
+	metrics string
+	ticks   uint64
+	inTick  uint64
+	// inSeed is the seed the loaded state was saved under, seed is the
+	// seed this run will actually draw from, and reseed is -state-reseed.
+	inSeed uint64
+	seed   uint64
+	reseed bool
+	// demand is true when the scenario carries demand parts, so the run
+	// would attach the embedded demand director.
+	demand bool
+	// driver is true when the run would attach the in-process default
+	// driver (-driver, default true).
+	driver bool
+}
+
+// validateStateFlags rejects warm-start/dump combinations that cannot do
+// what they say. Everything here is a usage error (exit 2) rather than a
+// runtime one, because every one of them is knowable before the run starts
+// and the alternative is discovering it after an hour of simulation.
+func validateStateFlags(f stateFlags) error {
+	if f.out != "" && !f.atSet {
+		return fmt.Errorf("-state-out needs -state-at TICK: there is no default tick to dump at, and a run that quietly never writes the file is the failure this flag exists to prevent")
+	}
+	if f.atSet && f.out == "" {
+		return fmt.Errorf("-state-at needs -state-out FILE: a dump tick with nowhere to write it does nothing")
+	}
+	if f.in != "" && f.metrics != "" {
+		// The metrics kernel refuses to attach to an engine that has already
+		// stepped (metrics.go: "attach before the first Step"), because its
+		// per-vehicle position deltas have no earlier frame to difference
+		// against. A warm-started run attaches at the restored tick, so the
+		// pair always dies — after the broker and store are up, with an
+		// error that reads like an internal ordering bug rather than a flag
+		// combination. Knowable here, so it is rejected here.
+		return fmt.Errorf("-state-in cannot be combined with -metrics-out: the metrics kernel must attach before the first Step, and a warm-started run begins at tick %d. Measure a cold run, or run the warm start unmeasured", f.inTick)
+	}
+	if f.in != "" && f.store != "" {
+		// The record plane anchors every recording with a keyframe at the
+		// run's FIRST tick and replay requires one at tick 0 (player.go:
+		// "no keyframe ≤ target tick 0"). A warm-started run's first
+		// keyframe is at the warm-start tick, so the recording it produces
+		// cannot be opened — it fails loudly at replay time, which is the
+		// wrong time. Bending the record plane to accept a nonzero floor is
+		// out of scope for ADR-0029 phase 1; warm start is for UNRECORDED
+		// debugging runs.
+		return fmt.Errorf("-state-in cannot be combined with -store: a warm-started run's first keyframe is at tick %d, not 0, and replay anchors on a tick-0 keyframe — the recording would be unopenable. Run warm starts undurable (no -store), or record a cold run", f.inTick)
+	}
+	if f.in != "" && !f.reseed && f.inSeed != f.seed {
+		// The restored engine draws every future stream from the RUN's
+		// seed (keyframe.go rebuilds the engine from the spec; new
+		// vehicles derive their RNG from spec.Seed, and the demand
+		// director samples from it too). A mismatch therefore splices one
+		// deterministic program's history onto another's continuation,
+		// which is exactly what ADR-0029's bit-exact criterion rules out.
+		//
+		// This is a default trap, not a hypothetical: -seed defaults to 1,
+		// so warm-starting a state saved under any other seed and simply
+		// FORGETTING the flag produces a plausible run from two programs.
+		// A printed note is not enough for a failure whose whole signature
+		// is that the run looks fine. Reseeding on purpose is legitimate
+		// and stays available, but it has to be said out loud.
+		return fmt.Errorf("-state-in was saved under seed %d and this run uses seed %d: the continuation draws from the run's seed, so the loaded history and everything after it would come from different deterministic programs. Pass -seed %d to continue that program, or -state-reseed to say the different draws are intended", f.inSeed, f.seed, f.inSeed)
+	}
+	if f.in != "" && f.driver {
+		// The contract plane is NOT part of the restored state, and the
+		// first resumed tick therefore runs with a controller that has not
+		// caught up yet.
+		//
+		// A warm restore builds a fresh Contract: empty claims, empty
+		// byVehicle, empty hold, empty announced. AfterStep publishes each
+		// controller's observation FIRST and only then announces the
+		// vehicles it does not have claims for, so on the first resumed
+		// tick every restored vehicle is unclaimed AND has no hold-last
+		// intent to bridge with (ADR-0008 §6) — it gets the default, not
+		// the driver's intent. The cold run at that same tick had the
+		// driver's. One tick of different inputs, and ADR-0029's whole
+		// claim is bit-exact continuation.
+		//
+		// Announcing before publishing would not close it either: claiming
+		// is a request/reply round trip over NATS, so the claim cannot be
+		// guaranteed to land before the step regardless of ordering within
+		// the tick. The real fix is to persist and reconstruct contract
+		// state — claims, hold-last, sequence numbers — which is ADR-0029
+		// phase 2 territory alongside the demand director's position.
+		//
+		// Refused rather than warned, for the same reason as the seed
+		// splice next door: a one-tick divergence is invisible in the
+		// output and fatal to a replay CRC. -driver=false gives a
+		// controller-free run whose warm start IS bit-exact, because then
+		// every tick uses the default on both sides.
+		return fmt.Errorf("-state-in cannot be combined with -driver: the contract plane is not restored, so on the first resumed tick (%d) every vehicle is unclaimed with no hold-last intent and gets the default instead of the driver's — a one-tick divergence from the cold run this flag promises to continue exactly. Pass -driver=false to warm-start a controller-free run, or start cold", f.inTick)
+	}
+	if f.reseed && f.in == "" {
+		// Same rule as -state-at without -state-out: a flag that modifies a
+		// mode you are not in is a misunderstanding, and silently ignoring
+		// it teaches the wrong thing about what it does.
+		return fmt.Errorf("-state-reseed needs -state-in: it only relaxes the seed check on a warm start, and there is no warm start here")
+	}
+	if f.in != "" && f.demand {
+		// The director's position cannot yet be restored EXACTLY, and the
+		// error is a silent duplicate rather than a loud failure.
+		//
+		// A cold director at tick N has already sent every arrival up to
+		// N+Lead (onSnapshot sends while `arrival <= f.Tick + Lead`), and
+		// the engine holds those as accepted directives in dirQueue — which
+		// the keyframe restores. But fastForward only skips arrivals
+		// <= StartTick, so the warm director resumes INSIDE that window and
+		// re-sends the whole lead's worth. The contract's request-id dedup
+		// map (`verbs`) is per-process and starts empty, so nothing catches
+		// the repeat: those arrivals spawn twice.
+		//
+		// Fast-forwarding to N+Lead instead is not the fix. The true
+		// boundary is whatever the engine had ACCEPTED when the dump fired,
+		// and verbs for arrivals near the edge of the window may still be
+		// in flight — so N+Lead can skip an arrival that never landed,
+		// trading duplicates for losses. Restoring it exactly means
+		// reconciling per flow against the restored queue, which is a
+		// design question and phase 2's (ADR-0029).
+		//
+		// Until then this is refused rather than approximated: warm start's
+		// whole claim is that the continuation is identical to the cold
+		// run's, and a run that quietly double-spawns a lead window of
+		// arrivals is precisely the plausible-looking wrong run the sidecar
+		// exists to prevent.
+		return fmt.Errorf("-state-in cannot be used with a scenario that has demand parts: the demand director cannot yet resume exactly where the saved state left off, and would re-send the arrivals already queued in it (ADR-0029 phase 2). Warm start is for runs whose spawning is built in")
+	}
+	if f.in != "" && f.inTick >= f.ticks {
+		return fmt.Errorf("-state-in is at tick %d and -ticks is %d: nothing left to simulate (-ticks is absolute, not additional)", f.inTick, f.ticks)
+	}
+	if f.out != "" && f.at > f.ticks {
+		return fmt.Errorf("-state-at %d is past -ticks %d: the run would end before the dump fired", f.at, f.ticks)
+	}
+	if f.out != "" && f.in != "" && f.at <= f.inTick {
+		// Not "it would never fire" — RunLive takes a dump requested AT the
+		// starting tick before the loop (natsio/run.go), so at == inTick
+		// fires and writes back the state just loaded. That is the useless
+		// case, and at < inTick is the incoherent one. Both are refused as
+		// usage errors; neither is a silent no-op.
+		return fmt.Errorf("-state-at %d is not after the warm-start tick %d: at the warm-start tick the dump just rewrites the state that was loaded, and before it there is no such tick in this run", f.at, f.inTick)
+	}
+	return nil
+}
+
+// probeWritable checks that a file can actually be created at path, without
+// leaving anything behind if it could not have been.
+func probeWritable(path string) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, ".state-probe-*")
+	if err != nil {
+		return err
+	}
+	name := f.Name()
+	f.Close()
+	return os.Remove(name)
+}
+
 // attachOutcome is one embedded client's report to the attach barrier.
 type attachOutcome struct {
 	client  string // barrier identity ("default driver", "demand director")
 	desc    string // success-line detail
 	cleanup func() // deferred Close calls; nil on failure
-	err     error
+	// drv is the driver replica behind this outcome (nil for non-driver
+	// clients), retained so the end-of-run report can ask it what it
+	// actually held and what its subscriptions dropped. Without a handle,
+	// "the driver could not keep up" is a symptom with nowhere to look.
+	drv *driver.Driver
+	err error
 }
 
 // attachDriver connects and attaches the in-process default driver replica.
@@ -669,6 +1038,7 @@ func attachDriver(ns *server.Server, run string, capacity int, exitRouting, inte
 		client:  name,
 		desc:    fmt.Sprintf("id %s, capacity %d", d.ID(), capacity),
 		cleanup: func() { d.Close(); dnc.Close() },
+		drv:     d,
 	}
 }
 
@@ -676,7 +1046,10 @@ func attachDriver(ns *server.Server, run string, capacity int, exitRouting, inte
 // waits for its snapshot subscription to be live on the server
 // (Director.Ready) so no early snapshot — tick 0's included — slips past
 // the verb loop.
-func attachDirector(ns *server.Server, run string, seed uint64, dfs []*scenario.DemandFile) attachOutcome {
+// startTick is the warm-start tick (0 for a cold run): the director skips
+// the arrivals already contained in the restored state instead of dumping
+// the whole backlog at the first snapshot (ADR-0029 phase 1).
+func attachDirector(ns *server.Server, run string, seed, startTick uint64, dfs []*scenario.DemandFile) attachOutcome {
 	dnc, err := nats.Connect(nats.DefaultURL, nats.InProcessServer(ns), nats.Name("demand-director"))
 	if err != nil {
 		return attachOutcome{client: "demand director", err: err}
@@ -687,7 +1060,7 @@ func attachDirector(ns *server.Server, run string, seed uint64, dfs []*scenario.
 		return attachOutcome{client: "demand director", err: err}
 	}
 	lg := log.New(os.Stderr, "", 0)
-	dd, err := demand.Attach(dnc, djs, demand.Config{Run: run, Seed: seed, Log: lg}, dfs)
+	dd, err := demand.Attach(dnc, djs, demand.Config{Run: run, Seed: seed, StartTick: startTick, Log: lg}, dfs)
 	if err != nil {
 		dnc.Close()
 		return attachOutcome{client: "demand director", err: err}

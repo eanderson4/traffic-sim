@@ -1,0 +1,20 @@
+ docs/kb/INDEX.md                                   |  2 +-
+ .../ADR-0036-congestion-adaptive-routing.md        | 64 ++++++++++++++++-
+ docs/show/README.md                                |  8 +++
+ engine/adaptive_test.go                            |  4 +-
+ engine/cmd/serve/main.go                           | 22 +++++-
+ engine/destination_test.go                         |  3 +
+ engine/engine.go                                   | 80 +++++++++++++++-------
+ engine/gridlock_test.go                            |  3 +
+ engine/keyframe.go                                 |  8 +++
+ engine/natsio/bake.go                              |  4 ++
+ engine/natsio/player.go                            |  6 ++
+ engine/natsio/replay.go                            |  4 ++
+ engine/natsio/run.go                               |  4 ++
+ engine/scenario/scenario.go                        | 14 ++--
+ engine/scenario/scenario_test.go                   | 40 +++++++----
+ scripts/chicago/mkscenario-portal.sh               |  4 ++
+ scripts/chicago/mkscenario.sh                      |  4 ++
+ scripts/demos/bottleneck_town.py                   |  3 +
+ scripts/demos/merge-pod.py                         |  6 +-
+ 19 files changed, 232 insertions(+), 51 deletions(-)

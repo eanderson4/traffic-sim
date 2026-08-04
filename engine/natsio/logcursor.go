@@ -31,10 +31,17 @@ import (
 // The RECORD FORMAT is untouched — this is a reader-side change only, so
 // every existing recording replays exactly as before (ADR-0024).
 
-// cursorBatch bounds one Fetch. Sized above a city tick's intent count
-// (~1,100 on chi-loop) so a tick is usually one round trip, and small
-// enough that the buffer stays incidental next to the tick's own records.
+// cursorBatch bounds one Fetch in MESSAGES. Sized above a city tick's
+// intent count (~1,100 on chi-loop) so a tick is usually one round trip.
 const cursorBatch = 2048
+
+// cursorBatchBytes bounds the same Fetch in BYTES. cursorBatch was sized
+// when one log message was one ~230-byte intent; a TSLB batch (ADR-0035)
+// is up to IntentBatchMax (768 KiB, ~350 KB for a chi-scale tick) in ONE
+// message, so 2,048 of them would buffer ~1.5 GiB — three orders of
+// magnitude over the bound this reader exists to keep (ADR-0024).
+// Whichever bound a fetch reaches first ends it.
+const cursorBatchBytes = 16 << 20
 
 // cursorWait bounds a Fetch that has nothing to deliver. The recording is
 // immutable by the time a player opens it, so "nothing available" means the
@@ -73,6 +80,18 @@ func (r *tickRecords) add(m *nats.Msg, run string) error {
 			return err
 		}
 		r.intents = append(r.intents, k.KeyedIntent)
+	case SubjectLogIntents(run):
+		// TSLB batch (ADR-0035). Appending in record order keeps the
+		// application order. decodeTSLBMsg refuses a batch whose records
+		// disagree with the NATS header tick the cursor groups by, so
+		// every record here belongs to this tick.
+		ks, err := decodeTSLBMsg(m)
+		if err != nil {
+			return err
+		}
+		for _, k := range ks {
+			r.intents = append(r.intents, k.KeyedIntent)
+		}
 	case SubjectLogVerb(run):
 		s, err := decodeLoggedVerb(m.Data)
 		if err != nil {
@@ -177,7 +196,8 @@ type logCursor struct {
 	// immutable by the time a player reads it). The difference is exactly
 	// how many messages are left, because the log stream's only subject is
 	// SubjectLogAll — every sequence in it matches the cursor's filter.
-	// Fetch blocks until it has the FULL batch or MaxWait elapses, so
+	// Fetch blocks until it has the FULL batch, the byte cap
+	// (cursorBatchBytes) or MaxWait elapses, so
 	// asking for more than remain would stall the run goroutine for the
 	// whole timeout at the tail of every recording.
 	curSeq  uint64
@@ -308,7 +328,7 @@ func (c *logCursor) nextMsg() (*nats.Msg, error) {
 		if batch > cursorBatch {
 			batch = cursorBatch
 		}
-		msgs, err := c.sub.Fetch(int(batch), nats.MaxWait(cursorWait))
+		msgs, err := c.sub.Fetch(int(batch), nats.MaxWait(cursorWait), nats.PullMaxBytes(cursorBatchBytes))
 		if err != nil && len(msgs) == 0 && vanishedConsumer(err) {
 			// The consumer went away underneath us (reaped, or the broker
 			// restarted). Reading forward is idempotent — curSeq records
@@ -319,7 +339,7 @@ func (c *logCursor) nextMsg() (*nats.Msg, error) {
 			if rerr := c.reset(c.curSeq + 1); rerr != nil {
 				return nil, fmt.Errorf("replay cursor reopen on %s at seq %d: %w", c.stream, c.curSeq, rerr)
 			}
-			msgs, err = c.sub.Fetch(int(batch), nats.MaxWait(cursorWait))
+			msgs, err = c.sub.Fetch(int(batch), nats.MaxWait(cursorWait), nats.PullMaxBytes(cursorBatchBytes))
 		}
 		if err != nil && len(msgs) == 0 {
 			// A timeout with sequences still outstanding is a real fault,

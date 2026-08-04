@@ -1,0 +1,1541 @@
+diff --git a/contracts/asyncapi.yaml b/contracts/asyncapi.yaml
+index c041011c339800826ee5b3779e27ded7a0db4b26..bae8d7a0c3e43789d781a602808f08c936429697 100644
+--- a/contracts/asyncapi.yaml
++++ b/contracts/asyncapi.yaml
+@@ -28,7 +28,7 @@ asyncapi: 3.0.0
+ 
+ info:
+   title: traffic-sim engine contract
+-  version: 2.5.0
++  version: 2.6.0
+   description: |
+     The engine's NATS surface per ADR-0006 (planes, taxonomy, pipelines) and
+     ADR-0008 (the engine↔controller contract — M4, schema_version 2):
+@@ -45,9 +45,13 @@ info:
+       (claim/release/unclaimed/pause/resume).
+     - **Record plane (JetStream, at-least-once):** the arbitrated intent
+       log, full-state keyframes, the rolling state CRC, and control events
+-      (pause/resume), one stream per run (LimitsPolicy, R=1 file). The
+-      engine is the SOLE WRITER; Nats-Expected-Last-Sequence asserts it
+-      broker-side.
++      (pause/resume), one stream per run (LimitsPolicy, R=1 file, S2
++      compression since ADR-0035). The engine is the SOLE WRITER;
++      Nats-Expected-Last-Sequence asserts it broker-side. The intent log is
++      batched one message per non-empty TICK since ADR-0035 (`log.intents`,
++      TSLB v1);
++      `log.intent` is the per-intent form it replaces and stays readable, so
++      earlier recordings replay unchanged.
+     - **Metadata plane (KV):** the run registry — run spec + status, and
+       the latest-state pointer for late joiners.
+ 
+@@ -438,6 +442,13 @@ channels:
+       The arbitrated intent log (record plane): one message per applied
+       intent, in application order, each with its applied_tick. Engine sole
+       writer; replay re-applies these instead of running controllers.
++
++      SUPERSEDED AS THE DEFAULT by logIntents (TSLB batches, ADR-0035),
++      which carries the same records with one message per non-empty tick
++      instead of one per intent. Still written when the recorder runs with
++      UnbatchedIntentLog (serve -log-batch=false), and every reader still
++      accepts it, so recordings made before ADR-0035 replay unchanged. A
++      recording carries one form or the other, never a mix.
+     parameters:
+       run: { $ref: '#/components/parameters/runId' }
+     messages:
+@@ -447,6 +458,43 @@ channels:
+       retention: limits
+       storage: file
+       replicas: 1
++      # Default; storage-layer only (payloads and readers unchanged).
++      # serve -store-compress=false writes the stream uncompressed.
++      compression: s2
++
++  logIntents:
++    address: ts.{run}.log.intents
++    description: |
++      The arbitrated intent log, batched: ONE message per NON-EMPTY tick
++      carrying that tick's applied intents in application order (TSLB v1,
++      ADR-0035). A tick with no applied intents emits no batch. The
++      default since ADR-0035; logIntent is the per-message form it replaces.
++
++      The records inside a batch are LoggedIntentFrame payloads
++      byte-identical to the ones logIntent publishes individually, in the
++      same order — a reframing, not a re-encoding. Motivation is framing
++      cost: one message per vehicle per tick at 10 Hz measured ~230 bytes
++      per message for a 61-byte fixed record, and a 90-minute
++      chi-loop-urban recording was 48 GiB of essentially this.
++
++      A tick whose records outgrow the recorder's IntentBatchMax (default
++      768 KiB) is split across consecutive TSLB messages, each
++      independently decodable and each naming the same tick. Unlike a
++      chunked keyframe (ADR-0015) there is NO i/n header: concatenating
++      consecutive messages' records in stream order is already the original
++      order, because stream order is the application order (ADR-0008 §4).
++    parameters:
++      run: { $ref: '#/components/parameters/runId' }
++    messages:
++      loggedIntentBatch: { $ref: '#/components/messages/LoggedIntentBatch' }
++    x-nats:
++      stream: TS_LOG_{run}
++      retention: limits
++      storage: file
++      replicas: 1
++      # Default; storage-layer only (payloads and readers unchanged).
++      # serve -store-compress=false writes the stream uncompressed.
++      compression: s2
+ 
+   logKeyframe:
+     address: ts.{run}.log.keyframe
+@@ -604,6 +652,10 @@ operations:
+     title: Engine → arbitrated record (sole writer; pubacks awaited per tick-batch; failure aborts the run loudly)
+     action: send
+     channel: { $ref: '#/channels/logIntent' }
++  writeLogBatched:
++    title: Engine → arbitrated record, batched (DEFAULT since ADR-0035; sole writer; one TSLB message per non-empty tick)
++    action: send
++    channel: { $ref: '#/channels/logIntents' }
+   writeKeyframe:
+     title: Engine → keyframe at cadence
+     action: send
+@@ -632,6 +684,10 @@ operations:
+     title: Replayer ← record plane (read-only; ephemeral pull consumers; paces by tick, never ReplayOriginal)
+     action: receive
+     channel: { $ref: '#/channels/logIntent' }
++  replayRecordBatched:
++    title: Replayer ← record plane, batched (read-only; the DEFAULT form since ADR-0035; every reader accepts both)
++    action: receive
++    channel: { $ref: '#/channels/logIntents' }
+ 
+ components:
+   parameters:
+@@ -837,6 +893,22 @@ components:
+         $ref: '#/components/schemas/LoggedIntentFrame'
+       x-json-view: '#/components/schemas/LoggedIntentView'
+ 
++    LoggedIntentBatch:
++      name: loggedIntentBatch
++      title: One tick's arbitrated log entries, batched (TSLB v1)
++      summary: |
++        The batched form of LoggedIntent (ADR-0035). Same sole-writer dedup +
++        OCC headers, same records, same order — the batch is a framing around
++        LoggedIntentFrame payloads, so everything LoggedIntent's summary says
++        about ordering, held, superseded and verbatim replay applies
++        unchanged. One message per tick; a tick too wide for
++        IntentBatchMax splits across consecutive messages naming the same
++        tick, with no chunk header (stream order suffices).
++      headers: { $ref: '#/components/schemas/LogHeaders' }
++      payload:
++        schemaFormat: application/octet-stream
++        $ref: '#/components/schemas/LoggedIntentBatchFrame'
++
+     Keyframe:
+       name: keyframe
+       title: Full-state keyframe (engine.MarshalState bytes, TSKF v2; v3 while director directives pending)
+@@ -1170,6 +1242,22 @@ components:
+         Stream order within a tick IS the application order (grant desc,
+         then vehicle ID — ADR-0008 §4).
+ 
++    LoggedIntentBatchFrame:
++      type: string
++      format: binary
++      description: |
++        TSLB v1, little-endian (ADR-0035):
++          magic 'T','S','L','B' 4B | version u8 = 1 | flags u8 = 0 (reserved) |
++          count u32 | tick u64 | count × LoggedIntentFrame
++        Header is 18 bytes. Every record's applied_tick MUST equal the
++        header tick; a reader refuses the batch otherwise, because records
++        replayed at the wrong tick diverge the run silently. count must
++        account for every byte after the header — trailing bytes are an
++        error, so an undercount cannot silently drop the records it omits.
++        Records are LoggedIntentFrame payloads byte-identical to the ones
++        ts.{run}.log.intent carries individually, so a batch is a reframing
++        and not a re-encoding.
++
+     LoggedIntentView:
+       title: JSON view of an arbitrated log entry (tooling only)
+       type: object
+diff --git a/docs/kb/INDEX.md b/docs/kb/INDEX.md
+index a21be5693a22ec539c18cc473f9c830a020daf8b..6b12ab4ac8751d0a887c26786902650d7c0ccae8 100644
+--- a/docs/kb/INDEX.md
++++ b/docs/kb/INDEX.md
+@@ -116,6 +116,7 @@ links its source synthesis for traceability.
+ - [x] [ADR-0032](decisions/ADR-0032-routed-branch-lookahead.md) — ACCEPTED: car-following looks down the branch the vehicle is ROUTED to. `leaderAt` walked `cur.Successors[0]` past an empty lane, so a vehicle approaching a diverge watched the queue on a road it was not taking: measured on chi-loop-urban, one vehicle read a leader 831 m away at 17 m/s down the default branch while its own branch held a standing queue 19 m past the junction, its lookahead collapsing 831 m to 19.4 m in the single tick it crossed. Stopping from 20 m/s needs 22.2 m; it ended 2.83 m inside the queue tail and sat there 44 s — 437 of that run's 801 collision observations (55%) from ONE pair of cars. The same error was already fixed for measurement (`updateStats`) and junction entry (`exitBlocked`); car-following was the last place reading the default branch. Validated: 801 to 48 observations over 12,000 ticks. Kernel-only; single-successor networks bit-identical
+ - [x] [ADR-0033](decisions/ADR-0033-permissive-mutual-yield.md) — ACCEPTED: the foe's SIGNAL is part of its priority class. ADR-0031 made permissive approaches minor so they would yield, but `foeApproachBlocks` decides whether the FOE yields from `foe.Row`, and a signalised internal lane carries `RowNone` — read there as "unmodeled, has priority". Two permissive greens that are each other's foes therefore each yielded to the other FOREVER, with the vehicle-ID tie-break that exists to resolve exactly this sitting unreachable behind the `foeYields` test. Reproduced in isolation: one junction, one green phase, no amber or red, 120 s, neither vehicle ever moves. This is the non-clearing Chicago network — every one of the ten worst delay lanes feeds a signalised cluster junction. Fix: red foe cannot commit (skip), permissive foe is yield-class (ID tie-break decides), protected/amber/unsignalled keep priority. Unsignalised junctions bit-identical. **Its "Not done here" diagnosis of the residual gridlock was wrong and is corrected in place — see ADR-0034**
+ - [x] [ADR-0034](decisions/ADR-0034-gridlock-escape.md) — ACCEPTED: gridlock is a MODELLED FAILURE MODE with a bounded escape. Gridlock is a circular wait on lane capacity — A waits for room ahead, whose head waits for room ahead of IT, around a closed cycle — and every gate in the chain is answering correctly, so nothing that reasons one junction at a time can see it or prevent it. Measured: of 427 lanes frozen with vehicles aboard and zero distance travelled in the base33 final interval, **403 are ordinary ROADS against 24 junction internals**, which refutes ADR-0033's unreserved-exit-room hypothesis (that straddle is real but 6%). Reproduced in a four-junction ring where no box is ever blocked. Decision: a vehicle stopped >`StrandAfterS` (default 300 s, SUMO's) at the head of its lane AND `boxBlocked` at the junction it is routed into is removed and counted as STRANDED — network-wide, by section, and as an incomplete flagged trip record. The `boxBlocked` condition is the whole discriminator and was found by measurement: head-of-lane alone stranded 8 vehicles on the I-80 M3 freeway fixture, where the queue was ordinary. Inert on healthy networks (all M1–M3 CRCs bit-identical); a red light is never a trigger
++- [ ] [ADR-0035](decisions/ADR-0035-batched-intent-log.md) — PROPOSED: the record plane wrote ONE JetStream message per applied intent, i.e. one per vehicle per tick at 10 Hz, and ADR-0026's TSIB batching stopped at that boundary by explicit scope note — the driver sends one ~150 KB batch per tick and the recorder re-explodes it into ~3,500 messages, re-paying exactly the framing the batch eliminated. Measured on the shipped chihalf recording: an 8 MiB stream block holds 34,794 intent messages over 10 ticks, ~230 B per message for a 61 B fixed record, and the whole 90-minute run is 48 GiB (~120 GiB across `data/recordings/`). Decision: TSLB v1 on a NEW subject `ts.{run}.log.intents` carrying one tick's records byte-identical to the per-message payloads they replace (one shared record codec, so the migration is checkable by construction), split by byte budget with no chunk index because stream order already IS application order; plus S2 storage compression on the stream, measured 6.2x gzip-3 / 7.2x zstd-3 on a real block. Per-record density (hoisting the repeated applied_tick and controller name, as TSIB does) is REJECTED on measurement: those bytes are what the compressor eats. Both default on, both revertible by flag (`-log-batch`, `-store-compress`). **Does not fix the harder wall, which is RAM**: a 54,000-tick run was OOM-killed at tick 38,200 on a 123 GB machine because the engine's in-memory intent log retains ~225M structs, and `-intent-log=false` is a requirement at that horizon rather than a tuning knob
+ 
+ ---
+ *Last distilled: 2026-07-17 | 18 articles from 56 raw research files*
+@@ -139,4 +140,5 @@ links its source synthesis for traceability.
+ *ADR-0032 ACCEPTED 2026-07-28 (car-following follows the routed branch — found by tracing the one pair of cars that was 55% of the post-0031 collision observations; 801 to 48 over 12,000 ticks)*
+ *ADR-0033 ACCEPTED 2026-07-28 (permissive mutual yield deadlock — ADR-0031's own regression, found by asking why the drain shape did not move after collisions were eliminated)*
+ *ADR-0034 ACCEPTED 2026-07-28 (gridlock escape — the fourth ADR aimed at the non-clearing Chicago network, and the one that stopped looking for a defect: the frozen lanes are 94% ordinary road, the cycle is a circular wait, and the fix is a counted escape rather than a cure)*
++*ADR-0035 PROPOSED 2026-07-29 (batched intent log + S2 record compression; written after a storage audit found 48 GiB for one 90-minute Chicago run, essentially all of it per-intent message framing that ADR-0026 had already solved one layer up — and after the same audit found the memory ceiling binds before the disk one)*
+ *Run `/update-kb` to check freshness*
+diff --git a/docs/kb/articles/architecture/nats-backbone.md b/docs/kb/articles/architecture/nats-backbone.md
+index 637cfb20eb928bbf31e3d2b4d8bf86716c053006..46fe476a3262128d483cbecf2e13531854d71771 100644
+--- a/docs/kb/articles/architecture/nats-backbone.md
++++ b/docs/kb/articles/architecture/nats-backbone.md
+@@ -71,7 +71,7 @@ by the single AsyncAPI contract document.
+ ### Subject taxonomy (ADR-0006)
+ 
+ `ts.{run_id}.state.snap`, `ts.{run_id}.ctl.intent.{controller_id}`,
+-`ts.{run_id}.log.intent|keyframe|crc`, `ts.{run_id}.metrics.>` — namespace
++`ts.{run_id}.log.intents|intent|keyframe|crc`, `ts.{run_id}.metrics.>` — namespace
+ first, run id second (the aggregate boundary), plane third, entity identifiers
+ last. Official guidance: ≤16 tokens, <256 chars, identifiers last, metadata in
+ headers. Run-as-second-token makes every wildcard and permission rule one token
+diff --git a/docs/kb/decisions/ADR-0006-nats-message-contract.md b/docs/kb/decisions/ADR-0006-nats-message-contract.md
+index c62adbe57ec2796259354b02bbfde2a6608301b4..c22b2b65702bd9d2411d07be9c80e660c4e6548c 100644
+--- a/docs/kb/decisions/ADR-0006-nats-message-contract.md
++++ b/docs/kb/decisions/ADR-0006-nats-message-contract.md
+@@ -376,3 +376,38 @@ the wire already carried.
+   rejected while pace is an unrecorded, client-invisible run condition
+   (recording pace in run meta is already queued in the KB work-queue; a
+   wall-clock budget can be reconsidered then).
++
++## Addendum (2026-07-29, ADR-0035: the intent log is batched per tick)
++
++§4's record plane gains one subject and one payload format; §5's seek
++semantics are unchanged. See
++[ADR-0035](ADR-0035-batched-intent-log.md) for the decision, the measurements
++and the migration note. What changes here:
++
++- **`ts.{run}.log.intents`** (plural) carries one tick's applied intents in a
++  single TSLB v1 message; a tick with no applied intents emits no batch. It
++  is the default. `ts.{run}.log.intent` is the
++  per-intent form it replaces; it stays readable, so every recording made
++  before this addendum replays unchanged, and `serve -log-batch=false` still
++  writes it. A recording carries one form or the other, never a mix.
++- The records inside a batch are the **same LoggedIntentFrame payloads,
++  byte-identical and in the same order**. Everything §4 says about sole
++  writership, dedup, `Nats-Expected-Last-Sequence`, and stream order being
++  application order (ADR-0008 §4) holds unchanged — one message per
++  non-empty tick instead of thousands does not alter the order of records
++  within it.
++- **Seek is unaffected.** §5's anchor is a keyframe ≤ target, and batches are
++  strictly per-tick, so tick granularity is preserved. A tick too wide for
++  the byte budget splits across consecutive messages naming that same tick,
++  with no chunk index: unlike a chunked keyframe (ADR-0015), which reassembles
++  one blob, concatenating consecutive batches' records in stream order is
++  already the original order.
++- The stream is created with **S2 storage compression**. That is a storage
++  setting, not a contract change — payloads and readers are untouched.
++
++Why: §4 as originally written implied nothing about message granularity, and
++one-message-per-applied-intent was the natural reading. At city scale that is
++one message per vehicle per tick at 10 Hz — measured ~230 bytes of framing and
++subject per 61-byte record, and 48 GiB for one 90-minute chi-loop-urban run.
++ADR-0026 had already solved the same problem one plane up and explicitly
++scoped this one out.
+diff --git a/docs/kb/decisions/ADR-0026-batched-intents.md b/docs/kb/decisions/ADR-0026-batched-intents.md
+index 5f3a5b001723cfef2ee89a16e08015053daa9c6b..fa878db4d7909c3be5686fb709a160d2b4e1d308 100644
+--- a/docs/kb/decisions/ADR-0026-batched-intents.md
++++ b/docs/kb/decisions/ADR-0026-batched-intents.md
+@@ -135,6 +135,16 @@ per-applied-intent recording on `ts.{run}.log.intent`, replay, the bake
+ pipeline — is **identical to today**. The record plane never sees a
+ batch.
+ 
++> **Superseded for the intent log (2026-07-29, ADR-0035).** Scoping the
++> record plane out kept this change contained, and the consequence was that
++> the recorder EXPANDED each batch back into one message per intent — one
++> per vehicle per tick, re-paying exactly the framing this ADR had just
++> eliminated. Measured later: ~230 bytes per message for a 61-byte record,
++> and 48 GiB for a single 90-minute chi-loop-urban recording. ADR-0035
++> carries the batch across that boundary as TSLB v1 on
++> `ts.{run}.log.intents`. Keyframes, replay and the bake pipeline are
++> still as described here.
++
+ One deliberate, deterministic exception to wire-order parity (M4 review):
+ on a tick where some of a controller's intents carry routes, the
+ standalone route v2 publishes mid-loop while the route-free intents wait
+diff --git a/docs/kb/decisions/ADR-0035-batched-intent-log.md b/docs/kb/decisions/ADR-0035-batched-intent-log.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..5b871c8fe0d82b7506c999d9c0a51873da282028
+--- /dev/null
++++ b/docs/kb/decisions/ADR-0035-batched-intent-log.md
+@@ -0,0 +1,174 @@
++# ADR-0035: Batched intent log and compressed record storage
++
++- **Status:** PROPOSED
++- **Date:** 2026-07-29
++- **Amends:** ADR-0006 §4–§5 (record plane) by adding one subject and one
++  payload format. ADR-0026's scope note ("the record plane never sees a
++  batch") is superseded — that was a deliberate boundary, and this is the
++  follow-up it left open.
++- **Does NOT touch:** the live plane (`ts.{run}.ctl.>`), TSIB, TSSF, TSKF, the
++  scenario schema, the ADR-0012 content hash, or engine behaviour. Nothing
++  here is visible to a simulation: the recorder only observes.
++
++## Context
++
++The record plane wrote **one JetStream message per applied intent**, which is
++one message per vehicle per tick at 10 Hz. Measured on the shipped `chihalf`
++recording (chi-loop-urban, 54,000 ticks, ~5,900 vehicles at peak):
++
++- an 8 MiB stream block holds **34,794 intent messages, 10 CRC, 4 verb** —
++  with `CRCEvery: 1` that is 10 ticks, so ~3,479 intent messages per tick;
++- that is **~230 bytes per message** for a record whose fixed section is 61
++  bytes. The difference is the subject string (`ts.chihalf.log.intent`, 21 B)
++  and JetStream's per-record framing, re-paid ~3,500 times a tick;
++- the whole recording is **48 GiB**, essentially all of it this. Across
++  `data/recordings/` there is ~120 GiB of it.
++
++It grows as vehicles × ticks, so a larger Chicago at 4× the vehicles over the
++same 90 minutes is ~200 GiB *per run*.
++
++**The batching already exists one layer up.** ADR-0026 aggregates each tick's
++driver intents into a single TSIB frame of fixed 44 B records. `DecodeTSIB`
++expands it, the engine arbitrates into `AppliedIntents()`, and `LogTick`
++then loops that flat slice calling `logIntent` once per element. So the driver
++sends one ~150 KB batch per tick and the recorder turns it back into ~3,500
++separate messages, re-paying exactly the framing the batch had eliminated.
++ADR-0026 says so explicitly (§ "Everything past that point … is identical to
++today. The record plane never sees a batch") — it was scoped out to keep that
++change contained, not overlooked.
++
++## Decision
++
++**1. TSLB v1 — one tick's applied intents in one message.**
++
++New subject `ts.{run}.log.intents`. Layout:
++
++```
++offset  size  field
++     0     4  magic 'T','S','L','B'
++     4     1  version = 1
++     5     1  flags (reserved, must be 0)
++     6     4  count — records in THIS message
++    10     8  tick — the applied_tick every record shares
++    18     -  count × v2 intent record, byte-identical to log.intent payloads
++```
++
++The records are the existing per-message payloads **byte-identical and in the
++same order**. `appendLoggedIntent` writes both forms and
++`decodeLoggedIntentAt` reads both, so this is a reframing, not a re-encoding —
++which makes "the batched log holds exactly what the per-message log held" a
++property a test checks by construction rather than one to be argued.
++
++**2. A new subject, not a new shape on the old one.** Old and new recordings
++are distinguished by the subject the broker already delivers. Sniffing a magic
++number on `log.intent` would mean reading `TSLB` as a u32 against a v2
++record's leading `applied_tick` — a collision at tick 1,112,888,660, which is
++implausible rather than impossible, and the failure mode is a misparsed record
++on the one plane where that is unrecoverable. `SubjectLogAll`
++(`ts.{run}.log.>`) already captures the new subject, so the stream config is
++unchanged and a v2 recording keeps replaying through the untouched
++`log.intent` path.
++
++**3. Splitting, without a chunk index.** A tick whose records outgrow
++`IntentBatchMax` (default 768 KiB, the `KeyframeChunkMax` budget and the same
++reasoning) is split across several TSLB messages, each independently decodable
++and each naming the same tick. Unlike ADR-0015 keyframes — which reassemble
++**one** blob and therefore need `i/n` — concatenating consecutive messages'
++records in stream order *is* the original order, because stream order is the
++application order (ADR-0006 §4).
++
++**4. S2 storage compression on the run's stream.** `Compression:
++nats.S2Compression` on the `StreamConfig`. This is a storage-layer setting:
++payloads, subjects and every reader are untouched, so it is **not** a change
++to the message contract — only to how the file store persists blocks.
++
++**5. Both are flags, defaulting on.** `serve -log-batch=false` restores the
++per-message record plane; `-store-compress=false` turns compression off. In
++`RecorderConfig` they are `UnbatchedIntentLog` and `UncompressedStore`, named
++for the non-default so the zero value is the new behaviour — the
++`DropEngineIntentLog` convention.
++
++**6. `AddStream` falls back to `UpdateStream` on name-already-in-use.** The
++recorder *adopts* an existing stream (serve's `checkFreshRecording` permits an
++empty one), and `AddStream` refuses to adopt when the config differs. Adding
++`Compression` is the first config change since that path was written, so
++without this it turns adoption into a hard failure.
++
++## Alternatives rejected
++
++**Hoist the repeated `applied_tick` and controller name out of each record**
++(a controller-index table and a route indirection, as TSIB does with its fixed
++44 B records). Rejected on measured grounds: those repeated bytes are exactly
++what a compressor eats. On a real stream block, **gzip -3 gets 6.2× and
++zstd -3 gets 7.2×**. Hoisting would buy perhaps 20% on top of compression
++while introducing new invariants — an index table and an indirection — on the
++one plane where a decode bug is unrecoverable, since the record *is* the run.
++Density is available later if the numbers ever justify it; the version byte
++exists for that.
++
++**Reuse TSIB for the log.** Rejected: TSIB cannot carry what the log must.
++ADR-0026 §"Route fields are forbidden in batch records" forbids routes, and
++the log carries `intentFlagRouteSet` with a route string; TSIB also has no
++`Held`, `Superseded`, `Grant`, `Seq` or controller name, all of which the
++arbitrated record needs. A batched log format is *not* TSIB verbatim, which is
++precisely why it wants an ADR rather than a quick edit.
++
++**Skip recording entirely for measurement runs.** Still worth doing and
++orthogonal — nothing downstream of a sweep reads the store (`fwsweep.sh` and
++the A/B harness both delete it), yet the run pays for it in disk *and* wall
++time, since `LogTick` ends in `awaitBatch` and blocks on pubacks. That is a
++separate change with a separate risk profile (it must refuse to combine with
++anything needing replay), so it is not bundled here.
++
++## Consequences
++
++Good: the record shrinks by the framing ratio — ~3,500 messages per tick
++become 1 — and compression takes another 3–7× on top, without touching a
++single reader's understanding of what an intent is. Old recordings replay
++unchanged. Both changes are revertible by a flag, not a rebuild.
++
++Costs and risks:
++
++- **Two log formats to maintain.** Mitigated by sharing one record codec
++  between them, so the surface that can diverge is the framing only.
++- **A reader that predates this cannot read a new recording.** It sees an
++  unknown subject and — depending on the reader — ignores it, yielding a run
++  with no intents. In-repo readers are all updated (`MaterializeRunRecord`,
++  `indexLogMsgs`, `logcursor`); `-log-batch=false` writes a recording an older
++  reader can consume. See the migration note.
++- **Compression costs write-side CPU.** Unmeasured under load at the time of
++  writing; `-store-compress=false` is the escape hatch.
++- **This does not fix the harder scaling wall, which is RAM.** A 54,000-tick
++  chi-loop-urban run was OOM-killed at tick 38,200 on a 123 GB machine,
++  because the engine's whole-run **in-memory** intent log retains ~225M
++  `TickedIntent` structs by then. `-intent-log=false` drops it and is a
++  requirement at that horizon, not a tuning knob. `scripts/whatif.py` passes
++  it; `scripts/chicago/fwsweep.sh` does not. Storage and memory are separate
++  ceilings and the memory one binds first.
++
++## Migration note
++
++- **Reading:** every in-repo reader handles both subjects. A recording written
++  before this change is byte-for-byte what it was and replays through the
++  `log.intent` path; a recording written after it carries `log.intents`.
++- **Writing:** `serve -log-batch=false` reproduces the old record plane
++  exactly, for an external reader or for A/B measurement.
++- **No re-recording is required or offered.** The 48 GiB `chihalf` recording
++  and the ~120 GiB in `data/recordings/` stay readable as they are; they do
++  not shrink retroactively, and reclaiming that space means re-recording those
++  runs, which is a separate decision (#24, #62 already cover re-baking).
++- **Compression applies to blocks written from here on.** An existing stream
++  is not rewritten.
++- **Nothing in the ADR-0012 content hash changes**, so scenario identity and
++  paired-seed A/B comparison are unaffected.
++
++## See also
++
++- [ADR-0006](ADR-0006-nats-message-contract.md) §4–§5 — the record plane and
++  seek semantics this amends
++- [ADR-0026](ADR-0026-batched-intents.md) — TSIB, the live-path batching whose
++  scope note this follows up
++- [ADR-0015](ADR-0015-keyframe-chunking.md) — keyframe chunking, and why TSLB
++  splitting deliberately does *not* copy its `i/n` framing
++- [ADR-0024](ADR-0024-bounded-memory-replay-reader.md) — the bounded-memory
++  reader, and the in-memory log `-intent-log=false` drops
+diff --git a/engine/cmd/serve/main.go b/engine/cmd/serve/main.go
+index 4d7db3bf283094a37100af6d363720170bd7d3d7..b62f414aa6d78f93088fcb2a22f75aa3b27d7096 100644
+--- a/engine/cmd/serve/main.go
++++ b/engine/cmd/serve/main.go
+@@ -95,7 +95,9 @@ func main() {
+ 	stateAt := flag.Uint64("state-at", 0, "tick at which -state-out writes the state file (required with -state-out, and only with it)")
+ 	stateIn := flag.String("state-in", "", "warm-start from a state file written by -state-out: the run begins at that state's tick with that state instead of an empty network at tick 0. -ticks stays ABSOLUTE, so a state at tick 20000 with -ticks 54000 simulates the remaining 34000. Refuses a state saved against a different network (lane fingerprint), and refuses a missing sidecar")
+ 	stateReseed := flag.Bool("state-reseed", false, "allow -state-in when the run's seed differs from the seed the state was saved under. Off by default: the continuation draws from the RUN's seed, so a mismatch splices two different deterministic programs. Set this when that is what you want (same state, different draws)")
+-	intentLog := flag.Bool("intent-log", true, "retain the engine's whole-run in-memory intent log; -intent-log=false drops it for long headless runs (the durable JetStream record and replay are unaffected — only the in-memory RunLog is lost)")
++	intentLog := flag.Bool("intent-log", true, "retain the engine's whole-run in-memory intent log; -intent-log=false drops it for long headless runs (the durable JetStream record and replay are unaffected — only the in-memory RunLog is lost). A 54,000-tick chi-loop-urban run at ~5,900 vehicles is ~225M retained intents and was OOM-killed at tick 38,200 on a 123 GB machine, so this is a requirement at that horizon rather than a tuning knob")
++	logBatch := flag.Bool("log-batch", true, "record each tick's applied intents as ONE TSLB batch message on ts.{run}.log.intents (ADR-0035) instead of one message per intent on ts.{run}.log.intent. Off restores the pre-ADR-0035 record plane, for A/B measurement and for writing a recording an older reader can consume; replay reads either form")
++	storeCompress := flag.Bool("store-compress", true, "S2-compress the recording stream's file storage (ADR-0035). Storage-layer only: payloads and every reader are unchanged. Off if the write-side CPU cost ever matters more than the bytes")
+ 	flag.Parse()
+ 
+ 	if *scenarioDir != "" && *netfile != "" {
+@@ -476,6 +478,8 @@ func main() {
+ 		}
+ 		lr, err := natsio.RunLive(nc, js, *run, spec, natsio.RecorderConfig{
+ 			DropEngineIntentLog: !*intentLog,
++			UnbatchedIntentLog:  !*logBatch,
++			UncompressedStore:   !*storeCompress,
+ 		}, cc)
+ 		if err == nil && mobs != nil {
+ 			err = mobs.finish(lr.Engine, *metricsOut, spec.Ticks)
+diff --git a/engine/natsio/logcursor.go b/engine/natsio/logcursor.go
+index be4b18d0974af1f055bc1d0889d48dc049d84e8d..e39a03f7eb9cb6b59e0afa7ac77a0fe845092a7a 100644
+--- a/engine/natsio/logcursor.go
++++ b/engine/natsio/logcursor.go
+@@ -31,11 +31,18 @@ import (
+ // The RECORD FORMAT is untouched — this is a reader-side change only, so
+ // every existing recording replays exactly as before (ADR-0024).
+ 
+-// cursorBatch bounds one Fetch. Sized above a city tick's intent count
+-// (~1,100 on chi-loop) so a tick is usually one round trip, and small
+-// enough that the buffer stays incidental next to the tick's own records.
++// cursorBatch bounds one Fetch in MESSAGES. Sized above a city tick's
++// intent count (~1,100 on chi-loop) so a tick is usually one round trip.
+ const cursorBatch = 2048
+ 
++// cursorBatchBytes bounds the same Fetch in BYTES. cursorBatch was sized
++// when one log message was one ~230-byte intent; a TSLB batch (ADR-0035)
++// is up to IntentBatchMax (768 KiB, ~350 KB for a chi-scale tick) in ONE
++// message, so 2,048 of them would buffer ~1.5 GiB — three orders of
++// magnitude over the bound this reader exists to keep (ADR-0024).
++// Whichever bound a fetch reaches first ends it.
++const cursorBatchBytes = 16 << 20
++
+ // cursorWait bounds a Fetch that has nothing to deliver. The recording is
+ // immutable by the time a player opens it, so "nothing available" means the
+ // end of the stream, not a slow writer — this only has to outlast a local
+@@ -73,6 +80,18 @@ func (r *tickRecords) add(m *nats.Msg, run string) error {
+ 			return err
+ 		}
+ 		r.intents = append(r.intents, k.KeyedIntent)
++	case SubjectLogIntents(run):
++		// TSLB batch (ADR-0035). Appending in record order keeps the
++		// application order. decodeTSLBMsg refuses a batch whose records
++		// disagree with the NATS header tick the cursor groups by, so
++		// every record here belongs to this tick.
++		ks, err := decodeTSLBMsg(m)
++		if err != nil {
++			return err
++		}
++		for _, k := range ks {
++			r.intents = append(r.intents, k.KeyedIntent)
++		}
+ 	case SubjectLogVerb(run):
+ 		s, err := decodeLoggedVerb(m.Data)
+ 		if err != nil {
+@@ -177,7 +196,8 @@ type logCursor struct {
+ 	// immutable by the time a player reads it). The difference is exactly
+ 	// how many messages are left, because the log stream's only subject is
+ 	// SubjectLogAll — every sequence in it matches the cursor's filter.
+-	// Fetch blocks until it has the FULL batch or MaxWait elapses, so
++	// Fetch blocks until it has the FULL batch, the byte cap
++	// (cursorBatchBytes) or MaxWait elapses, so
+ 	// asking for more than remain would stall the run goroutine for the
+ 	// whole timeout at the tail of every recording.
+ 	curSeq  uint64
+@@ -308,7 +328,7 @@ func (c *logCursor) nextMsg() (*nats.Msg, error) {
+ 		if batch > cursorBatch {
+ 			batch = cursorBatch
+ 		}
+-		msgs, err := c.sub.Fetch(int(batch), nats.MaxWait(cursorWait))
++		msgs, err := c.sub.Fetch(int(batch), nats.MaxWait(cursorWait), nats.PullMaxBytes(cursorBatchBytes))
+ 		if err != nil && len(msgs) == 0 && vanishedConsumer(err) {
+ 			// The consumer went away underneath us (reaped, or the broker
+ 			// restarted). Reading forward is idempotent — curSeq records
+@@ -319,7 +339,7 @@ func (c *logCursor) nextMsg() (*nats.Msg, error) {
+ 			if rerr := c.reset(c.curSeq + 1); rerr != nil {
+ 				return nil, fmt.Errorf("replay cursor reopen on %s at seq %d: %w", c.stream, c.curSeq, rerr)
+ 			}
+-			msgs, err = c.sub.Fetch(int(batch), nats.MaxWait(cursorWait))
++			msgs, err = c.sub.Fetch(int(batch), nats.MaxWait(cursorWait), nats.PullMaxBytes(cursorBatchBytes))
+ 		}
+ 		if err != nil && len(msgs) == 0 {
+ 			// A timeout with sequences still outstanding is a real fault,
+diff --git a/engine/natsio/recorder.go b/engine/natsio/recorder.go
+index 7c02444e875096468cbda6e55bea2311dc22e431..294fff7ee27fd0120b71393eafcd119012c9975c 100644
+--- a/engine/natsio/recorder.go
++++ b/engine/natsio/recorder.go
+@@ -2,6 +2,7 @@ package natsio
+ 
+ import (
+ 	"encoding/binary"
++	"errors"
+ 	"fmt"
+ 	"math"
+ 	"strconv"
+@@ -44,6 +45,25 @@ type RecorderConfig struct {
+ 	// headers). A larger keyframe is split into chunk messages reassembled
+ 	// by the reader (ADR-0015).
+ 	KeyframeChunkMax int
++	// UnbatchedIntentLog restores the pre-ADR-0035 record plane: one message
++	// per applied intent on ts.{run}.log.intent instead of one TSLB batch per
++	// tick on ts.{run}.log.intents. Named for the non-default so the zero
++	// value is the batched form, matching DropEngineIntentLog's convention.
++	// Kept for A/B measurement and for writing a recording an older reader
++	// can consume.
++	UnbatchedIntentLog bool
++	// IntentBatchMax bounds one TSLB message's payload in bytes (default
++	// 768 KiB, same budget and same reasoning as KeyframeChunkMax). A tick
++	// with more intents than fit is split across several batch messages.
++	IntentBatchMax int
++	// UncompressedStore turns OFF JetStream S2 storage compression for the
++	// run's stream. Named for the non-default: compression is on, because the
++	// log is dominated by a repeated subject, a repeated applied_tick and a
++	// repeated controller name per record — measured 6.2x (gzip -3) and 7.2x
++	// (zstd -3) on a real stream block. Set this if the write-side CPU cost
++	// ever matters more than the bytes; it changes only how the file store
++	// persists messages, never their content.
++	UncompressedStore bool
+ }
+ 
+ func (c *RecorderConfig) withDefaults() RecorderConfig {
+@@ -54,6 +74,9 @@ func (c *RecorderConfig) withDefaults() RecorderConfig {
+ 	if out.KeyframeChunkMax == 0 {
+ 		out.KeyframeChunkMax = 768 * 1024
+ 	}
++	if out.IntentBatchMax == 0 {
++		out.IntentBatchMax = 768 * 1024
++	}
+ 	if out.CRCEvery == 0 {
+ 		out.CRCEvery = 1
+ 	}
+@@ -73,12 +96,15 @@ type Recorder struct {
+ 	lastSeq uint64 // last stream sequence we published (OCC cursor)
+ 	batch   []batchEntry
+ 
+-	// Counters (observability).
+-	IntentsWritten   uint64
+-	KeyframesWritten uint64
+-	CRCsWritten      uint64
+-	EventsWritten    uint64
+-	VerbsWritten     uint64
++	// Counters (observability). IntentsWritten counts INTENTS either way, so
++	// it stays comparable across the format change; IntentBatchesWritten is
++	// the message count, and their ratio is the framing saved.
++	IntentsWritten       uint64
++	IntentBatchesWritten uint64
++	KeyframesWritten     uint64
++	CRCsWritten          uint64
++	EventsWritten        uint64
++	VerbsWritten         uint64
+ }
+ 
+ // Record-plane-only intent flag bits (the wire bits 0–4 are shared with the
+@@ -102,14 +128,51 @@ func NewRecorder(js nats.JetStreamContext, run string, cfg RecorderConfig) (*Rec
+ 	if r.cfg.KeyframeChunkMax < 1 {
+ 		return nil, fmt.Errorf("KeyframeChunkMax must be ≥ 1, got %d", r.cfg.KeyframeChunkMax)
+ 	}
+-	_, err := js.AddStream(&nats.StreamConfig{
+-		Name:      r.stream,
+-		Subjects:  []string{SubjectLogAll(run)},
+-		Retention: nats.LimitsPolicy,
+-		Storage:   nats.FileStorage,
+-		Replicas:  1,
+-		MaxAge:    r.cfg.MaxAge,
+-	})
++	if r.cfg.IntentBatchMax < loggedIntentMax {
++		// Below one maximal record the budget is meaningless: the first
++		// record of a batch always goes in (a batch must hold at least one),
++		// so every message would exceed the configured "maximum".
++		return nil, fmt.Errorf("IntentBatchMax must be ≥ one maximal record (%d), got %d", loggedIntentMax, r.cfg.IntentBatchMax)
++	}
++	// S2 storage compression (ADR-0035). A storage-layer setting: payloads,
++	// subjects and every reader are untouched, so this is not a change to the
++	// message contract — only to how the file store persists blocks.
++	compression := nats.S2Compression
++	if r.cfg.UncompressedStore {
++		compression = nats.NoCompression
++	}
++	scfg := &nats.StreamConfig{
++		Name:        r.stream,
++		Subjects:    []string{SubjectLogAll(run)},
++		Retention:   nats.LimitsPolicy,
++		Storage:     nats.FileStorage,
++		Replicas:    1,
++		MaxAge:      r.cfg.MaxAge,
++		Compression: compression,
++	}
++	_, err := js.AddStream(scfg)
++	if errors.Is(err, nats.ErrStreamNameAlreadyInUse) {
++		// The recorder ADOPTS an existing stream, but only an EMPTY one —
++		// serve's checkFreshRecording permits exactly that, and the guard
++		// below makes the invariant local instead of trusting every caller
++		// (RunLive is a public API) to have checked. AddStream refuses to
++		// adopt when the config differs, so before this change any config
++		// edit — Compression is the first — turned adoption into a hard
++		// failure. Converge it instead; compression applies to blocks
++		// written from here on, which is all of them for an empty stream.
++		// Without the emptiness check this fallback would silently rewrite
++		// a PRESERVED recording's subjects, retention, MaxAge and
++		// compression on a name collision — config drift applied to data
++		// that is someone else's run.
++		info, serr := js.StreamInfo(r.stream)
++		if serr != nil {
++			return nil, fmt.Errorf("stream %s exists but its info cannot be read: %w", r.stream, serr)
++		}
++		if info.State.Msgs > 0 {
++			return nil, fmt.Errorf("record plane: stream %s already holds %d messages — refusing to adopt and reconfigure a non-empty recording", r.stream, info.State.Msgs)
++		}
++		_, err = js.UpdateStream(scfg)
++	}
+ 	if err != nil {
+ 		return nil, fmt.Errorf("add stream %s: %w", r.stream, err)
+ 	}
+@@ -136,10 +199,14 @@ func (r *Recorder) LogStart(e *engine.Engine) error {
+ // cadences — and awaits the batch's pubacks.
+ func (r *Recorder) LogTick(e *engine.Engine) error {
+ 	tick := e.Tick
+-	for _, t := range e.AppliedIntents() {
+-		if err := r.logIntent(t); err != nil {
+-			return err
++	if r.cfg.UnbatchedIntentLog {
++		for _, t := range e.AppliedIntents() {
++			if err := r.logIntent(t); err != nil {
++				return err
++			}
+ 		}
++	} else if err := r.logIntentBatch(e.AppliedIntents(), tick); err != nil {
++		return err
+ 	}
+ 	for _, s := range e.AppliedSpawns() {
+ 		if err := r.logVerb(s); err != nil {
+@@ -245,6 +312,21 @@ func (r *Recorder) awaitBatch(tick uint64) error {
+ // bit4 route, bit5 held (hold-last re-issue by the contract layer), bit6
+ // superseded (lost the same-tick tie-break — recorded, not applied).
+ func (r *Recorder) logIntent(t engine.TickedIntent) error {
++	if err := r.publish(SubjectLogIntent(r.run), t.Tick,
++		appendLoggedIntent(nil, t), 0, 0); err != nil {
++		return err
++	}
++	r.IntentsWritten++
++	return nil
++}
++
++// appendLoggedIntent appends ONE v2 intent record to dst and returns the
++// grown slice. Extracted from logIntent so the per-message form
++// (ts.{run}.log.intent) and the batched form (ts.{run}.log.intents, TSLB —
++// ADR-0035) share one encoder: a batched record is byte-identical to the
++// per-message payload it replaces, which is what makes the migration
++// checkable rather than merely asserted.
++func appendLoggedIntent(dst []byte, t engine.TickedIntent) []byte {
+ 	tick := t.Tick
+ 	k := t.KeyedIntent
+ 	var flags uint32
+@@ -276,7 +358,7 @@ func (r *Recorder) logIntent(t engine.TickedIntent) error {
+ 		flags |= logFlagSuperseded
+ 	}
+ 	ctl := []byte(k.Controller)
+-	data := make([]byte, 0, 18+len(ctl)+8+4+4+8+8+4+4+1+2+len(route))
++	data := dst
+ 	data = binary.LittleEndian.AppendUint64(data, tick) // applied_tick
+ 	data = binary.LittleEndian.AppendUint64(data, k.Seq)
+ 	data = binary.LittleEndian.AppendUint16(data, uint16(len(ctl)))
+@@ -291,11 +373,70 @@ func (r *Recorder) logIntent(t engine.TickedIntent) error {
+ 	data = append(data, k.Grant)
+ 	data = binary.LittleEndian.AppendUint16(data, uint16(len(route)))
+ 	data = append(data, route...)
+-	if err := r.publish(SubjectLogIntent(r.run), tick, data, 0, 0); err != nil {
+-		return err
++	return data
++}
++
++// loggedIntentMax bounds one v2 record: the fixed section, a controller name
++// (u16-framed, but controller ids are NATS tokens — bounded well under this)
++// and a route already capped at intentMaxRoute by the encoder above. Used to
++// size the TSLB batch budget so that a record never fails to fit.
++const loggedIntentMax = 18 + 256 + 8 + 4 + 4 + 8 + 8 + 4 + 4 + 1 + 2 + intentMaxRoute
++
++// logIntentBatch writes this tick's applied intents as TSLB batch messages on
++// ts.{run}.log.intents (ADR-0035), splitting when a message would outgrow the
++// byte budget. Records keep AppliedIntents() order, which IS the application
++// order (ADR-0006 §4) — and stream order across split messages preserves it,
++// so a split needs no chunk index the way a keyframe does (ADR-0015): each
++// batch message is independently decodable.
++func (r *Recorder) logIntentBatch(ts []engine.TickedIntent, tick uint64) error {
++	if len(ts) == 0 {
++		return nil
+ 	}
+-	r.IntentsWritten++
+-	return nil
++	budget := r.cfg.IntentBatchMax
++	buf := make([]byte, 0, tslbHeader+64*loggedIntentMax)
++	n := 0
++	flush := func() error {
++		if n == 0 {
++			return nil
++		}
++		if err := r.publish(SubjectLogIntents(r.run), tick,
++			finishTSLB(buf, tick, n), 0, 0); err != nil {
++			return err
++		}
++		r.IntentsWritten += uint64(n)
++		r.IntentBatchesWritten++
++		// A FRESH buffer next time, not buf[:0]: the published messages are
++		// still in flight (their pubacks are awaited in awaitBatch), and
++		// nats.go retains each message — and with it this slice — so a resend
++		// would re-publish whatever the buffer holds THEN. Safe today only
++		// because async publish leaves retries disabled; if a retry option
++		// ever reaches publish, reusing the buffer lets a later batch
++		// overwrite an in-flight one, and a split tick's near-uniform batches
++		// can resend as byte-valid TSLB with one batch duplicated and another
++		// gone. One allocation per message is noise next to the publish.
++		buf, n = nil, 0
++		return nil
++	}
++	for _, t := range ts {
++		if t.Tick != tick {
++			// All of a tick's applied intents carry that tick (engine
++			// intent.go applyIntents). A mismatch means the caller mixed
++			// ticks into one batch, which would silently misattribute
++			// intents on replay — refuse rather than record it.
++			return fmt.Errorf("record plane: intent for tick %d in tick %d's batch (run aborts)", t.Tick, tick)
++		}
++		if n > 0 && len(buf)+loggedIntentMax > budget {
++			if err := flush(); err != nil {
++				return err
++			}
++		}
++		if len(buf) == 0 {
++			buf = beginTSLB(buf)
++		}
++		buf = appendLoggedIntent(buf, t)
++		n++
++	}
++	return flush()
+ }
+ 
+ // logVerb appends one accepted director spawn directive to the record
+diff --git a/engine/natsio/replay.go b/engine/natsio/replay.go
+index c652c4201508f459f02b38893feb79505e1d338c..1d7ead8057747d642c4a7442beb068e7d4a3afc4 100644
+--- a/engine/natsio/replay.go
++++ b/engine/natsio/replay.go
+@@ -61,6 +61,15 @@ func MaterializeRunRecord(js nats.JetStreamContext, meta *RunMeta) (*RunRecord,
+ 				return nil, err
+ 			}
+ 			rec.Log.Intents = append(rec.Log.Intents, k)
++		case SubjectLogIntents(run):
++			// TSLB batch (ADR-0035): the same records the v2 path appends one
++			// at a time, in the same order, so stream order remains the
++			// application order (ADR-0006 §4).
++			ks, err := decodeTSLBMsg(m)
++			if err != nil {
++				return nil, err
++			}
++			rec.Log.Intents = append(rec.Log.Intents, ks...)
+ 		case SubjectLogVerb(run):
+ 			s, err := decodeLoggedVerb(m.Data)
+ 			if err != nil {
+@@ -182,6 +191,18 @@ func indexLogMsgs(msgs []*nats.Msg, run string) (*logIndex, error) {
+ 				return nil, err
+ 			}
+ 			idx.intents[k.Tick] = append(idx.intents[k.Tick], k.KeyedIntent)
++		case SubjectLogIntents(run):
++			ks, err := decodeTSLBMsg(m)
++			if err != nil {
++				return nil, err
++			}
++			// Keyed by each record's own tick, exactly as the v2 case is.
++			// decodeTSLBMsg has already refused a batch whose records
++			// disagree with its header tick, so a split tick reassembles in
++			// order.
++			for _, k := range ks {
++				idx.intents[k.Tick] = append(idx.intents[k.Tick], k.KeyedIntent)
++			}
+ 		case SubjectLogVerb(run):
+ 			s, err := decodeLoggedVerb(m.Data)
+ 			if err != nil {
+@@ -393,12 +414,53 @@ func msgTick(m *nats.Msg) (uint64, error) {
+ 	return tick, nil
+ }
+ 
+-// decodeLoggedIntent parses the recorder's v2 intent payload (see
+-// recorder.go for the layout and flag bits).
++// decodeTSLBMsg decodes one TSLB batch message and cross-checks it against
++// its NATS header: DecodeTSLB verifies the records against the batch's
++// PAYLOAD tick, but readers group and order by the HEADER tick (msgTick),
++// and nothing else ties the two together. A message whose header and
++// payload disagree would otherwise apply or index its records at the wrong
++// tick — every reader goes through here so the check cannot drift between
++// them.
++func decodeTSLBMsg(m *nats.Msg) ([]engine.TickedIntent, error) {
++	ks, err := DecodeTSLB(m.Data)
++	if err != nil {
++		return nil, err
++	}
++	htick, err := msgTick(m)
++	if err != nil {
++		return nil, err
++	}
++	for _, k := range ks {
++		if k.Tick != htick {
++			return nil, fmt.Errorf("TSLB record for tick %d in a message headed tick %d", k.Tick, htick)
++		}
++	}
++	return ks, nil
++}
++
++// decodeLoggedIntent parses one whole v2 intent message (see recorder.go for
++// the layout and flag bits). The payload must be consumed EXACTLY: a message
++// carrying one record and nothing else is the v2 contract, and trailing bytes
++// mean the payload is not what this decoder thinks it is.
+ func decodeLoggedIntent(data []byte) (engine.TickedIntent, error) {
++	out, n, err := decodeLoggedIntentAt(data)
++	if err != nil {
++		return out, err
++	}
++	if n != len(data) {
++		return out, fmt.Errorf("logged intent: %d trailing bytes after the record", len(data)-n)
++	}
++	return out, nil
++}
++
++// decodeLoggedIntentAt parses the v2 record at the front of data and returns
++// it with the number of bytes it consumed, leaving anything after it alone.
++// Shared with the TSLB batch reader (ADR-0035) so both log forms decode
++// through one implementation — the records are byte-identical.
++func decodeLoggedIntentAt(data []byte) (engine.TickedIntent, int, error) {
+ 	var out engine.TickedIntent
+ 	if len(data) < 8+8+2 {
+-		return out, fmt.Errorf("logged intent: %d bytes, too short", len(data))
++		return out, 0, fmt.Errorf("logged intent: %d bytes, too short", len(data))
+ 	}
+ 	out.Tick = binary.LittleEndian.Uint64(data[0:])
+ 	out.Seq = binary.LittleEndian.Uint64(data[8:])
+@@ -406,7 +468,7 @@ func decodeLoggedIntent(data []byte) (engine.TickedIntent, error) {
+ 	rest := data[18:]
+ 	const fixed = 8 + 4 + 4 + 8 + 8 + 4 + 4 + 1 + 2 // through route_len
+ 	if len(rest) < ctlLen+fixed {
+-		return out, fmt.Errorf("logged intent: %d payload bytes, want at least %d", len(data), 18+ctlLen+fixed)
++		return out, 0, fmt.Errorf("logged intent: %d payload bytes, want at least %d", len(data), 18+ctlLen+fixed)
+ 	}
+ 	out.Controller = string(rest[:ctlLen])
+ 	rest = rest[ctlLen:]
+@@ -420,9 +482,11 @@ func decodeLoggedIntent(data []byte) (engine.TickedIntent, error) {
+ 	out.Grant = rest[40]
+ 	routeLen := int(binary.LittleEndian.Uint16(rest[41:]))
+ 	rest = rest[43:]
+-	if len(rest) != routeLen {
+-		return out, fmt.Errorf("logged intent: route_len %d, %d bytes remain", routeLen, len(rest))
++	if len(rest) < routeLen {
++		return out, 0, fmt.Errorf("logged intent: route_len %d, only %d bytes remain", routeLen, len(rest))
+ 	}
++	rest = rest[:routeLen]
++	used := 18 + ctlLen + fixed + routeLen
+ 	out.Intent.AccelSet = flags&intentFlagAccelSet != 0
+ 	out.Intent.SpeedSet = flags&intentFlagSpeedSet != 0
+ 	out.Intent.SignalSet = flags&intentFlagSignalSet != 0
+@@ -433,7 +497,7 @@ func decodeLoggedIntent(data []byte) (engine.TickedIntent, error) {
+ 	}
+ 	out.Held = flags&logFlagHeld != 0
+ 	out.Superseded = flags&logFlagSuperseded != 0
+-	return out, nil
++	return out, used, nil
+ }
+ 
+ func decodeLoggedCRC(data []byte) (uint64, error) {
+diff --git a/engine/natsio/server.go b/engine/natsio/server.go
+index f23f25697fdf7d45ab802f48f9d9c5b2aa4d8e61..0d628349ea54a7fdbf0892bb622aedf6d0665ea1 100644
+--- a/engine/natsio/server.go
++++ b/engine/natsio/server.go
+@@ -169,7 +169,17 @@ func SubjectEventPause(run string) string { return Namespace + "." + run + ".ctl
+ func SubjectDriveIntrospect(run string) string { return Namespace + "." + run + ".drive.introspect" }
+ 
+ // Record-plane subjects (engine sole writer): ts.{run}.log.{intent,keyframe,crc,event,verb}.
+-func SubjectLogIntent(run string) string   { return Namespace + "." + run + ".log.intent" }
++func SubjectLogIntent(run string) string { return Namespace + "." + run + ".log.intent" }
++
++// SubjectLogIntents carries TSLB batches: one tick's applied intents in one
++// message (ADR-0035). A NEW subject rather than a new payload shape on
++// log.intent, so old and new recordings are told apart by the subject the
++// broker already delivers instead of by sniffing a magic number that could
++// collide with a v2 record's leading applied_tick. Additive: SubjectLogAll
++// (ts.{run}.log.>) already captures it, so the stream config is unchanged,
++// and a v2 recording keeps replaying through the log.intent path untouched.
++func SubjectLogIntents(run string) string { return Namespace + "." + run + ".log.intents" }
++
+ func SubjectLogKeyframe(run string) string { return Namespace + "." + run + ".log.keyframe" }
+ func SubjectLogCRC(run string) string      { return Namespace + "." + run + ".log.crc" }
+ func SubjectLogEvent(run string) string    { return Namespace + "." + run + ".log.event" }
+diff --git a/engine/natsio/tslb.go b/engine/natsio/tslb.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..77bbdf699e0cc62a844ff69e152523296d9ff459
+--- /dev/null
++++ b/engine/natsio/tslb.go
+@@ -0,0 +1,134 @@
++package natsio
++
++import (
++	"encoding/binary"
++	"fmt"
++
++	"traffic-sim/engine"
++)
++
++// tslb.go — TSLB v1, the batched intent log record (ADR-0035).
++//
++// The record plane wrote one JetStream message per applied intent, which is
++// one message per vehicle per tick. ADR-0026 batched the LIVE intent path
++// into TSIB frames and deliberately scoped the record plane out ("the record
++// plane never sees a batch"), so the recorder expanded each batch back into
++// individual messages. Measured on the shipped chihalf recording: an 8 MiB
++// stream block held 34,794 intent messages over 10 ticks — ~230 bytes per
++// message for a record whose fixed section is 61 bytes. The difference is the
++// subject string and JetStream's per-record framing, re-paid ~3,500 times a
++// tick. The whole 90-minute recording is 48 GiB, essentially all of it this.
++//
++// TSLB carries one tick's records in one message. The records are the v2
++// per-message payloads BYTE-IDENTICAL and in the same order, so this is a
++// framing change and not a re-encoding: `appendLoggedIntent` writes both forms
++// and `decodeLoggedIntentAt` reads both. That is deliberate — it makes "the
++// batched log holds exactly what the per-message log held" a claim a test can
++// check by construction rather than a property to be argued.
++//
++// Per-record density (hoisting the repeated applied_tick and controller name
++// out of every record, as TSIB does with its fixed 44 B records) is left
++// undone ON PURPOSE. Those repeated bytes are exactly what a compressor eats:
++// measured on a real stream block, gzip -3 gets 6.2x and zstd -3 gets 7.2x,
++// and ADR-0035 turns on JetStream S2 storage compression in the same change.
++// Hoisting them would buy maybe 20% on top of that while introducing a
++// controller-index table and a route indirection — new invariants on the one
++// plane where a decode bug is unrecoverable, since the record IS the run.
++//
++//	offset  size  field
++//	     0     4  magic 'T','S','L','B'
++//	     4     1  version = 1
++//	     5     1  flags (reserved, must be 0)
++//	     6     4  count — records in THIS message (little endian)
++//	    10     8  tick — the applied_tick every record shares
++//	    18     -  count × v2 intent record (see recorder.go)
++//
++// A tick whose records outgrow the byte budget is split across several TSLB
++// messages, each independently decodable and each naming the same tick. That
++// needs no chunk index (unlike ADR-0015 keyframes, which reassemble ONE blob)
++// because concatenating the records of consecutive messages in stream order is
++// exactly the original order.
++const (
++	tslbHeader  = 18
++	tslbVersion = 1
++
++	// loggedIntentMin is the smallest possible v2 record: the 18-byte prefix
++	// plus the 43-byte fixed section, with an empty controller name and no
++	// route. Used to bound a batch's declared count against the bytes
++	// actually present before trusting it.
++	loggedIntentMin = 18 + 43
++)
++
++var tslbMagic = [4]byte{'T', 'S', 'L', 'B'}
++
++// beginTSLB appends a TSLB header with count and tick left zero, to be filled
++// by finishTSLB once the record count is known.
++func beginTSLB(dst []byte) []byte {
++	dst = append(dst, tslbMagic[0], tslbMagic[1], tslbMagic[2], tslbMagic[3])
++	dst = append(dst, tslbVersion, 0)
++	dst = binary.LittleEndian.AppendUint32(dst, 0) // count
++	dst = binary.LittleEndian.AppendUint64(dst, 0) // tick
++	return dst
++}
++
++// finishTSLB stamps count and tick into a buffer started by beginTSLB.
++func finishTSLB(buf []byte, tick uint64, count int) []byte {
++	binary.LittleEndian.PutUint32(buf[6:], uint32(count))
++	binary.LittleEndian.PutUint64(buf[10:], tick)
++	return buf
++}
++
++// DecodeTSLB parses one batch into its records, in record order.
++//
++// Strict: an unknown magic or version, a count that disagrees with the bytes
++// present, or trailing bytes after the last record are all errors. The record
++// plane is the run — a batch that does not decode exactly must fail the
++// replay loudly rather than yield a short tick that still simulates and still
++// produces plausible numbers.
++func DecodeTSLB(buf []byte) ([]engine.TickedIntent, error) {
++	if len(buf) < tslbHeader {
++		return nil, fmt.Errorf("TSLB: %d bytes, shorter than the %d-byte header", len(buf), tslbHeader)
++	}
++	if buf[0] != tslbMagic[0] || buf[1] != tslbMagic[1] ||
++		buf[2] != tslbMagic[2] || buf[3] != tslbMagic[3] {
++		return nil, fmt.Errorf("TSLB: bad magic %q", buf[:4])
++	}
++	if buf[4] != tslbVersion {
++		return nil, fmt.Errorf("TSLB: version %d, this build knows %d", buf[4], tslbVersion)
++	}
++	if buf[5] != 0 {
++		return nil, fmt.Errorf("TSLB: reserved flags byte is %#x, want 0", buf[5])
++	}
++	count := int(binary.LittleEndian.Uint32(buf[6:]))
++	tick := binary.LittleEndian.Uint64(buf[10:])
++	rest := buf[tslbHeader:]
++	// count comes from the payload, so it is untrusted until the records
++	// check out: a corrupt frame can declare ~4e9 records in an 18-byte
++	// message, and preallocating from it would OOM the reader where every
++	// other malformed input gets the loud error below. A record is at least
++	// loggedIntentMin bytes, so a count the bytes cannot contain is already
++	// corrupt — refuse it before sizing anything from it.
++	if count > len(rest)/loggedIntentMin {
++		return nil, fmt.Errorf("TSLB: count %d, only %d record bytes present", count, len(rest))
++	}
++	out := make([]engine.TickedIntent, 0, count)
++	for i := 0; i < count; i++ {
++		t, n, err := decodeLoggedIntentAt(rest)
++		if err != nil {
++			return nil, fmt.Errorf("TSLB record %d/%d: %w", i+1, count, err)
++		}
++		if t.Tick != tick {
++			// The header tick and the records must agree. Disagreement means
++			// a writer mixed ticks or the payload is corrupt; either way the
++			// intents would be applied at the wrong tick on replay.
++			return nil, fmt.Errorf("TSLB record %d/%d: applied_tick %d, batch tick %d",
++				i+1, count, t.Tick, tick)
++		}
++		out = append(out, t)
++		rest = rest[n:]
++	}
++	if len(rest) != 0 {
++		return nil, fmt.Errorf("TSLB: %d trailing bytes after %d records", len(rest), count)
++	}
++	return out, nil
++}
+diff --git a/engine/natsio/tslb_migration_test.go b/engine/natsio/tslb_migration_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..ae8076f06bcfc7d5ee37766bbfbb1bee976a9546
+--- /dev/null
++++ b/engine/natsio/tslb_migration_test.go
+@@ -0,0 +1,241 @@
++package natsio
++
++import (
++	"fmt"
++	"strings"
++	"testing"
++
++	"github.com/nats-io/nats.go"
++	"traffic-sim/engine"
++)
++
++// tslb_migration_test.go — the batched intent log must record the SAME LOG as
++// the per-message form (ADR-0035).
++//
++// tslb_test.go pins the codec in isolation. This drives the real Recorder over
++// a real JetStream stream and reads it back through the production reader
++// (MaterializeRunRecord), once per format, over an IDENTICAL synthetic intent
++// set. A framing change that loses, reorders or mis-ticks an intent shows up
++// here and nowhere else, because a replay built on a subtly wrong log still
++// simulates and still produces plausible numbers.
++//
++// The intent set is synthetic on purpose. Two separate LIVE runs are not
++// comparable — controller intents arrive over NATS, so which intent lands on
++// which tick varies between runs, and the existing determinism test
++// (TestLiveRecordReplayDeterminism) compares a live run to a REPLAY of itself
++// rather than to a second live run. Feeding both formats one fixed list is
++// what isolates the framing from that timing.
++
++// syntheticIntents builds a deterministic per-tick intent program: tick t
++// carries (t%4)+1 intents, so ticks differ in width, and every tenth tick
++// carries 16 — at ~62-90 B per record that outgrows the test's
++// 3-record budget, so the split path is exercised on those ticks.
++func syntheticIntents(ticks uint64) [][]engine.TickedIntent {
++	ctls := []string{"alpha", "default-driver-7", "b"}
++	out := make([][]engine.TickedIntent, 0, ticks)
++	var seq uint64
++	for tick := uint64(1); tick <= ticks; tick++ {
++		n := int(tick%4) + 1
++		if tick%10 == 0 {
++			n = 16 // wider than the test budget, so this tick splits
++		}
++		batch := make([]engine.TickedIntent, 0, n)
++		for i := 0; i < n; i++ {
++			seq++
++			t := ti(tick, seq, 1000+uint64(i), ctls[i%len(ctls)])
++			// Vary the optional fields so the comparison covers the flag bits
++			// and the variable-length route, not just the fixed section.
++			switch i % 3 {
++			case 0:
++				t.Held = true
++			case 1:
++				t.Superseded = true
++			case 2:
++				t.Intent.RouteSet = true
++				t.Intent.Route = fmt.Sprintf("lane_%d_%d", tick, i)
++			}
++			batch = append(batch, t)
++		}
++		out = append(out, batch)
++	}
++	return out
++}
++
++// writeLog records program through a Recorder in one of the two formats and
++// returns the materialized intents plus the message count.
++func writeLog(t *testing.T, run string, unbatched bool, program [][]engine.TickedIntent) ([]engine.TickedIntent, uint64) {
++	t.Helper()
++	srv := NewTestServer(t)
++	_, js := srv.JetStream(t)
++	r, err := NewRecorder(js, run, RecorderConfig{
++		CRCEvery:           1,
++		UnbatchedIntentLog: unbatched,
++		IntentBatchMax:     tslbHeader + 3*loggedIntentMax, // forces some splits
++	})
++	if err != nil {
++		t.Fatalf("NewRecorder: %v", err)
++	}
++	var msgs uint64
++	for _, batch := range program {
++		if len(batch) == 0 {
++			continue
++		}
++		tick := batch[0].Tick
++		if unbatched {
++			for _, ti := range batch {
++				if err := r.logIntent(ti); err != nil {
++					t.Fatalf("logIntent: %v", err)
++				}
++				msgs++
++			}
++		} else {
++			before := r.IntentBatchesWritten
++			if err := r.logIntentBatch(batch, tick); err != nil {
++				t.Fatalf("logIntentBatch: %v", err)
++			}
++			msgs += r.IntentBatchesWritten - before
++		}
++		if err := r.awaitBatch(tick); err != nil {
++			t.Fatalf("awaitBatch tick %d: %v", tick, err)
++		}
++	}
++	rec, err := MaterializeRunRecord(js, &RunMeta{RunID: run})
++	if err != nil {
++		t.Fatalf("materialize (unbatched=%v): %v", unbatched, err)
++	}
++	return rec.Log.Intents, msgs
++}
++
++func TestBatchedLogRecordsTheSameIntentsAsPerMessage(t *testing.T) {
++	program := syntheticIntents(60)
++	var want []engine.TickedIntent
++	for _, b := range program {
++		want = append(want, b...)
++	}
++
++	v2, v2msgs := writeLog(t, "migv2", true, program)
++	tslb, tslbmsgs := writeLog(t, "migtslb", false, program)
++
++	// Both must reproduce the program exactly...
++	for name, got := range map[string][]engine.TickedIntent{"v2": v2, "TSLB": tslb} {
++		if len(got) != len(want) {
++			t.Fatalf("%s: materialized %d intents, wrote %d", name, len(got), len(want))
++		}
++		for i := range want {
++			if got[i] != want[i] {
++				t.Fatalf("%s intent %d differs:\n got %+v\nwant %+v", name, i, got[i], want[i])
++			}
++		}
++	}
++	// ...and therefore each other, which is the migration claim.
++	for i := range v2 {
++		if v2[i] != tslb[i] {
++			t.Fatalf("intent %d differs between formats:\n  v2 %+v\nTSLB %+v", i, v2[i], tslb[i])
++		}
++	}
++	if tslbmsgs >= v2msgs {
++		t.Errorf("TSLB wrote %d messages for %d intents that took %d before — no framing saved",
++			tslbmsgs, len(want), v2msgs)
++	}
++	if tslbmsgs <= 60 {
++		t.Errorf("%d TSLB messages for 60 non-empty ticks — the wide ticks never split, "+
++			"so this test covers only the one-message-per-tick path", tslbmsgs)
++	}
++	t.Logf("%d intents: %d v2 messages -> %d TSLB messages (%.2fx fewer, with splits forced)",
++		len(want), v2msgs, tslbmsgs, float64(v2msgs)/float64(tslbmsgs))
++}
++
++func TestBatchedLogSplitsAWideTickAcrossMessagesInOrder(t *testing.T) {
++	// One tick far wider than the byte budget: it must split, and the records
++	// must come back in application order across the message boundary.
++	const n = 200
++	batch := make([]engine.TickedIntent, 0, n)
++	for i := 0; i < n; i++ {
++		batch = append(batch, ti(9, uint64(i+1), uint64(2000+i), "alpha"))
++	}
++	got, msgs := writeLog(t, "migsplit", false, [][]engine.TickedIntent{batch})
++	if msgs < 2 {
++		t.Fatalf("%d message(s) for %d intents; the split path was never exercised", msgs, n)
++	}
++	if len(got) != n {
++		t.Fatalf("materialized %d intents, wrote %d — a split lost records", len(got), n)
++	}
++	for i := range batch {
++		if got[i] != batch[i] {
++			t.Fatalf("intent %d out of order or altered across a split:\n got %+v\nwant %+v",
++				i, got[i], batch[i])
++		}
++	}
++	t.Logf("%d intents split across %d TSLB messages, order preserved", n, msgs)
++}
++
++func TestRecorderRefusesAMixedTickBatch(t *testing.T) {
++	// logIntentBatch is called with one tick's AppliedIntents(). If a caller
++	// ever mixes ticks, the records would replay at the wrong tick — the run
++	// would still complete and quietly diverge. Refuse at write time.
++	srv := NewTestServer(t)
++	_, js := srv.JetStream(t)
++	r, err := NewRecorder(js, "mixed", RecorderConfig{})
++	if err != nil {
++		t.Fatalf("NewRecorder: %v", err)
++	}
++	err = r.logIntentBatch([]engine.TickedIntent{ti(5, 1, 1, "a"), ti(6, 2, 2, "a")}, 5)
++	if err == nil {
++		t.Fatal("a batch mixing ticks 5 and 6 was accepted")
++	}
++}
++
++func TestRecorderRefusesToAdoptANonEmptyStream(t *testing.T) {
++	// NewRecorder ADOPTS an existing stream, converging its config via
++	// UpdateStream where AddStream refuses (Compression is the field that
++	// first forced the fallback). That is only safe for an EMPTY stream —
++	// serve's checkFreshRecording permits exactly that, but RunLive is a
++	// public API, so the guard lives in NewRecorder itself: a name collision
++	// with a PRESERVED recording must fail, not silently rewrite its
++	// subjects, retention, MaxAge and compression underneath its data.
++	srv := NewTestServer(t)
++	_, js := srv.JetStream(t)
++
++	// A stream holding a message stands in for a preserved recording. It is
++	// created without S2, so the recorder's default config DIFFERS and the
++	// adoption fallback is the path under test.
++	if _, err := js.AddStream(&nats.StreamConfig{
++		Name:     StreamName("occupied"),
++		Subjects: []string{SubjectLogAll("occupied")},
++		Storage:  nats.FileStorage,
++	}); err != nil {
++		t.Fatalf("seed stream: %v", err)
++	}
++	if _, err := js.Publish(SubjectLogCRC("occupied"), []byte("x")); err != nil {
++		t.Fatalf("seed message: %v", err)
++	}
++	if _, err := NewRecorder(js, "occupied", RecorderConfig{}); err == nil {
++		t.Fatal("NewRecorder adopted a non-empty stream")
++	} else if !strings.Contains(err.Error(), "non-empty") {
++		t.Fatalf("wrong refusal: %v", err)
++	}
++
++	// The case the fallback exists for: an EMPTY stream whose config DIFFERS
++	// from the recorder's (seeded without compression, adopted under the S2
++	// default) converges via UpdateStream instead of failing. Adopting with
++	// UncompressedStore would NOT exercise this — server normalization makes
++	// that config identical to the seed's, AddStream succeeds idempotently,
++	// and the fallback never runs.
++	if _, err := js.AddStream(&nats.StreamConfig{
++		Name:     StreamName("emptyadopt"),
++		Subjects: []string{SubjectLogAll("emptyadopt")},
++		Storage:  nats.FileStorage,
++	}); err != nil {
++		t.Fatalf("seed empty stream: %v", err)
++	}
++	if _, err := NewRecorder(js, "emptyadopt", RecorderConfig{}); err != nil {
++		t.Fatalf("empty-stream adoption with a differing config refused: %v", err)
++	}
++	info, err := js.StreamInfo(StreamName("emptyadopt"))
++	if err != nil {
++		t.Fatalf("StreamInfo: %v", err)
++	}
++	if info.Config.Compression != nats.S2Compression {
++		t.Errorf("adopted stream compression = %v, want S2 (the adoption fallback did not converge the config)", info.Config.Compression)
++	}
++}
+diff --git a/engine/natsio/tslb_test.go b/engine/natsio/tslb_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..143c6e05e10bbe2197e0752526f0083022d95181
+--- /dev/null
++++ b/engine/natsio/tslb_test.go
+@@ -0,0 +1,215 @@
++package natsio
++
++import (
++	"encoding/binary"
++	"strings"
++	"testing"
++
++	"github.com/nats-io/nats.go"
++	"traffic-sim/engine"
++)
++
++// tslb_test.go — the batched intent log (ADR-0035).
++//
++// The claim this format rests on is that a TSLB batch holds EXACTLY what the
++// per-message log held: the same records, byte-identical, in the same order.
++// These tests check that by construction rather than trusting it, because the
++// record plane is the run — a decode that silently drops or reorders intents
++// produces a replay that still simulates and still reports plausible numbers.
++
++func ti(tick, seq, veh uint64, ctl string) engine.TickedIntent {
++	var t engine.TickedIntent
++	t.Tick = tick
++	t.Seq = seq
++	t.Controller = ctl
++	t.Intent.VehicleID = veh
++	t.Intent.Accel = -1.25
++	t.Intent.AccelSet = true
++	t.Intent.SpeedSetpoint = 13.5
++	t.Intent.SpeedSet = true
++	t.Intent.LaneDelta = -1
++	t.Intent.Signals = 3
++	t.Intent.Turn = 2
++	t.Grant = 7
++	return t
++}
++
++// buildBatch encodes ts as one TSLB message the way logIntentBatch does.
++func buildBatch(tick uint64, ts []engine.TickedIntent) []byte {
++	buf := beginTSLB(nil)
++	for _, t := range ts {
++		buf = appendLoggedIntent(buf, t)
++	}
++	return finishTSLB(buf, tick, len(ts))
++}
++
++func TestTSLBRecordsAreByteIdenticalToTheV2Payload(t *testing.T) {
++	// THE migration claim. If this ever fails, the batched log is a
++	// re-encoding rather than a reframing, and every argument about it
++	// carrying the same information has to be made again from scratch.
++	in := ti(42, 9, 1234, "default-driver-3")
++	in.Intent.RouteSet = true
++	in.Intent.Route = "lane-7"
++	single := appendLoggedIntent(nil, in)
++	batch := buildBatch(42, []engine.TickedIntent{in})
++	if got := batch[tslbHeader:]; string(got) != string(single) {
++		t.Fatalf("batched record differs from the v2 payload:\n batch %x\nsingle %x", got, single)
++	}
++	// And the v2 decoder reads that record standalone, unchanged.
++	back, err := decodeLoggedIntent(single)
++	if err != nil {
++		t.Fatalf("v2 decode: %v", err)
++	}
++	if back != in {
++		t.Fatalf("v2 round-trip changed the intent:\n got %+v\nwant %+v", back, in)
++	}
++}
++
++func TestTSLBRoundTripPreservesOrderAndEveryField(t *testing.T) {
++	want := []engine.TickedIntent{
++		ti(7, 1, 100, "a"),
++		ti(7, 2, 101, "default-driver-8"),
++		ti(7, 3, 102, ""),
++	}
++	// Exercise the flag bits the batch must carry and TSIB cannot (ADR-0026
++	// forbids route fields in live batch records; the LOG has them).
++	want[1].Held = true
++	want[2].Superseded = true
++	want[2].Intent.RouteSet = true
++	want[2].Intent.Route = "n123_0_1"
++	want[0].Intent.TurnSet = true
++	want[0].Intent.SignalSet = true
++
++	got, err := DecodeTSLB(buildBatch(7, want))
++	if err != nil {
++		t.Fatalf("DecodeTSLB: %v", err)
++	}
++	if len(got) != len(want) {
++		t.Fatalf("got %d records, want %d", len(got), len(want))
++	}
++	for i := range want {
++		if got[i] != want[i] {
++			t.Errorf("record %d:\n got %+v\nwant %+v", i, got[i], want[i])
++		}
++	}
++}
++
++func TestTSLBEmptyBatchDecodesEmpty(t *testing.T) {
++	got, err := DecodeTSLB(buildBatch(3, nil))
++	if err != nil {
++		t.Fatalf("DecodeTSLB: %v", err)
++	}
++	if len(got) != 0 {
++		t.Fatalf("got %d records, want 0", len(got))
++	}
++}
++
++func TestTSLBRejectsBadMagicAndVersion(t *testing.T) {
++	good := buildBatch(1, []engine.TickedIntent{ti(1, 1, 1, "a")})
++
++	bad := append([]byte(nil), good...)
++	bad[0] = 'X'
++	if _, err := DecodeTSLB(bad); err == nil || !strings.Contains(err.Error(), "magic") {
++		t.Errorf("bad magic: got %v, want a magic error", err)
++	}
++
++	bad = append([]byte(nil), good...)
++	bad[4] = 99
++	if _, err := DecodeTSLB(bad); err == nil || !strings.Contains(err.Error(), "version") {
++		t.Errorf("bad version: got %v, want a version error", err)
++	}
++
++	// The reserved flags byte must stay zero, so a future format that sets it
++	// is refused by this build rather than silently misread.
++	bad = append([]byte(nil), good...)
++	bad[5] = 1
++	if _, err := DecodeTSLB(bad); err == nil || !strings.Contains(err.Error(), "reserved") {
++		t.Errorf("reserved flags: got %v, want a reserved-flags error", err)
++	}
++
++	if _, err := DecodeTSLB(good[:tslbHeader-1]); err == nil {
++		t.Error("a payload shorter than the header must not decode")
++	}
++}
++
++func TestTSLBRejectsACountThatDisagreesWithTheBytes(t *testing.T) {
++	two := []engine.TickedIntent{ti(5, 1, 1, "a"), ti(5, 2, 2, "b")}
++	buf := buildBatch(5, two)
++
++	// Undercount: the records are all there but the header claims fewer, so
++	// one would be dropped. Trailing bytes catch it — silently returning the
++	// first record is the failure mode this guards.
++	under := append([]byte(nil), buf...)
++	binary.LittleEndian.PutUint32(under[6:], 1)
++	if _, err := DecodeTSLB(under); err == nil || !strings.Contains(err.Error(), "trailing") {
++		t.Errorf("undercount: got %v, want a trailing-bytes error", err)
++	}
++
++	// Overcount: claims a record that is not there.
++	over := append([]byte(nil), buf...)
++	binary.LittleEndian.PutUint32(over[6:], 3)
++	if _, err := DecodeTSLB(over); err == nil {
++		t.Error("overcount must not decode")
++	}
++
++	// Absurd overcount: the declared count is used to size the record slice,
++	// so a corrupt frame could otherwise demand an allocation the machine
++	// cannot make — an OOM where every other malformed input gets an error.
++	// The count is refused against the bytes present BEFORE it sizes
++	// anything.
++	huge := append([]byte(nil), buf...)
++	binary.LittleEndian.PutUint32(huge[6:], 1<<32-1)
++	if _, err := DecodeTSLB(huge); err == nil || !strings.Contains(err.Error(), "count") {
++		t.Errorf("huge count: got %v, want a count error", err)
++	}
++}
++
++func TestDecodeTSLBMsgRefusesAHeaderPayloadTickMismatch(t *testing.T) {
++	// DecodeTSLB ties records to the PAYLOAD tick; readers group by the NATS
++	// HEADER tick. decodeTSLBMsg is the cross-check every reader goes
++	// through: a message whose two ticks disagree must fail, not apply at
++	// whichever tick the reader happened to trust.
++	m := &nats.Msg{Header: nats.Header{}, Data: buildBatch(7, []engine.TickedIntent{ti(7, 1, 1, "a")})}
++	m.Header.Set(headerTick, "9")
++	if _, err := decodeTSLBMsg(m); err == nil || !strings.Contains(err.Error(), "headed tick") {
++		t.Errorf("header 9 / payload 7: got %v, want a tick-mismatch error", err)
++	}
++	m.Header.Set(headerTick, "7")
++	if _, err := decodeTSLBMsg(m); err != nil {
++		t.Errorf("agreeing ticks refused: %v", err)
++	}
++}
++
++func TestTSLBRejectsARecordWhoseTickDisagreesWithTheHeader(t *testing.T) {
++	// A record carrying a different applied_tick would be replayed at the
++	// wrong tick — the intents still apply, so nothing crashes and the run
++	// just diverges. Refuse it.
++	mixed := []engine.TickedIntent{ti(5, 1, 1, "a"), ti(6, 2, 2, "b")}
++	if _, err := DecodeTSLB(buildBatch(5, mixed)); err == nil ||
++		!strings.Contains(err.Error(), "applied_tick") {
++		t.Errorf("mixed ticks: got %v, want an applied_tick error", err)
++	}
++}
++
++func TestV2DecoderStillRejectsTrailingBytes(t *testing.T) {
++	// Splitting decodeLoggedIntent into a "decode one record at an offset"
++	// helper must not loosen the whole-message form: a v2 message is exactly
++	// one record and nothing else.
++	one := appendLoggedIntent(nil, ti(1, 1, 1, "a"))
++	if _, err := decodeLoggedIntent(append(one, 0x00)); err == nil ||
++		!strings.Contains(err.Error(), "trailing") {
++		t.Errorf("got %v, want a trailing-bytes error", err)
++	}
++}
++
++func TestLoggedIntentMaxBoundsARealRecord(t *testing.T) {
++	// logIntentBatch reserves loggedIntentMax per record when deciding to
++	// flush. If a record could exceed it, a batch could overrun the byte
++	// budget and the broker would reject the publish mid-run.
++	long := ti(1, 1, 1, strings.Repeat("c", 200))
++	long.Intent.RouteSet = true
++	long.Intent.Route = strings.Repeat("r", 4*intentMaxRoute) // encoder truncates
++	if n := len(appendLoggedIntent(nil, long)); n > loggedIntentMax {
++		t.Fatalf("record encodes to %d bytes, over the %d-byte bound", n, loggedIntentMax)
++	}
++}

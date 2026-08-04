@@ -1,0 +1,14 @@
+ .../ADR-0036-congestion-adaptive-routing.md        | 174 +++++++++
+ engine/adaptive_test.go                            | 387 +++++++++++++++++++++
+ engine/director.go                                 |   1 +
+ engine/engine.go                                   | 108 ++++++
+ engine/gridlock.go                                 |   6 +-
+ engine/keyframe.go                                 |  86 ++++-
+ engine/mobil.go                                    |   1 +
+ engine/network.go                                  |   9 +
+ engine/routing.go                                  | 196 ++++++++++-
+ engine/scenario/scenario.go                        |   8 +
+ engine/scenario/scenario_test.go                   |  22 ++
+ engine/spawn.go                                    |   1 +
+ engine/vehicle.go                                  |  10 +
+ 13 files changed, 992 insertions(+), 17 deletions(-)

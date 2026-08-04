@@ -1,0 +1,5 @@
+ contracts/asyncapi.yaml                            |  2 +-
+ .../kb/decisions/ADR-0006-nats-message-contract.md | 33 ++++++++++++++
+ engine/routing.go                                  | 35 ++++++++++----
+ engine/routing_test.go                             | 53 ++++++++++++++++++++++
+ 4 files changed, 113 insertions(+), 10 deletions(-)

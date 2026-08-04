@@ -56,6 +56,13 @@ check "of demand never entered the network" \
     "the run did not simulate its own scenario (demand delivery below threshold)"
 check "the driver could not keep up" \
     "a material share of vehicle-ticks ran with no car-following control"
+# The cause behind that symptom, gated separately because it can fire while
+# the coasting share still looks survivable: the observation frame carries
+# every claimed ego in ONE message and stops fitting the 4 MiB broker cap
+# near 10,200 vehicles, so a controller receives nothing and drives nothing.
+# Split the fleet across replicas (-drivers N, -capacity/N under ~8000).
+check "observation frames FAILED to publish" \
+    "a controller went blind — the observation frame exceeded the broker payload cap, so part of the fleet was never driven"
 check "nats-server not ready" "the broker never came up"
 [ "$fail" = 0 ] || exit 1
 

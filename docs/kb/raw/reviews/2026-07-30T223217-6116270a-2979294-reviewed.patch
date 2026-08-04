@@ -1,0 +1,1313 @@
+diff --git a/docs/kb/decisions/ADR-0036-congestion-adaptive-routing.md b/docs/kb/decisions/ADR-0036-congestion-adaptive-routing.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..9d8fc2027ae4a03aa4053a6436a552998f71e5c0
+--- /dev/null
++++ b/docs/kb/decisions/ADR-0036-congestion-adaptive-routing.md
+@@ -0,0 +1,162 @@
++# ADR-0036: Congestion-adaptive routing
++
++- **Status:** PROPOSED
++- **Date:** 2026-07-30
++- **Amends:** ADR-0021 (route following), ADR-0006 addendum 2026-07-30
++  (route resolution cost model). No subject or payload-schema change;
++  the keyframe format bumps to v6, written only while the flag is on
++  (flag-off states marshal byte-identical to v5 and below).
++- **Builds on:** the free-flow-time weight change (ADR-0006 addendum
++  2026-07-30), ADR-0019 (metered route budgets), ADR-0034 (what a stopped
++  network costs).
++
++## Context
++
++Route following is static: one destination lane at spawn, next-hop tables
++computed once over free-flow weights, never invalidated, never re-planned.
++Every vehicle sharing an OD pair takes the identical path no matter how
++loaded it is (all-or-nothing assignment), and no vehicle ever diverts
++around a jam it drives into. Real fleets do divert — GPS guidance,
++local knowledge, visible queues — and that diversion is a load-shedding
++mechanism a grid under oversaturation depends on.
++
++Measured on chi-loop-urban (2026-07-30), `data/runs/drain-chi-base/`:
++seed 42 at the "half" demand profile collapses from 25 km/h to a FULL stop
++by minute ~65 — zero exits, zero movement for the remaining 5+ sim-hours,
++6,448 vehicles frozen at the horizon, 766 of 9,335 trips completed. The
++ADR-0034 escape stranded 2,121 vehicles without unlocking the core. Seeds
++1000–1003 survive the same demand in degraded form (~8.6 km/h and still
++falling at 90 min), so the difference between "spiral" and "dead stop" is
++partly luck of the realization — an unhealthy property either way: the
++network has no mechanism to work through heavy load.
++
++## Decision
++
++Three mechanisms, all deterministic (ADR-0005), gated behind
++`Params.AdaptiveRouting` (default OFF until the validation baselines land;
++flipping the default is a follow-up with its own measured baselines).
++
++### 1. Per-lane smoothed travel time (the congestion signal)
++
++Each lane carries `ttEMA`, initialized to free-flow time
++(`length / speedLimit`). A vehicle leaving a lane contributes one sample —
++its dwell time on that lane, `(exitTick − entryTick) · dt` — folded in with
++α = 1/8. Independently, every tick every lane's `ttEMA` relaxes back toward
++its free-flow time with a 10-minute time constant (dt-derived), so a jam
++that has cleared stops repelling traffic on the same timescale it formed.
++
++- `ttEMA` is state that decides behavior → it is KEYFRAMED (the ADR-0034
++  stuckTicks precedent: anything that decides what a vehicle does must
++  survive a restore exactly; float64, no quantization).
++- The vehicle's lane-entry tick is new per-vehicle keyframed state. A
++  pre-v6 keyframe restored into a flag-on spec starts every dwell clock at
++  the restore tick — "no evidence yet", not a capped run-long poison.
++- Dwell samples are capped at `StrandAfterS` (strand removals contribute
++  their sample too — the failure mode the feature exists to route around
++  must leave evidence) and FLOORED at the lane's free-flow time, so a
++  chained same-tick hop cannot make a lane read cheaper than empty.
++
++### 2. Epoch-frozen weights, epoch-stamped tables, static-reference
++### hysteresis (the re-plan)
++
++The routing weights are FROZEN per epoch: every 60 sim-seconds (dt-derived
++— dt is a scenario parameter) each lane's `ttEMA` is copied into `ttSnap`,
++a keyframed per-lane array, and table builds read `ttSnap` only. The
++memoized per-destination next-hop tables (`routeTabs`) gain an epoch
++stamp; accessing a stale table recomputes it by reverse Dijkstra over
++`ttSnap` — same algorithm, tie-breaks, and predecessor order as the
++static builder. Recomputation is METERED (ADR-0019 pattern): at most
++`RerouteBudgetPerTick` (default 4) recomputes per tick, first-use builds
++unmetered; a vehicle whose table is stale past the budget follows the
++stale table that tick.
++
++Hysteresis: lane i keeps its FREE-FLOW (static-table) next-hop unless the
++new path beats the static path's cost under current frozen weights by
++more than max(30 s, 15%). The reference is the static table, NOT the
++previous epoch's adaptive table — with hysteresis history, a mid-run
++restore (derived tables rebuilt empty) picks hops the live engine had
++rejected, an ADR-0029 replay violation found in external review; with the
++static reference every table is a pure function of (frozen weights,
++network), and `TestAdaptiveRestoreIsCRCExact` pins bit-exact continuation
++across a mid-run restore. Oscillation damping is the margin's job either
++way; the static reference additionally returns traffic to free-flow
++routes as congestion clears. Acyclicity of the mixed (new/static) table:
++proportional margins telescope around any would-be cycle to Σw < 0.15·Σw,
++impossible with positive weights; the additive 30 s floor weakens the
++argument for cycles of tiny lanes, and the behavioural backstop is that a
++looping vehicle's own dwell samples poison the loop's weights until it
++loses.
++
++### 3. Scope: whole-fleet, not a seeded fraction
++
++SUMO reroutes a per-vehicle fraction because each of its vehicles owns an
++explicit path. Our Route axis is a destination plus shared tables, so the
++natural unit of adoption is the table, not the vehicle; a per-vehicle
++fraction would require stored per-vehicle paths (memory + a second
++route-following mode) for realism that hysteresis already approximates.
++If the validation runs show oscillation despite hysteresis, the fallback
++is per-vehicle adoption epochs (vehicle adopts the current epoch's table
++only if a seeded coin — pure function of (scenario seed, vehicle ID) via a
++new `DeriveStreamDomain` label — lands it in the adaptive fraction), which
++needs no stored paths, only a keyframed epoch word per vehicle. That
++fallback is designed here so a reviewer can see the exit ramp; it is NOT
++implemented in v1.
++
++## Consequences
++
++- **Route intent semantics** (ADR-0006): the `route` axis still means
++  "destination lane id; persistent". Resolution is now congestion-adaptive
++  when the param is on — contract versions version the wire, not the world
++  model (2026-07-24 precedent). With the flag OFF behavior is bit-identical
++  to today, which keeps every M1–M3 CRC fixture and all existing baselines
++  valid.
++- **Replay:** with the flag ON, runs are deterministic and CRC-verified
++  like any other, and — because tables are pure functions of (frozen
++  weights, network) with no hysteresis history — a MID-RUN restore
++  continues bit-exactly (`TestAdaptiveRestoreIsCRCExact`). The epoch
++  freeze is the mechanism: within an epoch the routing weights are the
++  keyframed `ttSnap`, so a rebuilt table is the table the live engine
++  served. The price is up to one epoch of lag between congestion evidence
++  and routing response. Recordings made with the flag off replay
++  bit-identically (flag state lives in RunSpec/Params, which recordings
++  carry); a v6 keyframe into a flag-off spec is rejected loudly.
++- **Cost:** two float64 per lane per keyframe (ttEMA + ttSnap); one int64
++  per vehicle;
++  ≤ 4 Dijkstras per tick worst case (~55k nodes each on chi-loop-urban,
++  single-digit ms) plus a per-tick per-lane relaxation multiply.
++- **Failure mode bounded:** a poisoned or pathological ttEMA field can
++  only choose worse paths, never teleport, never abandon the destination —
++  the lateral guardrail (ADR-0021) and arrival logic are untouched, and
++  with weights ≡ free-flow the mechanism reduces exactly to the static
++  tables.
++
++## Validation plan (before the default flips)
++
++1. The seed-42 drain scenario (`data/scenarios/chi-loop-urban-half-base`,
++   216,000 ticks): success = no permanent 0.00 km/h plateau; the network
++   clears demand after injection stops.
++2. Four-seed paired bracket vs the static-routing build
++   (`scripts/whatif.py`, seeds 1000–1003, 54k ticks): mean interval speed,
++   completions, stranded counts.
++3. Oscillation check: per-epoch count of next-hop changes and ttEMA
++   variance on the bracket runs — expect bounded flip counts under
++   hysteresis; a runaway is the seeded-fallback trigger.
++4. Determinism: same-seed CRC equality with the flag on; flag-off
++   bit-identity against pre-ADR fixtures.
++
++## Alternatives considered
++
++- **Per-vehicle stored paths (SUMO-style).** Realistic per-vehicle
++  heterogeneity; costs a keyframed path array per vehicle, a second
++  route-following mode, and path-aware lane-change guardrails. Deferred —
++  the shared-table hysteresis design gets most of the effect for a tenth
++  of the machinery.
++- **Controller-side rerouting over the existing RouteSet intent.** No
++  engine change, but async intent latency already proved fidelity-fragile
++  (ADR-0035 blocked finding: batching changed which tick intents land on),
++  and driver-side routing compute is what ADR-0019 moved engine-side.
++  Rejected as the mechanism; remains available to experimenters.
++- **Do nothing; fix demand instead.** Rejected: oversaturation happens in
++  real cities and they do not dead-stop — the missing mechanism is the
++  diversion, and the seed-42 dead stop is a model artifact as much as a
++  demand artifact.
+diff --git a/engine/adaptive_test.go b/engine/adaptive_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..d813d9367e78bad93aeacd467118985f1b76edd6
+--- /dev/null
++++ b/engine/adaptive_test.go
+@@ -0,0 +1,405 @@
++package engine
++
++import (
++	"bytes"
++	"encoding/binary"
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++// adaptiveDiamondSpec is routeDiamondSpec with the adaptive flag on.
++func adaptiveDiamondSpec(t *testing.T) RunSpec {
++	t.Helper()
++	spec := routeDiamondSpec(t)
++	spec.Params.AdaptiveRouting = true
++	return spec
++}
++
++// dualExitSpec is the route-diamond geometry with a second exit y_0 off the
++// rejoin lane, so two route destinations share the a_0 fork decision — the
++// recompute meter needs two tables that go stale together.
++func dualExitSpec(t *testing.T) RunSpec {
++	t.Helper()
++	nf := NetFile{
++		Version: 1,
++		Name:    "route-dual-exit",
++		Lanes: []NetLane{
++			{ID: "a_0", Section: "a", Length: 500, SpeedLimit: 33.3, Width: 3.2,
++				Shape: [][2]float64{{0, 0}, {500, 0}}, Successors: []string{"b_0", "c_0"}, Origin: true},
++			{ID: "b_0", Section: "b", Length: 100, SpeedLimit: 5, Width: 3.2,
++				Shape: [][2]float64{{500, 0}, {520, 100}}, Successors: []string{"m_0"}},
++			{ID: "c_0", Section: "c", Length: 400, SpeedLimit: 33.3, Width: 3.2,
++				Shape: [][2]float64{{500, 0}, {520, -100}}, Successors: []string{"m_0"}},
++			{ID: "m_0", Section: "m", Length: 50, SpeedLimit: 13.9, Width: 3.2,
++				Shape: [][2]float64{{520, 100}, {600, 0}}, Successors: []string{"x_0", "y_0"}},
++			{ID: "x_0", Section: "x", Length: 2, SpeedLimit: 13.9, Width: 3.2,
++				Shape: [][2]float64{{600, 0}, {602, 0}}, Exit: true},
++			{ID: "y_0", Section: "y", Length: 2, SpeedLimit: 13.9, Width: 3.2,
++				Shape: [][2]float64{{600, 0}, {620, 20}}, Exit: true},
++		},
++	}
++	data, err := json.Marshal(nf)
++	if err != nil {
++		t.Fatal(err)
++	}
++	p := filepath.Join(t.TempDir(), "network.json")
++	if err := os.WriteFile(p, data, 0o644); err != nil {
++		t.Fatal(err)
++	}
++	return RunSpec{Net: NetSpec{Kind: "file", Path: p}, Params: DefaultParams(), Ticks: 5}
++}
++
++// The end-to-end ADR-0036 loop: congestion on the fast arm poisons its
++// travel-time EMA through DWELL SAMPLES, an epoch-boundary recompute sees
++// the poisoned weight, and a newly routed vehicle takes the other arm.
++//
++// The congestion is two crawlers parked at 1 m/s on c_0 (the arm static
++// routing prefers): each takes ~400 s to clear the lane, so each departure
++// folds a StrandAfterS-capped 300 s sample into c_0's ttEMA (α = 1/8). One
++// sample lifts the EMA to ~48 s — deliberately NOT enough to beat
++// hysteresis (the old path loses by only ~28 s < 30 s margin); the second
++// lifts it to ~79 s, which clears the margin with room. The crawlers are
++// placed on c_0 directly so the test does not have to wait out a_0.
++func TestAdaptiveDivertsAroundCongestion(t *testing.T) {
++	spec := adaptiveDiamondSpec(t)
++	e, err := NewEngine(spec)
++	if err != nil {
++		t.Fatal(err)
++	}
++	a0 := laneOf(t, e, "a_0")
++	c0 := laneOf(t, e, "c_0")
++	x0 := laneOf(t, e, "x_0")
++	// Seed the epoch-0 table the way the run's first routed crossing would.
++	e.routeTable(x0.Index)
++	for _, s := range []float64{10, 0.5} {
++		slow := e.AddInitialVehicle(c0, 0, s, 1, 1)
++		slow.Cruise, slow.CruiseOK = 1, true
++	}
++	// The slow pair leaves c_0 around ticks 3900/4000; the routing weights
++	// freeze at each 600-tick rollover, so the diversion becomes routable
++	// at the NEXT boundary after the samples land (4200) — tables lag the
++	// evidence by up to one epoch, the price of replay-safe weights.
++	for e.Tick < 4300 {
++		e.Step()
++	}
++	// The dwell evidence must have landed BEFORE the routing assertion below
++	// means anything: two capped 300 s samples at α = 1/8 over the 12 s
++	// free-flow time, damped a little by the per-tick relaxation.
++	if c0.ttEMA < 50 {
++		t.Fatalf("c_0 ttEMA = %.1f s after two capped dwell samples — the congestion signal never arrived", c0.ttEMA)
++	}
++	if e.ttSnap[c0.Index] < 40 {
++		t.Fatalf("c_0 ttSnap = %.1f s — the epoch freeze never picked the evidence up", e.ttSnap[c0.Index])
++	}
++	w := e.AddInitialVehicle(a0, 0, 499.5, 33.3, 1)
++	w.Route = "x_0"
++	for i := 0; i < 5 && w.Lane != nil && w.Lane.ID == "a_0"; i++ {
++		e.Step()
++	}
++	if w.Lane == nil || w.Lane.ID != "b_0" {
++		t.Fatalf("crossed to %v, want b_0 — a poisoned fast arm should divert traffic to the slow one", w.Lane)
++	}
++}
++
++// Hysteresis brackets: a poisoned arm whose new path is only MARGINALLY
++// better than the old keeps the old next-hop; one that is CLEARLY better
++// (beats it by more than max(30 s, 15%)) flips. ttEMA is set directly here
++// — the dwell-sampling path that produces it in the wild is pinned end-to-
++// end by TestAdaptiveDivertsAroundCongestion; this test isolates the margin.
++//
++// Bracket arithmetic (paths a_0 → {b_0|c_0} → m_0 → x_0; the m_0 + x_0
++// tail, ~3.7 s, is common to both arms): free flow via b_0 is 20 s, via
++// c_0 is 12 s. At ttEMA(c_0) = 45 the old path costs ~45.7 vs 23.7 new —
++// 22 s better, under the 30 s floor: KEEP. At 60 it is ~59.7 vs 23.7 —
++// 36 s better, over the floor: FLIP. (Both survive the ~10% relaxation
++// decay over the 602 ticks to the crossing.)
++func TestAdaptiveHysteresisMargin(t *testing.T) {
++	cases := []struct {
++		name string
++		tt   float64
++		want string
++	}{
++		{"marginal poison keeps the old hop", 45, "c_0"},
++		{"clear poison flips the hop", 60, "b_0"},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			spec := adaptiveDiamondSpec(t)
++			e, err := NewEngine(spec)
++			if err != nil {
++				t.Fatal(err)
++			}
++			e.routeTable(laneOf(t, e, "x_0").Index) // epoch-0 table
++			laneOf(t, e, "c_0").ttEMA = tc.tt
++			for e.Tick < 601 { // into epoch 1: the next access recomputes
++				e.Step()
++			}
++			w := e.AddInitialVehicle(laneOf(t, e, "a_0"), 0, 499.5, 33.3, 1)
++			w.Route = "x_0"
++			for i := 0; i < 5 && w.Lane != nil && w.Lane.ID == "a_0"; i++ {
++				e.Step()
++			}
++			if w.Lane == nil || w.Lane.ID != tc.want {
++				t.Fatalf("ttEMA %.0f: crossed to %v, want %s", tc.tt, w.Lane, tc.want)
++			}
++		})
++	}
++}
++
++// The core safety property: flag OFF, nothing about the wire changes. The
++// whole suite's CRC fixtures pin the trajectory; here the keyframe itself
++// must stay at v5 or below — v6 is written only while AdaptiveRouting is on.
++func TestAdaptiveOffStaysBelowV6(t *testing.T) {
++	e, err := NewEngine(routeDiamondSpec(t)) // flag off by default
++	if err != nil {
++		t.Fatal(err)
++	}
++	v := e.AddInitialVehicle(laneOf(t, e, "a_0"), 0, 499.5, 33.3, 1)
++	v.Route = "x_0"
++	for e.Tick < 10 {
++		e.Step()
++	}
++	data, err := e.MarshalState()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if ver := binary.LittleEndian.Uint16(data[4:6]); ver >= keyframeAdaptiveVersion {
++		t.Fatalf("flag-off state marshalled as v%d — the adaptive section leaked into a static run", ver)
++	}
++}
++
++// Flag-ON determinism (ADR-0005, mirror of TestRouteFollowingDeterministic):
++// two identical congested adaptive runs produce identical per-tick CRCs —
++// dwell samples, epoch recompute, budget, and hysteresis are all pure
++// functions of the keyframed state and the deterministic sweep order.
++func TestAdaptiveDeterministic(t *testing.T) {
++	run := func(t *testing.T) []uint64 {
++		spec := adaptiveDiamondSpec(t)
++		e, err := NewEngine(spec)
++		if err != nil {
++			t.Fatal(err)
++		}
++		e.routeTable(laneOf(t, e, "x_0").Index)
++		slow := e.AddInitialVehicle(laneOf(t, e, "c_0"), 0, 5, 5, 1)
++		slow.Cruise, slow.CruiseOK = 5, true
++		// Probes crossing in epochs 0, 1, and 2, so the memoized table is
++		// built, recomputed on dwell evidence, and recomputed again.
++		for _, at := range []uint64{0, 650, 1200} {
++			for e.Tick < at {
++				e.Step()
++			}
++			p := e.AddInitialVehicle(laneOf(t, e, "a_0"), 0, 499.5, 33.3, 1)
++			p.Route = "x_0"
++		}
++		for e.Tick < 1400 {
++			e.Step()
++		}
++		return e.CRCs
++	}
++	a, b := run(t), run(t)
++	if len(a) != len(b) {
++		t.Fatalf("CRC sequences differ in length: %d vs %d", len(a), len(b))
++	}
++	for i := range a {
++		if a[i] != b[i] {
++			t.Fatalf("tick %d: CRC %x != %x — adaptive routing is not deterministic", i, a[i], b[i])
++		}
++	}
++}
++
++// The replay-fidelity property the epoch-freeze and static-reference
++// hysteresis exist for (ADR-0036 §2, external review 2026-07-30): a run
++// restored from a mid-run keyframe continues bit-exactly. Tables are
++// derived, so the restored engine REBUILDS them — reproducibly, because
++// they are pure functions of (frozen weights, network): the weights come
++// from the keyframed ttSnap, the hysteresis reference is the static table,
++// and first-use builds are unmetered so the restore tick's budget cannot
++// diverge either. With hysteresis history (the pre-review design) the
++// restored engine picked hops the live engine had rejected, and this test
++// failed.
++func TestAdaptiveRestoreIsCRCExact(t *testing.T) {
++	spec := adaptiveDiamondSpec(t)
++	const split = 800 // mid-epoch-1, after dwell evidence has landed
++	full, err := NewEngine(spec)
++	if err != nil {
++		t.Fatal(err)
++	}
++	slow := full.AddInitialVehicle(laneOf(t, full, "c_0"), 0, 5, 5, 1)
++	slow.Cruise, slow.CruiseOK = 5, true
++	for _, at := range []uint64{0, 650, 1200} {
++		for full.Tick < at {
++			full.Step()
++		}
++		p := full.AddInitialVehicle(laneOf(t, full, "a_0"), 0, 499.5, 33.3, 1)
++		p.Route = "x_0"
++	}
++	for full.Tick < 1400 {
++		full.Step()
++	}
++
++	// Re-run to the split, restore, continue: the tail must be bit-exact.
++	half, err := NewEngine(spec)
++	if err != nil {
++		t.Fatal(err)
++	}
++	slow = half.AddInitialVehicle(laneOf(t, half, "c_0"), 0, 5, 5, 1)
++	slow.Cruise, slow.CruiseOK = 5, true
++	for _, at := range []uint64{0, 650} {
++		for half.Tick < at {
++			half.Step()
++		}
++		p := half.AddInitialVehicle(laneOf(t, half, "a_0"), 0, 499.5, 33.3, 1)
++		p.Route = "x_0"
++	}
++	for half.Tick < split {
++		half.Step()
++	}
++	data, err := half.MarshalState()
++	if err != nil {
++		t.Fatal(err)
++	}
++	warm, err := RestoreState(spec, data)
++	if err != nil {
++		t.Fatalf("RestoreState: %v", err)
++	}
++	for warm.Tick < 1200 {
++		warm.Step()
++	}
++	p := warm.AddInitialVehicle(laneOf(t, warm, "a_0"), 0, 499.5, 33.3, 1)
++	p.Route = "x_0"
++	for warm.Tick < 1400 {
++		warm.Step()
++	}
++	// CRCs are per-Step append-only and NOT restored: warm.CRCs[0] is the
++	// first post-restore tick (split+1), full.CRCs[i] is tick i+1.
++	for i := split; i < 1400; i++ {
++		if full.CRCs[i] != warm.CRCs[i-split] {
++			t.Fatalf("tick %d: CRC %x != %x — a mid-run restore diverges under adaptive routing",
++				i+1, full.CRCs[i], warm.CRCs[i-split])
++		}
++	}
++}
++
++// Keyframe v6 round-trip: a state carrying a perturbed ttEMA and a running
++// dwell clock marshals, restores, and re-marshals byte-identically, and the
++// restored engine makes the same next-hop decision the live one does. The
++// nLanes guard must reject the same bytes against the wrong spec.
++func TestKeyframeV6AdaptiveRoundTrip(t *testing.T) {
++	spec := adaptiveDiamondSpec(t)
++	e, err := NewEngine(spec)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for e.Tick < 30 { // spawn mid-run so laneEntryTick is a nonzero running clock
++		e.Step()
++	}
++	// Perturb BEFORE the first routed crossing: the live engine's memoized
++	// table and the restored engine's fresh build then see the same frozen
++	// weights. The perturbation is white-box on BOTH the EMA and the
++	// epoch-frozen snapshot — in the wild ttSnap only moves at a rollover
++	// (TestAdaptiveDivertsAroundCongestion pins that path end-to-end);
++	// here the round-trip of both fields is what is under test.
++	laneOf(t, e, "c_0").ttEMA = 77.5 // perturbed congestion signal
++	e.ttSnap[laneOf(t, e, "c_0").Index] = 77.5
++	w := e.AddInitialVehicle(laneOf(t, e, "a_0"), 0, 250, 20, 1)
++	w.Route = "x_0"
++	for e.Tick < 50 {
++		e.Step()
++	}
++
++	data, err := e.MarshalState()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if ver := binary.LittleEndian.Uint16(data[4:6]); ver != keyframeAdaptiveVersion {
++		t.Fatalf("flag-on state marshalled as v%d, want v%d", ver, keyframeAdaptiveVersion)
++	}
++	warm, err := RestoreState(spec, data)
++	if err != nil {
++		t.Fatalf("RestoreState: %v", err)
++	}
++	data2, err := warm.MarshalState()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Equal(data, data2) {
++		t.Fatal("v6 round-trip is not byte-identical")
++	}
++	// The live engine's table (built while w sat routed on a_0, over the
++	// perturbed weights) and the restored engine's fresh build must agree,
++	// and agree on the diversion the poisoned c_0 implies.
++	coldHop := e.routeNextHop(laneOf(t, e, "a_0"), "x_0")
++	warmHop := warm.routeNextHop(warm.Net.LaneByID("a_0"), "x_0")
++	if coldHop == nil || warmHop == nil || coldHop.ID != warmHop.ID {
++		t.Fatalf("next-hop decisions diverge across a restore: %v vs %v", coldHop, warmHop)
++	}
++	if coldHop.ID != "b_0" {
++		t.Fatalf("hop = %s, want b_0 — the restored ttEMA did not weight the recompute", coldHop.ID)
++	}
++	// The lane section is pinned to the spec's network: the diamond's bytes
++	// against the fork's 8-lane network must be rejected, not misread.
++	if _, err := RestoreState(routeForkSpec(t), data); err == nil {
++		t.Fatal("v6 lane section restored against the wrong network")
++	}
++}
++
++// The recompute meter: with RerouteBudgetPerTick = 1 and TWO destinations
++// whose tables both go stale in the same epoch, one tick serves one fresh
++// table and one STALE one — the budgeted vehicle diverts, the other follows
++// the stale hop. Next tick's budget covers the second table.
++//
++// Black-box at the decision level; the budget counter and epoch stamps are
++// asserted white-box because they ARE the meter being specified.
++func TestRerouteBudgetServesStaleTable(t *testing.T) {
++	// A second exit off the rejoin lane gives two destinations whose tables
++	// share the a_0 fork decision.
++	spec := dualExitSpec(t)
++	spec.Params.AdaptiveRouting = true
++	spec.Params.RerouteBudgetPerTick = 1
++	e, err := NewEngine(spec)
++	if err != nil {
++		t.Fatal(err)
++	}
++	a0 := laneOf(t, e, "a_0")
++	c0 := laneOf(t, e, "c_0")
++	x0 := laneOf(t, e, "x_0")
++	y0 := laneOf(t, e, "y_0")
++	e.routeTable(x0.Index) // both tables stamped epoch 0
++	e.routeTable(y0.Index)
++	c0.ttEMA = 100 // poisoned well past the hysteresis margin
++	for e.Tick < 601 {
++		e.Step()
++	}
++	// Both vehicles cross a_0 in the SAME tick (same position, same speed);
++	// the sweep serves x_0's table first (e.order), spends the one recompute,
++	// and y_0's asker gets the stale table.
++	va := e.AddInitialVehicle(a0, 0, 499.5, 33.3, 1)
++	va.Route = "x_0"
++	vb := e.AddInitialVehicle(a0, 0, 499.5, 33.3, 1)
++	vb.Route = "y_0"
++	e.Step()
++	if va.Lane == nil || va.Lane.ID != "b_0" {
++		t.Fatalf("budgeted recompute: crossed to %v, want b_0", va.Lane)
++	}
++	if vb.Lane == nil || vb.Lane.ID != "c_0" {
++		t.Fatalf("past-budget asker: crossed to %v, want the stale c_0", vb.Lane)
++	}
++	if e.rerouteBudget != 0 {
++		t.Fatalf("rerouteBudget = %d after one recompute with budget 1", e.rerouteBudget)
++	}
++	if e.routeEpochs[x0.Index] != 1 || e.routeEpochs[y0.Index] != 0 {
++		t.Fatalf("epochs = (%d, %d), want (1, 0) — only the budgeted table recomputed",
++			e.routeEpochs[x0.Index], e.routeEpochs[y0.Index])
++	}
++	// Next tick's budget recomputes the second table on demand.
++	vc := e.AddInitialVehicle(a0, 0, 499.5, 33.3, 1)
++	vc.Route = "y_0"
++	for i := 0; i < 5 && vc.Lane != nil && vc.Lane.ID == "a_0"; i++ {
++		e.Step()
++	}
++	if vc.Lane == nil || vc.Lane.ID != "b_0" {
++		t.Fatalf("later asker: crossed to %v, want b_0 — the stale table never recomputed", vc.Lane)
++	}
++}
+diff --git a/engine/director.go b/engine/director.go
+index a210d16b90b4a0f3993e2ab238813ae6891a92fc..2764bb5d2410d4cc47e20b57a7fa7566ff7a251b 100644
+--- a/engine/director.go
++++ b/engine/director.go
+@@ -296,6 +296,7 @@ func (e *Engine) injectDirective(d *TickedSpawn, lane *Lane, speed float64) {
+ 	v.Route = d.Destination              // routing axis set at birth (ADR-0021)
+ 	v.V = math.Min(speed, v.v0eff(lane)) // the plan is F-free; apply the driver's own factor
+ 	v.Cooldown = e.Params.SpawnCooldown
++	v.laneEntryTick = e.Tick // ADR-0036 dwell clock starts at injection
+ 	e.register(v)
+ 	e.Stats.Spawned++
+ 	if d.OffsetM > 0 {
+diff --git a/engine/engine.go b/engine/engine.go
+index 81fa63486340ced731d9502e83b95df4bb3f3416..5becd9bf30744b01fd90bb069e5e7be87d78d1e7 100644
+--- a/engine/engine.go
++++ b/engine/engine.go
+@@ -48,6 +48,22 @@ type Params struct {
+ 	// vehicle motionless at an open junction for five minutes. It is the
+ 	// bound on how long the model will stay stopped before saying so.
+ 	StrandAfterS float64
++
++	// AdaptiveRouting turns on congestion-adaptive route resolution
++	// (ADR-0036): lanes carry a smoothed travel-time estimate fed by vehicle
++	// dwell samples, and the memoized next-hop tables are recomputed once per
++	// 60-second epoch over those weights instead of serving free-flow tables
++	// forever. OFF is bit-identical to pre-ADR-0036 behavior — same tables,
++	// same keyframe bytes — which is what keeps every M1–M3 CRC fixture and
++	// recorded baseline valid.
++	AdaptiveRouting bool
++	// RerouteBudgetPerTick caps next-hop table recomputes per tick (ADR-0019
++	// metering applied to ADR-0036): a vehicle whose table is stale past the
++	// budget follows the stale table that tick, so a bad tick costs at most
++	// this many Dijkstras. The budget is derived state — a pure function of
++	// tick and deterministic sweep order — never keyframed, never CRC'd.
++	// Only read while AdaptiveRouting is on.
++	RerouteBudgetPerTick int
+ }
+ 
+ // DefaultParams returns the validated M1 defaults.
+@@ -75,6 +91,12 @@ func DefaultParams() Params {
+ 		// enough that a gridlocked network resumes within the run
+ 		// (ADR-0034).
+ 		StrandAfterS: 300,
++		// Off by default until the validation baselines land (ADR-0036's
++		// validation plan); flipping the default is a follow-up with its own
++		// measured bracket. The budget is SUMO-scale: a handful of ~55k-node
++		// Dijkstras per tick is single-digit milliseconds.
++		AdaptiveRouting:      false,
++		RerouteBudgetPerTick: 4,
+ 	}
+ }
+ 
+@@ -194,6 +216,20 @@ type Engine struct {
+ 	latTabs   map[int][]int32 // dest lane index → lateral-depth table
+ 	preds     [][]int32       // predecessor adjacency, built once
+ 
++	// Adaptive-routing state (ADR-0036, routing.go). ttSnap is the
++	// epoch-frozen routing weight per lane — snapshotted from ttEMA at each
++	// epoch rollover, KEYFRAMED (it decides behavior). routeEpochs and
++	// rerouteBudget are pure functions of (tick, keyframed state,
++	// deterministic sweep order), so they stay derived: not keyframed, not
++	// CRC'd. routeEpochTicks/ttRelaxTicks are dt-derived constants computed
++	// at NewEngine. All unused while Params.AdaptiveRouting is off.
++	ttSnap          []float64       // lane index → epoch-frozen travel time
++	routeEpochs     map[int]uint64  // dest lane index → epoch of the cached table
++	staticTabs      map[int][]int32 // dest lane index → free-flow table (hysteresis reference)
++	rerouteBudget   int             // table recomputes left this tick; reset each Step
++	routeEpochTicks uint64          // 60 s in ticks at this run's dt
++	ttRelaxTicks    float64         // 600 s in ticks at this run's dt
++
+ 	Stats Stats
+ }
+ 
+@@ -256,6 +292,7 @@ func NewEngine(spec RunSpec) (*Engine, error) {
+ 			v.S = float64(i) * spacing
+ 			v.V = veq
+ 			v.F = 1
++			v.laneEntryTick = e.Tick
+ 			e.register(v)
+ 		}
+ 	}
+@@ -264,6 +301,23 @@ func NewEngine(spec RunSpec) (*Engine, error) {
+ 	if e.spawner != nil {
+ 		e.spawner.init(e)
+ 	}
++	// Adaptive routing (ADR-0036 §1): the travel-time EMA starts at free
++	// flow, so the first epoch's tables are exactly the static ones and the
++	// mechanism reduces to ADR-0021 until dwell evidence says otherwise.
++	// Keyframe restore overwrites ttEMA and ttSnap from the lane section
++	// (format v6). The time constants are SECONDS converted to ticks here:
++	// dt is a scenario parameter, and 600/6000 ticks are 60 s/10 min only
++	// at the validated 0.1 s tick.
++	if e.Params.AdaptiveRouting {
++		e.ttSnap = make([]float64, len(net.Lanes))
++		for _, l := range net.Lanes {
++			l.ttEMA = freeFlowTime(l)
++			e.ttSnap[l.Index] = l.ttEMA
++		}
++		e.routeEpochs = map[int]uint64{}
++		e.routeEpochTicks = max(1, uint64(math.Round(60/e.Params.Dt)))
++		e.ttRelaxTicks = max(1, math.Round(600/e.Params.Dt))
++	}
+ 	e.rebuildOccupancy()
+ 	return e, nil
+ }
+@@ -307,6 +361,7 @@ func (e *Engine) AddInitialVehicle(lane *Lane, typeIdx int, s, v, f float64) *Ve
+ 	veh.S = s
+ 	veh.V = v
+ 	veh.F = f
++	veh.laneEntryTick = e.Tick
+ 	e.register(veh)
+ 	e.rebuildOccupancy()
+ 	return veh
+@@ -322,6 +377,8 @@ func (e *Engine) CRC() uint64 { return e.crc }
+ 
+ // Step advances the simulation exactly one tick. Phase order:
+ //
++//  0. adaptive routing (flag-gated, ADR-0036): recompute budget reset,
++//     travel-time EMA relaxation — before anything routes this tick
+ //  1. events: deterministic spawner, then director spawn directives
+ //     (ADR-0005: events fire before the sweep; the director queue's fixed
+ //     point is documented in director.go)
+@@ -335,6 +392,24 @@ func (e *Engine) CRC() uint64 { return e.crc }
+ //  7. metrics + rolling state CRC
+ func (e *Engine) Step() {
+ 	e.Tick++
++	// Adaptive routing (ADR-0036): reset the per-tick recompute budget and
++	// relax every lane's travel-time EMA back toward free flow BEFORE the
++	// sweep, so this tick's routing sees this tick's relaxation. Both are
++	// gated on the flag — off stays bit-identical — and both are pure
++	// functions of tick and lane order, so replay re-derives them.
++	if e.Params.AdaptiveRouting {
++		e.rerouteBudget = e.Params.RerouteBudgetPerTick
++		e.relaxTravelTimes()
++		// Epoch rollover: freeze the routing weights (ADR-0036 §2). Tables
++		// are built over the SNAPSHOT, not the live EMA, so a table is a
++		// pure function of (keyframed state, network): a mid-epoch restore
++		// recomputes exactly the table the live engine was serving.
++		if e.Tick%e.routeEpochTicks == 0 {
++			for _, l := range e.Net.Lanes {
++				e.ttSnap[l.Index] = l.ttEMA
++			}
++		}
++	}
+ 	for _, v := range e.order {
+ 		v.reqAccOK, v.reqLane = false, 0
+ 	}
+@@ -358,6 +433,46 @@ func (e *Engine) Step() {
+ 	e.CRCs = append(e.CRCs, e.crc)
+ }
+ 
++// relaxTravelTimes moves every lane's travel-time EMA one tick back toward
++// its free-flow time (ADR-0036 §1): an exponential decay with a 10-minute
++// time constant, so a jam that has CLEARED stops repelling traffic on the
++// same timescale it formed. Dwell samples alone only ever move the estimate
++// while vehicles cross; without this term a poisoned lane would repel
++// forever. Per-lane, in fixed lane order — 55k lanes per tick is a plain
++// loop. The constant is dt-derived at NewEngine: 6000 ticks is 10 min only
++// at the validated 0.1 s tick, and dt is a scenario parameter.
++func (e *Engine) relaxTravelTimes() {
++	for _, l := range e.Net.Lanes {
++		l.ttEMA += (freeFlowTime(l) - l.ttEMA) / e.ttRelaxTicks
++	}
++}
++
++// noteLaneLeave folds v's dwell on its current lane into the lane's
++// travel-time EMA and restarts v's dwell clock (ADR-0036 §1). Called on
++// every lane departure — junction crossing, lateral hop, exit or arrival
++// despawn, and strand removal — so the EMA sees one sample per vehicle per
++// lane traversal, α = 1/8. The sample is capped at StrandAfterS so one
++// stranded vehicle cannot poison a lane for longer than the escape's own
++// horizon (a disabled escape, StrandAfterS == 0, means no cap), and FLOORED
++// at the lane's free-flow time: a chained same-tick hop would otherwise
++// feed dwell ≈ 0 and let frequently-chained short lanes read cheaper than
++// empty — a systematic optimistic bias with no physical counterpart.
++func (e *Engine) noteLaneLeave(v *Vehicle) {
++	if !e.Params.AdaptiveRouting {
++		return
++	}
++	l := v.Lane
++	dwell := float64(e.Tick-v.laneEntryTick) * e.Params.Dt
++	if capS := e.Params.StrandAfterS; capS > 0 && dwell > capS {
++		dwell = capS
++	}
++	if ff := freeFlowTime(l); dwell < ff {
++		dwell = ff
++	}
++	l.ttEMA += (dwell - l.ttEMA) / 8
++	v.laneEntryTick = e.Tick
++}
++
+ // rebuildOccupancy re-sorts every lane's vehicle list by s (ties by ID —
+ // deterministic even in degenerate states).
+ func (e *Engine) rebuildOccupancy() {
+@@ -723,6 +838,7 @@ func (e *Engine) boundaries() {
+ 			}
+ 			switch {
+ 			case lane.Exit:
++				e.noteLaneLeave(v) // ADR-0036: the exit lane's last dwell sample
+ 				v.Lane = nil
+ 				despawned = true
+ 				e.Stats.Despawned++
+@@ -733,6 +849,7 @@ func (e *Engine) boundaries() {
+ 				// unreachable as a trip end — the vehicle would roll past it
+ 				// and the route would re-steer it back (the cyclic-network
+ 				// loop-back recorded in ADR-0019's deferrals).
++				e.noteLaneLeave(v)
+ 				v.Lane = nil
+ 				despawned = true
+ 				e.Stats.Despawned++
+@@ -756,6 +873,7 @@ func (e *Engine) boundaries() {
+ 						e.CrossOverlapsBySection[next.Section]++
+ 					}
+ 				}
++				e.noteLaneLeave(v) // ADR-0036: dwell sample for the lane just left
+ 				v.Lane = next
+ 				v.HeldTurn = 0 // turn-at-junction is held until consumed
+ 				// Stop-line duty is per junction APPROACH (ADR-0010), and an
+diff --git a/engine/gridlock.go b/engine/gridlock.go
+index 8766a67f6a544a83250a5a76bc4d8656d5ccc31c..69805ce79b26fda1ba67373823fad259e03899f4 100644
+--- a/engine/gridlock.go
++++ b/engine/gridlock.go
+@@ -121,7 +121,11 @@ func (e *Engine) strandStuck() {
+ 		// Off the lane immediately, not at the end of the sweep: later
+ 		// vehicles in this same tick's sweep read lane.vehs for their own
+ 		// head test and their own boxBlocked, and must not see a vehicle
+-		// that is already gone.
++		// that is already gone. The strand IS a lane departure: fold the
++		// capped dwell sample into the adaptive EMA first (ADR-0036 §1) —
++		// the failure mode the feature exists to route around is exactly
++		// the one that must leave congestion evidence.
++		e.noteLaneLeave(v)
+ 		lane.vehs = removeVehicle(lane.vehs, v)
+ 		v.Lane = nil
+ 		stranded = true
+diff --git a/engine/keyframe.go b/engine/keyframe.go
+index 9461b14b8e990de7acc7a05273ac7ab05e33baf4..b75db06f5c4bf6ff625f80eef8933adefaad5fd3 100644
+--- a/engine/keyframe.go
++++ b/engine/keyframe.go
+@@ -31,6 +31,11 @@ import (
+ //	v5 only (written solely while some vehicle has a running stuck timer or
+ //	a discharged stop duty), appended to each vehicle record:
+ //	  stuckTicks u64 | stopDone u8
++//	v6 only (written solely while Params.AdaptiveRouting is on), appended to
++//	each vehicle record after the v5 fields:
++//	  laneEntryTick u64
++//	v6 only, a lane section between the spawner and director sections:
++//	  nLanes u32 | per lane (network order): ttEMA f64 | ttSnap f64
+ //	v3 only (written solely while the director queue is non-empty):
+ //	  nDirectives u32 | per directive: tick u64 | laneIdx u32 | typeIdx u32 |
+ //	  earliestTick u64 | reqIDLen u16 | reqID bytes
+@@ -85,7 +90,25 @@ const (
+ 	// the line merely loses one tick — which is also not bit-exact.)
+ 	// Caught in review; the comment that used to justify the omission was
+ 	// the reason nobody looked twice.
+-	keyframeVersion = 5
++	//
++	// v6 (ADR-0036, written ONLY while Params.AdaptiveRouting is on — flag
++	// off keeps the v5/v4/v3 bytes exactly) appends one per-vehicle field
++	// after the v5 fields and a lane section between the spawner and
++	// director sections:
++	//
++	//	per vehicle: laneEntryTick u64
++	//	lanes: nLanes u32 | per lane (network order): ttEMA f64 | ttSnap f64
++	//
++	// Both decide what vehicles DO — the dwell clock feeds the travel-time
++	// samples, the travel times weight the epoch recompute — so both are
++	// keyframed on the stuckTicks precedent: anything that decides behavior
++	// must survive a restore exactly. ttEMA is float64, no quantization.
++	// The next-hop tables and the recompute budget are NOT here: they are
++	// derived state, re-computed identically from tick and keyframed state.
++	keyframeVersion = 6
++	// keyframeAdaptiveVersion is the version the ADR-0036 adaptive-routing
++	// state (laneEntryTick, ttEMA) needs.
++	keyframeAdaptiveVersion = 6
+ 	// keyframeStuckVersion is the version the stuck timer needs.
+ 	keyframeStuckVersion = 5
+ 	// keyframeDestVersion is the version a director queue entry carrying the
+@@ -123,6 +146,13 @@ func (e *Engine) MarshalState() ([]byte, error) {
+ 			break
+ 		}
+ 	}
++	// Adaptive routing (ADR-0036) needs v6 unconditionally: ttEMA exists on
++	// every lane from the first tick, so there is no "nothing to record"
++	// state to stay below v6 with. Flag off never reaches this and keeps
++	// the v5/v4/v3 bytes exactly.
++	if e.Params.AdaptiveRouting {
++		version = keyframeAdaptiveVersion
++	}
+ 	w.u16(version)
+ 	w.u16(0)
+ 	w.u64(e.Tick)
+@@ -174,6 +204,9 @@ func (e *Engine) MarshalState() ([]byte, error) {
+ 				w.u8(0)
+ 			}
+ 		}
++		if version >= keyframeAdaptiveVersion {
++			w.u64(v.laneEntryTick) // ADR-0036 dwell clock
++		}
+ 	}
+ 	if e.spawner != nil {
+ 		for i := range e.spawner.origins {
+@@ -191,6 +224,20 @@ func (e *Engine) MarshalState() ([]byte, error) {
+ 			w.bytes(rngBytes)
+ 		}
+ 	}
++	// TSKF v6 (ADR-0036): the per-lane travel-time EMAs and their
++	// epoch-frozen routing snapshots, in network order. Placed between the
++	// spawner and director sections — the reader is gated on the same
++	// version condition, so the two never disagree. ttSnap is keyframed
++	// for the same reason ttEMA is: it decides what vehicles do, and a
++	// table rebuilt after a restore must be the table the live engine was
++	// serving.
++	if version >= keyframeAdaptiveVersion {
++		w.u32(uint32(len(e.Net.Lanes)))
++		for _, l := range e.Net.Lanes {
++			w.f64(l.ttEMA)
++			w.f64(e.ttSnap[l.Index])
++		}
++	}
+ 	// TSKF v3+: pending director directives (seek must resume the injection
+ 	// queue bit-exactly). Gated on the VERSION, not on the queue being
+ 	// non-empty, because the reader is gated on the version — and since v5
+@@ -259,6 +306,12 @@ func restoreState(spec RunSpec, data []byte, checkNet func(*Network) error) (*En
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	// A v6 payload is written only by a flag-ON engine (ADR-0036); reading
++	// one into a flag-OFF spec would silently drop the travel-time state
++	// the run's routing depends on. Refuse the mismatch loudly instead.
++	if ver >= keyframeAdaptiveVersion && !e.Params.AdaptiveRouting {
++		return nil, fmt.Errorf("keyframe: v%d payload carries adaptive-routing state but the spec has AdaptiveRouting off", ver)
++	}
+ 	if checkNet != nil {
+ 		if err := checkNet(e.Net); err != nil {
+ 			return nil, err
+@@ -307,6 +360,14 @@ func restoreState(spec RunSpec, data []byte, checkNet func(*Network) error) (*En
+ 			stuckTicks = r.u64() // ADR-0034
+ 			stopDone = r.u8() != 0
+ 		}
++		// A pre-v6 keyframe carries no dwell clock. Restoring one into a
++		// flag-ON spec with laneEntryTick = 0 would make every vehicle's
++		// first departure a capped run-long poison sample; starting the
++		// clock at the restore tick is the honest "no evidence yet".
++		laneEntryTick := tick
++		if ver >= keyframeAdaptiveVersion {
++			laneEntryTick = r.u64() // ADR-0036 dwell clock
++		}
+ 		if r.err != nil {
+ 			return nil, fmt.Errorf("keyframe: vehicle %d controller state: %w", i, r.err)
+ 		}
+@@ -328,6 +389,8 @@ func restoreState(spec RunSpec, data []byte, checkNet func(*Network) error) (*En
+ 
+ 			stuckTicks: stuckTicks,
+ 			stopDone:   stopDone,
++
++			laneEntryTick: laneEntryTick,
+ 		})
+ 	}
+ 	if e.spawner != nil {
+@@ -355,6 +418,27 @@ func restoreState(spec RunSpec, data []byte, checkNet func(*Network) error) (*En
+ 			st.pend = &Vehicle{ID: pendID, rng: stream}
+ 		}
+ 	}
++	// TSKF v6 (ADR-0036): the per-lane travel-time EMAs, in network order,
++	// between the spawner and director sections — writer and reader are
++	// gated on the same version condition, so the two never disagree. The
++	// count must equal the lane count of the network the spec built, or
++	// this keyframe pairs with the wrong spec.
++	if ver >= keyframeAdaptiveVersion {
++		nLanes := r.u32()
++		if r.err != nil {
++			return nil, fmt.Errorf("keyframe: lane count: %w", r.err)
++		}
++		if int(nLanes) != len(e.Net.Lanes) {
++			return nil, fmt.Errorf("keyframe: %d lanes, spec builds %d", nLanes, len(e.Net.Lanes))
++		}
++		for _, l := range e.Net.Lanes {
++			l.ttEMA = r.f64()
++			e.ttSnap[l.Index] = r.f64()
++		}
++		if r.err != nil {
++			return nil, fmt.Errorf("keyframe: lane section: %w", r.err)
++		}
++	}
+ 	if ver >= 3 {
+ 		// Pending director directives resume with the queue (their recorded
+ 		// applied ticks and request ids ride along so the CRC chain and any
+diff --git a/engine/mobil.go b/engine/mobil.go
+index b597f1526dfe7be863f12773a235feb95857f856..0fb1c50d6458f9034e10f92663b81e4144981403 100644
+--- a/engine/mobil.go
++++ b/engine/mobil.go
+@@ -172,6 +172,7 @@ func (e *Engine) execLaneChange(v *Vehicle, dir int) {
+ 	}
+ 	cur.vehs = removeVehicle(cur.vehs, v)
+ 	tgt.vehs = insertVehicle(tgt.vehs, v)
++	e.noteLaneLeave(v) // ADR-0036: a lateral hop is a lane departure too
+ 	v.Lane = tgt
+ 	v.Cooldown = e.Params.LCCooldown
+ 	e.Stats.LaneChanges++
+diff --git a/engine/network.go b/engine/network.go
+index 22f359301d4022cce6b15ef571c3ad2bb027f1a2..ca3c37bddff815f646f5472c278f519b0b40c6a2 100644
+--- a/engine/network.go
++++ b/engine/network.go
+@@ -53,6 +53,15 @@ type Lane struct {
+ 	cum       []float64 // cumulative arc lengths, built by SetShape
+ 
+ 	vehs []*Vehicle // occupancy sorted by S ascending; rebuilt every tick
++
++	// ttEMA is the lane's smoothed travel time in seconds (ADR-0036 §1):
++	// free-flow time at build, updated by vehicle dwell samples (α = 1/8)
++	// and relaxed back toward free flow every tick with a 10-minute time
++	// constant. It is the congestion signal the epoch recompute weights its
++	// Dijkstra with. State that decides behavior → keyframed (format v6,
++	// the stuckTicks precedent); not in the CRC, which stays the trajectory
++	// oracle. Zero-valued and unused while Params.AdaptiveRouting is off.
++	ttEMA float64
+ }
+ 
+ // Network is a fixed-order lane list plus spawn origins. Maps here are for
+diff --git a/engine/routing.go b/engine/routing.go
+index 877ff3a4b77ec0fc9bd35aede2d2cb9fbc1ae75d..06dd56941b67a6ac273c71f9d7a0c62259d94b94 100644
+--- a/engine/routing.go
++++ b/engine/routing.go
+@@ -19,6 +19,24 @@ import (
+ // run, so a table never invalidates. The cache is derived state: not
+ // serialized, not folded into the CRC, recomputed identically on demand.
+ //
++// Adaptive mode (ADR-0036, Params.AdaptiveRouting): the weights stop being
++// free-flow constants. Each lane carries ttEMA, a smoothed travel time fed
++// by vehicle dwell samples and relaxed back toward free flow every tick
++// (engine.go), frozen into ttSnap at each 60-second epoch rollover, and the
++// memoized tables gain an epoch stamp — accessing a stale table recomputes
++// it over the frozen weights, metered at RerouteBudgetPerTick recomputes
++// per tick (a vehicle past the budget follows the stale table that tick)
++// and damped by hysteresis against the STATIC free-flow table (a lane
++// keeps its free-flow next-hop unless the new path beats it by more than
++// max(30 s, 15%), so a shared table cannot flip the whole flow between two
++// arms every epoch). The static reference is what makes every table a pure
++// function of (frozen weights, network) — no hysteresis history to
++// keyframe, replay recomputes exactly what the live engine served. The
++// lateral-depth tables below are topology-based and do NOT participate.
++// Budget, stamps, and tables stay derived state; ttSnap is keyframed.
++// With the flag off none of this runs and every byte is what the static
++// builder produced.
++//
+ // Determinism (ADR-0005): adjacency walks fixed slice order (predecessor
+ // lists are built in lane-then-successor order), heap ties break toward
+ // the lower lane index, equal-cost relaxations keep the first (fixed)
+@@ -154,18 +172,155 @@ func freeFlowTime(l *Lane) float64 {
+ 	return l.Length / l.SpeedLimit
+ }
+ 
++// routeWeight is the edge weight the table builder uses: the lane's
++// EPOCH-FROZEN travel time (ttSnap, snapshotted from the EMA at each epoch
++// rollover, engine.go) while AdaptiveRouting is on — the freeze is what
++// makes a table a pure function of (keyframed state, network), so a
++// mid-epoch restore recomputes exactly the table the live engine was
++// serving. With the flag off it is free-flow time, and the builder runs
++// once per destination and never again.
++func (e *Engine) routeWeight(l *Lane) float64 {
++	if e.Params.AdaptiveRouting {
++		return e.ttSnap[l.Index]
++	}
++	return freeFlowTime(l)
++}
++
+ // routeTable returns — computing and memoizing on first use — the next-hop
+ // table toward the destination lane at destIdx: tab[i] is the index of the
+ // successor of lane i on the shortest-FREE-FLOW-TIME path to the destination,
+ // −1 when lane i cannot reach it (or is the destination itself).
++//
++// Adaptive mode (ADR-0036 §2): the memoized entry carries an epoch stamp
++// (epoch = tick / e.routeEpochTicks). Serving a stale entry recomputes it
++// over the epoch-frozen weights — budget permitting; past this tick's
++// budget the stale table is served and the stamp stays old, so the next
++// tick's first asker retries. First-use builds are NOT metered: the meter
++// bounds recomputes, and a table that does not exist cannot be "stale".
+ func (e *Engine) routeTable(destIdx int) []int32 {
+ 	if t, ok := e.routeTabs[destIdx]; ok {
++		if !e.Params.AdaptiveRouting {
++			return t
++		}
++		epoch := e.Tick / e.routeEpochTicks
++		if e.routeEpochs[destIdx] >= epoch || e.rerouteBudget <= 0 {
++			return t
++		}
++		e.rerouteBudget--
++		t = e.rerouteTable(destIdx)
++		e.routeTabs[destIdx] = t
++		e.routeEpochs[destIdx] = epoch
+ 		return t
+ 	}
++	next, _ := e.routeDijkstra(destIdx, e.routeWeight)
++	if e.routeTabs == nil {
++		e.routeTabs = map[int][]int32{}
++	}
++	e.routeTabs[destIdx] = next
++	if e.routeEpochs != nil {
++		e.routeEpochs[destIdx] = e.Tick / e.routeEpochTicks
++	}
++	return next
++}
++
++// staticRouteTable memoizes the FREE-FLOW next-hop table toward destIdx —
++// the hysteresis reference for adaptive recomputes. The network is
++// immutable for the run, so this never invalidates; it is exactly the
++// table the flag-off builder produces.
++func (e *Engine) staticRouteTable(destIdx int) []int32 {
++	if t, ok := e.staticTabs[destIdx]; ok {
++		return t
++	}
++	next, _ := e.routeDijkstra(destIdx, freeFlowTime)
++	if e.staticTabs == nil {
++		e.staticTabs = map[int][]int32{}
++	}
++	e.staticTabs[destIdx] = next
++	return next
++}
++
++// rerouteTable recomputes the next-hop table toward destIdx over the
++// epoch-frozen travel-time weights and reconciles it with the STATIC
++// free-flow table under hysteresis (ADR-0036 §2): lane i keeps its
++// free-flow next-hop unless the new path beats the free-flow path's cost
++// (under CURRENT weights) by more than max(30 s, 15%). Without the margin
++// the whole flow flips between two near-equal arms every epoch
++// (braess-style oscillation); with it only clearly-better alternatives
++// divert, and traffic falls back to the free-flow routes as congestion
++// clears.
++//
++// The reference is the static table, not the previous epoch's adaptive
++// table, for one reason above all: replay. A table is then a PURE FUNCTION
++// of (epoch-frozen weights, network) — no hysteresis history to keyframe,
++// and a restore at any tick recomputes exactly what the live engine served
++// (external review, 2026-07-30). Acyclicity: new hops come from one
++// Dijkstra tree (strictly decreasing dist along every hop), static hops
++// are kept only when dist_new(u) ≥ costW(static path from u) − margin,
++// and the proportional part of the margin telescopes around any would-be
++// cycle to Σw < 0.15·Σw — impossible with positive weights. The 30 s
++// additive floor weakens that argument for cycles of tiny lanes; the
++// bound that closes it is behavioural — a looping vehicle's own dwell
++// samples poison the loop's weights until the loop loses — plus the
++// hop-capped defensive walk below, which treats a broken chain as
++// infinitely bad rather than looping the recompute.
++func (e *Engine) rerouteTable(destIdx int) []int32 {
++	next, dist := e.routeDijkstra(destIdx, e.routeWeight)
++	old := e.staticRouteTable(destIdx)
++	for i := range next {
++		if next[i] == old[i] {
++			continue
++		}
++		// Cost of the STATIC path under CURRENT weights: walk the free-flow
++		// next-hop chain from i to the destination, same convention as the
++		// builder (successor lanes summed, destination included, i
++		// excluded). The walk runs only for lanes whose hop would change;
++		// the common case pays nothing.
++		oldCost := math.Inf(1)
++		if j := int(old[i]); j >= 0 {
++			cost, reached := 0.0, false
++			for hops := 0; hops <= len(old); hops++ {
++				cost += e.routeWeight(e.Net.Lanes[j])
++				if j == destIdx {
++					reached = true
++					break
++				}
++				if j = int(old[j]); j < 0 {
++					break
++				}
++			}
++			if reached {
++				oldCost = cost
++			}
++		}
++		if math.IsInf(oldCost, 1) {
++			continue // no static path to defend — take the new hop
++		}
++		margin := 30.0
++		if m := 0.15 * oldCost; m > margin {
++			margin = m
++		}
++		if dist[i] >= oldCost-margin {
++			next[i] = old[i] // not CLEARLY better: keep the free-flow hop
++		}
++	}
++	return next
++}
++
++// routeDijkstra runs the reverse Dijkstra toward destIdx over the given
++// edge weight and returns the next-hop table and the cost-to-destination
++// of every lane. This is the static builder's exact algorithm — same
++// predecessor order, same heap tie-breaks, same strict-< relaxation — so
++// with weights ≡ free flow its tables are the static ones bit-for-bit.
++//
++// Reverse relaxation: forward edge p→u costs the travel time of the lane
++// ENTERED. Measured on chi-loop-urban (2026-07): length weights route
++// traffic through short alleys in preference to faster arterials,
++// concentrating flow on exactly the links that saturate first.
++func (e *Engine) routeDijkstra(destIdx int, weight func(*Lane) float64) (next []int32, dist []float64) {
+ 	n := len(e.Net.Lanes)
+ 	preds := e.routePreds()
+-	dist := make([]float64, n)
+-	next := make([]int32, n)
++	dist = make([]float64, n)
++	next = make([]int32, n)
+ 	for i := range dist {
+ 		dist[i], next[i] = math.Inf(1), -1
+ 	}
+@@ -178,14 +333,7 @@ func (e *Engine) routeTable(destIdx int) []int32 {
+ 			continue
+ 		}
+ 		done[u] = true
+-		// Reverse relaxation: forward edge p→u costs the FREE-FLOW TIME of
+-		// the lane entered (length / speed limit). Measured on chi-loop-urban
+-		// (2026-07): length weights route traffic through short alleys in
+-		// preference to faster arterials, concentrating flow on exactly the
+-		// links that saturate first. A zero/negative limit degrades to the
+-		// lane's length rather than dividing by zero.
+-		ul := e.Net.Lanes[u]
+-		w := dist[u] + freeFlowTime(ul)
++		w := dist[u] + weight(e.Net.Lanes[u])
+ 		for _, p := range preds[u] {
+ 			pi := int(p)
+ 			if !done[pi] && w < dist[pi] {
+@@ -195,11 +343,7 @@ func (e *Engine) routeTable(destIdx int) []int32 {
+ 			}
+ 		}
+ 	}
+-	if e.routeTabs == nil {
+-		e.routeTabs = map[int][]int32{}
+-	}
+-	e.routeTabs[destIdx] = next
+-	return next
++	return next, dist
+ }
+ 
+ // routePreds returns — building once — the predecessor adjacency of the
+diff --git a/engine/scenario/scenario.go b/engine/scenario/scenario.go
+index 63af7c8b3fa57365506e4898393549a56e0b3691..3dbfe5a6dabf06241ee964706f31819cd9ecd58e 100644
+--- a/engine/scenario/scenario.go
++++ b/engine/scenario/scenario.go
+@@ -77,6 +77,14 @@ type Manifest struct {
+ // (ADR-0005: tick length is a scenario parameter, 100 ms the default).
+ type Params struct {
+ 	Dt float64 `yaml:"dt,omitempty"`
++	// AdaptiveRouting turns on congestion-adaptive route resolution
++	// (ADR-0036). Go's zero value means the manifest cannot express
++	// "explicitly off" — acceptable while the engine default is off;
++	// revisit with a *bool if the default ever flips.
++	AdaptiveRouting bool `yaml:"adaptive_routing,omitempty"`
++	// RerouteBudgetPerTick overrides the ADR-0036 recompute budget; zero
++	// keeps the engine default.
++	RerouteBudgetPerTick int `yaml:"reroute_budget_per_tick,omitempty"`
+ }
+ 
+ // Spawner configures the kernel's built-in deterministic spawner — the
+@@ -410,6 +418,12 @@ func (s *Scenario) RunSpec(typeReg map[string]*engine.VehicleType) (engine.RunSp
+ 	if s.Manifest.Params.Dt != 0 {
+ 		spec.Params.Dt = s.Manifest.Params.Dt
+ 	}
++	if s.Manifest.Params.AdaptiveRouting {
++		spec.Params.AdaptiveRouting = true
++	}
++	if s.Manifest.Params.RerouteBudgetPerTick != 0 {
++		spec.Params.RerouteBudgetPerTick = s.Manifest.Params.RerouteBudgetPerTick
++	}
+ 	if sp := s.Manifest.Spawner; sp != nil {
+ 		spec.Scen.SpawnRatePerLaneHour = sp.RatePerLaneHour
+ 		spec.Scen.DensityTargetPerKm = sp.DensityPerKm
+diff --git a/engine/scenario/scenario_test.go b/engine/scenario/scenario_test.go
+index c9c520b131ca13856e955c7ad9b8c4c1ab1a7310..980f8bb81ce57cd4dc101d9315cd4e29cfaca731 100644
+--- a/engine/scenario/scenario_test.go
++++ b/engine/scenario/scenario_test.go
+@@ -109,6 +109,28 @@ func TestLoadRunSpec(t *testing.T) {
+ 	}
+ }
+ 
++// The manifest params block maps onto RunSpec.Params, with zero fields
++// keeping the engine defaults (ADR-0036's flag is the case that matters:
++// a scenario must be able to turn adaptive routing on).
++func TestRunSpecParamsOverride(t *testing.T) {
++	dir := t.TempDir()
++	writeNet(t, dir)
++	writeFile(t, dir, ManifestFile, strings.Replace(goodManifest, "ticks: 3000",
++		"ticks: 3000\nparams: {adaptive_routing: true, reroute_budget_per_tick: 7}", 1))
++	writeFile(t, dir, "demand/main.yaml", goodDemand)
++	s, err := Load(dir)
++	if err != nil {
++		t.Fatalf("Load: %v", err)
++	}
++	spec, err := s.RunSpec(map[string]*engine.VehicleType{"car": &engine.Car, "truck": &engine.Truck})
++	if err != nil {
++		t.Fatalf("RunSpec: %v", err)
++	}
++	if !spec.Params.AdaptiveRouting || spec.Params.RerouteBudgetPerTick != 7 {
++		t.Errorf("params override did not map: %+v", spec.Params)
++	}
++}
++
+ func TestHashStableAcrossFormatting(t *testing.T) {
+ 	dir := goodScenario(t)
+ 	s1, err := Load(dir)
+diff --git a/engine/spawn.go b/engine/spawn.go
+index fe9717be44fd28449ff19a93f01016b554a422dc..3719ccbe17b07a2659172938f5f22fa15639ebfa 100644
+--- a/engine/spawn.go
++++ b/engine/spawn.go
+@@ -284,6 +284,7 @@ func (sp *Spawner) step(e *Engine) {
+ 		}
+ 		v.V = math.Min(speed, v.v0eff(st.lane)) // the plan is F-free; apply the driver's own factor
+ 		v.Cooldown = e.Params.SpawnCooldown
++		v.laneEntryTick = e.Tick // ADR-0036 dwell clock starts at injection, not at pend creation
+ 		e.register(v)
+ 		e.Stats.Spawned++
+ 
+diff --git a/engine/vehicle.go b/engine/vehicle.go
+index de7436051c4315b473604ffe83a7165233a249c0..3ef816ab60dc4e597d48ce554729d073f1abddba 100644
+--- a/engine/vehicle.go
++++ b/engine/vehicle.go
+@@ -98,6 +98,16 @@ type Vehicle struct {
+ 	// whole StrandAfterS late and diverges the replay.
+ 	// TestStuckTimerSurvivesAKeyframe pins it; do not make this derived.
+ 	stuckTicks uint64
++
++	// laneEntryTick is the tick the vehicle entered its current lane; the
++	// difference from e.Tick at the next departure is the dwell sample fed
++	// into the lane's travel-time EMA (ADR-0036 §1). Set at injection and at
++	// every lane crossing and lateral hop. Keyframed (format v6) for the
++	// stuckTicks reason above: a restored zero would attribute the whole
++	// pre-restore dwell to the post-restore lane and poison ITS travel time,
++	// diverging every later routing decision. Written but never read while
++	// Params.AdaptiveRouting is off.
++	laneEntryTick uint64
+ }
+ 
+ // v0eff is the vehicle's desired speed on the given lane: type desired speed

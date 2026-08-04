@@ -201,3 +201,82 @@ func TestJetStreamStoreDirNamed(t *testing.T) {
 		t.Errorf("existing dir should be accepted: %v", err)
 	}
 }
+
+// The -state-in/-state-out/-state-at surface (ADR-0029 phase 1). Every rule
+// here is a usage error rather than a runtime one: all of them are knowable
+// before the run starts, and the alternative is finding out an hour in that
+// the state file was never going to be written.
+func TestValidateStateFlags(t *testing.T) {
+	ok := stateFlags{ticks: 1000}
+	cases := []struct {
+		name string
+		f    stateFlags
+		want string // substring of the expected error; "" = must pass
+	}{
+		{"neither", ok, ""},
+		{"dump pair", stateFlags{out: "s.bin", at: 500, atSet: true, ticks: 1000}, ""},
+		{"dump at tick 0", stateFlags{out: "s.bin", at: 0, atSet: true, ticks: 1000}, ""},
+		{"warm start", stateFlags{in: "s.bin", inTick: 500, ticks: 1000}, ""},
+		{"warm start and dump", stateFlags{in: "s.bin", inTick: 500, out: "t.bin", at: 800, atSet: true, ticks: 1000}, ""},
+
+		{"out without at", stateFlags{out: "s.bin", ticks: 1000}, "-state-at"},
+		{"at without out", stateFlags{at: 500, atSet: true, ticks: 1000}, "-state-out"},
+		{"in with store", stateFlags{in: "s.bin", inTick: 500, store: "/tmp/js", ticks: 1000}, "-store"},
+		{"state past horizon", stateFlags{in: "s.bin", inTick: 1000, ticks: 1000}, "nothing left"},
+		{"dump past horizon", stateFlags{out: "s.bin", at: 1001, atSet: true, ticks: 1000}, "past -ticks"},
+		{"dump before warm start", stateFlags{in: "s.bin", inTick: 500, out: "t.bin", at: 500, atSet: true, ticks: 1000}, "just rewrites the state that was loaded"},
+
+		// A seed mismatch splices two deterministic programs, and -seed
+		// defaults to 1, so the way to hit it is to forget the flag.
+		{"seed mismatch", stateFlags{in: "s.bin", inTick: 500, ticks: 1000, inSeed: 1000, seed: 1}, "-state-reseed"},
+		{"seed mismatch names the saved seed", stateFlags{in: "s.bin", inTick: 500, ticks: 1000, inSeed: 1000, seed: 1}, "-seed 1000"},
+		{"seed match", stateFlags{in: "s.bin", inTick: 500, ticks: 1000, inSeed: 1000, seed: 1000}, ""},
+		{"seed mismatch opted into", stateFlags{in: "s.bin", inTick: 500, ticks: 1000, inSeed: 1000, seed: 1, reseed: true}, ""},
+		// The seed only binds a warm start: -state-reseed without
+		// -state-in has nothing to say, and a cold run is not affected.
+		{"cold run ignores seeds", stateFlags{ticks: 1000, inSeed: 1000, seed: 1}, ""},
+
+		// The contract plane is not restored, so a warm start with a
+		// controller attached diverges on its first resumed tick. -driver
+		// DEFAULTS to true, so this is the combination a user gets by
+		// simply not passing the flag — the same default-trap shape as the
+		// seed mismatch above, and the reason it is refused rather than
+		// warned.
+		{"warm start with the driver", stateFlags{in: "s.bin", inTick: 500, ticks: 1000, driver: true}, "-driver=false"},
+		{"warm start names the resumed tick", stateFlags{in: "s.bin", inTick: 500, ticks: 1000, driver: true}, "(500)"},
+		{"warm start without the driver", stateFlags{in: "s.bin", inTick: 500, ticks: 1000, driver: false}, ""},
+		// A cold run with the driver is the ordinary case and must stay
+		// untouched — the refusal binds the warm start, not the driver.
+		{"cold run with the driver", stateFlags{ticks: 1000, driver: true}, ""},
+	}
+	for _, c := range cases {
+		err := validateStateFlags(c.f)
+		switch {
+		case c.want == "" && err != nil:
+			t.Errorf("%s: rejected a valid combination: %v", c.name, err)
+		case c.want != "" && err == nil:
+			t.Errorf("%s: accepted, want an error naming %q", c.name, c.want)
+		case c.want != "" && !strings.Contains(err.Error(), c.want):
+			t.Errorf("%s: error %q does not name %q", c.name, err, c.want)
+		}
+	}
+}
+
+// probeWritable must catch an unwritable destination and leave nothing
+// behind when it does not.
+func TestProbeWritable(t *testing.T) {
+	dir := t.TempDir()
+	if err := probeWritable(filepath.Join(dir, "state.bin")); err != nil {
+		t.Fatalf("writable dir rejected: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("probe left %d files behind", len(entries))
+	}
+	if err := probeWritable(filepath.Join(dir, "missing", "state.bin")); err == nil {
+		t.Fatal("nonexistent directory accepted")
+	}
+}

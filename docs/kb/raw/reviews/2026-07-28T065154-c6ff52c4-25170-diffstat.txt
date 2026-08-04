@@ -1,0 +1,23 @@
+ AGENTS.md                                          |   3 +
+ docs/kb/decisions/ADR-0013-external-review-gate.md |  53 ++
+ .../2026-07-27T160119-db91ade6-4054859-brief.md    |  20 +
+ ...2026-07-27T160119-db91ade6-4054859-diffstat.txt |   8 +
+ ...26-07-27T160119-db91ade6-4054859-gpt-5.6-sol.md |   5 +
+ .../2026-07-27T160119-db91ade6-4054859-kimi-k3.md  |  28 +
+ ...26-07-27T160119-db91ade6-4054859-reviewed.patch | 765 ++++++++++++++++++
+ .../2026-07-27T161040-9c7432d7-4085638-brief.md    |  20 +
+ ...2026-07-27T161040-9c7432d7-4085638-diffstat.txt |  10 +
+ ...26-07-27T161040-9c7432d7-4085638-gpt-5.6-sol.md |   5 +
+ .../2026-07-27T161040-9c7432d7-4085638-kimi-k3.md  |  38 +
+ ...26-07-27T161040-9c7432d7-4085638-reviewed.patch | 854 +++++++++++++++++++++
+ docs/show/chi-loop-options.md                      |  18 +
+ docs/show/diag/chi-loop-urban__setup.png.json      |   2 +
+ hooks/pre-commit                                   |   1 +
+ scripts/chicago/corridorspeed.py                   |  29 +
+ scripts/chicago/mkquiz.py                          | 142 +++-
+ scripts/external-review.sh                         | 104 ++-
+ scripts/show/build-quiz.sh                         |  84 +-
+ scripts/show/mkcongestionmap.py                    | 399 ++++++++++
+ scripts/whatif.py                                  |  48 +-
+ viz/public/quiz.html                               |   2 +-
+ 22 files changed, 2595 insertions(+), 43 deletions(-)

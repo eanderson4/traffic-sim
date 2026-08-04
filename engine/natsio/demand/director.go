@@ -51,6 +51,16 @@ type Config struct {
 	Seed uint64
 	Lead uint64      // send verbs this many ticks ahead of their earliest tick (0 → 30)
 	Log  *log.Logger // nil → discard
+	// StartTick is the tick the run BEGINS at — nonzero only for a warm
+	// started run (ADR-0029 phase 1). Those arrivals already happened: they
+	// are baked into the state being restored. Attach advances each flow's
+	// sampler past them without publishing, which both avoids dumping the
+	// whole backlog as one burst of already-expired verbs at the first
+	// snapshot and leaves every sampler at exactly the position the cold run
+	// held at that tick — so the program from StartTick on is identical to
+	// the cold run's. Zero (the default) skips nothing and is byte-identical
+	// to the pre-warm-start behavior.
+	StartTick uint64
 }
 
 // Director is an attached demand director. The verb loop is driven by the
@@ -178,6 +188,17 @@ func Attach(nc *nats.Conn, js nats.JetStreamContext, cfg Config, dfs []*scenario
 		}
 		d.pending[i] = pendingArrival{at: at, vtype: vtype, dest: dest}
 	}
+	// Warm start (ADR-0029 phase 1): fast-forward past arrivals the restored
+	// state already contains. The draws are consumed exactly as sending them
+	// would have, so each sampler lands on the position the cold run held at
+	// StartTick and the remaining program is identical. Without this the
+	// first snapshot drains the whole backlog at once — tens of thousands of
+	// verbs with earliest ticks already in the past, which the kernel either
+	// injects as one impossible burst or expires wholesale.
+	if cfg.StartTick > 0 {
+		lg.Printf("demand director: warm start at tick %d — skipped %d arrivals already contained in the restored state",
+			cfg.StartTick, d.fastForward(cfg.StartTick))
+	}
 	lg.Printf("demand director: attached as %s (director grant) to run %q (dt=%.3fs, %d ticks, %d flows)",
 		ctlID, cfg.Run, d.dt, meta.Spec.Ticks, len(flows))
 
@@ -242,6 +263,28 @@ func (d *Director) Close() {
 	defer d.mu.Unlock()
 	d.log.Printf("demand director: done — verbs=%d accepted=%d rejected=%d spawn-announcements=%d claims=%d",
 		d.Sent, d.Accepted, d.Rejected, d.Unclaimed, d.Claims)
+}
+
+// fastForward advances every flow past the arrivals at or before startTick
+// WITHOUT publishing them, and reports how many it skipped. It consumes the
+// same draws sending them would have, so each sampler lands on exactly the
+// position the cold run held at that tick — the program from startTick on is
+// then identical to the cold run's, which is the property that makes a warm
+// started run comparable to the one it was cut out of.
+func (d *Director) fastForward(startTick uint64) int {
+	skipped := 0
+	for i := range d.samplers {
+		for !d.exhausted[i] && uint64(d.pending[i].at/d.dt+0.5) <= startTick {
+			at, vtype, dest, ok := d.samplers[i].next(d.dt)
+			skipped++
+			if !ok {
+				d.exhausted[i] = true
+				break
+			}
+			d.pending[i] = pendingArrival{at: at, vtype: vtype, dest: dest}
+		}
+	}
+	return skipped
 }
 
 func (d *Director) onSnapshot(m *nats.Msg) {

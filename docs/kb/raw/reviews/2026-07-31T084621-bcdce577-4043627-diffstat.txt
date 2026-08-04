@@ -1,0 +1,10 @@
+ docs/kb/INDEX.md                                   |  2 +-
+ .../ADR-0036-congestion-adaptive-routing.md        | 48 +++++++++++++++-
+ docs/show/README.md                                |  8 +++
+ engine/adaptive_test.go                            |  4 +-
+ engine/destination_test.go                         |  3 +
+ engine/engine.go                                   | 66 ++++++++++++++--------
+ engine/gridlock_test.go                            |  3 +
+ engine/scenario/scenario.go                        | 14 ++---
+ engine/scenario/scenario_test.go                   | 40 ++++++++-----
+ 9 files changed, 141 insertions(+), 47 deletions(-)

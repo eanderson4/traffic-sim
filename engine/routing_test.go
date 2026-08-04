@@ -89,6 +89,59 @@ func TestPickSuccessorFollowsRoute(t *testing.T) {
 	}
 }
 
+// routeDiamondSpec builds the weight-preference fixture: origin a_0 forks
+// into two arms that REJOIN at m_0 and exit at x_0 — b_0 is the SHORT arm
+// (100 m at 5 m/s = 20 s) and c_0 the LONG but fast arterial (400 m at
+// 33.3 m/s = 12 s). Distance weights pick b; free-flow-time weights pick c.
+func routeDiamondSpec(t *testing.T) RunSpec {
+	t.Helper()
+	dir := t.TempDir()
+	nf := NetFile{
+		Version: 1,
+		Name:    "route-diamond",
+		Lanes: []NetLane{
+			{ID: "a_0", Section: "a", Length: 500, SpeedLimit: 33.3, Width: 3.2,
+				Shape: [][2]float64{{0, 0}, {500, 0}}, Successors: []string{"b_0", "c_0"}, Origin: true},
+			{ID: "b_0", Section: "b", Length: 100, SpeedLimit: 5, Width: 3.2,
+				Shape: [][2]float64{{500, 0}, {520, 100}}, Successors: []string{"m_0"}},
+			{ID: "c_0", Section: "c", Length: 400, SpeedLimit: 33.3, Width: 3.2,
+				Shape: [][2]float64{{500, 0}, {520, -100}}, Successors: []string{"m_0"}},
+			{ID: "m_0", Section: "m", Length: 50, SpeedLimit: 13.9, Width: 3.2,
+				Shape: [][2]float64{{520, 100}, {600, 0}}, Successors: []string{"x_0"}},
+			{ID: "x_0", Section: "x", Length: 2, SpeedLimit: 13.9, Width: 3.2,
+				Shape: [][2]float64{{600, 0}, {602, 0}}, Exit: true},
+		},
+	}
+	data, err := json.Marshal(nf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, "network.json")
+	if err := os.WriteFile(p, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return RunSpec{Net: NetSpec{Kind: "file", Path: p}, Params: DefaultParams(), Ticks: 5}
+}
+
+// Route cost is FREE-FLOW TIME, not distance: routed to the shared exit, a
+// vehicle takes the long fast arterial over the short slow alley — measured
+// on chi-loop-urban, length weights prefer alleys and concentrate flow on
+// the links that saturate first (2026-07).
+func TestRoutePrefersFreeFlowTime(t *testing.T) {
+	e, err := NewEngine(routeDiamondSpec(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := e.AddInitialVehicle(e.Net.LaneByID("a_0"), 0, 499.5, 33.3, 1)
+	v.Route = "x_0"
+	for i := 0; i < 3 && v.Lane != nil && v.Lane.ID == "a_0"; i++ {
+		e.Step()
+	}
+	if v.Lane == nil || v.Lane.ID != "c_0" {
+		t.Fatalf("crossed to %v, want c_0 — route cost is not free-flow time", v.Lane)
+	}
+}
+
 // Route following is a pure function of (network, vehicle state): two
 // identical runs with routed vehicles produce identical per-tick CRCs.
 func TestRouteFollowingDeterministic(t *testing.T) {

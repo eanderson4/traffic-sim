@@ -1,0 +1,68 @@
+{
+  "title": "The Merge",
+  "baseline": "base",
+  "metric": "speed_kmh",
+  "seeds": 12,
+  "ticks": 12000,
+  "winner": "mainline-lane",
+  "options": [
+    {
+      "name": "mainline-lane",
+      "label": "Add a third lane through the merge",
+      "delta_pct": 58.339322328367736,
+      "p": 2.669978249534957e-15,
+      "cohen_d": 17.7107550449239,
+      "verdict": "UPGRADE",
+      "carries_traffic": true
+    },
+    {
+      "name": "frontage-road",
+      "label": "Build a frontage road \u2014 ramp traffic bypasses the freeway",
+      "delta_pct": 6.949016136188206,
+      "p": 2.8820117777610532e-05,
+      "cohen_d": 1.9683346834536577,
+      "verdict": "UPGRADE",
+      "carries_traffic": true
+    },
+    {
+      "name": "accel-extend",
+      "label": "Lengthen the merging lane \u2014 300 m to 700 m",
+      "delta_pct": 4.72461957608037,
+      "p": 8.293891814729366e-06,
+      "cohen_d": 2.2519350683155723,
+      "verdict": "UPGRADE",
+      "carries_traffic": true
+    },
+    {
+      "name": "ramp-meter",
+      "label": "Meter the on-ramp \u2014 a stop-and-go signal where there was none",
+      "delta_pct": -4.684427922158066,
+      "p": 0.0003079254165190466,
+      "cohen_d": -1.4927985780107071,
+      "verdict": "WORSE",
+      "carries_traffic": false
+    }
+  ],
+  "all_tested": {
+    "accel-extend": {
+      "delta_pct": 4.72461957608037,
+      "p": 8.293891814729366e-06,
+      "verdict": "UPGRADE"
+    },
+    "frontage-road": {
+      "delta_pct": 6.949016136188206,
+      "p": 2.8820117777610532e-05,
+      "verdict": "UPGRADE"
+    },
+    "mainline-lane": {
+      "delta_pct": 58.339322328367736,
+      "p": 2.669978249534957e-15,
+      "verdict": "UPGRADE"
+    },
+    "ramp-meter": {
+      "delta_pct": -4.684427922158066,
+      "p": 0.0003079254165190466,
+      "verdict": "WORSE"
+    }
+  }
+}

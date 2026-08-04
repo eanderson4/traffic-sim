@@ -1,0 +1,321 @@
+{
+ "type": "FeatureCollection",
+ "note": "Analysis districts for chi-loop-urban: a strict TILING of the network extent, used both to steer destinations (mkod.py --dest-zones) and to say where congestion is (runreport.py --zones). Rectangles on Chicago cut lines, not neighbourhood outlines: they must not overlap, because every share computed from them assumes a lane belongs to exactly one district.",
+ "features": [
+  {
+   "type": "Feature",
+   "properties": {
+    "name": "cbd",
+    "label": "The Loop",
+    "kind": "district"
+   },
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -87.64,
+       41.8757
+      ],
+      [
+       -87.58,
+       41.8757
+      ],
+      [
+       -87.58,
+       41.8895
+      ],
+      [
+       -87.64,
+       41.8895
+      ],
+      [
+       -87.64,
+       41.8757
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "name": "near-north",
+    "label": "River North / Streeterville / Gold Coast",
+    "kind": "district"
+   },
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -87.655,
+       41.8895
+      ],
+      [
+       -87.58,
+       41.8895
+      ],
+      [
+       -87.58,
+       41.9105
+      ],
+      [
+       -87.655,
+       41.9105
+      ],
+      [
+       -87.655,
+       41.8895
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "name": "west-loop",
+    "label": "West Loop / Fulton / Greektown",
+    "kind": "district"
+   },
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -87.69,
+       41.8757
+      ],
+      [
+       -87.64,
+       41.8757
+      ],
+      [
+       -87.64,
+       41.8895
+      ],
+      [
+       -87.69,
+       41.8895
+      ],
+      [
+       -87.69,
+       41.8757
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "name": "south-loop",
+    "label": "South Loop / Near South",
+    "kind": "district"
+   },
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -87.655,
+       41.84
+      ],
+      [
+       -87.58,
+       41.84
+      ],
+      [
+       -87.58,
+       41.8757
+      ],
+      [
+       -87.655,
+       41.8757
+      ],
+      [
+       -87.655,
+       41.84
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "name": "near-west",
+    "label": "Wicker Park / Noble Square",
+    "kind": "district"
+   },
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -87.69,
+       41.8895
+      ],
+      [
+       -87.655,
+       41.8895
+      ],
+      [
+       -87.655,
+       41.9105
+      ],
+      [
+       -87.69,
+       41.9105
+      ],
+      [
+       -87.69,
+       41.8895
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "name": "southwest",
+    "label": "Pilsen / Lower West Side",
+    "kind": "district"
+   },
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -87.69,
+       41.84
+      ],
+      [
+       -87.655,
+       41.84
+      ],
+      [
+       -87.655,
+       41.8757
+      ],
+      [
+       -87.69,
+       41.8757
+      ],
+      [
+       -87.69,
+       41.84
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "name": "north",
+    "label": "North Side",
+    "kind": "district"
+   },
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -87.75,
+       41.9105
+      ],
+      [
+       -87.58,
+       41.9105
+      ],
+      [
+       -87.58,
+       42.0
+      ],
+      [
+       -87.75,
+       42.0
+      ],
+      [
+       -87.75,
+       41.9105
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "name": "west",
+    "label": "West Side",
+    "kind": "district"
+   },
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -87.75,
+       41.84
+      ],
+      [
+       -87.69,
+       41.84
+      ],
+      [
+       -87.69,
+       41.9105
+      ],
+      [
+       -87.75,
+       41.9105
+      ],
+      [
+       -87.75,
+       41.84
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "name": "south",
+    "label": "South Side",
+    "kind": "district"
+   },
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -87.75,
+       41.79
+      ],
+      [
+       -87.58,
+       41.79
+      ],
+      [
+       -87.58,
+       41.84
+      ],
+      [
+       -87.75,
+       41.84
+      ],
+      [
+       -87.75,
+       41.79
+      ]
+     ]
+    ]
+   }
+  }
+ ]
+}

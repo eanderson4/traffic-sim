@@ -1,0 +1,6 @@
+ docs/kb/INDEX.md                                   |   4 +-
+ .../decisions/ADR-0028-demand-profile-library.md   |  56 +++++-
+ scripts/chicago/mkod.py                            | 221 +++++++++++++++++----
+ scripts/chicago/profiles-am-kennedy.json           |  63 ++++++
+ scripts/chicago/test_mkod.py                       |  84 ++++++++
+ 5 files changed, 387 insertions(+), 41 deletions(-)

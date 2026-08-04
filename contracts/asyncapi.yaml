@@ -28,7 +28,7 @@ asyncapi: 3.0.0
 
 info:
   title: traffic-sim engine contract
-  version: 2.5.0
+  version: 2.6.0
   description: |
     The engine's NATS surface per ADR-0006 (planes, taxonomy, pipelines) and
     ADR-0008 (the engine↔controller contract — M4, schema_version 2):
@@ -45,9 +45,13 @@ info:
       (claim/release/unclaimed/pause/resume).
     - **Record plane (JetStream, at-least-once):** the arbitrated intent
       log, full-state keyframes, the rolling state CRC, and control events
-      (pause/resume), one stream per run (LimitsPolicy, R=1 file). The
-      engine is the SOLE WRITER; Nats-Expected-Last-Sequence asserts it
-      broker-side.
+      (pause/resume), one stream per run (LimitsPolicy, R=1 file, S2
+      compression since ADR-0035). The engine is the SOLE WRITER;
+      Nats-Expected-Last-Sequence asserts it broker-side. The intent log is
+      batched one message per non-empty TICK since ADR-0035 (`log.intents`,
+      TSLB v1);
+      `log.intent` is the per-intent form it replaces and stays readable, so
+      earlier recordings replay unchanged.
     - **Metadata plane (KV):** the run registry — run spec + status, and
       the latest-state pointer for late joiners.
 
@@ -438,6 +442,13 @@ channels:
       The arbitrated intent log (record plane): one message per applied
       intent, in application order, each with its applied_tick. Engine sole
       writer; replay re-applies these instead of running controllers.
+
+      SUPERSEDED AS THE DEFAULT by logIntents (TSLB batches, ADR-0035),
+      which carries the same records with one message per non-empty tick
+      instead of one per intent. Still written when the recorder runs with
+      UnbatchedIntentLog (serve -log-batch=false), and every reader still
+      accepts it, so recordings made before ADR-0035 replay unchanged. A
+      recording carries one form or the other, never a mix.
     parameters:
       run: { $ref: '#/components/parameters/runId' }
     messages:
@@ -447,6 +458,43 @@ channels:
       retention: limits
       storage: file
       replicas: 1
+      # Default; storage-layer only (payloads and readers unchanged).
+      # serve -store-compress=false writes the stream uncompressed.
+      compression: s2
+
+  logIntents:
+    address: ts.{run}.log.intents
+    description: |
+      The arbitrated intent log, batched: ONE message per NON-EMPTY tick
+      carrying that tick's applied intents in application order (TSLB v1,
+      ADR-0035). A tick with no applied intents emits no batch. The
+      default since ADR-0035; logIntent is the per-message form it replaces.
+
+      The records inside a batch are LoggedIntentFrame payloads
+      byte-identical to the ones logIntent publishes individually, in the
+      same order — a reframing, not a re-encoding. Motivation is framing
+      cost: one message per vehicle per tick at 10 Hz measured ~230 bytes
+      per message for a 61-byte fixed record, and a 90-minute
+      chi-loop-urban recording was 48 GiB of essentially this.
+
+      A tick whose records outgrow the recorder's IntentBatchMax (default
+      768 KiB) is split across consecutive TSLB messages, each
+      independently decodable and each naming the same tick. Unlike a
+      chunked keyframe (ADR-0015) there is NO i/n header: concatenating
+      consecutive messages' records in stream order is already the original
+      order, because stream order is the application order (ADR-0008 §4).
+    parameters:
+      run: { $ref: '#/components/parameters/runId' }
+    messages:
+      loggedIntentBatch: { $ref: '#/components/messages/LoggedIntentBatch' }
+    x-nats:
+      stream: TS_LOG_{run}
+      retention: limits
+      storage: file
+      replicas: 1
+      # Default; storage-layer only (payloads and readers unchanged).
+      # serve -store-compress=false writes the stream uncompressed.
+      compression: s2
 
   logKeyframe:
     address: ts.{run}.log.keyframe
@@ -604,6 +652,10 @@ operations:
     title: Engine → arbitrated record (sole writer; pubacks awaited per tick-batch; failure aborts the run loudly)
     action: send
     channel: { $ref: '#/channels/logIntent' }
+  writeLogBatched:
+    title: Engine → arbitrated record, batched (DEFAULT since ADR-0035; sole writer; one TSLB message per non-empty tick)
+    action: send
+    channel: { $ref: '#/channels/logIntents' }
   writeKeyframe:
     title: Engine → keyframe at cadence
     action: send
@@ -632,6 +684,10 @@ operations:
     title: Replayer ← record plane (read-only; ephemeral pull consumers; paces by tick, never ReplayOriginal)
     action: receive
     channel: { $ref: '#/channels/logIntent' }
+  replayRecordBatched:
+    title: Replayer ← record plane, batched (read-only; the DEFAULT form since ADR-0035; every reader accepts both)
+    action: receive
+    channel: { $ref: '#/channels/logIntents' }
 
 components:
   parameters:
@@ -837,18 +893,41 @@ components:
         $ref: '#/components/schemas/LoggedIntentFrame'
       x-json-view: '#/components/schemas/LoggedIntentView'
 
+    LoggedIntentBatch:
+      name: loggedIntentBatch
+      title: One tick's arbitrated log entries, batched (TSLB v1)
+      summary: |
+        The batched form of LoggedIntent (ADR-0035). Same sole-writer dedup +
+        OCC headers, same records, same order — the batch is a framing around
+        LoggedIntentFrame payloads, so everything LoggedIntent's summary says
+        about ordering, held, superseded and verbatim replay applies
+        unchanged. One message per tick; a tick too wide for
+        IntentBatchMax splits across consecutive messages naming the same
+        tick, with no chunk header (stream order suffices).
+      headers: { $ref: '#/components/schemas/LogHeaders' }
+      payload:
+        schemaFormat: application/octet-stream
+        $ref: '#/components/schemas/LoggedIntentBatchFrame'
+
     Keyframe:
       name: keyframe
-      title: Full-state keyframe (engine.MarshalState bytes, TSKF v2; v3 while director directives pending)
+      title: Full-state keyframe (engine.MarshalState bytes, TSKF v2–v6 by run state and params)
       summary: |
         Complete dynamic state: tick, rolling CRC, next vehicle id, every
         vehicle (id, lane, type, s, v, f, cooldown, RNG words + draw count,
         persistent controller axes — cruise setpoint, held turn, signals,
         route), spawner demand state. Layout: engine/keyframe.go ("TSKF";
-        v2 adds the controller axes, v3 — written ONLY while the director
+        v2 adds the controller axes; v3 — written ONLY while the director
         injection queue is non-empty — appends the pending directives so a
-        seek resumes them bit-exactly; an empty queue marshals
-        byte-identical v2, and readers accept v2|v3). A keyframe larger
+        seek resumes them bit-exactly; v4 appends per-directive
+        destination/offset while any queued directive carries them
+        (ADR-0021); v5 appends per-vehicle stuckTicks/stopDone while any
+        such timer or duty is live (ADR-0034); v6 — written ONLY while
+        Params.AdaptiveRouting is on — appends per-vehicle laneEntryTick
+        and a per-lane ttEMA/ttSnap section (ADR-0036). Each higher
+        version is state-gated, so a run with no qualifying state marshals
+        byte-identical to a lower one; readers accept v2–v6, and a v6
+        payload into a flag-off spec is rejected loudly). A keyframe larger
         than the recorder's KeyframeChunkMax (default 768 KiB) is split
         into consecutive chunk messages (ADR-0015); reassembled bytes are
         exactly this payload.
@@ -1075,7 +1154,7 @@ components:
         speed_setpoint: { type: number, description: 'm/s; persistent cruise until replaced; negative clears; clamped to v0eff' }
         lane_delta: { type: integer, enum: [-1, 0, 1], description: '+1 left, −1 right; one-shot, expires if infeasible' }
         turn: { type: integer, enum: [-1, 0, 1], description: 'junction choice; held until consumed at the next lane crossing; 0 clears' }
-        route: { type: string, maxLength: 48, description: 'destination lane id; persistent. The engine follows it at every multi-successor lane (shortest path by lane length); an explicit held turn wins the crossing; unknown/unreachable destinations degrade to the successor default' }
+        route: { type: string, maxLength: 48, description: 'destination lane id; persistent. The engine follows it at every multi-successor lane (shortest path by FREE-FLOW TIME — lane length over speed limit; ADR-0006 addendum 2026-07-30); an explicit held turn wins the crossing; unknown/unreachable destinations degrade to the successor default' }
         signals: { type: integer, enum: [0, 1, 2, 3], description: '0 off, 1 left, 2 right, 3 hazard; persistent, informational in v1' }
 
     IntentEncodingHeaders:
@@ -1170,6 +1249,22 @@ components:
         Stream order within a tick IS the application order (grant desc,
         then vehicle ID — ADR-0008 §4).
 
+    LoggedIntentBatchFrame:
+      type: string
+      format: binary
+      description: |
+        TSLB v1, little-endian (ADR-0035):
+          magic 'T','S','L','B' 4B | version u8 = 1 | flags u8 = 0 (reserved) |
+          count u32 | tick u64 | count × LoggedIntentFrame
+        Header is 18 bytes. Every record's applied_tick MUST equal the
+        header tick; a reader refuses the batch otherwise, because records
+        replayed at the wrong tick diverge the run silently. count must
+        account for every byte after the header — trailing bytes are an
+        error, so an undercount cannot silently drop the records it omits.
+        Records are LoggedIntentFrame payloads byte-identical to the ones
+        ts.{run}.log.intent carries individually, so a batch is a reframing
+        and not a re-encoding.
+
     LoggedIntentView:
       title: JSON view of an arbitrated log entry (tooling only)
       type: object
@@ -1193,12 +1288,14 @@ components:
       type: string
       format: binary
       description: |
-        Magic "TSKF", version 2; canonical layout documented in
-        engine/keyframe.go. Contains the full CRC-covered state plus raw
-        RNG words, spawner demand state, and (since v2) the persistent
-        controller axes (cruise setpoint, held turn, signals, route), so
-        RestoreState resumes the run bit-exactly. Does NOT contain the run
-        spec — that pairs via the run registry (ts.{run}.meta).
+        Magic "TSKF", versions 2–6 (state- and params-gated; readers accept
+        the whole line, v6 only from runs with Params.AdaptiveRouting on —
+        ADR-0036); canonical layout documented in engine/keyframe.go.
+        Contains the full CRC-covered state plus raw RNG words, spawner
+        demand state, and (since v2) the persistent controller axes (cruise
+        setpoint, held turn, signals, route), so RestoreState resumes the
+        run bit-exactly. Does NOT contain the run spec — that pairs via
+        the run registry (ts.{run}.meta).
 
     LoggedCRCFrame:
       type: string

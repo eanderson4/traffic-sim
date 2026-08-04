@@ -25,9 +25,24 @@ func main() {
 	demandFile := flag.String("demand", "", "demand definition (ADR-0012 strict YAML) (required)")
 	seed := flag.Uint64("seed", 1, "sampler seed (keys every per-vehicle stream)")
 	lead := flag.Uint64("lead", 30, "send verbs this many ticks ahead of their earliest tick")
+	startTick := flag.Uint64("start-tick", 0, "tick the run BEGINS at when attaching to a warm-started run (ADR-0029). CURRENTLY REFUSED if nonzero: skipping arrivals <= start-tick is only half the job, because the restored state ALSO holds accepted directives for arrivals in (start-tick, start-tick+lead] and those would be re-sent and spawn TWICE. Re-enabled when the director can reconcile against the restored queue")
 	flag.Parse()
 	if *run == "" || *demandFile == "" {
 		fmt.Fprintln(os.Stderr, "demand-director: -run and -demand are required")
+		os.Exit(2)
+	}
+
+	if *startTick > 0 {
+		// Refused, not warned. serve refuses -state-in with demand parts for
+		// this exact defect, and the standard this commit sets elsewhere (the
+		// seed splice, -state-reseed) is that a printed note is not enough
+		// for a failure whose whole signature is that the run looks fine.
+		// A warning here would be strictly weaker than the guard next door
+		// on the same hazard. demand.Config.StartTick stays — it is the
+		// correct first half of the fix, and the library seam is where phase
+		// 2 will finish it.
+		fmt.Fprintf(os.Stderr, "demand-director: -start-tick %d is refused: the restored state already holds accepted directives for arrivals in (%d, %d+lead], and this director would re-send them — they spawn TWICE, because the engine's request-id dedup is per-process and starts empty. Warm start with demand is not supported yet (ADR-0029 phase 2); serve refuses the same combination\n",
+			*startTick, *startTick, *startTick)
 		os.Exit(2)
 	}
 
@@ -50,7 +65,7 @@ func main() {
 	}
 
 	lg := log.New(os.Stderr, "", 0)
-	d, err := demand.Attach(nc, js, demand.Config{Run: *run, Seed: *seed, Lead: *lead, Log: lg},
+	d, err := demand.Attach(nc, js, demand.Config{Run: *run, Seed: *seed, Lead: *lead, StartTick: *startTick, Log: lg},
 		[]*scenario.DemandFile{df})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "demand-director:", err)

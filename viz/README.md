@@ -45,6 +45,15 @@ URL parameters (all optional):
 | `buffer` | `250` | interpolation buffer (ms) |
 | `theme` | `navy` | palette from `src/theme.ts` THEMES (`navy` \| `paper`); the HUD/menu toggle writes `localStorage["viz-theme"]`, which wins when no param is given |
 | `bare` | off | `?bare=1` hides all HUD chrome + the loading overlay (clean-canvas screenshots) |
+| `report` | `/sample-runreport.json` | run report for the stats panel (`scripts/runreport.py --json`, ADR-0030 schema v1); the panel hides if it 404s |
+
+The **stats panel** (top-left, `▤ stats`) renders that report: window and
+totals, the density/speed distributions per scope as share-of-road vs
+share-of-travel bars, the corridor/district tables (sortable, veh-h lost
+first), the per-interval curve, and the delay hotspots — clicking a hotspot
+flies the map to that lane. Reports live in gitignored run directories, so a
+report file can also be dragged onto the map (or picked with `file`) instead
+of being served.
 
 `serve` flags: `-ticks` (default 36000 = 1 h at the 100 ms tick), `-seed`,
 `-rate` (veh/h per origin lane), `-density`, `-driver` (in-process default
