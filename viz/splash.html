@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>traffic-sim — open-source traffic simulation</title>
+    <style>
+      /* splash page — same palette as the map app and demos.html via the
+         same CSS variables (theme.ts THEMES.navy values as :root defaults;
+         this page follows the localStorage theme via the toggle, copied
+         verbatim from demos.html). */
+      :root {
+        --t-bg: #0e1d5c;
+        --t-text: #d6e1ff;
+        --t-text-bright: #eaf0ff;
+        --t-text-dim: #9fb2e8;
+        --t-accent: #7e9dff;
+        --t-card-bg: rgba(18, 40, 129, 0.45);
+        --t-card-bg-hover: rgba(18, 40, 129, 0.75);
+        --t-card-border: #2e5bff;
+        --t-chip-border: rgba(126, 157, 255, 0.5);
+      }
+      html, body { margin: 0; min-height: 100%; background: var(--t-bg); }
+      body {
+        font: 14px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: var(--t-text);
+        padding: 64px 24px 48px;
+      }
+      a { color: inherit; text-decoration: none; }
+      .wrap { max-width: 1080px; margin: 0 auto; }
+      header h1 { font-size: 30px; letter-spacing: 0.04em; margin: 0; color: var(--t-text-bright); }
+      header h1 .accent { color: var(--t-accent); }
+      header .pitch { margin: 10px 0 0; color: var(--t-text-dim); font-size: 13px; max-width: 640px; }
+      #notice {
+        max-width: 1080px; margin: 24px auto 0; display: none;
+        border: 1px solid #e5484d; border-radius: 6px; padding: 8px 12px;
+        color: #ffb4b6; font-size: 12px; white-space: pre-wrap;
+      }
+      section { margin-top: 40px; }
+      section > h2 {
+        margin: 0 0 14px; font-size: 12px; font-weight: normal;
+        letter-spacing: 0.12em; text-transform: uppercase; color: var(--t-text-dim);
+      }
+      /* Featured CTA — one big card, same chrome as the demos.html cards. */
+      #featured {
+        display: block; cursor: pointer;
+        background: var(--t-card-bg);
+        border: 1px solid var(--t-card-border); border-radius: 8px;
+        padding: 24px 26px 20px;
+        transition: border-color 0.15s, background 0.15s, transform 0.15s;
+      }
+      #featured:hover { border-color: var(--t-accent); background: var(--t-card-bg-hover); transform: translateY(-1px); }
+      #featured.running { border-color: #1e9e6a; }
+      #featured h3 { margin: 0; font-size: 19px; color: var(--t-text-bright); }
+      #featured .blurb { margin: 8px 0 14px; color: var(--t-text-dim); font-size: 12px; max-width: 640px; }
+      #featured .cta { color: var(--t-accent); font-size: 13px; letter-spacing: 0.04em; }
+      .tags { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+      .chip {
+        font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
+        color: var(--t-accent); border: 1px solid var(--t-chip-border);
+        border-radius: 999px; padding: 2px 9px;
+      }
+      .chip.soon { color: #e8b43a; border-color: rgba(232, 180, 58, 0.55); }
+      .badge {
+        float: right;
+        font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
+        color: #1e9e6a;
+      }
+      .badge::before { content: "●"; margin-right: 5px; }
+      .grid {
+        display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px;
+      }
+      .card {
+        display: block;
+        background: var(--t-card-bg);
+        border: 1px solid var(--t-card-border); border-radius: 8px;
+        padding: 16px 18px 14px;
+        transition: border-color 0.15s, background 0.15s, transform 0.15s;
+      }
+      .card:hover { border-color: var(--t-accent); background: var(--t-card-bg-hover); transform: translateY(-1px); }
+      .card h3 { margin: 0; font-size: 14px; color: var(--t-text-bright); }
+      .card .blurb { margin: 8px 0 0; color: var(--t-text-dim); font-size: 12px; }
+      .card .tags { margin-bottom: 10px; }
+      #browse {
+        display: inline-block; margin-top: 4px;
+        color: var(--t-accent); font-size: 13px; letter-spacing: 0.04em;
+        border: 1px solid var(--t-card-border); border-radius: 6px;
+        padding: 10px 18px;
+        transition: border-color 0.15s, background 0.15s;
+      }
+      #browse:hover { border-color: var(--t-accent); background: var(--t-card-bg); }
+      footer {
+        max-width: 1080px; margin: 56px auto 0; padding-top: 16px;
+        border-top: 1px solid var(--t-card-border);
+        color: var(--t-text-dim); font-size: 11px;
+      }
+      footer a { color: var(--t-accent); }
+      /* Theme toggle — identical markup/behavior to demos.html. */
+      #theme-toggle {
+        position: fixed; top: 14px; right: 16px; z-index: 2;
+        font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        letter-spacing: 0.08em;
+        color: var(--t-text);
+        background: var(--t-card-bg);
+        border: 1px solid var(--t-card-border); border-radius: 4px;
+        padding: 4px 10px; cursor: pointer;
+      }
+      #theme-toggle:hover { border-color: var(--t-accent); }
+    </style>
+  </head>
+  <body>
+    <button id="theme-toggle" type="button" title="theme — click to switch">NAVY</button>
+    <header class="wrap">
+      <h1>traffic-sim <span class="accent">//</span></h1>
+      <p class="pitch">An open-source traffic simulation engine — real road networks, replayable scenarios, decision-grade congestion metrics.</p>
+    </header>
+    <div id="notice"></div>
+
+    <section class="wrap">
+      <h2>Featured demo</h2>
+      <!-- The LA card is wired by splash.ts: click starts the LA run via
+           demosrv (or deep-links into it when already live) — the same
+           URLs the demos.html card builds (viz/src/demos-core.ts). -->
+      <a id="featured" href="#">
+        <span class="badge" id="featured-badge" hidden>running</span>
+        <h3>Los Angeles — full basin</h3>
+        <p class="blurb">Full-city Overpass import (33.70,-118.75 → 34.35,-117.60; 1.38M lanes — the sprawl is the story.) Demand-free; spawner-driven smoke runs.</p>
+        <div class="tags">
+          <span class="chip">urban</span>
+          <span class="chip">city-scale</span>
+          <span class="chip">los-angeles</span>
+        </div>
+        <span class="cta" id="featured-cta">launch live demo →</span>
+      </a>
+    </section>
+
+    <section class="wrap">
+      <h2>Analysis &amp; write-ups</h2>
+      <!-- docs/show and docs/kb are not served by the deploy (demosrv only
+           serves the built viz), so these link to the repo on GitHub. -->
+      <div class="grid">
+        <a class="card" href="https://github.com/eanderson4/traffic-sim/blob/main/docs/show/chi-loop-options.md" target="_blank" rel="noopener">
+          <h3>Chicago — the Loop and the expressways</h3>
+          <p class="blurb">Paired-seed A/B runs over downtown Chicago plus the Kennedy, Dan Ryan, Eisenhower, Stevenson and Lake Shore Drive — which upgrade actually fixes it.</p>
+        </a>
+        <a class="card" href="https://github.com/eanderson4/traffic-sim/blob/main/docs/show/cbd-options.md" target="_blank" rel="noopener">
+          <h3>Chicago Loop CBD</h3>
+          <p class="blurb">The downtown grid alone: 1,057 signals in 208 lane-km. Two nothings that make the best something in the dataset.</p>
+        </a>
+        <a class="card" href="https://github.com/eanderson4/traffic-sim/blob/main/docs/show/kennedy-options.md" target="_blank" rel="noopener">
+          <h3>Kennedy corridor</h3>
+          <p class="blurb">One expressway and its ramp terminals — where a peak-hour freight ban beats laying concrete.</p>
+        </a>
+        <a class="card" href="https://github.com/eanderson4/traffic-sim/blob/main/docs/show/audit.md" target="_blank" rel="noopener">
+          <h3>Audit — what these results can and cannot carry</h3>
+          <p class="blurb">Every headline number re-derived from the saved reports. Three claims did not survive. Read before quoting any of the above.</p>
+        </a>
+        <a class="card" href="https://github.com/eanderson4/traffic-sim/blob/main/docs/kb/articles/business-domains/simulator-landscape.md" target="_blank" rel="noopener">
+          <h3>Simulator landscape</h3>
+          <p class="blurb">SUMO, MATSim, CARLA and nine more — a survey of 12 simulators in five camps, and the quadrant none of them covers.</p>
+        </a>
+        <!-- Deliberately NOT a link: analysis/lit-lineage is local-only so
+             far (not yet pushed to GitHub) — a repo URL would 404. -->
+        <div class="card">
+          <h3>Traffic literature lineage</h3>
+          <div class="tags"><span class="chip soon">in progress — coming soon</span></div>
+          <p class="blurb">A citation graph of traffic-flow research: who published what, who cites whom, and how the field's main ideas descend from one another.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="wrap">
+      <h2>More</h2>
+      <a id="browse" href="/demos.html">browse all demos →</a>
+    </section>
+
+    <footer>
+      traffic-sim is open source —
+      <a href="https://github.com/eanderson4/traffic-sim" target="_blank" rel="noopener">github.com/eanderson4/traffic-sim</a>
+    </footer>
+
+    <script>
+      // Theme toggle — copied verbatim from demos.html: two palettes for
+      // this page's CSS vars, persisted to localStorage "viz-theme" so the
+      // map app (src/config.ts resolveThemeName) inherits the choice.
+      (function () {
+        var KEY = "viz-theme";
+        var PALETTES = {
+          navy: {
+            "--t-bg": "#0e1d5c",
+            "--t-text": "#d6e1ff",
+            "--t-text-bright": "#eaf0ff",
+            "--t-text-dim": "#9fb2e8",
+            "--t-accent": "#7e9dff",
+            "--t-card-bg": "rgba(18, 40, 129, 0.45)",
+            "--t-card-bg-hover": "rgba(18, 40, 129, 0.75)",
+            "--t-card-border": "#2e5bff",
+            "--t-chip-border": "rgba(126, 157, 255, 0.5)"
+          },
+          paper: {
+            "--t-bg": "#fafafa",
+            "--t-text": "#26262b",
+            "--t-text-bright": "#111113",
+            "--t-text-dim": "#6e6e76",
+            "--t-accent": "#2563eb",
+            "--t-card-bg": "#ffffff",
+            "--t-card-bg-hover": "#f0f0f2",
+            "--t-card-border": "#e5e5e8",
+            "--t-chip-border": "rgba(37, 99, 235, 0.5)"
+          }
+        };
+        var btn = document.getElementById("theme-toggle");
+        function apply(name) {
+          var palette = PALETTES[name] || PALETTES.navy;
+          for (var k in palette) document.documentElement.style.setProperty(k, palette[k]);
+          btn.textContent = name.toUpperCase();
+          btn.dataset.theme = name;
+        }
+        var stored = null;
+        try { stored = localStorage.getItem(KEY); } catch (e) { /* private mode */ }
+        apply(stored === "paper" ? "paper" : "navy");
+        btn.addEventListener("click", function () {
+          var next = btn.dataset.theme === "navy" ? "paper" : "navy";
+          try { localStorage.setItem(KEY, next); } catch (e) { /* private mode */ }
+          apply(next);
+        });
+      })();
+    </script>
+    <script type="module" src="/src/splash.ts"></script>
+  </body>
+</html>
