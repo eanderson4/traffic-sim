@@ -54,6 +54,10 @@ Rules for anyone (human or agent) working in this repo.
   When Fable is unavailable (quota, outage), `--kimi` substitutes Kimi K3
   in its slot — still two model families, and the archive names whoever
   actually reviewed (ADR-0013 addendum 2026-07-27).
+  Archive policy: commit the reviews themselves (brief, diffstat, model
+  outputs); the `*-reviewed.patch` snapshot is written locally but
+  gitignored — it is byte-reproducible from git and was nearly all of the
+  archive's weight (ADR-0013 addendum 2026-08-04).
 - **Triage bar: blockers only, one round.** Fix blockers before
   committing; record should-fixes in the commit message or KB and defer
   them; ignore nits. Reviewers will always find one more edge case — at

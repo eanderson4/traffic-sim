@@ -169,3 +169,29 @@ nonblank line.
 — just stop passing `--kimi`), or a second reviewer needs the same
 treatment, at which point the slot should become a named list rather than
 a two-valued flag.
+
+## Addendum 2026-08-04: stop committing the reviewed-patch snapshots
+
+The Consequences section predicted this one: "Repo growth is bounded by
+review size; prune by policy later if it matters." It matters. Each
+archived `*-reviewed.patch` is the byte-complete staged diff, and for a
+large milestone batch that is 1–11 MB per round — the patches were the
+overwhelming majority of the archive's weight, and they made a
+24-commit push carry tens of MB of redundant diff text.
+
+**Decision.** The archive keeps what is *not* reproducible — the brief,
+the diffstat, and the reviewers' outputs (`claude-fable.md` /
+`kimi-k3.md`, `gpt-5.6-sol.md`, `gemini.md` when present) — and those
+continue to be committed. The `*-reviewed.patch` snapshot is still
+written locally by `scripts/external-review.sh` (the committer may want
+it in hand while triaging) but is now gitignored, never committed. The
+patch is byte-reproducible from git itself: the stamp binds (base HEAD,
+index tree), and the committed review `.md` files name the run whose
+diff they cover, so the paper trail loses nothing — the patch was never
+*enforced* against anything (this ADR says so: "nothing enforces it"),
+it only made tampering "detectable in principle," and that principle is
+preserved by regeneration.
+
+**Revisit when:** a dispute actually arises over what a past round
+reviewed — at which point regenerating the diff from the stamped range
+is the answer, not re-committing snapshots.
