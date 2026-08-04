@@ -17,3 +17,7 @@ tools/
 viz/public/network.geojson
 __pycache__/
 .wrangler/
+# External-review archives: commit the reviews (brief, diffstat, model
+# outputs), not the reviewed-patch snapshots — multi-MB each, and
+# byte-reproducible from git (ADR-0013 addendum 2026-08-04).
+docs/kb/raw/reviews/*-reviewed.patch
