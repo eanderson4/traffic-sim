@@ -448,3 +448,26 @@ versions untouched. What changes is how the kernel resolves it.
 - Versioning note: same formal supersession as 2026-07-24 — contract
   versions version the wire, not the world model; engine behavior fixes
   change trajectories without versioning the contract.
+
+## Addendum (2026-07-31, ADR-0037 milestone 1: the `signal_set` verb)
+
+Additive, same formal shape as the M10 verb addendum: the director verb
+channel `ts.{run}.ctl.verb.{controller_id}` gains a second verb kind,
+`signal_set` (payload: signal program id, commanded phase index, optional
+hold_ticks — default one program cycle, clamped to the engine's starvation
+bound of 300 sim-seconds, compiled onto the run's tick grid — 3000 ticks
+at the validated 100 ms tick). Same subject, same request/reply with request-id
+idempotency, same record-plane logging on `ts.{run}.log.verb` — the logged
+payload grows an omitted-when-spawn `verb` discriminator plus the signal
+fields, so every pre-ADR-0037 recording decodes unchanged (all-spawn), and
+replay re-enqueues both kinds at their recorded applied ticks. A held
+phase past its bound LAPSES back to the fixed-time program — a
+`signal_lapse` event on `ts.{run}.log.event` (the pause/resume idiom:
+derived dead-time metadata the replayer ignores and re-derives), never
+silent. Keyframes grow TSKF v7 (written only while an
+override is held; v7 gives the TSKF header flags word its first bit,
+marking the v6 adaptive-routing state — per-vehicle dwell clock AND lane
+section — as present, which the version number alone
+expressed through v6). Contract versions version the wire: schema_version
+stays 2, asyncapi goes to 2.7.0. Details and verification:
+[ADR-0037](ADR-0037-runtime-signal-control.md).

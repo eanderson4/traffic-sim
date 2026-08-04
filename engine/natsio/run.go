@@ -1,6 +1,7 @@
 package natsio
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"time"
@@ -227,6 +228,29 @@ func RunLive(nc *nats.Conn, js nats.JetStreamContext, run string, spec engine.Ru
 			e.EnqueueIntent(k)
 		}
 		e.Step()
+		// The starvation rail firing (ADR-0037) is an operator-visible
+		// event, never a silent fallback: a held phase reached its bound and
+		// the signal is back on its fixed-time program. Two surfaces, same
+		// event: the record plane (ts.{run}.log.event — a RECORDING must
+		// contain the evidence; the pause/resume events are the precedent,
+		// and like them the lapse is dead-time metadata the replayer
+		// re-derives from keyframed state rather than re-applying) and the
+		// process log (the sim core cannot log, so the edge does). A failed
+		// record write aborts the run loudly (ADR-0006 §4, emitPause's
+		// contract).
+		for _, lp := range e.LapsedSignals() {
+			phase := lp.Phase
+			data, _ := json.Marshal(ContractEvent{
+				Type: EventSignalLapse, Tick: e.Tick,
+				Signal: lp.Signal, Phase: &phase, Since: lp.Since, Until: lp.Until,
+				RequestID: lp.RequestID,
+			})
+			if err := rec.LogEvent(e.Tick, data); err != nil {
+				return finish(fmt.Errorf("record signal_lapse event at tick %d: %w", e.Tick, err))
+			}
+			log.Printf("run %s: signal %s phase %d hold LAPSED at tick %d (held [%d, %d), verb %q) — fixed-time program resumed (ADR-0037 starvation rail)",
+				run, lp.Signal, lp.Phase, e.Tick, lp.Since, lp.Until, lp.RequestID)
+		}
 		if contractCfg.Observer != nil {
 			contractCfg.Observer.Observe(e)
 		}

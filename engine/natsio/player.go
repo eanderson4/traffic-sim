@@ -459,6 +459,12 @@ func (p *Player) stepTick(countErrs bool) error {
 				fmt.Sprintf("verb %q at tick %d rejected (%v) — record and spec disagree", d.RequestID, next, err))
 		}
 	}
+	for _, d := range rec.sverbs {
+		if err := p.e.EnqueueSignal(d); err != nil {
+			p.reportDivergence(countErrs, &p.verbErrs,
+				fmt.Sprintf("signal verb %q at tick %d rejected (%v) — record and spec disagree", d.RequestID, next, err))
+		}
+	}
 	p.e.Step()
 	if rec.hasCRC && p.e.CRC() != rec.crc {
 		p.reportDivergence(countErrs, &p.crcErrs,

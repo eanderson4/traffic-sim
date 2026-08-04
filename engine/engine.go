@@ -172,6 +172,23 @@ type Engine struct {
 	interiorInj   []InteriorInjection // ADR-0021 mid-lane injections of the last Step (derived, per-tick)
 	SpawnLog      []TickedSpawn       // every accepted directive, in application order
 
+	// Commanded signal overrides (ADR-0037, sigctl.go). sigOv maps a program
+	// id to its override history (oldest→newest, last in force; ended holds
+	// are retained for the clearance window) — the map is lookup only,
+	// NEVER iterated (ADR-0005); every per-tick use walks Net.Signals in
+	// network order. The table is behavior-deciding state: keyframed (TSKF
+	// v7) and folded into the CRC, both only while non-empty, so a run
+	// without signal verbs keeps the pre-ADR-0037 byte stream exactly.
+	sigOv map[string][]sigOverride // program id → override history (lookup only)
+	// sigNew is NOT keyframed: a marshal between EnqueueSignal and the next
+	// Step would drop a buffered verb. Every marshal site runs with the
+	// buffer drained (the record plane marshals after Step) — the same
+	// emergent invariant as the spawn path's dirNew.
+	sigNew     []TickedSignal // buffered signal directives, applied next boundary
+	appliedSig []TickedSignal // took effect during the last Step (reused)
+	sigLapses  []SigLapse     // holds that reached their bound in the last Step (reused)
+	SigLog     []TickedSignal // every accepted signal directive, in application order
+
 	// Director spawn-outcome tallies. Derived observability only — never
 	// serialized, never in the CRC, so they cannot affect replay. They exist
 	// because expiry (director.go's DirectorSpawnHoldTicks) drops demand
@@ -228,12 +245,14 @@ type Engine struct {
 
 	Stats Stats
 
-	// RestoreNotice is set by RestoreState when a pre-v6 (static-routing)
-	// keyframe is restored into a flag-ON spec — the ADR-0036 migration
-	// path, which since the default flip also fires on a plain -state-in of
-	// an old static keyframe. The sim core cannot log (ADR-0005: no wall
-	// clock inside it), so this is deterministic state; edge callers
-	// (natsio replay/bake/player) surface it. Never serialized, never CRC'd.
+	// RestoreNotice is set by RestoreState when a keyframe without
+	// adaptive-routing lane state (a pre-v6 static-routing payload, or a
+	// flag-off v7 one) is restored into a flag-ON spec — the ADR-0036
+	// migration path, which since the default flip also fires on a plain
+	// -state-in of an old static keyframe. The sim core cannot log
+	// (ADR-0005: no wall clock inside it), so this is deterministic state;
+	// edge callers (natsio replay/bake/player) surface it. Never
+	// serialized, never CRC'd.
 	RestoreNotice string
 }
 
@@ -397,7 +416,8 @@ func (e *Engine) CRC() uint64 { return e.crc }
 //     this tick
 //  1. events: deterministic spawner, then director spawn directives
 //     (ADR-0005: events fire before the sweep; the director queue's fixed
-//     point is documented in director.go)
+//     point is documented in director.go), then commanded signal overrides
+//     (ADR-0037: apply, lapse, sweep — sigctl.go)
 //  2. intents: buffered controller intents applied in deterministic order
 //     (ADR-0006 §4), recorded in the arbitrated log
 //  3. IDM acceleration per vehicle from a consistent snapshot (intent
@@ -445,6 +465,7 @@ func (e *Engine) Step() {
 		e.spawner.step(e)
 	}
 	e.stepDirectorSpawns()
+	e.stepSignalOverrides()
 	e.applyIntents()
 	e.rebuildOccupancy()
 	e.computeAccels()
@@ -1073,6 +1094,33 @@ func (e *Engine) computeCRC() uint64 {
 		}
 		for _, v := range e.order {
 			u(v.laneEntryTick)
+		}
+	}
+	// Commanded signal overrides (ADR-0037): a held command decides the
+	// light state, so a replay that diverges in it must diverge in the CRC
+	// the same tick — the ADR-0036 fold's own argument. Folded LAST (the
+	// byte stream above is untouched) and only while the table is non-empty,
+	// so a run that never receives a signal verb keeps the pre-ADR-0037
+	// stream bit-identical. Iteration is over the network's program list in
+	// network order, each program's history in chronological order (the
+	// table is lookup-only); ended holds still in clearance retention are
+	// folded too — they still answer sigInClearance's lookback. The
+	// behavior-deciding fields only: the request id is audit trail and
+	// stays out.
+	if len(e.sigOv) > 0 {
+		n := 0
+		for _, p := range e.Net.Signals {
+			n += len(e.sigOv[p.ID])
+		}
+		u(uint64(n))
+		for i, p := range e.Net.Signals {
+			for _, ov := range e.sigOv[p.ID] {
+				u(uint64(i))
+				u(uint64(ov.phase))
+				u(ov.since)
+				u(ov.until)
+				u(ov.chainStart)
+			}
 		}
 	}
 	return h.Sum64()

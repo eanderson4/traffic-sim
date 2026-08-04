@@ -66,6 +66,7 @@ type tickRecords struct {
 	tick    uint64
 	intents []engine.KeyedIntent
 	verbs   []engine.SpawnDirective
+	sverbs  []engine.SignalDirective // ADR-0037 signal_set verbs
 	crc     uint64
 	hasCRC  bool
 }
@@ -93,11 +94,15 @@ func (r *tickRecords) add(m *nats.Msg, run string) error {
 			r.intents = append(r.intents, k.KeyedIntent)
 		}
 	case SubjectLogVerb(run):
-		s, err := decodeLoggedVerb(m.Data)
+		s, sig, isSignal, err := decodeLoggedVerbAny(m.Data)
 		if err != nil {
 			return err
 		}
-		r.verbs = append(r.verbs, s.SpawnDirective)
+		if isSignal {
+			r.sverbs = append(r.sverbs, sig.SignalDirective)
+		} else {
+			r.verbs = append(r.verbs, s.SpawnDirective)
+		}
 	case SubjectLogCRC(run):
 		crc, err := decodeLoggedCRC(m.Data)
 		if err != nil {

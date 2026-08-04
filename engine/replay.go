@@ -27,6 +27,10 @@ type RunLog struct {
 	Spec    RunSpec
 	Intents []TickedIntent // applied intents, chronological (Tick ascending)
 	Spawns  []TickedSpawn  // accepted director directives, chronological
+	// Signals holds the accepted signal_set directives, chronological
+	// (ADR-0037). Additive: a run without signal verbs carries a nil slice,
+	// exactly as before.
+	Signals []TickedSignal
 	CRCs    []uint64
 }
 
@@ -40,7 +44,7 @@ func Run(spec RunSpec) (*Engine, *RunLog, error) {
 	for e.Tick < spec.Ticks {
 		e.Step()
 	}
-	return e, &RunLog{Spec: spec, Intents: e.IntentLog, Spawns: e.SpawnLog, CRCs: e.CRCs}, nil
+	return e, &RunLog{Spec: spec, Intents: e.IntentLog, Spawns: e.SpawnLog, Signals: e.SigLog, CRCs: e.CRCs}, nil
 }
 
 // Replay re-executes a recorded run from its spec and arbitrated intent log
@@ -53,7 +57,7 @@ func Replay(log *RunLog) (*RunLog, error) {
 	if err != nil {
 		return nil, err
 	}
-	ii, si := 0, 0
+	ii, si, gi := 0, 0, 0
 	for e.Tick < log.Spec.Ticks {
 		for ii < len(log.Intents) && log.Intents[ii].Tick <= e.Tick+1 {
 			if log.Intents[ii].Tick == e.Tick+1 {
@@ -70,9 +74,20 @@ func Replay(log *RunLog) (*RunLog, error) {
 			}
 			si++
 		}
+		for gi < len(log.Signals) && log.Signals[gi].Tick <= e.Tick+1 {
+			if log.Signals[gi].Tick == e.Tick+1 {
+				// Validated when first accepted; re-resolution against the
+				// same spec is deterministic and cannot newly fail.
+				if err := e.EnqueueSignal(log.Signals[gi].SignalDirective); err != nil {
+					return nil, fmt.Errorf("replay signal verb %q at tick %d: %w",
+						log.Signals[gi].RequestID, log.Signals[gi].Tick, err)
+				}
+			}
+			gi++
+		}
 		e.Step()
 	}
-	relog := &RunLog{Spec: log.Spec, Intents: e.IntentLog, Spawns: e.SpawnLog, CRCs: e.CRCs}
+	relog := &RunLog{Spec: log.Spec, Intents: e.IntentLog, Spawns: e.SpawnLog, Signals: e.SigLog, CRCs: e.CRCs}
 	if len(relog.CRCs) != len(log.CRCs) {
 		return nil, fmt.Errorf("replay produced %d CRCs, log has %d", len(relog.CRCs), len(log.CRCs))
 	}

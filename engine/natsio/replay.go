@@ -23,14 +23,15 @@ import (
 
 // ReplayReport summarizes a verified replay.
 type ReplayReport struct {
-	Run             string
-	KeyframeTick    uint64 // keyframe the seek landed on
-	KeyframeSeq     uint64 // its stream sequence
-	ToTick          uint64 // last re-simulated tick
-	IntentsReplayed int
-	VerbsReplayed   int // director spawn directives re-enqueued
-	CRCsVerified    int
-	FinalCRC        uint64 // rolling CRC at ToTick
+	Run              string
+	KeyframeTick     uint64 // keyframe the seek landed on
+	KeyframeSeq      uint64 // its stream sequence
+	ToTick           uint64 // last re-simulated tick
+	IntentsReplayed  int
+	VerbsReplayed    int // director spawn directives re-enqueued
+	SigVerbsReplayed int // signal_set directives re-enqueued (ADR-0037)
+	CRCsVerified     int
+	FinalCRC         uint64 // rolling CRC at ToTick
 }
 
 // RunRecord is the materialized record plane of a run: the in-memory RunLog
@@ -72,11 +73,15 @@ func MaterializeRunRecord(js nats.JetStreamContext, meta *RunMeta) (*RunRecord, 
 			}
 			rec.Log.Intents = append(rec.Log.Intents, ks...)
 		case SubjectLogVerb(run):
-			s, err := decodeLoggedVerb(m.Data)
+			s, sig, isSignal, err := decodeLoggedVerbAny(m.Data)
 			if err != nil {
 				return nil, err
 			}
-			rec.Log.Spawns = append(rec.Log.Spawns, s)
+			if isSignal {
+				rec.Log.Signals = append(rec.Log.Signals, sig)
+			} else {
+				rec.Log.Spawns = append(rec.Log.Spawns, s)
+			}
 		case SubjectLogCRC(run):
 			crc, err := decodeLoggedCRC(m.Data)
 			if err != nil {
@@ -143,6 +148,13 @@ func ReplayFromStream(js nats.JetStreamContext, meta *RunMeta, target uint64) (*
 			}
 			rep.VerbsReplayed++
 		}
+		for _, d := range idx.sverbs[next] {
+			// Same argument as the spawn verbs above (ADR-0037).
+			if err := e.EnqueueSignal(d); err != nil {
+				return nil, fmt.Errorf("replay signal verb %q at tick %d: %w", d.RequestID, next, err)
+			}
+			rep.SigVerbsReplayed++
+		}
 		e.Step()
 		if want, ok := idx.crcs[next]; ok {
 			if e.CRC() != want {
@@ -166,6 +178,7 @@ func ReplayFromStream(js nats.JetStreamContext, meta *RunMeta, target uint64) (*
 type logIndex struct {
 	intents   map[uint64][]engine.KeyedIntent
 	verbs     map[uint64][]engine.SpawnDirective
+	sverbs    map[uint64][]engine.SignalDirective // ADR-0037 signal_set verbs
 	crcs      map[uint64]uint64
 	keyframes []uint64 // keyframe ticks, stream order (for cadence derivation)
 	lastTick  uint64   // highest tick header seen on any message
@@ -178,6 +191,7 @@ func indexLogMsgs(msgs []*nats.Msg, run string) (*logIndex, error) {
 	idx := &logIndex{
 		intents: map[uint64][]engine.KeyedIntent{},
 		verbs:   map[uint64][]engine.SpawnDirective{},
+		sverbs:  map[uint64][]engine.SignalDirective{},
 		crcs:    map[uint64]uint64{},
 	}
 	for _, m := range msgs {
@@ -208,11 +222,15 @@ func indexLogMsgs(msgs []*nats.Msg, run string) (*logIndex, error) {
 				idx.intents[k.Tick] = append(idx.intents[k.Tick], k.KeyedIntent)
 			}
 		case SubjectLogVerb(run):
-			s, err := decodeLoggedVerb(m.Data)
+			s, sig, isSignal, err := decodeLoggedVerbAny(m.Data)
 			if err != nil {
 				return nil, err
 			}
-			idx.verbs[s.Tick] = append(idx.verbs[s.Tick], s.SpawnDirective)
+			if isSignal {
+				idx.sverbs[sig.Tick] = append(idx.sverbs[sig.Tick], sig.SignalDirective)
+			} else {
+				idx.verbs[s.Tick] = append(idx.verbs[s.Tick], s.SpawnDirective)
+			}
 		case SubjectLogCRC(run):
 			crc, err := decodeLoggedCRC(m.Data)
 			if err != nil {
