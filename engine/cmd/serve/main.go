@@ -100,8 +100,8 @@ func main() {
 	stateIn := flag.String("state-in", "", "warm-start from a state file written by -state-out: the run begins at that state's tick with that state instead of an empty network at tick 0. -ticks stays ABSOLUTE, so a state at tick 20000 with -ticks 54000 simulates the remaining 34000. Refuses a state saved against a different network (lane fingerprint), and refuses a missing sidecar")
 	stateReseed := flag.Bool("state-reseed", false, "allow -state-in when the run's seed differs from the seed the state was saved under. Off by default: the continuation draws from the RUN's seed, so a mismatch splices two different deterministic programs. Set this when that is what you want (same state, different draws)")
 	intentLog := flag.Bool("intent-log", true, "retain the engine's whole-run in-memory intent log; -intent-log=false drops it for long headless runs (the durable JetStream record and replay are unaffected — only the in-memory RunLog is lost). A 54,000-tick chi-loop-urban run at ~5,900 vehicles is ~225M retained intents and was OOM-killed at tick 38,200 on a 123 GB machine, so this is a requirement at that horizon rather than a tuning knob")
-	logBatch := flag.Bool("log-batch", true, "record each tick's applied intents as ONE TSLB batch message on ts.{run}.log.intents (ADR-0035) instead of one message per intent on ts.{run}.log.intent. Off restores the pre-ADR-0035 record plane, for A/B measurement and for writing a recording an older reader can consume; replay reads either form")
-	storeCompress := flag.Bool("store-compress", true, "S2-compress the recording stream's file storage (ADR-0035). Storage-layer only: payloads and every reader are unchanged. Off if the write-side CPU cost ever matters more than the bytes")
+	logBatch := flag.Bool("log-batch", false, "record each tick's applied intents as ONE TSLB batch message on ts.{run}.log.intents (ADR-0035) instead of one message per intent on ts.{run}.log.intent. Default OFF while ADR-0035's live-run reproducibility blocker stands (a faster record plane changes which tick an async controller's intents land on); enable for recordings where run-to-run reproduction is not the goal. Replay reads either form")
+	storeCompress := flag.Bool("store-compress", false, "S2-compress the recording stream's file storage (ADR-0035). Storage-layer only: payloads and every reader are unchanged. Default OFF under the same ADR-0035 blocker; enable where the write-side CPU cost matters less than the bytes")
 	flag.Parse()
 
 	if *scenarioDir != "" && *netfile != "" {
@@ -496,8 +496,8 @@ func main() {
 		}
 		lr, err := natsio.RunLive(nc, js, *run, spec, natsio.RecorderConfig{
 			DropEngineIntentLog: !*intentLog,
-			UnbatchedIntentLog:  !*logBatch,
-			UncompressedStore:   !*storeCompress,
+			BatchedIntentLog:    *logBatch,
+			CompressedStore:     *storeCompress,
 		}, cc)
 		if err == nil && mobs != nil {
 			err = mobs.finish(lr.Engine, *metricsOut, spec.Ticks)

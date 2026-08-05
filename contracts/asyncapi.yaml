@@ -46,11 +46,12 @@ info:
     - **Record plane (JetStream, at-least-once):** the arbitrated intent
       log, full-state keyframes, the rolling state CRC, and control events
       (pause/resume), one stream per run (LimitsPolicy, R=1 file, S2
-      compression since ADR-0035). The engine is the SOLE WRITER;
-      Nats-Expected-Last-Sequence asserts it broker-side. The intent log is
-      batched one message per non-empty TICK since ADR-0035 (`log.intents`,
-      TSLB v1);
-      `log.intent` is the per-intent form it replaces and stays readable, so
+      compression opt-in via -store-compress since ADR-0035). The engine is the SOLE WRITER;
+      Nats-Expected-Last-Sequence asserts it broker-side. The intent log
+      batches to one message per non-empty TICK under -log-batch (`log.intents`,
+      TSLB v1; opt-in since ADR-0035, default off under its
+      reproducibility blocker);
+      `log.intent` is the per-intent default form and stays readable, so
       earlier recordings replay unchanged.
     - **Metadata plane (KV):** the run registry — run spec + status, and
       the latest-state pointer for late joiners.
@@ -443,11 +444,12 @@ channels:
       intent, in application order, each with its applied_tick. Engine sole
       writer; replay re-applies these instead of running controllers.
 
-      SUPERSEDED AS THE DEFAULT by logIntents (TSLB batches, ADR-0035),
-      which carries the same records with one message per non-empty tick
-      instead of one per intent. Still written when the recorder runs with
-      UnbatchedIntentLog (serve -log-batch=false), and every reader still
-      accepts it, so recordings made before ADR-0035 replay unchanged. A
+      The DEFAULT form. logIntents (TSLB batches, ADR-0035) carries the
+      same records with one message per non-empty tick instead of one per
+      intent when the recorder runs with BatchedIntentLog
+      (serve -log-batch); it is opt-in while ADR-0035's live-run
+      reproducibility blocker stands. Every reader accepts both forms, so
+      recordings made before ADR-0035 replay unchanged. A
       recording carries one form or the other, never a mix.
     parameters:
       run: { $ref: '#/components/parameters/runId' }
@@ -458,9 +460,11 @@ channels:
       retention: limits
       storage: file
       replicas: 1
-      # Default; storage-layer only (payloads and readers unchanged).
-      # serve -store-compress=false writes the stream uncompressed.
-      compression: s2
+      # Storage compression is OPT-IN via serve -store-compress (default
+      # off under ADR-0035's live-run reproducibility blocker), so an
+      # unflagged run's stream carries no compression and none is declared
+      # here. Storage-layer only: payloads and readers are unchanged either
+      # way; a compressed stream is the same contract.
 
   logIntents:
     address: ts.{run}.log.intents
@@ -468,7 +472,8 @@ channels:
       The arbitrated intent log, batched: ONE message per NON-EMPTY tick
       carrying that tick's applied intents in application order (TSLB v1,
       ADR-0035). A tick with no applied intents emits no batch. The
-      default since ADR-0035; logIntent is the per-message form it replaces.
+      opt-in form (serve -log-batch; default off under ADR-0035's
+      reproducibility blocker); logIntent is the per-message default.
 
       The records inside a batch are LoggedIntentFrame payloads
       byte-identical to the ones logIntent publishes individually, in the
@@ -492,9 +497,11 @@ channels:
       retention: limits
       storage: file
       replicas: 1
-      # Default; storage-layer only (payloads and readers unchanged).
-      # serve -store-compress=false writes the stream uncompressed.
-      compression: s2
+      # Storage compression is OPT-IN via serve -store-compress (default
+      # off under ADR-0035's live-run reproducibility blocker), so an
+      # unflagged run's stream carries no compression and none is declared
+      # here. Storage-layer only: payloads and readers are unchanged either
+      # way; a compressed stream is the same contract.
 
   logKeyframe:
     address: ts.{run}.log.keyframe

@@ -89,7 +89,7 @@ sequenceDiagram
     Note over E: phase 7 — metrics + rolling CRC
     E->>B: state.snap (TSSF) · ctl.obs (TSOB) · ctl.ack
     B->>V: TSSF frame → render
-    E->>J: log.intents (TSLB) · log.crc · keyframe (cadence)
+    E->>J: log.intent (per-message default) · log.intents (TSLB, under -log-batch) · log.crc · keyframe (cadence)
 ```
 
 ## 4. Recording, replay, and baked replay

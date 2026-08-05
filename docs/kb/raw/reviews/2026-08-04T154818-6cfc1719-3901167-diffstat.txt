@@ -1,0 +1,6 @@
+ contracts/asyncapi.yaml                          | 26 +++++++++++++++---------
+ docs/kb/INDEX.md                                 |  2 +-
+ docs/kb/decisions/ADR-0035-batched-intent-log.md | 16 +++++++++------
+ engine/cmd/serve/main.go                         |  4 ++--
+ engine/network.go                                |  6 ++++--
+ 5 files changed, 33 insertions(+), 21 deletions(-)
