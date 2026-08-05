@@ -4,6 +4,10 @@ Target: GKE cluster `carbon-dev` (project `roaring-bots`, us-central1),
 behind the existing GCE Ingress. One pod, one replica, forever — demosrv
 supervises a single active run; horizontal scaling is meaningless here.
 
+Routing: `/` serves the splash landing page (`viz/splash.html` →
+`dist/splash.html`); the demos menu stays at `/demos.html` and the map app
+at `/app/` (all from the built viz in `/srv/viz`).
+
 ## GO-LIVE PRECONDITIONS — do not `kubectl apply` the Ingress until these land
 
 1. **Broker auth on the engine ws plane** (ADR-0020 §go-live): the embedded

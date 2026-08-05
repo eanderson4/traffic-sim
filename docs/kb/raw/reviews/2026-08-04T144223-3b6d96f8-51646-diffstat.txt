@@ -1,0 +1,3 @@
+ viz/splash.html   |  9 ++++--
+ viz/src/splash.ts | 88 +++++++++++++++++++++++++++++++++----------------------
+ 2 files changed, 59 insertions(+), 38 deletions(-)

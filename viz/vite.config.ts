@@ -1,5 +1,6 @@
-// vite.config.ts — the viz is a TWO-PAGE build (M-demo launcher): index.html
-// is the live map app, demos.html the demosrv menu page. ADR-0003 stands
+// vite.config.ts — the viz is a THREE-PAGE build (M-demo launcher): splash.html
+// is the landing page (served at / by demosrv), index.html the live map app,
+// demos.html the demos menu. ADR-0003 stands
 // (vanilla TS, no framework) — this file only declares the multi-page
 // inputs; everything else stays vite defaults.
 
@@ -12,6 +13,7 @@ export default defineConfig({
       input: {
         app: fileURLToPath(new URL("index.html", import.meta.url)),
         demos: fileURLToPath(new URL("demos.html", import.meta.url)),
+        splash: fileURLToPath(new URL("splash.html", import.meta.url)),
       },
     },
   },

@@ -1,0 +1,15 @@
+ analysis/lit-lineage/README.md                |  55 ++++
+ analysis/lit-lineage/research/first-pull.md   | 274 +++++++++++++++++++
+ analysis/lit-lineage/research/phase-2.md      | 322 +++++++++++++++++++++++
+ analysis/lit-lineage/research/phase-3-plan.md |  98 +++++++
+ analysis/lit-lineage/scripts/analyze.py       | 362 ++++++++++++++++++++++++++
+ analysis/lit-lineage/scripts/anchors.py       | 222 ++++++++++++++++
+ analysis/lit-lineage/scripts/export_csv.py    |  48 ++++
+ analysis/lit-lineage/scripts/filter.py        | 200 ++++++++++++++
+ analysis/lit-lineage/scripts/harvest.py       | 331 +++++++++++++++++++++++
+ deploy/README.md                              |   4 +
+ engine/cmd/demosrv/main.go                    |  21 +-
+ viz/splash.html                               | 231 ++++++++++++++++
+ viz/src/splash.ts                             |  95 +++++++
+ viz/vite.config.ts                            |   6 +-
+ 14 files changed, 2258 insertions(+), 11 deletions(-)

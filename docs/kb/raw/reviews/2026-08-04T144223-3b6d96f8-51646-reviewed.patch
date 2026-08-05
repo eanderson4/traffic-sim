@@ -1,0 +1,139 @@
+diff --git a/viz/splash.html b/viz/splash.html
+index 7111cc5c5bb7b33e9569e08b4b83d75eb7abfb13..1c1186e92be6e24f27ba3a61e2b492b48c577134 100644
+--- a/viz/splash.html
++++ b/viz/splash.html
+@@ -121,9 +121,12 @@
+ 
+     <section class="wrap">
+       <h2>Featured demo</h2>
+-      <!-- The LA card is wired by splash.ts: click starts the LA run via
+-           demosrv (or deep-links into it when already live) — the same
+-           URLs the demos.html card builds (viz/src/demos-core.ts). -->
++      <!-- The featured card is wired by splash.ts, baked-first (ADR-0023):
++           with BAKED_FEATURED_URL set the click plays the published replay
++           in-browser; unset, it starts the LA run via demosrv (or deep-links
++           when already live) — the same URLs demos.html builds
++           (viz/src/demos-core.ts). The initial CTA label is replaced by
++           render() on load. -->
+       <a id="featured" href="#">
+         <span class="badge" id="featured-badge" hidden>running</span>
+         <h3>Los Angeles — full basin</h3>
+diff --git a/viz/src/splash.ts b/viz/src/splash.ts
+index 103acf36ca37be85cce75c3cec62139cb6c91649..27dbaa0b27704e61e732d0f44e90a1ec34704dec 100644
+--- a/viz/src/splash.ts
++++ b/viz/src/splash.ts
+@@ -1,14 +1,20 @@
+-// splash.ts — controller for the landing page (splash.html): wires the ONE
+-// featured card to the LA demo exactly like the demos.html card for it —
+-// already-running deep-links straight into the map via deepLinkURL,
+-// otherwise a POST to startPath spawns the run and navigates on the {url}
+-// response (demos-core.ts; demosrv builds the same shapes). On the public
+-// deployment the start POST is admin-gated (ADR-0020): a 401/403 flips the
+-// card into a watch-only posture — the CTA routes to the demos menu instead
+-// of dead-ending on an error. Everything else on the page is static.
++// splash.ts — controller for the landing page (splash.html). The featured
++// card is BAKED-FIRST (ADR-0023): when BAKED_FEATURED_URL names a published
++// baked replay, the CTA plays it entirely in the browser — no live run, no
++// admin gate, unlimited concurrent viewers. With it empty (no bake published
++// yet) the card falls back to the live-demosrv behavior: running deep-links
++// into the map via deepLinkURL, otherwise a POST to startPath spawns the run
++// (demos-core.ts); a 401/403 (public deploy, ADR-0020) or a registry without
++// the demo flips the card to watch-only and routes to /demos.html.
++// Everything else on the page is static.
+ 
+ import { deepLinkURL, startPath, type DemoInfo, type RunStatus } from "./demos-core.ts";
+ 
++// Published baked replay URL (phantomjam.com viz + data.phantomjam.com
++// artifact, ?bake=<absolute index.json URL>&center=...&zoom=...). Fill in
++// when the featured bake is uploaded to R2; empty = live-demosrv fallback.
++const BAKED_FEATURED_URL: string = "";
++
+ // Fallback entry for static previews (no demosrv behind the page); when the
+ // registry answers, the live entry for id "la" replaces this wholesale.
+ const LA: DemoInfo = {
+@@ -63,23 +69,31 @@ function showError(err: unknown): void {
+ }
+ 
+ function render(): void {
+-  const running = status.active === demo.id;
++  // Baked mode is fully static: no live-run badge, no registry notices.
++  const running = BAKED_FEATURED_URL === "" && status.active === demo.id;
+   featured.classList.toggle("running", running);
+   badge.hidden = !running;
+-  cta.textContent = starting
+-    ? "starting…"
+-    : running
+-      ? "watch it live →"
+-      : unregistered || gated
+-        ? "browse the demos →"
+-        : "launch live demo →";
++  cta.textContent = BAKED_FEATURED_URL !== ""
++    ? "watch the replay →"
++    : starting
++      ? "starting…"
++      : running
++        ? "watch it live →"
++        : unregistered || gated
++          ? "browse the demos →"
++          : "launch live demo →";
+ }
+ 
+-// activate mirrors the demos.html card click for LA (demos.ts): the running
+-// card deep-links without a start round-trip; otherwise the start POST
+-// spawns serve and the response carries the map URL. Two soft landings:
+-// unregistered or gated cards route to the demos menu instead of POSTing.
++// activate: baked-first — a configured replay URL navigates straight there
++// (static artifacts, works for every visitor). Otherwise it mirrors the
++// demos.html card click for LA (demos.ts): the running card deep-links
++// without a start round-trip; the start POST spawns serve and the response
++// carries the map URL; unregistered or gated cards route to the demos menu.
+ async function activate(): Promise<void> {
++  if (BAKED_FEATURED_URL !== "") {
++    location.href = BAKED_FEATURED_URL;
++    return;
++  }
+   if (starting) return;
+   if (status.active === demo.id) {
+     location.href = deepLinkURL(demo, engineWs, status.run);
+@@ -115,22 +129,26 @@ async function main(): Promise<void> {
+     ev.preventDefault(); // the href="#" is a button affordance, not a link
+     void activate();
+   });
+-  try {
+-    const reg = await fetchJSON<{ ws?: string; demos?: DemoInfo[] }>("/api/demos");
+-    engineWs = reg.ws;
+-    const entry = (reg.demos ?? []).find((d) => d.id === LA.id);
+-    if (entry) {
+-      demo = entry;
+-    } else {
+-      unregistered = true;
+-      notice.classList.add("info");
+-      notice.textContent = "The featured demo isn't in this deployment's registry — browse the demos page instead.";
+-      notice.style.display = "block";
++  // Baked mode has no live plane to consult — skip the registry/status
++  // fetches so no live-run state can contradict the replay CTA.
++  if (BAKED_FEATURED_URL === "") {
++    try {
++      const reg = await fetchJSON<{ ws?: string; demos?: DemoInfo[] }>("/api/demos");
++      engineWs = reg.ws;
++      const entry = (reg.demos ?? []).find((d) => d.id === LA.id);
++      if (entry) {
++        demo = entry;
++      } else {
++        unregistered = true;
++        notice.classList.add("info");
++        notice.textContent = "The featured demo isn't in this deployment's registry — browse the demos page instead.";
++        notice.style.display = "block";
++      }
++      status = await fetchJSON<RunStatus>("/api/status");
++    } catch {
++      // No demosrv behind the page (static preview): the card stays clickable
++      // and activation surfaces the real error in the notice box.
+     }
+-    status = await fetchJSON<RunStatus>("/api/status");
+-  } catch {
+-    // No demosrv behind the page (static preview): the card stays clickable
+-    // and activation surfaces the real error in the notice box.
+   }
+   render();
+ }
