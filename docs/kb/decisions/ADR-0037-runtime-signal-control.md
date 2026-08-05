@@ -403,3 +403,266 @@ left latitude, the implementation chose:
   lacks an early exit; ContractEvent Since/Until use omitempty while
   Phase uses a pointer). Kimi's round-10 review found no blockers and
   confirmed the earlier deferred lists match the shipped code.
+
+## Addendum (2026-08-04, milestone 2 implementation notes — reference actuated controller)
+
+Milestone 2 ships the reference client the design sketch promised ("a
+minimal actuated controller (gap-out on detector occupancy from
+`state.snap` / metrics)"): `engine/natsio/sigctl` (library), `cmd/sigctl`
+(standalone), and `serve -sigctl` (in-process embed behind the attach
+barrier, the demand director's pattern — but every command rides the
+signal_set verb channel, which is what the client exists to prove).
+
+- **Detectors are virtual stop-line loops, and the ADR's "occupancy from
+  state.snap" needed one honest refinement.** The TSSF snapshot carries
+  (id, x, y, angle, class) per vehicle — no lane, no s — so approach
+  presence is read the way a physical detector reads it: a fixed zone in
+  space (default 25 m radius around each signal link's stop line, the
+  start of the signal-bound internal lane's centerline). Dynamic
+  structure (programs, phases, link→lane binding) arrives over the wire
+  (TSSG/TSSF); only the geometry comes from the network file, which is
+  static scenario content. Programs with < 2 movement phases or no usable
+  shapes are left on fixed time. Presence is binned through a coarse
+  spatial grid (50 m cells) — city-scale snapshot fan-out is fine.
+- **Control law: gap-out with min-green, max-green-on-call, and the rail
+  as the backstop.** Phases are classified movement vs transition:
+  anything containing an amber char (even mixed green/amber — one exists
+  in chi-loop-urban, program 2169310) or with no green at all is a
+  transition, never a serve or hold target. Per program per decision
+  (cadence 20 ticks): an uncontested serving phase is extended freely
+  (renew when the hold runs below 30 ticks); a conflicting call (≥ 1
+  waiting vehicle on another candidate phase's detectors) caps the
+  extension at 200 ticks (max-green-on-call — past it the call is served
+  regardless of the gap); a gap with a call waiting switches after a
+  100-tick minimum green; idle junctions (no presence anywhere) stay on
+  fixed time and cost no verbs. A switch is never a jump: the controller
+  walks the program's table order to the target, commanding every
+  intermediate phase at its NATURAL duration — the program's yellow/
+  all-red intervals are actually simulated (free clearance time would
+  inflate the measurement; caught in M2 review round 1, fixed before the
+  full bracket ran). Same-phase renewals accumulate into the kernel's
+  starvation chain, so the 300 s chain bound remains the hard backstop,
+  and the controller predicts it from its own verb history — it never
+  issues a renewal the rail would decline (the chain-contiguity boundary
+  matches the kernel's exactly: `applied > holdUntil` starts a new
+  chain; equality continues it). Min-green measures the PHASE's age:
+  renewals do not restart it (the kernel's displayed-onset merging gives
+  the same answer — same-state spans merge across renewal boundaries, so
+  controller and kernel agree on when the displayed phase began). Two defects
+  were found and fixed BY MEASUREMENT on the smoke bracket before these
+  notes were written: detectors that reached past the stop line never
+  gapped out (zero switches; renewals held toward the chain bound —
+  detectors now count the approach side only, using the lane's direction
+  vector), and unconditional renewals then suppressed cross calls
+  entirely (fixed by the max-green-on-call cap). Measured on chi-loop
+  smoke brackets (9,000 ticks, warmup 6,000, seed 1000): naive gap-out
+  cost ~40 % network speed vs fixed time; approach-side detectors →
+  −24 %; + max-green-on-call → +15.9 % speed, +15.2 % completions —
+  and M2 review round 1 then showed that number was INFLATED by
+  transition-skipping (free clearance time); the final controller
+  (transition walk, seamless steps) measures **+10 % speed, +6 %
+  completions** on the same smoke (one seed, smoke length — direction,
+  not significance; the full bracket is the measurement).
+- **Cadence decision (round-10 deferral a).** Verbs are issued only on a
+  decision — a renewal when the running hold has < 30 ticks left, a
+  switch when one is warranted — never one-verb-per-cycle. A switch is a
+  supersede and fires NO `signal_lapse`; a lapse fires only when a hold
+  is allowed to end (gap-out release, or the chain bound). So record-plane
+  event volume is bounded by phase SERVICES, not by cadence: ≤ 1 lapse
+  per service per program. Measured on the final smoke run: 30,432 verbs
+  over 933 controlled programs in 9,000 ticks (~1.7 M verbs projected at
+  the full 54k-tick bracket — small next to the intent log's millions).
+- **Feedback gap (round-10 deferral b) — resolved for the reference
+  client by self-tracking, documented for the contract.** The controller
+  keeps its own command history per program, so the enforced phase, the
+  chain start, and the exact decline point of the chain bound are all
+  COMPUTED locally (estimated()): it never issues a renewal the rail
+  would decline, because it can see the decline coming. This is exact
+  while the controller is the only commander of a program — the reference
+  deployment shape. What the contract would need for anything stronger
+  (multi-controller programs, an external monitor, a viz showing held
+  phases): an override-state echo — minimally, the effective
+  (program, phase, until) published on the state plane (state.sig or a
+  sibling), or a per-verb effective-hold field in the verb reply.
+  PROPOSED, not implemented: the contract is not changed unilaterally.
+- **The controller never relies on the rail to arbitrate same-boundary
+  multi-verb sequences (round-10 deferral c):** one verb per program per
+  decision, and decisions are cadence-gated, so two verbs for one program
+  never share a boundary.
+- **Bracket:** `scripts/sigctl-bracket.py` pairs the scenario
+  (`data/scenarios/chi-loop-urban-half-base`, the ADR-0036 survivable
+  bracket's, 54k ticks, seeds 1000+) fixed-time vs `-sigctl`, reusing
+  whatif.py's run_one/fidelity gates/paired statistics (whatif's pod
+  model cannot express arms that differ by a serve flag). Smoke-validated
+  at 9,000 ticks (both arms clean, fidelity gates pass, control
+  diverges). Full command in the addendum below.
+- **Verified:** decision core unit tests (take-control, renew,
+  max-green-on-call switch, rail-cap switch, gap-out, min-green,
+  transition-phase and idle leave-alone, tie-break); estimated-phase
+  tracking; the live integration test (`TestControllerLive`, signal-4way
+  crop): attach, 10/10 verbs accepted, deterministic request ids, and at
+  least one held tick diverging from the fixed-time schedule. Smoke
+  bracket (seed 1000, 9,000 ticks, warmup 6,000): both arms exit clean
+  through the fidelity gates; the actuated arm's controller attached,
+  commanded 933 programs, 30,432 verbs, 0 rejections. The full bracket
+  command (runner validated by the smoke):
+
+      python3 scripts/sigctl-bracket.py \
+        --scenario data/scenarios/chi-loop-urban-half-base \
+        --seeds 4 --ticks 54000 --warmup 6000 --jobs 4 \
+        --serve ./serve --out data/runs/sigctl-bracket.json
+
+## Addendum (2026-08-04, M2 review round 1 — fixes and deferrals)
+
+Fixed before the full bracket ran (the pre-fix bracket was discarded and
+re-run against this controller):
+
+- **(A) Phase model and the transition walk.** Any phase containing an
+  amber char — even mixed green/amber — is now a transition phase: never
+  a serve or hold target (previously the controller could hold a
+  clearance phase for a full 100-tick hold). Switches walk the program's
+  table order to the target, commanding intermediate phases at their
+  natural durations, so yellow/all-red intervals are simulated rather
+  than skipped. Direct movement-to-movement jumps were free clearance
+  time and would have inflated the bracket.
+- **(B) Min-green measures the phase's age.** `phaseSince` moves only
+  when the commanded phase changes; renewals no longer restart the clock
+  (with hold == min-green == 100 a gap after a renewal could never gap
+  out before the hold lapsed). The kernel's displayed-onset merging
+  (same-state spans merge across renewal boundaries) makes its answer
+  identical — an intentional, documented equivalence, not a divergence.
+- **(C) Table acquisition.** The controller requests the program table
+  at attach (ADR-0016 request/reply on its own inbox), and the chunk
+  accumulator enforces 1..n sequence per generation — a partial or
+  out-of-order generation is dropped and the previously installed table
+  keeps serving (previously a mid-generation attach could install a
+  partial table).
+- **(D) Chain-contiguity boundary matches the kernel exactly:**
+  `applied > holdUntil` starts a new chain; equality continues it (the
+  kernel renews iff `last.until >= applied`). The equality case is
+  unit-tested.
+- **(E) Detector scan extent derives from the radius** (50 m cells;
+  radius > 50 scans wider) — a larger -detect-radius can no longer
+  silently miss detectors.
+- **(F) Timing precondition documented, not fixed:** self-tracking
+  assumes next-boundary application (`applied := tick + 1`); nothing on
+  the wire guarantees it, and at pace 0 (the bracket's mode) the applied
+  tick can lag a boundary. The skew is conservative — a predicted
+  holdUntil that ends early falls back to fixed-time derivation while
+  the kernel still holds, and the uncontested branch may re-command the
+  schedule's phase over its own live hold; self-correcting noise and
+  latency, never free green. The same skew applies to WALK STEPS
+  (round-3 note): a lagging drain can supersede a yellow early or zero
+  a short transition step via a shared drain, so seamless clearance is
+  the next-boundary ideal, not a pace-0 guarantee. The shipped smoke
+  numbers include this skew. The VerbReply applied-tick/effective-hold
+  echo remains the recorded contract proposal — this review is its
+  concrete argument.
+- **Recorded and deferred (round-1 nits/questions):** the send loop's
+  map iteration order varies cross-program verb order on the wire (sim
+  state unaffected; sorting would make the client deterministic given
+  identical snapshots); the 15 s snapshot-silence watchdog cannot
+  distinguish run-ended from a capacity-gate pause and never fires if
+  the run dies before the first snapshot; LoadGeom panics on a negative
+  tlLink in a hand-crafted netfile (standalone-only input, netimport
+  never emits one); live_run_test.go is a loaded-CI flake candidate
+  (900-tick run at a 1 ms floor); CadenceTicks: 1 in the hello versus
+  the 20-tick decision cadence is intended — the handshake cadence feeds
+  only drive-claim hold bridging, which this client never uses; and the
+  open measurement question: control-drain cost at 933-program scale
+  under pace 0 (the ~1.7 M-verb projection is the only unmeasured number
+  in the M2 addendum; the full bracket run answers it empirically).
+
+## Addendum (2026-08-04, M2 review round 2 — fixes and deferrals)
+
+Fixed before the bracket restart:
+
+- **(1) Seamless walks.** The round-1 walk stepped transition phases at
+  natural durations, but decisions were cadence-gated (20 ticks) and the
+  keep-condition required ≥ 30 ticks of hold left, so every short
+  transition step LAPSED mid-walk into ~10 ticks of fixed-time
+  fallthrough — which could re-green the movement being vacated, then
+  jump red with no live clearance, plus a lapse event per step. Now the
+  cadence gate lifts while a walk is in progress (dueNow), and each walk
+  step's verb is issued exactly when the current step's hold has one
+  tick left, so it applies at the expiry boundary: from switch decision
+  to target arrival every tick is under a commanded phase — zero
+  fallthrough, zero mid-walk lapses (TestWalkSeamless pins it, movement
+  → yellow → all-red → target with natural durations).
+- **(2) Attach means controlling.** Ready now blocks until a COMPLETE
+  table generation is installed (10 s bound, loud error) — the serve
+  embed's start gate can no longer open with the controller controlling
+  nothing. A complete empty table (signal-free run) releases normally.
+- **(3) Request ids carry the engine-assigned controller id**
+  (sigctl-{ctlID}-{program}-{seq}): a controller restarting mid-run can
+  never collide with its previous process's run-global dedup entries and
+  draw a stale accepted reply for a command that never applied.
+- **(4) Deterministic verb order.** The decision loop iterates sorted
+  program ids — ProcessControl may drain only a prefix of a tick's
+  buffered verbs, so publication order can decide which programs apply
+  at which boundary; given identical snapshots the order is now fixed.
+- **(5) `estimated()` onset saturates at 0** for offset programs in the
+  run's first wrapped phase (elapsed > tick underflowed to ~2^64, and
+  min-green could never pass there).
+- **(6) Bracket fidelity:** the actuated arm must show signal verbs
+  applied (the serve log's sigctl tally) or the run is voided —
+  whatif.py's fidelity-gate pattern; a clean exit with zero verbs is the
+  silent-no-op failure and would otherwise read as a valid arm.
+- **Recorded and deferred (round-2 nits/questions):** onReply rejections
+  never roll back the optimistic myPhase/holdUntil (self-corrects at
+  holdUntil; the restart-collision half is moot after fix 3); the
+  lastDecide == 0 tick-0 carve-out (one doubled decision, harmless);
+  candidate movement phases whose green links all lack shapes register
+  no presence — partial detector coverage is unlogged (revisit if a
+  network import ever ships shapeless signal lanes); whole-table frames
+  install without resetting the chunk accumulator (inert — the table is
+  static per run); bracket verb BYTES are not run-to-run reproducible
+  even at pace 0 (applied ticks can lag a boundary — the documented
+  round-1 skew); and cmd/sigctl's missing Ready() call is resolved by
+  fix 2's semantics (the standalone relies on the silence watchdog; the
+  embed blocks the start gate on the table).
+
+## Addendum (2026-08-04, M2 review round 3 — final fixes and deferrals)
+
+Final fix round before merge:
+
+- **(1) The bracket fidelity gate keys on `accepted`, not `verbs`** —
+  Sent is incremented before the publish attempt, so an all-rejected
+  arm passed the old gate. The void message names the rejected count.
+- **(2) The contested switch consults min-green.** An expired
+  max-green-on-call budget no longer walks a green the schedule rotated
+  into seconds ago — callSince measures the call's age, not the phase's.
+  The gate uses the same saturated-onset phase age as the gap-out
+  branch (TestContestedSwitchMinGreen).
+- **Recorded and deferred (round 3):** (a) a vehicle marks every
+  detector within the radius with no approach/link dedup — clustered
+  stop-line points on different phases could let one vehicle fabricate
+  multiple or conflicting calls and satisfy SwitchMinQueue alone;
+  control-fidelity concern, no evidence it fires on chi-loop-urban
+  geometry, candidate fix nearest-detector assignment or per-link
+  dedup, deferred pending bracket evidence. (b) Same-phase renewal
+  bookkeeping stores applied+hold unclamped while the kernel clamps to
+  chainStart+bound — after the final allowed renewal, estimated()
+  believes the hold persists up to one extra hold interval past the
+  actual lapse; bounded and self-correcting, and canExtend's decline
+  prediction was independently verified exact. (c) Seamless clearance
+  assumes next-boundary application at pace 0 — drain lag can supersede
+  a yellow early or zero it via a shared drain; this is the round-1 F
+  skew applied to walk steps (the addendum's F note now names them);
+  the real fix is the recorded VerbReply applied-tick/effective-hold
+  echo contract proposal. (d) The chunk accumulator doesn't verify a
+  generation's declared n or request resync after a gap/count change
+  (needs a dropped chunk on local NATS; the table is static per run).
+  (e) Nits: walk-past-target after a dropped snapshot mid-walk
+  (self-correcting); the takeover phaseSince vs kernel displayed-onset
+  agreement claim is stated slightly strong (conservative direction);
+  mid-comment prose in TestChainBoundaryEquality; the bracket runner
+  docstring overstated whatif.py reuse (run_one is re-implemented
+  inline — doc accuracy, fixed in the same pass). (f) Questions for the
+  record: the reference client requests the director grant while the
+  contract defines a stub GrantSignal — a future contract pass should
+  decide whether the signal client defines/exercises the signal grant
+  (the verb handler checks director today); and 25 m stop-line
+  detectors read only the first queue positions, so a queue held
+  upstream by spillback reads as a gap — shared with physical stop-line
+  loops, accepted for the reference client.
