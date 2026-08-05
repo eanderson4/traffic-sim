@@ -686,3 +686,16 @@ Final fix round before merge:
   nits: live-test divergence loop doesn't clamp superseded spans,
   zero-length first shape segment degenerates the approach-side test,
   hold>cadence+renew-below constraint is doc-only (Kimi).
+- **Full bracket result (2026-08-04, final controller, 4 paired seeds
+  1000-1003, 54k ticks, warmup 6k, chi-loop-urban-half-base;
+  data/runs/sigctl-bracket.json):** actuated vs fixed-time —
+  speed +8.4% (20.50 → 22.23 km/h, p=0.0010, d=+6.47),
+  completions +10.8% (4951 → 5485, p=0.0015, d=+5.62),
+  time loss −6.2% (p=0.0177), active-at-horizon −11.7% (p=0.0007),
+  delivered fraction unchanged (0.99 both arms). Direction consistent
+  across all four seeds. The earlier +15.9% smoke figure was inflated
+  by skipped clearance (review round 1); +8-11% is the honest effect
+  at survivable demand. Signal control moves throughput meaningfully
+  but does not lift the oversaturated regime's discharge ceiling on
+  its own — that remains demand-side (metering/gating) per the M1
+  two-regime verdict.
