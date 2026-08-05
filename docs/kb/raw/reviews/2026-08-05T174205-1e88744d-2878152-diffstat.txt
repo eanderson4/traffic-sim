@@ -1,0 +1,17 @@
+ docs/kb/articles/cross-topic-concerns.md           |  2 +-
+ .../2026-08-05T172333-aaf918b9-2834097-brief.md    | 20 +++++++++++++
+ ...6-08-05T172333-aaf918b9-2834097-claude-fable.md | 13 ++++++++
+ ...2026-08-05T172333-aaf918b9-2834097-diffstat.txt |  2 ++
+ ...26-08-05T172333-aaf918b9-2834097-gpt-5.6-sol.md |  3 ++
+ .../2026-08-05T173326-a4fb2c43-2857164-brief.md    | 20 +++++++++++++
+ ...6-08-05T173326-a4fb2c43-2857164-claude-fable.md | 12 ++++++++
+ ...2026-08-05T173326-a4fb2c43-2857164-diffstat.txt |  2 ++
+ ...26-08-05T173326-a4fb2c43-2857164-gpt-5.6-sol.md |  3 ++
+ .../2026-08-05T173758-02436b38-2868649-brief.md    | 20 +++++++++++++
+ ...6-08-05T173758-02436b38-2868649-claude-fable.md | 17 +++++++++++
+ ...2026-08-05T173758-02436b38-2868649-diffstat.txt | 12 ++++++++
+ ...26-08-05T173758-02436b38-2868649-gpt-5.6-sol.md |  4 +++
+ engine/natsio/bus.go                               | 14 +++++++++
+ engine/natsio/contract.go                          | 10 +++++++
+ engine/natsio/run.go                               | 35 +++++++++++++---------
+ 16 files changed, 174 insertions(+), 15 deletions(-)

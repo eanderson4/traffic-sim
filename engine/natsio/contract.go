@@ -385,6 +385,16 @@ func NewContract(nc *nats.Conn, run string, cfg ContractConfig, bus *Bus, rec *R
 	if err := bind(SubjectCtlVerbAll(run), reqVerb, true); err != nil {
 		return nil, err
 	}
+	// Flush so all five request responders are registered SERVER-side
+	// before we return — a hello/claim published from another connection
+	// right after construction must not beat the SUB registration and
+	// fast-fail 'nats: no responders' (KB: cross-topic-concerns, ADR-0026
+	// M3 hardening notes; the M1-era explanation for the load-sensitive
+	// test flakes).
+	if err := nc.Flush(); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("flush contract subscriptions: %w", err)
+	}
 	return c, nil
 }
 

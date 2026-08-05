@@ -238,6 +238,12 @@ func NewBus(nc *nats.Conn, run string, e *engine.Engine) (*Bus, error) {
 		return nil, fmt.Errorf("subscribe intents: %w", err)
 	}
 	b.sub = sub
+	// Flush so the intent subscription is registered SERVER-side before we
+	// return (same race as the sig.req responder in NewPublishBus).
+	if err := nc.Flush(); err != nil {
+		b.Close()
+		return nil, fmt.Errorf("flush intent subscription: %w", err)
+	}
 	return b, nil
 }
 
@@ -282,6 +288,14 @@ func NewPublishBus(nc *nats.Conn, run string, e *engine.Engine) (*Bus, error) {
 		return nil, fmt.Errorf("subscribe signal-table requests: %w", err)
 	}
 	b.sigReq = sub
+	// Flush: the sig.req responder must be registered SERVER-side before
+	// we return — a catch-up request published right after construction
+	// must not beat the SUB and fast-fail 'no responders' (KB:
+	// cross-topic-concerns, ADR-0026 M3 hardening notes).
+	if err := nc.Flush(); err != nil {
+		b.Close()
+		return nil, fmt.Errorf("flush signal-table subscription: %w", err)
+	}
 	return b, nil
 }
 
