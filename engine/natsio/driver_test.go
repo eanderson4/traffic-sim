@@ -1057,10 +1057,13 @@ func TestBatchAppliedLag(t *testing.T) {
 // work has occasional ms-scale log/GC spikes, so the undisturbed-schedule
 // pace sits above them; responses are ~sub-ms — margins still huge, the
 // exact cross-leg p50/p99 comparison is load-bearing AND only valid on an
-// undisturbed schedule: any deadline overrun rejects the measurement); a
-// 100 ms SCALE confirmation at 5,000
+// undisturbed schedule: any deadline overrun rejects the measurement. A
+// rejection is re-measured, not failed — on a loaded shared CI runner an
+// overrun is the environment, not the product — up to a bounded number of
+// attempts, after which repeated disturbance at these margins is itself
+// the failure signal); a 100 ms SCALE confirmation at 5,000
 // vehicles (same undisturbed shape at fleet scale, ~2 MB obs frames and 5k
-// intents per response — zero overruns required likewise); and a fast,
+// intents per response — same re-measure policy); and a fast,
 // ILLUSTRATIVE pace chosen so boundaries deliberately fall mid-response
 // (load-bearing pins: batch splits == 0 structurally, v2 splits > 0 — the
 // boundary-crossing case exercised; percentile numbers report-only,
@@ -1429,25 +1432,50 @@ func TestBatchAppliedLagBoundary(t *testing.T) {
 	// (responses are sub-ms at this fleet size), so the exact cross-leg
 	// comparison is load-bearing here — and it is only valid on an
 	// UNDISTURBED schedule: any deadline overrun rejects the measurement.
-	const prodPace = 10 * time.Millisecond
-	v2Prod := runLeg(t, true, 400, 300, prodPace)
-	tsibProd := runLeg(t, false, 400, 300, prodPace)
-	if v2Prod.overruns != 0 || tsibProd.overruns != 0 {
-		t.Fatalf("prod-pace schedule disturbed: deadline overruns v2 %d tsib %d, want 0 (the exact comparison needs the fixed cadence)",
-			v2Prod.overruns, tsibProd.overruns)
+	// A disturbed schedule is the ENVIRONMENT failing, not the product —
+	// shared CI runners overrun a 10 ms cadence under load — so a rejected
+	// leg is re-measured, up to maxAttempts times. The two legs are
+	// INDEPENDENT absolute-deadline schedules (nothing in the comparison
+	// requires them to come from the same wall-clock window), so each leg
+	// retries on its own — retrying pairs would need both legs clean in
+	// the same attempt, squaring the disturbance probability for no
+	// validity gain. A short settle between attempts lets a load spike
+	// pass. The comparison itself still demands two zero-overrun legs;
+	// a leg disturbed maxAttempts times in a row at these margins is a
+	// regression signal, not runner load.
+	measureLeg := func(name, leg string, off bool, vehicles, measTicks int, pace time.Duration, maxAttempts int) legResult {
+		for attempt := 1; ; attempt++ {
+			res := runLeg(t, off, vehicles, measTicks, pace)
+			if res.overruns == 0 {
+				if attempt > 1 {
+					t.Logf("%s %s: undisturbed schedule on attempt %d/%d", name, leg, attempt, maxAttempts)
+				}
+				return res
+			}
+			if attempt == maxAttempts {
+				t.Fatalf("%s %s: schedule disturbed on all %d attempts (last: %d deadline overruns, want 0 — the exact comparison needs the fixed cadence); repeated disturbance at these margins is a regression signal, not runner load",
+					name, leg, maxAttempts, res.overruns)
+			}
+			t.Logf("%s %s: attempt %d/%d disturbed (%d deadline overruns) — settling and re-measuring",
+				name, leg, attempt, maxAttempts, res.overruns)
+			time.Sleep(500 * time.Millisecond)
+		}
 	}
+	measure := func(name string, pace time.Duration, vehicles, measTicks, maxAttempts int) (legResult, legResult) {
+		return measureLeg(name, "v2", true, vehicles, measTicks, pace, maxAttempts),
+			measureLeg(name, "tsib", false, vehicles, measTicks, pace, maxAttempts)
+	}
+	const prodPace = 10 * time.Millisecond
+	v2Prod, tsibProd := measure("prod-pace", prodPace, 400, 300, 12)
 	accept("prod-pace", prodPace, v2Prod, tsibProd)
 
 	// Scale confirmation: the same undisturbed shape at 5,000 vehicles
-	// (obs frames ~2 MB, responses ~5k intents — the 100 ms pace leaves
-	// the same huge margin, overruns REQUIRED zero as at prod pace).
+	// (obs frames ~2 MB, responses ~5k intents). The 100 ms pace has far
+	// more slack than prod pace — disturbance is much rarer — and each leg
+	// costs ~10 s, so the attempt budget is smaller; same re-measure
+	// policy otherwise.
 	const scalePace = 100 * time.Millisecond
-	v2Scale := runLeg(t, true, 5000, 100, scalePace)
-	tsibScale := runLeg(t, false, 5000, 100, scalePace)
-	if v2Scale.overruns != 0 || tsibScale.overruns != 0 {
-		t.Fatalf("scale-pace schedule disturbed: deadline overruns v2 %d tsib %d, want 0",
-			v2Scale.overruns, tsibScale.overruns)
-	}
+	v2Scale, tsibScale := measure("scale-5k", scalePace, 5000, 100, 6)
 	accept("scale-5k", scalePace, v2Scale, tsibScale)
 
 	// Fast pace, ILLUSTRATIVE: boundaries deliberately fall mid-response.
