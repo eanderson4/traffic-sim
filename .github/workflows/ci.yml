@@ -22,7 +22,17 @@ jobs:
         run: go vet ./...
       - name: test
         working-directory: engine
-        run: go test ./... -count=1
+        # -p 1: one test binary at a time. The natsio suite runs embedded
+        # NATS servers against real-time cadences (fixed-cadence lag
+        # acceptance, hold-last healing, slow consumers); sharing the runner
+        # with three other package binaries makes those schedules the
+        # environment's, not the product's, and the suite flakes as a
+        # family (TestBatchAppliedLagBoundary, TestAttachHandshake,
+        # TestClaimExclusivity, TestHoldLastThenDecay all failed CI under
+        # cross-package load while passing locally). Serial packages give
+        # each binary the whole runner, which is what the timing assertions
+        # assume.
+        run: go test ./... -count=1 -p 1
 
   viz:
     runs-on: ubuntu-latest
