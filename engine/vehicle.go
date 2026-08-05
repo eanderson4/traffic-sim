@@ -78,9 +78,36 @@ type Vehicle struct {
 
 	// stopDone records that a stop-approach vehicle has completed its
 	// mandatory full stop at the current junction's line (ADR-0010); set by
-	// the right-of-way gate, reset at every lane crossing. Derived state,
-	// not folded into the CRC (same precedent as HeldTurn/Cruise).
+	// the right-of-way gate, reset at every lane crossing. Not folded into
+	// the CRC (same precedent as HeldTurn/Cruise), but it IS keyframed
+	// (format v5) — see keyframe.go. It was left out at first, on the
+	// argument that its worst case is a vehicle stopping twice; under
+	// ADR-0029's bit-exact criterion stopping twice IS the failure, and a
+	// vehicle already MOVING off the line cannot re-satisfy the test that
+	// sets this, so it brakes to a second full stop the original run never
+	// made. TestStopDoneSurvivesAKeyframe pins it.
 	stopDone bool
+
+	// stuckTicks counts consecutive ticks spent below stuckSpeed; it drives
+	// the gridlock escape (ADR-0034, gridlock.go). Not in the CRC but
+	// keyframed (format v5), and for a stronger reason than stopDone above:
+	// this decides whether a vehicle EXISTS, because strandStuck
+	// removes one that reaches StrandAfterS. ReplayFromStream and
+	// Player.seek restore from a MID-RUN keyframe and then verify every
+	// logged CRC, so a timer zeroed by the restore strands the vehicle a
+	// whole StrandAfterS late and diverges the replay.
+	// TestStuckTimerSurvivesAKeyframe pins it; do not make this derived.
+	stuckTicks uint64
+
+	// laneEntryTick is the tick the vehicle entered its current lane; the
+	// difference from e.Tick at the next departure is the dwell sample fed
+	// into the lane's travel-time EMA (ADR-0036 §1). Set at injection and at
+	// every lane crossing and lateral hop. Keyframed (format v6) for the
+	// stuckTicks reason above: a restored zero would attribute the whole
+	// pre-restore dwell to the post-restore lane and poison ITS travel time,
+	// diverging every later routing decision. Written but never read while
+	// Params.AdaptiveRouting is off.
+	laneEntryTick uint64
 }
 
 // v0eff is the vehicle's desired speed on the given lane: type desired speed

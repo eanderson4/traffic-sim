@@ -21,7 +21,7 @@ import (
 func TestNetCacheContentKeyed(t *testing.T) {
 	scenA := writeScenarioDir(t)          // dt 0.05
 	scenB := writeScenarioDirDt(t, "0.1") // manifest-only change (dt), SAME network bytes
-	scenC := writeScenarioDirLanes(t, 7) // different network bytes entirely
+	scenC := writeScenarioDirLanes(t, 7)  // different network bytes entirely
 	c := &netCache{dir: t.TempDir()}
 
 	pA1, err := c.path("rec1", scenA)

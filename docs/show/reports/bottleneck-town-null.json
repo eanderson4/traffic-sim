@@ -1,0 +1,204 @@
+{
+  "pod": "data/pods/bottleneck-town-null",
+  "baseline": "base",
+  "seeds": [
+    1000,
+    1001,
+    1002,
+    1003,
+    1004,
+    1005,
+    1006,
+    1007
+  ],
+  "ticks": 15000,
+  "warmup": 6000,
+  "variants": {
+    "base": {
+      "n": 8,
+      "metric": "speed_kmh",
+      "mean": 23.147675297776786,
+      "delta": 0.0,
+      "delta_pct": 0.0,
+      "p": 1.0,
+      "cohen_d": 0.0,
+      "verdict": "\u2014 baseline \u2014",
+      "per_seed": {
+        "1000": {
+          "speed_kmh": 22.250544979788845,
+          "completed": 209,
+          "mean_time_loss_s": 172.45977009152335,
+          "mean_trip_s": 328.6502392344498,
+          "vmt_km": 906.1277949652884,
+          "active_at_horizon": 177,
+          "delivered_frac": 1
+        },
+        "1001": {
+          "speed_kmh": 25.04941114537767,
+          "completed": 219,
+          "mean_time_loss_s": 152.19194181389202,
+          "mean_trip_s": 321.289497716895,
+          "vmt_km": 901.5987312754971,
+          "active_at_horizon": 156,
+          "delivered_frac": 1
+        },
+        "1002": {
+          "speed_kmh": 20.815306406960786,
+          "completed": 209,
+          "mean_time_loss_s": 195.087985922869,
+          "mean_trip_s": 354.7076555023924,
+          "vmt_km": 936.4706006623433,
+          "active_at_horizon": 187,
+          "delivered_frac": 1
+        },
+        "1003": {
+          "speed_kmh": 23.053515120945125,
+          "completed": 199,
+          "mean_time_loss_s": 160.72780360415737,
+          "mean_trip_s": 322.93467336683415,
+          "vmt_km": 895.9663835343008,
+          "active_at_horizon": 180,
+          "delivered_frac": 1
+        },
+        "1004": {
+          "speed_kmh": 22.258364026508424,
+          "completed": 207,
+          "mean_time_loss_s": 172.85423012655804,
+          "mean_trip_s": 339.1724637681159,
+          "vmt_km": 918.069980695835,
+          "active_at_horizon": 168,
+          "delivered_frac": 1
+        },
+        "1005": {
+          "speed_kmh": 22.263272807609365,
+          "completed": 210,
+          "mean_time_loss_s": 173.43207359587652,
+          "mean_trip_s": 338.2295238095238,
+          "vmt_km": 935.47749892721,
+          "active_at_horizon": 165,
+          "delivered_frac": 1
+        },
+        "1006": {
+          "speed_kmh": 24.59784673185364,
+          "completed": 219,
+          "mean_time_loss_s": 148.5735201714862,
+          "mean_trip_s": 320.64611872146116,
+          "vmt_km": 919.3789770369499,
+          "active_at_horizon": 159,
+          "delivered_frac": 1
+        },
+        "1007": {
+          "speed_kmh": 24.89314116317044,
+          "completed": 236,
+          "mean_time_loss_s": 142.1338232861037,
+          "mean_trip_s": 302.94279661016947,
+          "vmt_km": 862.0322771573391,
+          "active_at_horizon": 148,
+          "delivered_frac": 1
+        }
+      },
+      "all_metrics": {
+        "active_at_horizon": 167.5,
+        "completed": 213.5,
+        "delivered_frac": 1.0,
+        "mean_time_loss_s": 164.68264357655826,
+        "mean_trip_s": 328.5716210912302,
+        "speed_kmh": 23.147675297776786,
+        "vmt_km": 909.3902805318455
+      }
+    },
+    "base2": {
+      "n": 8,
+      "metric": "speed_kmh",
+      "mean": 23.145359192782763,
+      "delta": -0.002316104994023682,
+      "delta_pct": -0.010005777963569983,
+      "p": 0.9543603951226425,
+      "cohen_d": -0.020970399444769,
+      "verdict": "no-op (n.s.)",
+      "per_seed": {
+        "1000": {
+          "speed_kmh": 22.25293602372771,
+          "completed": 209,
+          "mean_time_loss_s": 172.45775671422518,
+          "mean_trip_s": 328.6478468899522,
+          "vmt_km": 906.128289726467,
+          "active_at_horizon": 177,
+          "delivered_frac": 1
+        },
+        "1001": {
+          "speed_kmh": 25.049040876682803,
+          "completed": 219,
+          "mean_time_loss_s": 152.19279332420305,
+          "mean_trip_s": 321.2917808219178,
+          "vmt_km": 901.5888915536092,
+          "active_at_horizon": 156,
+          "delivered_frac": 1
+        },
+        "1002": {
+          "speed_kmh": 20.968559625121635,
+          "completed": 208,
+          "mean_time_loss_s": 192.50110224257554,
+          "mean_trip_s": 352.5375,
+          "vmt_km": 933.2567282522535,
+          "active_at_horizon": 188,
+          "delivered_frac": 1
+        },
+        "1003": {
+          "speed_kmh": 22.813325752261036,
+          "completed": 202,
+          "mean_time_loss_s": 167.32552034835854,
+          "mean_trip_s": 330.8544554455446,
+          "vmt_km": 894.2768631518976,
+          "active_at_horizon": 177,
+          "delivered_frac": 1
+        },
+        "1004": {
+          "speed_kmh": 22.25957973313192,
+          "completed": 207,
+          "mean_time_loss_s": 172.8148178638993,
+          "mean_trip_s": 339.13188405797104,
+          "vmt_km": 918.0698929600139,
+          "active_at_horizon": 168,
+          "delivered_frac": 1
+        },
+        "1005": {
+          "speed_kmh": 22.2633134653178,
+          "completed": 210,
+          "mean_time_loss_s": 173.43168159470451,
+          "mean_trip_s": 338.2295238095238,
+          "vmt_km": 935.4781959667675,
+          "active_at_horizon": 165,
+          "delivered_frac": 1
+        },
+        "1006": {
+          "speed_kmh": 24.66301527496215,
+          "completed": 218,
+          "mean_time_loss_s": 147.39668993012495,
+          "mean_trip_s": 319.9412844036697,
+          "vmt_km": 916.3348256466122,
+          "active_at_horizon": 160,
+          "delivered_frac": 1
+        },
+        "1007": {
+          "speed_kmh": 24.893102791057057,
+          "completed": 236,
+          "mean_time_loss_s": 142.1356051229038,
+          "mean_trip_s": 302.94406779661017,
+          "vmt_km": 862.0331749781435,
+          "active_at_horizon": 148,
+          "delivered_frac": 1
+        }
+      },
+      "all_metrics": {
+        "active_at_horizon": 167.375,
+        "completed": 213.625,
+        "delivered_frac": 1.0,
+        "mean_time_loss_s": 165.03199589262437,
+        "mean_trip_s": 329.19729290314865,
+        "speed_kmh": 23.145359192782763,
+        "vmt_km": 908.3958577794706
+      }
+    }
+  }
+}

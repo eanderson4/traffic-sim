@@ -1,0 +1,6 @@
+ scripts/chicago/mkquiz.py |  2 ++
+ viz/public/quiz.html      |  2 ++
+ viz/src/config.ts         |  6 ++++--
+ viz/src/main.ts           | 14 ++++++++++++--
+ viz/test/config.test.ts   |  9 +++++++++
+ 5 files changed, 29 insertions(+), 4 deletions(-)

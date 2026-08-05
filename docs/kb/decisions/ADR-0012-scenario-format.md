@@ -391,3 +391,36 @@ the scoping choices. Written design-first per the milestone plan.
   hash, the RunSpec, and the run (CRC-pinned), not path resolution.
   Today's consumers use the eagerly loaded parts; revisit when a
   consumer needs to resolve manifest paths through `Dir`.
+
+## Addendum (2026-07-31, content vs behavioral identity — ADR-0036 flip)
+
+§6's run key identifies scenario CONTENT, and always has: engine behavior
+changes (the ADR-0006 free-flow-time route weights, the ADR-0034 gridlock
+escape, and now the ADR-0036 default flip) have shipped under unchanged
+content hashes throughout. The ADR-0036 review pressed the point because
+the flip makes a same-(hash, seed) trajectory divergence common rather
+than incidental. The contract, stated plainly:
+
+- **Content identity = (content-hash, seed)** — "is this the same scenario
+  definition", the question display binding (`demosrv`'s
+  `checkRecordingHash`: was the scenario edited after recording?) and
+  sweep tooling ask.
+- **Behavioral identity = (content-hash, seed, resolved engine params,
+  engine build).** RunMeta-backed artifacts (the registry, recordings,
+  keyframes) already record the resolved side: RunMeta embeds the full
+  RunSpec (routing flag included — pre-flip recordings show
+  `AdaptiveRouting: false` explicitly), and replay is CRC-verified, so a
+  regime-mismatched continuation fails loudly rather than corrupting
+  silently. Offline artifacts are weaker — metrics JSONs and what-if
+  reports record neither params nor build (ADR-0036 addendum); for those
+  the regime comes from the scenario manifest, which the published pins
+  now make explicit. A consumer that needs behavioral binding must
+  compare the recorded spec's resolved params, not the content hash alone.
+
+Folding resolved defaults into the content hash was considered and
+rejected: it would re-key every existing recording, bake, and report
+repo-wide (including the display binding above, which would start
+rejecting every pre-flip recording), to defend against a conflation the
+recorded spec already prevents. Where the regime matters for
+reproduction, the manifest now states it explicitly — the docs/show arms
+carry `adaptive_routing: false` pins, and their generators emit them.

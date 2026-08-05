@@ -1,0 +1,13 @@
+ docs/kb/INDEX.md                                   |  2 +-
+ .../ADR-0036-congestion-adaptive-routing.md        | 55 +++++++++++++++++-
+ docs/show/README.md                                |  8 +++
+ engine/adaptive_test.go                            |  4 +-
+ engine/destination_test.go                         |  3 +
+ engine/engine.go                                   | 66 ++++++++++++++--------
+ engine/gridlock_test.go                            |  3 +
+ engine/scenario/scenario.go                        | 14 ++---
+ engine/scenario/scenario_test.go                   | 40 ++++++++-----
+ scripts/chicago/mkscenario.sh                      |  4 ++
+ scripts/demos/bottleneck_town.py                   |  3 +
+ scripts/demos/merge-pod.py                         |  6 +-
+ 12 files changed, 160 insertions(+), 48 deletions(-)

@@ -1,0 +1,19 @@
+ contracts/asyncapi.yaml                            | 41 +++++++++--------
+ docs/architecture.md                               |  2 +-
+ docs/kb/INDEX.md                                   |  2 +-
+ .../kb/decisions/ADR-0006-nats-message-contract.md | 15 ++++---
+ docs/kb/decisions/ADR-0026-batched-intents.md      |  5 ++-
+ docs/kb/decisions/ADR-0035-batched-intent-log.md   | 51 ++++++++++++++--------
+ .../2026-08-04T154818-6cfc1719-3901167-brief.md    | 20 +++++++++
+ ...6-08-04T154818-6cfc1719-3901167-claude-fable.md | 13 ++++++
+ ...2026-08-04T154818-6cfc1719-3901167-diffstat.txt |  6 +++
+ ...26-08-04T154818-6cfc1719-3901167-gpt-5.6-sol.md |  5 +++
+ .../2026-08-04T155703-9d826e6e-3926623-brief.md    | 20 +++++++++
+ ...6-08-04T155703-9d826e6e-3926623-claude-fable.md | 11 +++++
+ ...2026-08-04T155703-9d826e6e-3926623-diffstat.txt | 13 ++++++
+ ...26-08-04T155703-9d826e6e-3926623-gpt-5.6-sol.md |  7 +++
+ engine/cmd/serve/main.go                           |  8 ++--
+ engine/natsio/recorder.go                          | 34 +++++++--------
+ engine/natsio/tslb_migration_test.go               | 47 +++++++++++++++-----
+ engine/network.go                                  |  6 ++-
+ 18 files changed, 228 insertions(+), 78 deletions(-)

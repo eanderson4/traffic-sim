@@ -284,6 +284,7 @@ func (sp *Spawner) step(e *Engine) {
 		}
 		v.V = math.Min(speed, v.v0eff(st.lane)) // the plan is F-free; apply the driver's own factor
 		v.Cooldown = e.Params.SpawnCooldown
+		v.laneEntryTick = e.Tick // ADR-0036 dwell clock starts at injection, not at pend creation
 		e.register(v)
 		e.Stats.Spawned++
 

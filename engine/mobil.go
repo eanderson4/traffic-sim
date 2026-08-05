@@ -172,6 +172,7 @@ func (e *Engine) execLaneChange(v *Vehicle, dir int) {
 	}
 	cur.vehs = removeVehicle(cur.vehs, v)
 	tgt.vehs = insertVehicle(tgt.vehs, v)
+	e.noteLaneLeave(v) // ADR-0036: a lateral hop is a lane departure too
 	v.Lane = tgt
 	v.Cooldown = e.Params.LCCooldown
 	e.Stats.LaneChanges++

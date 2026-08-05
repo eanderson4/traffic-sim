@@ -48,6 +48,15 @@ import (
 // separate a blocked origin from a verb that arrived too late to try.
 const DirectorSpawnHoldTicks = 600
 
+// MaxRequestIDBytes bounds the director-assigned verb idempotency key, in
+// BYTES: the TSKF keyframe codec length-prefixes it with a u16 (the
+// director spawn queue since v3, the signal override table since v7), so
+// an over-long id would marshal a truncated length next to the full
+// string and make the keyframe unreadable. Enforced here, at the kernel
+// enqueue — EVERY caller is guarded, not just the NATS contract layer
+// (which keeps its own wire-facing check against this same constant).
+const MaxRequestIDBytes = 65535
+
 // SpawnDirective is the kernel form of a director spawn verb: where and
 // what to inject, and not before which tick. RequestID is the director-
 // assigned idempotency key (dedup lives in the contract layer, which
@@ -100,6 +109,9 @@ type TickedSpawn struct {
 // Like EnqueueIntent, it must be called only from the goroutine that owns
 // the engine, between Steps.
 func (e *Engine) EnqueueSpawn(d SpawnDirective) error {
+	if len(d.RequestID) > MaxRequestIDBytes {
+		return fmt.Errorf("request_id too long: %d bytes, want ≤ %d (keyframe codec limit)", len(d.RequestID), MaxRequestIDBytes)
+	}
 	var lane *Lane
 	switch {
 	case d.OffsetM < 0 || math.IsNaN(d.OffsetM):
@@ -296,6 +308,7 @@ func (e *Engine) injectDirective(d *TickedSpawn, lane *Lane, speed float64) {
 	v.Route = d.Destination              // routing axis set at birth (ADR-0021)
 	v.V = math.Min(speed, v.v0eff(lane)) // the plan is F-free; apply the driver's own factor
 	v.Cooldown = e.Params.SpawnCooldown
+	v.laneEntryTick = e.Tick // ADR-0036 dwell clock starts at injection
 	e.register(v)
 	e.Stats.Spawned++
 	if d.OffsetM > 0 {

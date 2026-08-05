@@ -1101,7 +1101,7 @@ func TestBatchAppliedLagBoundary(t *testing.T) {
 			t.Fatal(err)
 		}
 		run := fmt.Sprintf("lagb%d", liveCounter.Add(1))
-		if err := reg.Start(run, spec); err != nil {
+		if err := reg.Start(run, spec, e.Tick); err != nil {
 			t.Fatal(err)
 		}
 		bus, err := natsio.NewBus(nc, run, e)

@@ -26,6 +26,9 @@ func main() {
 	seed := flag.Uint64("seed", 1, "scenario seed")
 	verbose := flag.Bool("v", false, "print per-section collision counts")
 	metricsOut := flag.String("metrics-out", "", "write M13 metric-kernel output (ADR-0014 §6) as JSON to this path")
+	adaptiveRouting := flag.Bool("adaptive-routing", true,
+		"congestion-adaptive route resolution (ADR-0036, engine default ON), builtin/-netfile runs only: "+
+			"with -scenario the manifest's content-hashed adaptive_routing pin owns this and an explicit flag is rejected")
 	flag.Parse()
 
 	var spec engine.RunSpec
@@ -41,7 +44,7 @@ func main() {
 		conflicting := []string{}
 		flag.Visit(func(f *flag.Flag) {
 			switch f.Name {
-			case "rate", "density", "net":
+			case "rate", "density", "net", "adaptive-routing":
 				conflicting = append(conflicting, "-"+f.Name)
 			}
 		})
@@ -93,6 +96,18 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "simrun:", err)
 		os.Exit(2)
+	}
+	// Explicit-only: with -scenario the flag is rejected above, so a set
+	// flag here is always a builtin/-netfile run; the default otherwise
+	// leaves DefaultParams/DefaultSpec (and the manifest pin) untouched.
+	adaptiveSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "adaptive-routing" {
+			adaptiveSet = true
+		}
+	})
+	if adaptiveSet {
+		spec.Params.AdaptiveRouting = *adaptiveRouting
 	}
 	var e *engine.Engine
 	var mk *engine.Kernel

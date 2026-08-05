@@ -1,0 +1,63 @@
+{
+  "bands": [
+    [
+      0.2,
+      [
+        176,
+        22,
+        26
+      ]
+    ],
+    [
+      0.4,
+      [
+        214,
+        78,
+        32
+      ]
+    ],
+    [
+      0.6,
+      [
+        232,
+        152,
+        42
+      ]
+    ],
+    [
+      0.8,
+      [
+        206,
+        200,
+        62
+      ]
+    ],
+    [
+      10.0,
+      [
+        72,
+        156,
+        92
+      ]
+    ]
+  ],
+  "empty_rgb": [
+    48,
+    54,
+    62
+  ],
+  "end_tick": 12000,
+  "first_interval_tick": 4000,
+  "lanes_drawn": 55555,
+  "lanes_with_traffic": 32171,
+  "last_interval_end": 10000,
+  "metrics": "chiquizbase.metrics.json",
+  "metrics_bytes": 67547649,
+  "metrics_sha256": "944a92adf4fed9784d03b81b182905f387ffaba5fc1935880d78d2ede044bf7e",
+  "network": "data/networks/chi-loop-urban/chi-loop-urban.json",
+  "note": "Fidelity caveat: 1.5% of vehicle-ticks in this run had no controller intent, above the repo's 0.1% bar, because one driver replica cannot drive a fleet this size. The option numbers share that limitation. The colours are indicative, not a certified measurement \u2014 see README.",
+  "run_label": "pod-chi base, seed 1000, 12,000 ticks \u2014 the quiz's own baseline arm",
+  "set_id": "net",
+  "warmup_tick": 4000,
+  "width": 1400
+}

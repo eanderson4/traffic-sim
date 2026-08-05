@@ -1,0 +1,5 @@
+ docs/kb/decisions/ADR-0034-gridlock-escape.md |  47 +++++++++++
+ engine/gridlock.go                            |  32 +++++--
+ engine/gridlock_test.go                       | 116 ++++++++++++++++++++++++++
+ engine/rightofway.go                          |  29 +++++--
+ 4 files changed, 211 insertions(+), 13 deletions(-)

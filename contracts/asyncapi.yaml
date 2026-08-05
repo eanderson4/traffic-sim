@@ -28,7 +28,7 @@ asyncapi: 3.0.0
 
 info:
   title: traffic-sim engine contract
-  version: 2.5.0
+  version: 2.7.0
   description: |
     The engine's NATS surface per ADR-0006 (planes, taxonomy, pipelines) and
     ADR-0008 (the engine↔controller contract — M4, schema_version 2):
@@ -45,9 +45,14 @@ info:
       (claim/release/unclaimed/pause/resume).
     - **Record plane (JetStream, at-least-once):** the arbitrated intent
       log, full-state keyframes, the rolling state CRC, and control events
-      (pause/resume), one stream per run (LimitsPolicy, R=1 file). The
-      engine is the SOLE WRITER; Nats-Expected-Last-Sequence asserts it
-      broker-side.
+      (pause/resume), one stream per run (LimitsPolicy, R=1 file, S2
+      compression opt-in via -store-compress since ADR-0035). The engine is the SOLE WRITER;
+      Nats-Expected-Last-Sequence asserts it broker-side. The intent log
+      batches to one message per non-empty TICK under -log-batch (`log.intents`,
+      TSLB v1; opt-in since ADR-0035, default off under its
+      reproducibility blocker);
+      `log.intent` is the per-intent default form and stays readable, so
+      earlier recordings replay unchanged.
     - **Metadata plane (KV):** the run registry — run spec + status, and
       the latest-state pointer for late joiners.
 
@@ -112,6 +117,27 @@ info:
     Skew is covered by HelloReply capability advertisement (`intent_encodings`,
     additive) with v2 fallback — see the ctlIntent channel's migration note.
 
+    **ADR-0037 changes (additive; info version 2.7.0):** runtime signal
+    control, milestone 1. The director verb channel gains a second verb
+    kind, `signal_set`: command a signal program onto one of its phases
+    for a bounded hold (payload: signal program id, phase index, optional
+    hold_ticks — default one program cycle, clamped to the engine's
+    starvation bound). Same channel, same four properties as `spawn`
+    (request/reply, request-id idempotency, applied_tick logging on
+    `ts.{run}.log.verb`, verbatim replay re-enqueue); the logged record
+    is told apart by an omitted-when-spawn `verb` discriminator (any
+    OTHER discriminator value is a hard decode error on every reader),
+    so every pre-ADR-0037 recording decodes unchanged. A held phase past
+    its bound LAPSES — the fixed-time program resumes and the lapse is a
+    `signal_lapse` event on `ts.{run}.log.event` (signal, phase, hold
+    span, request id), never silent. Keyframes grow TSKF v7, written only
+    while an override is
+    held (a run without signal verbs keeps the v6-and-below bytes
+    exactly); v7 gives the TSKF header flags word its first bit to mark
+    the v6 adaptive-routing state (per-vehicle dwell clock AND lane
+    section) as present, which the version number alone
+    expressed through v6.
+
 servers:
   embedded:
     host: in-process
@@ -155,6 +181,17 @@ channels:
       convergence, never corrupts state. An empty program_count means the
       run has no signalized junctions (explicit — distinguishable from
       "no table received yet").
+
+      **ADR-0037 caveat (runtime signal control, milestone 1):** the
+      derivation above is the FIXED-TIME derivation. During a signal_set
+      hold the engine's enforced per-approach state comes from the
+      commanded override, not the tick-derived schedule — so a client's
+      tick-derived state is WRONG for a held program, and override state
+      is not yet published on the state plane (the lapse is visible on
+      the record plane as a `signal_lapse` event, nothing live). Treat
+      this table's derivation as fixed-time-only until the milestone-2
+      feedback story lands (ADR-0037 addendum); runs without signal_set
+      verbs are exactly as before.
 
       **Chunking (additive; ADR-0016):** a table over ~768 KiB is
       published as n consecutive messages on this subject, each a
@@ -347,20 +384,45 @@ channels:
   ctlVerb:
     address: ts.{run}.ctl.verb.{controller_id}
     description: |
-      Director verbs (ADR-0008 §5; ADR-0006 2026-07-20 M10 addendum),
-      request/reply, JSON. The sender must hold the director grant. v1
-      implements verb "spawn": origin lane id (a network origin, or any
-      lane when offset_m > 0), vehicle-type name (resolved against the
-      scenario type list), earliest_tick (not-before, sim ticks), and the
-      optional ADR-0021 pair destination + offset_m. Every verb carries a
-      director-assigned request_id — the engine remembers the reply per id
-      for the run's lifetime, so a retried verb (reconnect, publish retry,
-      director failover) gets the same answer with duplicate: true and
-      NEVER double-spawns. Request/reply (not fire-and-forget like raw
+      Director verbs (ADR-0008 §5; ADR-0006 2026-07-20 M10 addendum;
+      ADR-0037), request/reply, JSON. The sender must hold the director
+      grant. v1 implements two verb kinds. "spawn": origin lane id (a
+      network origin, or any lane when offset_m > 0), vehicle-type name
+      (resolved against the scenario type list), earliest_tick
+      (not-before, sim ticks), and the optional ADR-0021 pair destination
+      + offset_m. "signal_set" (ADR-0037): signal program id, commanded
+      phase index, and an optional hold_ticks — the hold is relative to
+      the applied tick, defaults to one program cycle (the natural
+      bounded quantum), and is CLAMPED to the engine's starvation bound
+      (300 sim-seconds, compiled onto the run's tick grid — 3000 ticks at
+      the validated 100 ms tick); the override takes
+      effect at the next tick boundary and lapses — loudly logged — back
+      to the fixed-time program when the hold ends. The resume follows the
+      schedule from the lapse tick: one cycle after the command began the
+      schedule is back at the phase that was active WHEN THE COMMAND
+      BEGAN, which is not necessarily the COMMANDED phase, so a lapse can
+      jump from the held phase to an unrelated schedule phase (the
+      engine's clearance window covers the transition). Every verb carries a
+      director-assigned request_id. The idempotency window, stated
+      exactly: the wire layer remembers the reply per id for the LIVE
+      SESSION (Contract.verbs), so a retried verb (reconnect, publish
+      retry, director failover) gets the same answer with duplicate: true
+      and never double-applies; the kernel additionally rejects duplicates
+      against its own live state — the same-boundary buffer plus the
+      keyframed override history (active and clearance-retained holds)
+      for signal_set, the live injection queue for spawn — which is what
+      survives a warm restore. But the kernel window is BOUNDED: once a
+      hold has lapsed AND left retention (a spawn: left the queue), a
+      warm-restored run can no longer detect the duplicate, so request
+      ids must not be deliberately reused within a run. Request/reply (not fire-and-forget like raw
       intents) because the director paces its schedule on accept/reject.
       Validation rejections (unknown origin, lane not a spawn origin,
       unknown type, unknown destination, offset past the lane end,
-      unsupported verb) carry a reason; accepted verbs take
+      unknown signal program, phase out of range, an omitted phase —
+      presence-checked so omission cannot silently command phase 0 — an
+      over-long request_id — 65535 bytes, the keyframe codec's u16
+      length-prefix limit — unsupported verb)
+      carry a reason; accepted verbs take
       effect at the next tick boundary and are logged on
       ts.{run}.log.verb. Blocked origins hold-and-retry (bounded, 600
       ticks past earliest_tick) with the Spawner's own clearance and
@@ -438,6 +500,14 @@ channels:
       The arbitrated intent log (record plane): one message per applied
       intent, in application order, each with its applied_tick. Engine sole
       writer; replay re-applies these instead of running controllers.
+
+      The DEFAULT form. logIntents (TSLB batches, ADR-0035) carries the
+      same records with one message per non-empty tick instead of one per
+      intent when the recorder runs with BatchedIntentLog
+      (serve -log-batch); it is opt-in while ADR-0035's live-run
+      reproducibility blocker stands. Every reader accepts both forms, so
+      recordings made before ADR-0035 replay unchanged. A
+      recording carries one form or the other, never a mix.
     parameters:
       run: { $ref: '#/components/parameters/runId' }
     messages:
@@ -447,6 +517,48 @@ channels:
       retention: limits
       storage: file
       replicas: 1
+      # Storage compression is OPT-IN via serve -store-compress (default
+      # off under ADR-0035's live-run reproducibility blocker), so an
+      # unflagged run's stream carries no compression and none is declared
+      # here. Storage-layer only: payloads and readers are unchanged either
+      # way; a compressed stream is the same contract.
+
+  logIntents:
+    address: ts.{run}.log.intents
+    description: |
+      The arbitrated intent log, batched: ONE message per NON-EMPTY tick
+      carrying that tick's applied intents in application order (TSLB v1,
+      ADR-0035). A tick with no applied intents emits no batch. The
+      opt-in form (serve -log-batch; default off under ADR-0035's
+      reproducibility blocker); logIntent is the per-message default.
+
+      The records inside a batch are LoggedIntentFrame payloads
+      byte-identical to the ones logIntent publishes individually, in the
+      same order — a reframing, not a re-encoding. Motivation is framing
+      cost: one message per vehicle per tick at 10 Hz measured ~230 bytes
+      per message for a 61-byte fixed record, and a 90-minute
+      chi-loop-urban recording was 48 GiB of essentially this.
+
+      A tick whose records outgrow the recorder's IntentBatchMax (default
+      768 KiB) is split across consecutive TSLB messages, each
+      independently decodable and each naming the same tick. Unlike a
+      chunked keyframe (ADR-0015) there is NO i/n header: concatenating
+      consecutive messages' records in stream order is already the original
+      order, because stream order is the application order (ADR-0008 §4).
+    parameters:
+      run: { $ref: '#/components/parameters/runId' }
+    messages:
+      loggedIntentBatch: { $ref: '#/components/messages/LoggedIntentBatch' }
+    x-nats:
+      stream: TS_LOG_{run}
+      retention: limits
+      storage: file
+      replicas: 1
+      # Storage compression is OPT-IN via serve -store-compress (default
+      # off under ADR-0035's live-run reproducibility blocker), so an
+      # unflagged run's stream carries no compression and none is declared
+      # here. Storage-layer only: payloads and readers are unchanged either
+      # way; a compressed stream is the same contract.
 
   logKeyframe:
     address: ts.{run}.log.keyframe
@@ -481,15 +593,23 @@ channels:
   logEvent:
     address: ts.{run}.log.event
     description: |
-      Control-plane events on the record plane (ADR-0008 §6): pause and
-      resume, as JSON. Pause gates the tick loop when available claim
+      Control-plane and rail events on the record plane: pause and
+      resume (ADR-0008 §6), and signal_lapse (ADR-0037), as JSON. Pause
+      gates the tick loop when available claim
       capacity < demand (unclaimed vehicles) for T consecutive ticks
       (default 5); resume fires on capacity recovery — or on the
       pause-gate escape (ADR-0008 §6, 2026-07-24 clarification): after
       PauseEscapeAfter of persistent deficit the engine resumes anyway on
       hold-last, so an escape resume is identifiable by demand >
-      available. These are dead-time
-      metadata: they carry no world state, the replayer ignores them, and
+      available. A signal_lapse fires when a commanded phase hold reaches
+      its bound and the signal returns to its fixed-time program — the
+      starvation rail; the event carries the signal id, held phase, the
+      hold's [since, until) span, and the commanding verb's request_id, so
+      a recording contains the evidence the rail fired. These are
+      dead-time
+      metadata: they carry no world state, the replayer ignores them (a
+      lapse is re-derived from keyframed state at a fixed tick, not
+      re-applied from the record), and
       tick determinism is unaffected — the CRC chain is contiguous across
       a pause.
     parameters:
@@ -503,15 +623,22 @@ channels:
     address: ts.{run}.log.verb
     description: |
       Accepted director verbs on the record plane (ADR-0006 2026-07-20
-      M10 addendum), one JSON message per verb, written in the tick's log
-      batch after the arbitrated intents, stamped with the verb's
-      applied_tick (the tick it entered the kernel's injection queue).
-      Replay re-enqueues verbs at their recorded ticks; the kernel's
+      M10 addendum; ADR-0037), one JSON message per verb, written in the
+      tick's log batch after the arbitrated intents, stamped with the
+      verb's applied_tick (the tick it entered the kernel). Spawn verbs
+      first, then signal_set verbs, each kind in application order.
+      Replay re-enqueues verbs at their recorded ticks: the kernel's
       deterministic hold-and-retry injection reproduces the identical
       spawn ticks and vehicle streams — the demand sampler never re-runs
-      (scenario-format §3). Rejected or duplicate verbs are NOT recorded:
-      the log reflects exactly what the engine accepted, and dedup makes
-      the accepted-set canonical.
+      (scenario-format §3) — and the override table re-takes the recorded
+      commanded phase for the recorded hold (ADR-0037). The payload's
+      `verb` discriminator ("signal_set" or omitted = spawn) tells the
+      kinds apart; a pre-ADR-0037 recording carries no discriminator and
+      decodes as all-spawn, unchanged, and an UNKNOWN discriminator is a
+      hard decode error on every reader — a newer engine's verb kind must
+      fail replay loudly, never decode as the wrong command. Rejected or
+      duplicate verbs are NOT recorded: the log reflects exactly what the
+      engine accepted, and dedup makes the accepted-set canonical.
     parameters:
       run: { $ref: '#/components/parameters/runId' }
     messages:
@@ -585,7 +712,7 @@ operations:
     action: receive
     channel: { $ref: '#/channels/ctlHeartbeat' }
   directorVerbs:
-    title: Engine ↔ director verbs (spawn; accept/reject, request-id idempotent)
+    title: Engine ↔ director verbs (spawn, signal_set; accept/reject, request-id idempotent)
     action: receive
     channel: { $ref: '#/channels/ctlVerb' }
   publishObservations:
@@ -604,6 +731,10 @@ operations:
     title: Engine → arbitrated record (sole writer; pubacks awaited per tick-batch; failure aborts the run loudly)
     action: send
     channel: { $ref: '#/channels/logIntent' }
+  writeLogBatched:
+    title: Engine → arbitrated record, batched (DEFAULT since ADR-0035; sole writer; one TSLB message per non-empty tick)
+    action: send
+    channel: { $ref: '#/channels/logIntents' }
   writeKeyframe:
     title: Engine → keyframe at cadence
     action: send
@@ -632,6 +763,10 @@ operations:
     title: Replayer ← record plane (read-only; ephemeral pull consumers; paces by tick, never ReplayOriginal)
     action: receive
     channel: { $ref: '#/channels/logIntent' }
+  replayRecordBatched:
+    title: Replayer ← record plane, batched (read-only; the DEFAULT form since ADR-0035; every reader accepts both)
+    action: receive
+    channel: { $ref: '#/channels/logIntents' }
 
 components:
   parameters:
@@ -768,7 +903,7 @@ components:
 
     VerbRequest:
       name: verbRequest
-      title: 'Director verb (v1 spawn; request_id is the idempotency key)'
+      title: 'Director verb (v1: spawn, signal_set; request_id is the idempotency key)'
       headers: { $ref: '#/components/schemas/SchemaHeaders' }
       payload:
         schemaFormat: application/schema+json;version=draft-07
@@ -837,18 +972,45 @@ components:
         $ref: '#/components/schemas/LoggedIntentFrame'
       x-json-view: '#/components/schemas/LoggedIntentView'
 
+    LoggedIntentBatch:
+      name: loggedIntentBatch
+      title: One tick's arbitrated log entries, batched (TSLB v1)
+      summary: |
+        The batched form of LoggedIntent (ADR-0035). Same sole-writer dedup +
+        OCC headers, same records, same order — the batch is a framing around
+        LoggedIntentFrame payloads, so everything LoggedIntent's summary says
+        about ordering, held, superseded and verbatim replay applies
+        unchanged. One message per tick; a tick too wide for
+        IntentBatchMax splits across consecutive messages naming the same
+        tick, with no chunk header (stream order suffices).
+      headers: { $ref: '#/components/schemas/LogHeaders' }
+      payload:
+        schemaFormat: application/octet-stream
+        $ref: '#/components/schemas/LoggedIntentBatchFrame'
+
     Keyframe:
       name: keyframe
-      title: Full-state keyframe (engine.MarshalState bytes, TSKF v2; v3 while director directives pending)
+      title: Full-state keyframe (engine.MarshalState bytes, TSKF v2–v7 by run state and params)
       summary: |
         Complete dynamic state: tick, rolling CRC, next vehicle id, every
         vehicle (id, lane, type, s, v, f, cooldown, RNG words + draw count,
         persistent controller axes — cruise setpoint, held turn, signals,
         route), spawner demand state. Layout: engine/keyframe.go ("TSKF";
-        v2 adds the controller axes, v3 — written ONLY while the director
+        v2 adds the controller axes; v3 — written ONLY while the director
         injection queue is non-empty — appends the pending directives so a
-        seek resumes them bit-exactly; an empty queue marshals
-        byte-identical v2, and readers accept v2|v3). A keyframe larger
+        seek resumes them bit-exactly; v4 appends per-directive
+        destination/offset while any queued directive carries them
+        (ADR-0021); v5 appends per-vehicle stuckTicks/stopDone while any
+        such timer or duty is live (ADR-0034); v6 — written ONLY while
+        Params.AdaptiveRouting is on — appends per-vehicle laneEntryTick
+        and a per-lane ttEMA/ttSnap section (ADR-0036); v7 — written ONLY
+        while a commanded signal override is held — appends the override
+        table and gives the header flags word its first bit (whether the
+        v6 lane section is present, which the version number expressed
+        through v6 — ADR-0037). Each higher
+        version is state-gated, so a run with no qualifying state marshals
+        byte-identical to a lower one; readers accept v2–v7, and a v6
+        payload into a flag-off spec is rejected loudly). A keyframe larger
         than the recorder's KeyframeChunkMax (default 768 KiB) is split
         into consecutive chunk messages (ADR-0015); reassembled bytes are
         exactly this payload.
@@ -1075,7 +1237,7 @@ components:
         speed_setpoint: { type: number, description: 'm/s; persistent cruise until replaced; negative clears; clamped to v0eff' }
         lane_delta: { type: integer, enum: [-1, 0, 1], description: '+1 left, −1 right; one-shot, expires if infeasible' }
         turn: { type: integer, enum: [-1, 0, 1], description: 'junction choice; held until consumed at the next lane crossing; 0 clears' }
-        route: { type: string, maxLength: 48, description: 'destination lane id; persistent. The engine follows it at every multi-successor lane (shortest path by lane length); an explicit held turn wins the crossing; unknown/unreachable destinations degrade to the successor default' }
+        route: { type: string, maxLength: 48, description: 'destination lane id; persistent. The engine follows it at every multi-successor lane (shortest path by FREE-FLOW TIME — lane length over speed limit; ADR-0006 addendum 2026-07-30); an explicit held turn wins the crossing; unknown/unreachable destinations degrade to the successor default' }
         signals: { type: integer, enum: [0, 1, 2, 3], description: '0 off, 1 left, 2 right, 3 hazard; persistent, informational in v1' }
 
     IntentEncodingHeaders:
@@ -1170,6 +1332,22 @@ components:
         Stream order within a tick IS the application order (grant desc,
         then vehicle ID — ADR-0008 §4).
 
+    LoggedIntentBatchFrame:
+      type: string
+      format: binary
+      description: |
+        TSLB v1, little-endian (ADR-0035):
+          magic 'T','S','L','B' 4B | version u8 = 1 | flags u8 = 0 (reserved) |
+          count u32 | tick u64 | count × LoggedIntentFrame
+        Header is 18 bytes. Every record's applied_tick MUST equal the
+        header tick; a reader refuses the batch otherwise, because records
+        replayed at the wrong tick diverge the run silently. count must
+        account for every byte after the header — trailing bytes are an
+        error, so an undercount cannot silently drop the records it omits.
+        Records are LoggedIntentFrame payloads byte-identical to the ones
+        ts.{run}.log.intent carries individually, so a batch is a reframing
+        and not a re-encoding.
+
     LoggedIntentView:
       title: JSON view of an arbitrated log entry (tooling only)
       type: object
@@ -1193,12 +1371,14 @@ components:
       type: string
       format: binary
       description: |
-        Magic "TSKF", version 2; canonical layout documented in
-        engine/keyframe.go. Contains the full CRC-covered state plus raw
-        RNG words, spawner demand state, and (since v2) the persistent
-        controller axes (cruise setpoint, held turn, signals, route), so
-        RestoreState resumes the run bit-exactly. Does NOT contain the run
-        spec — that pairs via the run registry (ts.{run}.meta).
+        Magic "TSKF", versions 2–7 (state- and params-gated; readers accept
+        the whole line, v6 only from runs with Params.AdaptiveRouting on —
+        ADR-0036; v7 only while a signal_set override is held — ADR-0037); canonical layout documented in engine/keyframe.go.
+        Contains the full CRC-covered state plus raw RNG words, spawner
+        demand state, and (since v2) the persistent controller axes (cruise
+        setpoint, held turn, signals, route), so RestoreState resumes the
+        run bit-exactly. Does NOT contain the run spec — that pairs via
+        the run registry (ts.{run}.meta).
 
     LoggedCRCFrame:
       type: string
@@ -1287,23 +1467,26 @@ components:
           description: 'ADDITIVE (ADR-0026 M4 addendum): every intent wire encoding this engine accepts on ctlIntent — ["v2","tsib"] from asyncapi 2.5.0 onward, OMITTED by pre-TSIB engines (JSON consumers ignore unknown fields both directions). A batch-capable controller SHOULD fall back to per-vehicle v2 when tsib is not advertised; the default driver does exactly that (one log line, session-scoped).'
 
     VerbRequestView:
-      title: Director verb request (ADR-0008 §5; M10)
+      title: Director verb request (ADR-0008 §5; M10; ADR-0037)
       type: object
-      required: [verb, request_id, origin, vtype, earliest_tick]
+      required: [verb, request_id]
       properties:
         verb:
           type: string
-          enum: [spawn]
-          description: 'v1 implements spawn only; despawn/teleport/trigger (the remaining OpenSCENARIO verbs) land additively on this same channel — unknown verbs are rejected, never silently ignored.'
+          enum: [spawn, signal_set]
+          description: 'v1 implements spawn and signal_set (ADR-0037); despawn/teleport/trigger (the remaining OpenSCENARIO verbs) land additively on this same channel — unknown verbs are rejected, never silently ignored. The kind selects which of the remaining fields apply: spawn REQUIRES origin/vtype (earliest_tick, destination, offset_m optional), signal_set REQUIRES signal and phase (hold_ticks optional; phase is presence-checked — see its field); the other kind''s fields are ignored.'
         request_id:
           type: string
           minLength: 1
-          description: 'Director-assigned idempotency key: unique per intended spawn for the run. The engine remembers the reply per id; a retry answers duplicate: true and never double-spawns. Deterministic ids (e.g. f{flow}-{ordinal}) make director failover invisible.'
-        origin: { type: string, description: 'Origin lane id. Must be a network ORIGIN lane unless offset_m > 0, which admits any lane (ADR-0021 interior injection).' }
-        vtype: { type: string, description: 'Vehicle-type name, resolved against the scenario type list (rejected if unknown).' }
-        earliest_tick: { type: integer, minimum: 0, description: 'Not-before sim tick (ADR-0005 tick clock; 0 = as soon as applied). A blocked origin holds-and-retries from this tick, bounded at 600 ticks.' }
-        destination: { type: string, description: 'OPTIONAL (ADR-0021). Route destination lane id, applied as the vehicle Route axis at injection: the kernel routes toward it and ENDS the trip at its end (arrival despawn). Rejected if it is not a lane of the network. Omitted = unrouted, the pre-ADR-0021 shape.' }
-        offset_m: { type: number, minimum: 0, description: 'OPTIONAL (ADR-0021). Injection position along the origin lane in meters. Omitted/0 = portal semantics and the origin must be a network origin. Positive = interior injection (a mid-block garage): admits any lane, must be < the lane length, and is additionally clearance-checked BEHIND — an entry that would be rear-ended is denied and held as demand.' }
+          description: 'Director-assigned idempotency key: unique per intended verb for the run. The idempotency window, stated exactly: the wire layer remembers the reply per id for the live session (a retry answers duplicate: true and never double-applies), and the kernel rejects duplicates against its live state — the same-boundary buffer plus the keyframed override history (signal_set) / live injection queue (spawn) — which survives a warm restore but is BOUNDED: once a hold has lapsed AND left retention, a warm-restored run can no longer detect the duplicate, so ids must not be deliberately reused. Deterministic ids (e.g. f{flow}-{ordinal}) make director failover invisible. Bounded at 65535 BYTES of UTF-8 (the TSKF keyframe codec length-prefixes it with a u16 — director queue since v3, signal overrides since v7 — and an over-long id would corrupt the keyframe). NOTE: the limit is bytes, and JSON Schema maxLength counts CHARACTERS, so the constraint is documented here rather than expressed as a schema keyword — a non-ASCII id consumes several bytes per character and the engine-side check is authoritative.'
+        origin: { type: string, description: 'spawn. Origin lane id. Must be a network ORIGIN lane unless offset_m > 0, which admits any lane (ADR-0021 interior injection).' }
+        vtype: { type: string, description: 'spawn. Vehicle-type name, resolved against the scenario type list (rejected if unknown).' }
+        earliest_tick: { type: integer, minimum: 0, description: 'spawn. Not-before sim tick (ADR-0005 tick clock; 0 = as soon as applied). A blocked origin holds-and-retries from this tick, bounded at 600 ticks.' }
+        destination: { type: string, description: 'spawn, OPTIONAL (ADR-0021). Route destination lane id, applied as the vehicle Route axis at injection: the kernel routes toward it and ENDS the trip at its end (arrival despawn). Rejected if it is not a lane of the network. Omitted = unrouted, the pre-ADR-0021 shape.' }
+        offset_m: { type: number, minimum: 0, description: 'spawn, OPTIONAL (ADR-0021). Injection position along the origin lane in meters. Omitted/0 = portal semantics and the origin must be a network origin. Positive = interior injection (a mid-block garage): admits any lane, must be < the lane length, and is additionally clearance-checked BEHIND — an entry that would be rear-ended is denied and held as demand.' }
+        signal: { type: string, description: 'signal_set (ADR-0037). Signal program id (the network file''s tlLogic id, published in the ts.{run}.state.sig table). Rejected if unknown.' }
+        phase: { type: integer, minimum: 0, description: 'signal_set (ADR-0037), REQUIRED for that kind (conditional requirement, documented per-kind in the file''s established style — the schema''s required list is the shared [verb, request_id]). Commanded phase index into the program''s phase list; out of range is rejected. PRESENCE is checked: an omitted phase is rejected ("missing phase") rather than defaulting — JSON cannot distinguish omission from 0, and an accidental default would silently command phase 0, so phase 0 must be written explicitly. Ignored by spawn (never serialized there). The program shows that phase''s state string for the whole hold; enforcement (stop-line discipline, clearance, box checks, permissive yield) is unchanged — a held green never means enter a box you cannot exit.' }
+        hold_ticks: { type: integer, minimum: 0, description: 'signal_set (ADR-0037), OPTIONAL. Hold length in sim ticks, relative to the applied tick. Omitted/0 = one cycle of the commanded program — the natural bounded quantum, NOT a seamless resume: the fixed-time program resumes at whatever phase the schedule is in at the lapse tick (one cycle after the command began, that is the phase the schedule was in WHEN THE COMMAND BEGAN, not necessarily the commanded one); the clearance window covers the transition. Values past the starvation bound (300 sim-seconds, compiled onto the run''s tick grid) are CLAMPED, not rejected. The bound is CUMULATIVE across an uninterrupted same-phase hold chain: a renewal (same phase, no fixed-time gap) never extends the hold past first-hold-start + bound, and a renewal arriving at the bound is recorded but not installed — the lapse fires exactly once, at the bound. A different phase, or any fixed-time gap, starts a new chain. The logged verb carries the EFFECTIVE hold in ticks (chain-clamped where the rail shortened it; an explicit 0 marks a renewal declined at the bound — accepted, enforced nothing). When the hold ends the lapse is logged, never silent.' }
 
     VerbReplyView:
       title: Director verb reply
@@ -1314,21 +1497,26 @@ components:
         verb: { type: string }
         request_id: { type: string, description: 'Echoed even on parse-level and not-attached rejections.' }
         duplicate: { type: boolean, description: 'true = this request_id was seen before; the ORIGINAL reply is replayed and nothing re-queued.' }
-        reason: { type: string, description: '"not attached" | "verb requires the director grant" | "unsupported verb" | "missing request_id" | validation message (unknown origin lane / not a spawn origin / unknown vehicle type / unknown destination lane / offset past the end of lane).' }
+        reason: { type: string, description: '"not attached" | "verb requires the director grant" | "unsupported verb" | "missing request_id" | "request_id too long" (> 65535 bytes — the keyframe codec''s u16 length-prefix limit) | "missing phase" (signal_set presence-checks it) | validation message (unknown origin lane / not a spawn origin / unknown vehicle type / unknown destination lane / offset past the end of lane / unknown signal program / phase out of range).' }
 
     LoggedVerbView:
       title: Recorded director verb (ts.{run}.log.verb payload)
       type: object
-      required: [tick, request_id, origin, vtype, type_idx, earliest_tick]
+      required: [tick, request_id]
       properties:
-        tick: { type: integer, minimum: 0, description: 'applied_tick — the tick the verb entered the injection queue; replay re-enqueues here.' }
+        tick: { type: integer, minimum: 0, description: 'applied_tick — the tick the verb entered the kernel; replay re-enqueues here.' }
         request_id: { type: string }
-        destination: { type: string, description: 'OPTIONAL (ADR-0021), omitted when unrouted — so a recording of portal-only demand is byte-identical to a pre-ADR-0021 one.' }
-        offset_m: { type: number, minimum: 0, description: 'OPTIONAL (ADR-0021), omitted when zero (see destination).' }
-        origin: { type: string, description: 'Origin lane id; replay re-resolves it against the run spec (deterministic).' }
-        vtype: { type: string }
-        type_idx: { type: integer, minimum: 0, description: 'Resolved scenario type index (auditability).' }
-        earliest_tick: { type: integer, minimum: 0 }
+        verb: { type: string, enum: [signal_set], description: 'OPTIONAL kind discriminator (ADR-0037): "signal_set" marks a signal command (carries signal/signal_idx/phase/hold_ticks); ABSENT = spawn (carries origin/vtype/type_idx/earliest_tick and the optional ADR-0021 pair — every pre-ADR-0037 recording, and any spawn-only one, is byte-identical to the pre-ADR-0037 shape). ANY OTHER VALUE IS A HARD DECODE ERROR: readers reject the record loudly — replay, the player, bake, and the log cursor all fail — rather than re-enqueue a future engine''s verb kind as the wrong command. A new kind is a contract event: extend this enum and the readers in the same reviewed change.' }
+        destination: { type: string, description: 'spawn, OPTIONAL (ADR-0021), omitted when unrouted — so a recording of portal-only demand is byte-identical to a pre-ADR-0021 one.' }
+        offset_m: { type: number, minimum: 0, description: 'spawn, OPTIONAL (ADR-0021), omitted when zero (see destination).' }
+        origin: { type: string, description: 'spawn. Origin lane id; replay re-resolves it against the run spec (deterministic).' }
+        vtype: { type: string, description: 'spawn. Vehicle-type name.' }
+        type_idx: { type: integer, minimum: 0, description: 'spawn. Resolved scenario type index (auditability).' }
+        earliest_tick: { type: integer, minimum: 0, description: 'spawn. Not-before tick as requested.' }
+        signal: { type: string, description: 'signal_set (ADR-0037). Signal program id; replay re-resolves it against the run spec (deterministic).' }
+        signal_idx: { type: integer, minimum: 0, description: 'signal_set (ADR-0037). Resolved Network.Signals index (auditability, same argument as type_idx). ALWAYS encoded on signal_set records and presence-checked on decode — 0 is legitimate, so an omitempty encoding would make a zero value indistinguishable from a missing field; a signal_set record missing it is a hard decode error.' }
+        phase: { type: integer, minimum: 0, description: 'signal_set (ADR-0037). Commanded phase index. ALWAYS encoded on signal_set records and presence-checked on decode (0 is legitimate — phase 0 must be explicit on the record exactly as on the request); a signal_set record missing it is a hard decode error.' }
+        hold_ticks: { type: integer, minimum: 0, description: 'signal_set (ADR-0037). The EFFECTIVE hold — default applied, starvation-bound- and chain-clamped at application — so the record shows exactly what the engine enforced. An explicit 0 means the verb was accepted but enforced nothing (a renewal declined at the hold chain''s bound; the signal_lapse event carries the enforced truth). A signal_set record MISSING the field is a hard decode error (presence-checked).' }
         run: { type: string }
         tick: { type: integer, minimum: 0, description: Tick at attach (the contract's clock reference). }
         reason: { type: string, description: Reject reason when accepted = false. }
@@ -1437,7 +1625,7 @@ components:
       type: object
       required: [type, tick]
       properties:
-        type: { type: string, enum: [claim, release, unclaimed, pause, resume] }
+        type: { type: string, enum: [claim, release, unclaimed, pause, resume, signal_lapse] }
         tick: { type: integer, minimum: 0 }
         controller_id: { type: string }
         vehicle_ids:
@@ -1446,6 +1634,11 @@ components:
         reason: { type: string, enum: [spawn, release, disconnect], description: unclaimed events only }
         demand: { type: integer, minimum: 0, description: 'pause/resume: unclaimed vehicles at the gate' }
         available: { type: integer, minimum: 0, description: 'pause/resume: spare claim capacity across attached drive controllers' }
+        signal: { type: string, description: 'signal_lapse (ADR-0037, record plane only — ts.{run}.log.event): the signal program id whose commanded hold lapsed' }
+        phase: { type: integer, minimum: 0, description: 'signal_lapse: the held phase index that lapsed (0 is legitimate — the field is omitted only on other event types)' }
+        since: { type: integer, minimum: 0, description: 'signal_lapse: tick the hold CHAIN began — the first hold of an uninterrupted same-phase run (the starvation bound is cumulative across renewals) — so the event spans the whole starved interval' }
+        until: { type: integer, minimum: 0, description: 'signal_lapse: tick the fixed-time program resumed — the hold chain''s clamped end (the chain start plus the cumulative starvation bound when the rail clamped it; the last renewal''s own applied tick + effective hold_ticks otherwise)' }
+        request_id: { type: string, description: 'signal_lapse: the verb that commanded the lapsed hold' }
 
     IntrospectRequestView:
       title: Introspection query — a JSON view of the reference-policy context

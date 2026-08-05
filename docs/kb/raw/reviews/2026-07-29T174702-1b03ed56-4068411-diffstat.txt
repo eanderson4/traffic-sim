@@ -1,0 +1,27 @@
+ hooks/pre-commit                  |   1 +
+ scripts/chicago/corridorspeed.py  |  47 +-
+ scripts/chicago/districts.geojson | 321 ++++++++++++++
+ scripts/chicago/mkod.py           | 800 ++++++++++++++++++++++++++++++++--
+ scripts/chicago/mkquiz.py         | 173 +++++++-
+ scripts/chicago/mkscenario.sh     |   5 +
+ scripts/chicago/mkzones.py        | 179 ++++++++
+ scripts/chicago/profiles-am.json  |  39 ++
+ scripts/chicago/test_mkod.py      | 477 +++++++++++++++++++++
+ scripts/chicago/test_mkzones.py   | 118 ++++++
+ scripts/external-review.sh        | 104 ++++-
+ scripts/runreport.py              | 587 +++++++++++++++++++++++++
+ scripts/show/build-quiz.sh        |  84 +++-
+ scripts/show/mkcongestionmap.py   | 407 ++++++++++++++++++
+ scripts/show/mkflowcurve.py       | 150 +++++++
+ scripts/test_runreport.py         | 274 ++++++++++++
+ scripts/whatif.py                 | 186 +++++++-
+ viz/README.md                     |   9 +
+ viz/index.html                    | 127 ++++++
+ viz/src/config.ts                 |  15 +
+ viz/src/flowpanel.ts              | 544 ++++++++++++++++++++++++
+ viz/src/main.ts                   |  30 ++
+ viz/src/statspanel.ts             | 872 ++++++++++++++++++++++++++++++++++++++
+ viz/test/config.test.ts           |   5 +
+ viz/test/flowpanel.test.ts        | 255 +++++++++++
+ viz/test/statspanel.test.ts       | 370 ++++++++++++++++
+ 26 files changed, 6097 insertions(+), 82 deletions(-)

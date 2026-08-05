@@ -53,6 +53,17 @@ type Lane struct {
 	cum       []float64 // cumulative arc lengths, built by SetShape
 
 	vehs []*Vehicle // occupancy sorted by S ascending; rebuilt every tick
+
+	// ttEMA is the lane's smoothed travel time in seconds (ADR-0036 §1):
+	// free-flow time at build, updated by vehicle dwell samples (α = 1/8)
+	// and relaxed back toward free flow every tick with a 10-minute time
+	// constant. It is the congestion signal the epoch recompute weights its
+	// Dijkstra with. State that decides behavior → keyframed (format v6,
+	// the stuckTicks precedent) and folded into the CRC in lane order when
+	// adaptive routing is on (engine.go); flag-off the CRC stays the
+	// pre-v6 trajectory oracle. Zero-valued and unused while
+	// Params.AdaptiveRouting is off.
+	ttEMA float64
 }
 
 // Network is a fixed-order lane list plus spawn origins. Maps here are for

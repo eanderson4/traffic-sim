@@ -1,0 +1,43 @@
+{
+  "_comment": [
+    "Baked baseline replay per quiz scenario — the run a guest watches before",
+    "being asked to pick an upgrade. mkquiz.py builds the 'watch it running'",
+    "link from this file and VERIFIES each bake exists under the served root,",
+    "so a re-bake that changes the content hash breaks the build instead of",
+    "shipping a dead link nobody clicks until it is on screen.",
+    "",
+    "The bake must be the SAME baseline the options were measured against.",
+    "chishow is the fw20 cut, which is what docs/show/quiz/chi-loop-urban.json",
+    "was measured on — the newer, properly congested chi-show-fw35 scenario is",
+    "not baked and is NOT the baseline behind those numbers, so linking it",
+    "here would show one network and score another.",
+    "",
+    "'window' is the stretch worth showing on camera and the rate to show it",
+    "at, from docs/show/README.md. Everything else in a 12,000-tick replay is",
+    "the network filling or a steady state that has already made its point."
+  ],
+  "merge-pod": {
+    "run": "mergejam",
+    "bake": "/baked/mergejam/017140a46b75/index.json",
+    "center": "-98.46977,39.49933",
+    "zoom": "14.6",
+    "ticks": 12000,
+    "window": "ticks 4200-10200 at 8x = 75 s: the shockwave forming at the merge and walking 2 km upstream"
+  },
+  "bottleneck-town": {
+    "run": "townbase",
+    "bake": "/baked/townbase/b6f967b72fe4/index.json",
+    "center": "-98.4840,39.6963",
+    "zoom": "14.2",
+    "ticks": 15000,
+    "window": "ticks 6300-7200 at 1x = 90 s: one full 86 s cycle at every junction with the queues fully developed"
+  },
+  "chi-loop-urban": {
+    "run": "chishow",
+    "bake": "/baked/chishow/f941d8888b18/index.json",
+    "center": "-87.6298,41.8790",
+    "zoom": "14.5",
+    "ticks": 18000,
+    "window": "the whole run reads; the expressways in this cut run 59-76 km/h, faster than the real thing"
+  }
+}

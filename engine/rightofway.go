@@ -96,12 +96,25 @@ func (e *Engine) rowGate(v *Vehicle) (float64, bool) {
 	if next == nil {
 		return 0, false
 	}
+	// A permissive green ('g') is a green that has NOT separated the
+	// conflict: the light says go, the foes are green too, and yielding is
+	// the driver's job (sigPermissive). Protected green ('G') keeps the
+	// original contract — the light adjudicated, so the priority model below
+	// is skipped. Without this split every permissive movement behaved as
+	// protected and crossed its foes unconditionally.
+	permissive := false
 	if next.Signal != nil {
 		if w, gated := e.sigGate(v, next, dist); gated {
 			return w, true
 		}
+		permissive = e.sigPermissive(next)
 	}
-	if next.Row == RowNone {
+	// Signalised internal lanes carry RowNone (the light is their control),
+	// so a permissive approach has to be exempted from this early return to
+	// reach rowConflict at all. It lands there as a minor approach — RowNone
+	// != RowMajor — which is exactly the discipline permissive green means:
+	// yield to every crossing and merging foe.
+	if next.Row == RowNone && !permissive {
 		return 0, false
 	}
 	hold := true
@@ -188,12 +201,12 @@ func (e *Engine) rowConflict(v *Vehicle, next *Lane) bool {
 	// major approach are minor themselves and do the yielding.
 	minor := next.Row != RowMajor
 	for _, f := range next.FoesCross {
-		if minor && foeApproachBlocks(v, f, minor) {
+		if minor && e.foeApproachBlocks(v, f, minor) {
 			return true
 		}
 	}
 	for _, f := range next.FoesMerge {
-		if foeApproachBlocks(v, f, minor) {
+		if e.foeApproachBlocks(v, f, minor) {
 			return true
 		}
 	}
@@ -206,19 +219,27 @@ func (e *Engine) rowConflict(v *Vehicle, next *Lane) bool {
 // (ADR-0010) and the signal guardrail (ADR-0011 — green never means enter
 // a box you cannot exit).
 func (e *Engine) boxBlocked(v *Vehicle, next *Lane) bool {
+	blocked, _ := e.boxWalk(v, next)
+	return blocked
+}
+
+// boxWalk is boxBlocked with the cause attached (see exitWalk for the
+// holdSeal contract): the gridlock escape needs to tell a capacity seal
+// from a holding stop line, entry gating does not.
+func (e *Engine) boxWalk(v *Vehicle, next *Lane) (blocked, holdSeal bool) {
 	// Box occupancy: never enter against conflicting traffic already inside
 	// (any class — a vehicle physically in the conflict zone owns it).
 	for _, f := range next.FoesCross {
 		if len(f.vehs) > 0 {
-			return true
+			return true, false
 		}
 	}
 	for _, f := range next.FoesMerge {
 		if len(f.vehs) > 0 {
-			return true
+			return true, false
 		}
 	}
-	return e.exitBlocked(v, next, false)
+	return e.exitWalk(v, next, false, true)
 }
 
 // exitBlocked reports whether the lane's EXIT chain cannot take v. The
@@ -245,6 +266,23 @@ func (e *Engine) boxBlocked(v *Vehicle, next *Lane) bool {
 // (leaderAt) already brakes for it, and walling the box end against it
 // serialized discharge to one vehicle per box traversal.
 func (e *Engine) exitBlocked(v *Vehicle, next *Lane, inBox bool) bool {
+	blocked, _ := e.exitWalk(v, next, inBox, true)
+	return blocked
+}
+
+// exitWalk is exitBlocked with the cause attached: the second return
+// reports whether the seal — when there is one — is a HOLDING STOP LINE
+// (red/amber downstream) rather than capacity. Entry gating treats the
+// two identically (both mean "do not enter"); the gridlock escape must
+// not — a red that holds an in-box vehicle past the strand threshold is
+// stop-line starvation, a signal's domain, and the escape's doctrine is
+// that a red light is never a trigger (ADR-0034, jammedAtJunction).
+//   - turnSpent says whether v's held turn was already consumed reaching
+//     `next`. Every entry-gate caller passes true (the crossing into next
+//     spent it, boundaries()); the escape's IN-BOX arm passes false — v is
+//     still in the box and the walk's FIRST hop is the crossing that will
+//     consume the turn (leaderAt spends it there for the same reason).
+func (e *Engine) exitWalk(v *Vehicle, next *Lane, inBox, turnSpent bool) (blocked, holdSeal bool) {
 	need := v.Type.Length + v.Type.S0
 	free := 0.0
 	// dist is v's distance to the lane being examined; it is consumed by
@@ -252,16 +290,20 @@ func (e *Engine) exitBlocked(v *Vehicle, next *Lane, inBox bool) bool {
 	// there, so next.Length is correct). In the entry case it is unused.
 	dist := next.Length - v.S
 	cur := next
-	// Virtual walk: reaching `next` already consumed the held turn (the
-	// crossing into it spends it, boundaries()) — every hop here follows
-	// the route/default only.
+	// Virtual walk: when turnSpent, reaching `next` already consumed the
+	// held turn (the crossing into it spends it, boundaries()) — every hop
+	// then follows the route/default only. Otherwise the FIRST pick below
+	// honors the held turn and spends it, matching boundaries().
 	probe := *v
-	probe.HeldTurn = 0
+	if turnSpent {
+		probe.HeldTurn = 0
+	}
 	for hops := 0; hops < maxLaneHops; hops++ {
 		if len(cur.Successors) == 0 {
 			break
 		}
 		exit := e.pickSuccessor(cur, &probe) // v's actual route, not the default
+		probe.HeldTurn = 0                   // the first hop spent it, if still held
 		// A shared funnel (several lanes feeding one) arbitrates
 		// simultaneous arrivals itself: no foe set covers cross-junction
 		// merges (netimport compiles foes WITHIN a junction only), so a
@@ -275,11 +317,11 @@ func (e *Engine) exitBlocked(v *Vehicle, next *Lane, inBox bool) bool {
 		// (rowConflict/foe approaches) owns near-merge arbitration, and
 		// entry distances would make every converging branch a blocker.
 		if inBox && len(exit.Prevs) > 1 && e.mergeThreat(v, cur, exit, dist) {
-			return true
+			return true, false
 		}
 		if n := len(exit.vehs); n > 0 {
 			if inBox {
-				return false // own-path tail: car-following owns it
+				return false, false // own-path tail: car-following owns it
 			}
 			first := exit.vehs[0]
 			// Room behind the tail measured from this lane's start; a tail
@@ -290,24 +332,25 @@ func (e *Engine) exitBlocked(v *Vehicle, next *Lane, inBox bool) bool {
 		if exit.Internal {
 			for _, f := range exit.FoesCross {
 				if len(f.vehs) > 0 {
-					return true
+					return true, false
 				}
 			}
 			for _, f := range exit.FoesMerge {
 				if len(f.vehs) > 0 {
-					return true
+					return true, false
 				}
 			}
 			// A HOLDING stop line caps the room at its start; shallow by
 			// design (signal wall states + stop class only): no foe
 			// evaluation, so no recursion into rowConflict → boxBlocked.
 			if e.downstreamHold(exit) {
+				holdSeal = true
 				break
 			}
-			return false // the next box's gate takes over from here
+			return false, false // the next box's gate takes over from here
 		}
 		if exit.Exit {
-			return false // drains out of the network: room is unbounded
+			return false, false // drains out of the network: room is unbounded
 		}
 		free += exit.Length
 		dist += exit.Length
@@ -317,9 +360,9 @@ func (e *Engine) exitBlocked(v *Vehicle, next *Lane, inBox bool) bool {
 		cur = exit
 	}
 	if free < need {
-		return true
+		return true, holdSeal
 	}
-	return false
+	return false, false
 }
 
 // mergeThreat reports whether a vehicle on a sibling branch feeding exit
@@ -417,7 +460,13 @@ func (e *Engine) junctionHold(v *Vehicle, next *Lane) bool {
 // at its own line (it can start into the box at any tick), resolved by
 // priority class — minor yields to major — and within one class by lower
 // vehicle ID (deterministic tie-break).
-func foeApproachBlocks(v *Vehicle, foe *Lane, egoMinor bool) bool {
+//
+// The foe's SIGNAL is part of its priority class (ADR-0033). Reading only
+// foe.Row deadlocks a signalised junction, because a signalised internal
+// lane carries RowNone — "unmodeled, has priority" — so two permissive
+// greens facing each other each classified the other as a priority foe and
+// gave way to it forever. See foeSignalClass.
+func (e *Engine) foeApproachBlocks(v *Vehicle, foe *Lane, egoMinor bool) bool {
 	for _, p := range foe.Prevs {
 		n := len(p.vehs)
 		if n == 0 {
@@ -432,7 +481,11 @@ func foeApproachBlocks(v *Vehicle, foe *Lane, egoMinor bool) bool {
 			// Stopped AT its line: it can start into the box at any tick.
 			// Yield-class foes (minor/stop) gate themselves against us;
 			// major/unmodeled foes have the priority.
-			foeYields := foe.Row == RowMinor || foe.Row == RowStop
+			cls := e.foeSignalClass(foe)
+			if cls == foeHeld {
+				continue // its light is holding it: it cannot start
+			}
+			foeYields := foe.Row == RowMinor || foe.Row == RowStop || cls == foeYieldClass
 			if egoMinor {
 				if !foeYields {
 					return true // major/unmodeled foe has priority
@@ -455,3 +508,39 @@ func foeApproachBlocks(v *Vehicle, foe *Lane, egoMinor bool) bool {
 	}
 	return false
 }
+
+// foeSignalClass is what the foe lane's CURRENT signal state says about the
+// foe's priority, for a foe stopped at its own line (ADR-0033).
+//
+//	foeHeld       red: its own light forbids it entering. Yielding to a
+//	              vehicle that cannot move is how a permissive movement
+//	              stalls for the whole of every red the foe gets.
+//	foeYieldClass permissive green ('g'): it is required to yield too, so
+//	              this is a mutual yield and the ID tie-break decides.
+//	foePriority   protected green, amber, or no signal at all: the caller
+//	              falls back to foe.Row, which is the pre-ADR-0033 behaviour.
+//
+// Amber is deliberately priority, not held: an amber foe at its line may be
+// committed and entitled to clear the box.
+func (e *Engine) foeSignalClass(foe *Lane) foeClass {
+	if foe.Signal == nil {
+		return foePriority
+	}
+	switch e.sigState(foe) {
+	case SigRed:
+		return foeHeld
+	case SigGreen:
+		if e.sigPermissive(foe) {
+			return foeYieldClass
+		}
+	}
+	return foePriority
+}
+
+type foeClass int
+
+const (
+	foePriority foeClass = iota
+	foeYieldClass
+	foeHeld
+)

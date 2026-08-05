@@ -71,7 +71,7 @@ by the single AsyncAPI contract document.
 ### Subject taxonomy (ADR-0006)
 
 `ts.{run_id}.state.snap`, `ts.{run_id}.ctl.intent.{controller_id}`,
-`ts.{run_id}.log.intent|keyframe|crc`, `ts.{run_id}.metrics.>` — namespace
+`ts.{run_id}.log.intents|intent|keyframe|crc`, `ts.{run_id}.metrics.>` — namespace
 first, run id second (the aggregate boundary), plane third, entity identifiers
 last. Official guidance: ≤16 tokens, <256 chars, identifiers last, metadata in
 headers. Run-as-second-token makes every wildcard and permission rule one token

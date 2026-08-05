@@ -5,6 +5,19 @@ dist/
 .claude/settings.local.json
 data/
 analysis/ngsim/ngsim-xt
+# Go build artifacts, ~25 MB each. record-hero.sh and the pod harnesses build
+# them into the working tree on purpose (rather than dropping them somewhere
+# global), so they sit next to their sources and `git add -A engine` will
+# happily stage them if they are not named here.
+engine/serve
+engine/bake
+engine/replay
+engine/demosrv
 tools/
 viz/public/network.geojson
 __pycache__/
+.wrangler/
+# External-review archives: commit the reviews (brief, diffstat, model
+# outputs), not the reviewed-patch snapshots — multi-MB each, and
+# byte-reproducible from git (ADR-0013 addendum 2026-08-04).
+docs/kb/raw/reviews/*-reviewed.patch

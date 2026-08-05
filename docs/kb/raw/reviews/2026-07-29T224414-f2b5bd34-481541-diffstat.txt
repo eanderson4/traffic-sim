@@ -1,0 +1,15 @@
+ contracts/asyncapi.yaml                            |  88 +++++++-
+ docs/kb/INDEX.md                                   |   2 +
+ docs/kb/articles/architecture/nats-backbone.md     |   2 +-
+ .../kb/decisions/ADR-0006-nats-message-contract.md |  35 ++++
+ docs/kb/decisions/ADR-0026-batched-intents.md      |  10 +
+ docs/kb/decisions/ADR-0035-batched-intent-log.md   | 174 ++++++++++++++++
+ engine/cmd/serve/main.go                           |   6 +-
+ engine/natsio/logcursor.go                         |  32 ++-
+ engine/natsio/recorder.go                          | 185 ++++++++++++++--
+ engine/natsio/replay.go                            |  78 ++++++-
+ engine/natsio/server.go                            |  12 +-
+ engine/natsio/tslb.go                              | 134 ++++++++++++
+ engine/natsio/tslb_migration_test.go               | 232 +++++++++++++++++++++
+ engine/natsio/tslb_test.go                         | 215 +++++++++++++++++++
+ 14 files changed, 1163 insertions(+), 42 deletions(-)

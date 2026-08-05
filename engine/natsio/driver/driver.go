@@ -290,6 +290,35 @@ func (d *Driver) LastObsTick() uint64 { return d.lastObsTick.Load() }
 // semantics are meant.
 func (d *Driver) CompletedObsTick() uint64 { return d.completedObsTick.Load() }
 
+// SubDrops reports messages the server dropped for each of this replica's
+// subscriptions because the client could not keep up, keyed by subject.
+//
+// This is not decoration. Two of these subscriptions are load-bearing in a
+// way that fails SILENTLY when they drop:
+//
+//   - the OBSERVATION subject is the control input; a dropped frame means
+//     this replica's whole fleet goes a tick with no intent and coasts.
+//   - the SNAPSHOT subject is the claim backstop. The engine announces a
+//     newly spawned vehicle as unclaimed exactly ONCE (contract.go's
+//     `announced` map); core NATS is at-most-once, so the snapshot diff is
+//     the only thing that recovers a missed announcement. If snapshots
+//     drop, unclaimed vehicles are never re-offered and the fleet leaks
+//     vehicles that nothing will ever drive.
+//
+// Both subscriptions use the client default pending limits (65,536 msgs /
+// 64 MB) and onSnap does a synchronous claim Request inside the handler, so
+// a big network can back the dispatcher up. Reported so that "the driver
+// could not keep up" can be attributed instead of guessed at.
+func (d *Driver) SubDrops() map[string]int {
+	out := make(map[string]int, len(d.subs))
+	for _, sub := range d.subs {
+		if n, err := sub.Dropped(); err == nil && n > 0 {
+			out[sub.Subject] += n
+		}
+	}
+	return out
+}
+
 // SentIntents counts per-vehicle intents published (TSIB records plus
 // standalone v2) — the same unit in batch and batch-off mode, so the
 // counter is comparable across -intent-batch settings (observability).

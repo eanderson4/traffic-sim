@@ -135,6 +135,19 @@ per-applied-intent recording on `ts.{run}.log.intent`, replay, the bake
 pipeline — is **identical to today**. The record plane never sees a
 batch.
 
+> **Superseded for the intent log (2026-07-29, ADR-0035).** Scoping the
+> record plane out kept this change contained, and the consequence was that
+> the recorder EXPANDED each batch back into one message per intent — one
+> per vehicle per tick, re-paying exactly the framing this ADR had just
+> eliminated. Measured later: ~230 bytes per message for a 61-byte record,
+> and 48 GiB for a single 90-minute chi-loop-urban recording. ADR-0035
+> carries the batch across that boundary as TSLB v1 on
+> `ts.{run}.log.intents` (opt-in via `-log-batch`; default off since
+> 2026-08-04 under ADR-0035's reproducibility blocker, so unflagged the
+> per-intent expansion described above is again the shipped behavior).
+> Keyframes, replay and the bake pipeline are
+> still as described here.
+
 One deliberate, deterministic exception to wire-order parity (M4 review):
 on a tick where some of a controller's intents carry routes, the
 standalone route v2 publishes mid-loop while the route-free intents wait

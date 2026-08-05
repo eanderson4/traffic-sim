@@ -99,6 +99,32 @@ type ContractConfig struct {
 	// latency. Dead wall-clock time like the pause gate: sim time stays
 	// frozen, invisible to tick determinism.
 	StartGate <-chan struct{}
+
+	// InitialState warm-starts the run (ADR-0029 phase 1): non-nil, it is a
+	// state saved by engine.SaveState and the run BEGINS at that state's
+	// tick with that state, instead of a fresh engine at tick 0. Everything
+	// downstream is unchanged — the loop already works against an engine at
+	// a nonzero tick, because that is what replay does.
+	//
+	// InitialStateMeta is that state's sidecar and is REQUIRED with it: it
+	// carries the network fingerprint, and without it a state taken under a
+	// different lane array would load silently onto valid WRONG lanes
+	// (engine/warmstart.go explains why that is the dangerous case). RunLive
+	// refuses InitialState without it.
+	InitialState     []byte
+	InitialStateMeta *engine.StateMeta
+	// StateDumpPath, with StateDumpTick, writes the engine's full state (and
+	// its sidecar) when the loop reaches that tick. The run CONTINUES after
+	// the dump — a run that both records and drops a state file partway is
+	// strictly more useful than one that exits, and it costs nothing. The
+	// tick loop lives inside RunLive, so this is the only seam from which a
+	// caller can reach the engine at a chosen tick.
+	//
+	// A dump that FAILS aborts the run: the file was asked for, and a run
+	// that silently produces no state file is the failure this exists to
+	// avoid. Callers should check the path is writable before starting.
+	StateDumpPath string
+	StateDumpTick uint64
 }
 
 func (c ContractConfig) withDefaults() ContractConfig {
@@ -182,13 +208,25 @@ type ReleaseRequest struct {
 // ContractEvent is the JSON payload of every contract event feed message
 // (ts.{run}.ctl.events.*) and of record-plane events (ts.{run}.log.event).
 type ContractEvent struct {
-	Type         string   `json:"type"` // claim | release | unclaimed | pause | resume
+	Type         string   `json:"type"` // claim | release | unclaimed | pause | resume | signal_lapse
 	Tick         uint64   `json:"tick"`
 	ControllerID string   `json:"controller_id,omitempty"`
 	VehicleIDs   []uint64 `json:"vehicle_ids,omitempty"`
 	Reason       string   `json:"reason,omitempty"` // spawn | release | disconnect
 	Demand       int      `json:"demand,omitempty"`
 	Available    int      `json:"available,omitempty"`
+	// The signal_lapse fields (ADR-0037: a held phase reached its bound and
+	// the fixed-time program resumed), present only on that type. Phase is
+	// a pointer because phase 0 is a legitimate phase index — omitempty on
+	// a plain int would silently drop it. Since is the hold CHAIN's start
+	// (the first hold of an uninterrupted same-phase run — the starvation
+	// bound is cumulative across renewals), so the event spans the whole
+	// starved interval; Until is the chain's clamped end.
+	Signal    string `json:"signal,omitempty"`     // signal program id
+	Phase     *int   `json:"phase,omitempty"`      // the held phase that lapsed
+	Since     uint64 `json:"since,omitempty"`      // tick the hold chain began
+	Until     uint64 `json:"until,omitempty"`      // tick the fixed-time program resumed
+	RequestID string `json:"request_id,omitempty"` // the verb that commanded the lapsed hold
 }
 
 // Event types and reasons.
@@ -198,6 +236,13 @@ const (
 	EventUnclaimed = "unclaimed"
 	EventPause     = "pause"
 	EventResume    = "resume"
+	// EventSignalLapse is the ADR-0037 starvation rail firing: a commanded
+	// phase hold reached its bound and the signal returned to its
+	// fixed-time program. Record-plane only (ts.{run}.log.event) — it is
+	// derived from keyframed state at a fixed tick, so replay re-derives
+	// it; like pause/resume it is dead-time metadata the replayer does not
+	// re-apply.
+	EventSignalLapse = "signal_lapse"
 
 	ReasonSpawn      = "spawn"
 	ReasonRelease    = "release"
@@ -216,6 +261,14 @@ type controller struct {
 	claims   map[uint64]bool
 	lastSeen uint64 // tick of last wire activity (liveness)
 	seq      uint64
+
+	// obsErrRun is the CURRENT unbroken streak of failed observation
+	// publishes for this controller, reset by the first success. Run-loop
+	// only (AfterStep), so it needs no synchronization; the contract-wide
+	// maximum it feeds is atomic because readers are off-loop. NOTE the
+	// asymmetry: obsErrMaxRun is safe to read from anywhere, but anything
+	// that walks c.ctrls itself is run-loop-only.
+	obsErrRun uint64
 }
 
 // holdState is the per-vehicle hold-last bookkeeping: the last fresh intent
@@ -274,6 +327,8 @@ type Contract struct {
 	subs []*nats.Subscription
 
 	claimViolations atomic.Uint64 // intents dropped: claim required
+	obsErrs         atomic.Uint64 // observation frames that FAILED to publish (see publishObs)
+	obsErrMaxRun    atomic.Uint64 // longest CONSECUTIVE such run, any one controller
 	eventsPub       atomic.Uint64
 	obsOut          atomic.Uint64
 }
@@ -354,6 +409,61 @@ func (c *Contract) PaceFloor() time.Duration { return c.cfg.PaceFloor }
 func (c *Contract) Stats() (claimViolations, events, observations uint64) {
 	return c.claimViolations.Load(), c.eventsPub.Load(), c.obsOut.Load()
 }
+
+// ObsErrs is the count of observation frames that failed to publish — a
+// separate accessor rather than a fourth Stats return so the existing
+// signature does not churn. It is a fidelity counter, but on its own it does
+// NOT invalidate a run: see ObsWorstOutage for the figure that does.
+func (c *Contract) ObsErrs() uint64 { return c.obsErrs.Load() }
+
+// noteObsErr/noteObsOK maintain the per-controller consecutive-failure streak
+// and the contract-wide maximum of it. Split out of publishObs so the streak
+// rule is testable without a broker that can be made to refuse a publish:
+// getting "consecutive" wrong is the difference between a run being called
+// void and being called fine, and it is not visible in any other output.
+func (c *Contract) noteObsErr(ctl *controller) {
+	ctl.obsErrRun++
+	for {
+		cur := c.obsErrMaxRun.Load()
+		if ctl.obsErrRun <= cur || c.obsErrMaxRun.CompareAndSwap(cur, ctl.obsErrRun) {
+			return
+		}
+	}
+}
+
+func (c *Contract) noteObsOK(ctl *controller) { ctl.obsErrRun = 0 }
+
+// ObsWorstOutage is the longest run of CONSECUTIVE failed observation frames
+// suffered by any one controller. This — not the raw ObsErrs total — is the
+// number that decides whether a run is still fidelitous, because ADR-0008 §2
+// bridges message loss: a controller's vehicles keep their last intent for
+// (cadence−1) + HoldLastTicks ticks, so an outage inside that window is
+// healed and the vehicles stay controlled. Only a streak LONGER than the
+// bridge drops them to Acc = 0 with no car-following term. Counting every
+// isolated failure as blindness (as the first cut of this counter did) makes
+// a healthy run look void and would refuse perfectly good bakes.
+func (c *Contract) ObsWorstOutage() uint64 { return c.obsErrMaxRun.Load() }
+
+// ObsBridgeTicks is the outage length the hold-last window is GUARANTEED to
+// absorb, for any attached drive controller and any alignment. Reported next
+// to ObsWorstOutage so a reader can see the threshold the run was judged
+// against instead of rediscovering it from the ADR.
+//
+// It is HoldLastTicks, not (cadence−1) + HoldLastTicks, and the difference
+// is the difference between a safe bound and an optimistic one. Obs frames go
+// out every tick per drive controller, so a streak of r failures is r blind
+// ticks — but hold-last measures from the last FRESH intent, and a controller
+// at cadence k only emits one every k ticks. If the outage covers a
+// cadence-due tick, which is the case that matters, the gap between fresh
+// intents is k + r and the fleet falls out of the window as soon as
+// r > HoldLastTicks, whatever k is. The cadence term describes the lucky
+// alignment, not the one a gate must survive.
+//
+// This is deliberately conservative in the direction that costs a re-run
+// rather than the direction that ships a bad artifact: at cadence 1 (the only
+// cadence the default driver attaches at, driver.go) the two formulas agree,
+// and above it this one calls "void" slightly sooner than strictly necessary.
+func (c *Contract) ObsBridgeTicks() uint64 { return c.cfg.HoldLastTicks }
 
 // ProcessControl handles everything the wire brought in since the last
 // call — hellos, claims, releases, heartbeats — then runs the liveness
@@ -630,12 +740,13 @@ func (c *Contract) handleRelease(e *engine.Engine, r ctlReq) {
 }
 
 // handleVerb answers one director verb (ts.{run}.ctl.verb.{id},
-// request/reply). The director grant is required; v1 implements "spawn".
-// Dedup is by the director-assigned request_id: the first-seen reply is
-// remembered and replayed (Duplicate set) for any retry, so a retried verb
-// never double-spawns. Accepted verbs are validated and buffered by the
-// kernel (engine.EnqueueSpawn) and take effect at the next tick boundary;
-// the record plane logs them with that applied_tick.
+// request/reply). The director grant is required; v1 implements "spawn"
+// and "signal_set" (ADR-0037). Dedup is by the director-assigned
+// request_id: the first-seen reply is remembered and replayed (Duplicate
+// set) for any retry, so a retried verb never double-applies. Accepted
+// verbs are validated and buffered by the kernel (engine.EnqueueSpawn /
+// engine.EnqueueSignal) and take effect at the next tick boundary; the
+// record plane logs them with that applied_tick.
 func (c *Contract) handleVerb(e *engine.Engine, r ctlReq) {
 	var reply VerbReply
 	defer func() {
@@ -662,12 +773,22 @@ func (c *Contract) handleVerb(e *engine.Engine, r ctlReq) {
 		reply.Reason = "verb requires the director grant"
 		return
 	}
-	if req.Verb != "spawn" {
-		reply.Reason = fmt.Sprintf("unsupported verb %q (v1: spawn)", req.Verb)
+	if req.Verb != "spawn" && req.Verb != "signal_set" {
+		reply.Reason = fmt.Sprintf("unsupported verb %q (v1: spawn, signal_set)", req.Verb)
 		return
 	}
 	if req.RequestID == "" {
 		reply.Reason = "missing request_id"
+		return
+	}
+	// The idempotency key is length-prefixed with a u16 in the keyframe
+	// codec (director queue since TSKF v3, signal overrides since v7):
+	// an over-long id would corrupt the keyframe — reject it here, one
+	// shared check for every verb kind, measured in BYTES. The kernel
+	// enforces the same bound at enqueue (engine.MaxRequestIDBytes), so
+	// every caller is guarded; this is the wire-facing rejection.
+	if len(req.RequestID) > engine.MaxRequestIDBytes {
+		reply.Reason = fmt.Sprintf("request_id too long: %d bytes, want ≤ %d (keyframe codec limit)", len(req.RequestID), engine.MaxRequestIDBytes)
 		return
 	}
 	if prev, dup := c.verbs[req.RequestID]; dup {
@@ -675,14 +796,31 @@ func (c *Contract) handleVerb(e *engine.Engine, r ctlReq) {
 		reply.Duplicate = true
 		return
 	}
-	err := e.EnqueueSpawn(engine.SpawnDirective{
-		RequestID:    req.RequestID,
-		Origin:       req.Origin,
-		TypeName:     req.VType,
-		EarliestTick: req.EarliestTick,
-		Destination:  req.Destination,
-		OffsetM:      req.OffsetM,
-	})
+	var err error
+	switch req.Verb {
+	case "spawn":
+		err = e.EnqueueSpawn(engine.SpawnDirective{
+			RequestID:    req.RequestID,
+			Origin:       req.Origin,
+			TypeName:     req.VType,
+			EarliestTick: req.EarliestTick,
+			Destination:  req.Destination,
+			OffsetM:      req.OffsetM,
+		})
+	case "signal_set":
+		if req.Phase == nil {
+			// Presence, not value: an omitted phase must not silently
+			// command phase 0.
+			err = fmt.Errorf("missing phase: signal_set commands a phase index (phase 0 must be written explicitly)")
+		} else {
+			err = e.EnqueueSignal(engine.SignalDirective{
+				RequestID: req.RequestID,
+				Signal:    req.Signal,
+				Phase:     *req.Phase,
+				HoldTicks: req.HoldTicks,
+			})
+		}
+	}
 	if err != nil {
 		reply.Reason = err.Error()
 	} else {
@@ -960,9 +1098,37 @@ func (c *Contract) publishObs(e *engine.Engine, ctl *controller) {
 	msg.Data = EncodeObs(e.Tick, ctl.window.Features, egos, nbs)
 	msg.Header.Set(headerTick, fmt.Sprintf("%d", e.Tick))
 	msg.Header.Set(headerSchemaVersion, fmt.Sprintf("%d", SchemaVersion))
-	if err := c.nc.PublishMsg(msg); err == nil {
-		c.obsOut.Add(1)
+	// A failed observation frame is the loudest failure on this plane, not
+	// the quietest: the frame IS the controller's input, so a controller
+	// that does not receive it emits no intents at all. Discarding this
+	// error (as this call did until 2026-07-26) made a total loss of control
+	// look like congestion.
+	//
+	// But ONE lost frame is not a loss of control. ADR-0008 §2 holds the
+	// last intent for (cadence−1) + HoldLastTicks ticks precisely so that
+	// message loss heals; vehicles only fall to Acc = 0 with no
+	// car-following term once the outage outlives that bridge. So the
+	// invalidating quantity is the length of the CONSECUTIVE streak
+	// (obsErrRun → ObsWorstOutage), not the total — which is why the total
+	// alone must never fail a gate.
+	//
+	// The dominant cause is the 4 MiB broker cap (cmd/serve MaxPayload): the
+	// frame is ONE message carrying every claimed ego at 392 B + route each,
+	// so it stops being deliverable near 10,200 egos — measured cliff in
+	// intentload_test.go. Hence the ego count and byte size in the message:
+	// they are what tells a reader "this is the cap, split the fleet across
+	// -drivers replicas or chunk the frame", not "the network glitched".
+	if err := c.nc.PublishMsg(msg); err != nil {
+		c.noteObsErr(ctl)
+		if n := c.obsErrs.Add(1); n <= 3 {
+			log.Printf("run %s: OBSERVATION FRAME LOST for controller %s at tick %d (%d egos, %d bytes, consecutive %d, hold-last bridges %d): %v — that controller drives NOTHING this tick; past the bridge its vehicles coast uncontrolled",
+				c.run, ctl.id, e.Tick, len(egos), len(msg.Data),
+				ctl.obsErrRun, c.ObsBridgeTicks(), err)
+		}
+		return
 	}
+	c.noteObsOK(ctl)
+	c.obsOut.Add(1)
 }
 
 // neighborList builds the sorted/capped raw neighbor list: vehicles not

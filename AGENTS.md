@@ -51,12 +51,29 @@ Rules for anyone (human or agent) working in this repo.
   review always covers what ships. The gate proves review *happened* —
   triaging findings is the committer's job. Docs/KB-only commits pass
   ungated. Escape hatch: `EXTERNAL_REVIEW_SKIP=1` (noisy on purpose).
+  When Fable is unavailable (quota, outage), `--kimi` substitutes Kimi K3
+  in its slot — still two model families, and the archive names whoever
+  actually reviewed (ADR-0013 addendum 2026-07-27).
+  Archive policy: commit the reviews themselves (brief, diffstat, model
+  outputs); the `*-reviewed.patch` snapshot is written locally but
+  gitignored — it is byte-reproducible from git and was nearly all of the
+  archive's weight (ADR-0013 addendum 2026-08-04).
 - **Triage bar: blockers only, one round.** Fix blockers before
   committing; record should-fixes in the commit message or KB and defer
   them; ignore nits. Reviewers will always find one more edge case — at
   this stage "too early to need this" is a valid triage outcome, and
   hardening against hypotheticals is a reject-by-default. One review
   round per commit, not a fix-and-re-review loop for polish.
+  Addendum (2026-08-04, after ADR-0037 M1 took 9 rounds): a *blocker* is
+  a defect reachable in normal operation — wrong simulation behavior,
+  determinism/replay breakage, record-plane corruption, or a contract
+  promise a well-behaved client can trip. Findings that require corrupt
+  or hand-crafted payloads, configs we don't run, direct kernel callers
+  bypassing the wire, or deliberate contract misuse are defer-by-default
+  even when a reviewer labels them "blocker" — record them and move on.
+  Every fix, however small, invalidates the stamp and buys a full
+  re-review round plus its fresh tranche of findings; that loop does not
+  converge on its own, so the committer has to end it.
 - `/external-review <scope>` — the deeper milestone round (all three
   models incl. Gemini, richer brief, ADR-level design questions). Run it
   after every ADR-implementing milestone, before anything durable binds

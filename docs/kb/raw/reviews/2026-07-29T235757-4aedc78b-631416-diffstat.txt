@@ -1,0 +1,4 @@
+ scripts/chicago/mknetvariant.py      |  36 ++++++++--
+ scripts/chicago/test_mknetvariant.py | 123 +++++++++++++++++++++++++++++++++++
+ scripts/whatif.py                    |  11 +++-
+ 3 files changed, 163 insertions(+), 7 deletions(-)

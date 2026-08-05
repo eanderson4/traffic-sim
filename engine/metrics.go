@@ -144,7 +144,13 @@ type TripRecord struct {
 	TimeLossS     float64
 	Stops         int     // stop-episode starts (§3)
 	StoppedTimeS  float64 // total stopped time (§3)
-	Completed     bool    // false = horizon partial
+	Completed     bool    // false = horizon partial OR stranded
+	// Stranded marks a trip the gridlock escape ended (ADR-0034): the
+	// vehicle was removed from a jam it could not leave, at ExitTick,
+	// wherever DestLaneID says it stood. Always Completed = false. Distinct
+	// from a horizon partial, whose ExitTick is the horizon and which was
+	// still in the network when the run ended.
+	Stranded bool
 }
 
 // LaneDenied is the denied-entry (latent) demand of one origin lane
@@ -172,7 +178,11 @@ type LaneDenied struct {
 // (genuinely disjoint — the defensive fallback books them, but the
 // undercount risk is surfaced here, never silent).
 type Totals struct {
-	CompletedTrips  int
+	CompletedTrips int
+	// StrandedTrips counts vehicles the gridlock escape removed (ADR-0034).
+	// Disjoint from CompletedTrips and from ActiveAtHorizon. Nonzero means
+	// the network gridlocked; StrandedBySection on engine Stats says where.
+	StrandedTrips   int
 	ActiveAtHorizon int
 	VMT             float64 // Σ distance over all observed vehicle-ticks (m)
 	VHT             float64 // Σ time over all observed vehicle-ticks (s)
@@ -214,11 +224,14 @@ type Kernel struct {
 	// accounting.
 	vmt, vht, timeLoss float64
 	completedTrips     int
-	activeAtHorizon    int
-	finalized          bool
-	observed           bool   // an Observe has landed (pairing guard)
-	lastTick           uint64 // last observed tick (pairing guard)
-	maxFirstSeenID     uint64 // highest first-observed vehicle ID (invisible-gap detection)
+	// strandedTrips counts vehicles the gridlock escape removed (ADR-0034).
+	// Disjoint from completedTrips: a strand is not a completion.
+	strandedTrips   int
+	activeAtHorizon int
+	finalized       bool
+	observed        bool   // an Observe has landed (pairing guard)
+	lastTick        uint64 // last observed tick (pairing guard)
+	maxFirstSeenID  uint64 // highest first-observed vehicle ID (invisible-gap detection)
 	// pendingGaps holds vehicle IDs skipped by the first-observation
 	// sequence but not yet accounted: an ID leaving the set on its first
 	// observation was just a late-spawning pending entry (jittered
@@ -269,6 +282,7 @@ type tripState struct {
 	timeLoss  float64
 	stops     int
 	stoppedS  float64
+	stranded  bool // removed by the gridlock escape, not driven out (ADR-0034)
 }
 
 // laneAccum is the open-interval accumulator for one (set, lane).
@@ -583,8 +597,32 @@ func (k *Kernel) Observe(e *Engine) {
 		}
 	}
 	sort.Slice(gone, func(i, j int) bool { return gone[i] < gone[j] })
+	// Vehicles the gridlock escape removed this tick (ADR-0034). They did
+	// not drive out of the network, so there is no exit chain to account and
+	// no completion to book: the trip closes where the vehicle stood, flagged
+	// Stranded, and counts in neither CompletedTrips nor the exit distance.
+	// Booking a strand as a despawn would credit it the whole exit-lane
+	// length it never drove and hide a gridlock inside the completion rate.
+	var stranded map[uint64]bool
+	if len(e.StrandedIDs) > 0 {
+		stranded = make(map[uint64]bool, len(e.StrandedIDs))
+		for _, id := range e.StrandedIDs {
+			stranded[id] = true
+		}
+	}
 	for _, id := range gone {
 		prev := k.last[id]
+		if stranded[id] {
+			k.strandedTrips++
+			if k.trips {
+				if ts := k.tstates[id]; ts != nil {
+					ts.stranded = true
+					k.emitTrip(id, ts, tick, false)
+					delete(k.tstates, id)
+				}
+			}
+			continue
+		}
 		// Exit-tick travel (exit lanes despawn past Length): the vehicle
 		// drove from its last-seen position to the network edge this tick.
 		// When the last-seen lane is not an exit lane, the vehicle crossed
@@ -898,6 +936,7 @@ func (k *Kernel) DrainTrips() []TripRecord {
 func (k *Kernel) Totals() Totals {
 	t := Totals{
 		CompletedTrips:   k.completedTrips,
+		StrandedTrips:    k.strandedTrips,
 		ActiveAtHorizon:  k.activeAtHorizon,
 		VMT:              k.vmt,
 		VHT:              k.vht,
@@ -905,7 +944,12 @@ func (k *Kernel) Totals() Totals {
 		DroppedCrossings: k.droppedCrossings + len(k.pendingGaps),
 		DeniedByLane:     map[string]LaneDenied{},
 	}
-	if n := k.completedTrips + len(k.last); n > 0 {
+	// Stranded trips belong in the denominator: their time loss is already in
+	// k.timeLoss, but the strand takes them out of k.last without adding them
+	// to completedTrips, so leaving them out counts their loss against
+	// everybody else's trips (ADR-0034). On the 90-minute Chicago baseline
+	// that was 1,055 of 10,519 trips — an 11% inflation of the reported mean.
+	if n := k.completedTrips + k.strandedTrips + len(k.last); n > 0 {
 		t.MeanTimeLossS = k.timeLoss / float64(n)
 	}
 	ids := make([]string, 0, len(k.deniedWait)+len(k.deniedPending)+len(k.deniedServed))
@@ -1337,6 +1381,7 @@ func (k *Kernel) emitTrip(id uint64, ts *tripState, exitTick uint64, completed b
 		Stops:         ts.stops,
 		StoppedTimeS:  ts.stoppedS,
 		Completed:     completed,
+		Stranded:      ts.stranded,
 	})
 }
 

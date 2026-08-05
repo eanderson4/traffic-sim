@@ -26,6 +26,9 @@ func destSpec(t *testing.T, ticks uint64) RunSpec {
 	spec.Scen.Types = []*VehicleType{&Car, &Truck}
 	spec.Scen.SpawnRatePerLaneHour = 0 // director-only demand
 	spec.Scen.UncontrolledPolicy = PolicyIDM
+	// These are ADR-0021 director-queue tests on the static-routing
+	// baseline; the engine default is adaptive-on (ADR-0036 addendum).
+	spec.Params.AdaptiveRouting = false
 	return spec
 }
 
@@ -291,8 +294,8 @@ func TestKeyframeDirectiveRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := keyframeVersionOf(blob); got != keyframeVersion {
-		t.Errorf("keyframe version %d, want %d for a queue using ADR-0021 fields", got, keyframeVersion)
+	if got := keyframeVersionOf(blob); got != keyframeDestVersion {
+		t.Errorf("keyframe version %d, want %d for a queue using ADR-0021 fields", got, keyframeDestVersion)
 	}
 	back, err := RestoreState(destSpec(t, 10), blob)
 	if err != nil {

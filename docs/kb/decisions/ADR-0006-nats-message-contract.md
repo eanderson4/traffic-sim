@@ -376,3 +376,101 @@ the wire already carried.
   rejected while pace is an unrecorded, client-invisible run condition
   (recording pace in run meta is already queued in the KB work-queue; a
   wall-clock budget can be reconsidered then).
+
+## Addendum (2026-07-29, ADR-0035: the intent log is batched per tick)
+
+§4's record plane gains one subject and one payload format; §5's seek
+semantics are unchanged. See
+[ADR-0035](ADR-0035-batched-intent-log.md) for the decision, the measurements
+and the migration note. What changes here:
+
+- **`ts.{run}.log.intents`** (plural) carries one tick's applied intents in a
+  single TSLB v1 message; a tick with no applied intents emits no batch. It
+  is opt-in (`serve -log-batch`, default off under ADR-0035's reproducibility
+  blocker since 2026-08-04). `ts.{run}.log.intent` is the
+  per-intent default form; it stays readable either way, so every recording
+  made before this addendum replays unchanged. A recording carries one form
+  or the other, never a mix.
+- The records inside a batch are the **same LoggedIntentFrame payloads,
+  byte-identical and in the same order**. Everything §4 says about sole
+  writership, dedup, `Nats-Expected-Last-Sequence`, and stream order being
+  application order (ADR-0008 §4) holds unchanged — one message per
+  non-empty tick instead of thousands does not alter the order of records
+  within it.
+- **Seek is unaffected.** §5's anchor is a keyframe ≤ target, and batches are
+  strictly per-tick, so tick granularity is preserved. A tick too wide for
+  the byte budget splits across consecutive messages naming that same tick,
+  with no chunk index: unlike a chunked keyframe (ADR-0015), which reassembles
+  one blob, concatenating consecutive batches' records in stream order is
+  already the original order.
+- The stream is created with **S2 storage compression when
+  `-store-compress` is set** (default off under ADR-0035's blocker since
+  2026-08-04). That is a storage setting, not a contract change — payloads
+  and readers are untouched.
+
+Why: §4 as originally written implied nothing about message granularity, and
+one-message-per-applied-intent was the natural reading. At city scale that is
+one message per vehicle per tick at 10 Hz — measured ~230 bytes of framing and
+subject per 61-byte record, and 48 GiB for one 90-minute chi-loop-urban run.
+ADR-0026 had already solved the same problem one plane up and explicitly
+scoped this one out.
+
+## Addendum (2026-07-30, Route resolution cost model: free-flow time, not lane length)
+
+Contract-semantics clarification in the 2026-07-24 line: no wire change —
+`route` remains "destination lane id; persistent"; subjects, layouts and
+versions untouched. What changes is how the kernel resolves it.
+
+- **Next-hop tables are now weighted by FREE-FLOW TIME** (lane length over
+  speed limit) instead of raw lane length (`engine/routing.go`,
+  `freeFlowTime`). Measured on chi-loop-urban (2026-07): length weights
+  route traffic through short alleys in preference to faster arterials —
+  the network's shortest-distance paths concentrate flow on exactly the
+  links that saturate first, one contributor to the observed oversaturation
+  spiral (inflow ~2× discharge capacity; 41% of trips incomplete).
+- **Determinism behavior note:** resolution stays a pure function of
+  (network, vehicle state) — same Dijkstra, same tie-breaks, no new state —
+  but any run whose vehicles carry Route intents may change trajectory and
+  CRC versus the length-weighted kernel. Runs without Route intents are
+  bit-identical.
+- **Durable-binding check (2026-07-30):** routed recordings now exist
+  (`data/recordings/chi-loop-od-peak`, `chi-half-*`), so the 2026-07-24
+  "every recording predates Route intents" escape no longer applies. Both
+  replay paths re-execute `Step()` and verify logged CRCs
+  (`engine/replay.go`, `engine/natsio/player.go`) — routing IS re-derived
+  during replay, so **routed recordings made under length weights are
+  incompatible with strict replay under this kernel**: they diverge after
+  the first affected routing decision (`Replay` aborts; `Player` logs and
+  continues per its loud-and-continue policy). Those recordings are
+  gitignored, regenerable artifacts and are superseded as of this change;
+  BAKED viz artifacts (`data/baked/`) are plain data and play unaffected.
+  The what-if comparison tables built under length weights
+  (`data/runs/whatif-chi-*`) were paired-bracket designs measured against
+  a same-build baseline, so their rankings stand; absolute speeds from
+  before this change are not comparable to runs after it.
+- Versioning note: same formal supersession as 2026-07-24 — contract
+  versions version the wire, not the world model; engine behavior fixes
+  change trajectories without versioning the contract.
+
+## Addendum (2026-07-31, ADR-0037 milestone 1: the `signal_set` verb)
+
+Additive, same formal shape as the M10 verb addendum: the director verb
+channel `ts.{run}.ctl.verb.{controller_id}` gains a second verb kind,
+`signal_set` (payload: signal program id, commanded phase index, optional
+hold_ticks — default one program cycle, clamped to the engine's starvation
+bound of 300 sim-seconds, compiled onto the run's tick grid — 3000 ticks
+at the validated 100 ms tick). Same subject, same request/reply with request-id
+idempotency, same record-plane logging on `ts.{run}.log.verb` — the logged
+payload grows an omitted-when-spawn `verb` discriminator plus the signal
+fields, so every pre-ADR-0037 recording decodes unchanged (all-spawn), and
+replay re-enqueues both kinds at their recorded applied ticks. A held
+phase past its bound LAPSES back to the fixed-time program — a
+`signal_lapse` event on `ts.{run}.log.event` (the pause/resume idiom:
+derived dead-time metadata the replayer ignores and re-derives), never
+silent. Keyframes grow TSKF v7 (written only while an
+override is held; v7 gives the TSKF header flags word its first bit,
+marking the v6 adaptive-routing state — per-vehicle dwell clock AND lane
+section — as present, which the version number alone
+expressed through v6). Contract versions version the wire: schema_version
+stays 2, asyncapi goes to 2.7.0. Details and verification:
+[ADR-0037](ADR-0037-runtime-signal-control.md).

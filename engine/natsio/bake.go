@@ -2,6 +2,7 @@ package natsio
 
 import (
 	"fmt"
+	"log"
 
 	"github.com/nats-io/nats.go"
 	"traffic-sim/engine"
@@ -67,6 +68,9 @@ func NewBakeSource(js nats.JetStreamContext, run string) (*BakeSource, error) {
 	e, err := engine.RestoreState(spec, kf.payload)
 	if err != nil {
 		return nil, fmt.Errorf("run %q: restore tick-0 keyframe: %w", run, err)
+	}
+	if e.RestoreNotice != "" {
+		log.Print(e.RestoreNotice)
 	}
 	// A dirty store (a run id recorded twice into the same stream) can
 	// yield two keyframes at the same tick — refuse the corrupt record
@@ -180,6 +184,12 @@ func (b *BakeSource) Run(sink BakeSink) error {
 		for _, d := range rec.verbs {
 			if err := e.EnqueueSpawn(d); err != nil {
 				return fmt.Errorf("bake of run %q aborted: verb %q at tick %d rejected (%v) — record and spec disagree",
+					b.run, d.RequestID, next, err)
+			}
+		}
+		for _, d := range rec.sverbs {
+			if err := e.EnqueueSignal(d); err != nil {
+				return fmt.Errorf("bake of run %q aborted: signal verb %q at tick %d rejected (%v) — record and spec disagree",
 					b.run, d.RequestID, next, err)
 			}
 		}

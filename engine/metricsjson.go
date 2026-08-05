@@ -54,6 +54,10 @@ type tripJSON struct {
 	Stops         int     `json:"stops"`
 	StoppedTimeS  float64 `json:"stopped_time_s"`
 	Completed     bool    `json:"completed"`
+	// Stranded: the gridlock escape ended this trip (ADR-0034). Always with
+	// completed=false; omitted on every ordinary trip so existing readers
+	// see the document they already knew.
+	Stranded bool `json:"stranded,omitempty"`
 }
 
 type laneDeniedJSON struct {
@@ -78,6 +82,7 @@ type demandJSON struct {
 
 type totalsJSON struct {
 	CompletedTrips   int              `json:"completed_trips"`
+	StrandedTrips    int              `json:"stranded_trips"`
 	ActiveAtHorizon  int              `json:"active_at_horizon"`
 	VMT              float64          `json:"vmt"`
 	VHT              float64          `json:"vht"`
@@ -149,6 +154,7 @@ func WriteMetricsJSON(w io.Writer, k *Kernel, ticks uint64, dd ...DemandDelivery
 			Stops:         r.Stops,
 			StoppedTimeS:  r.StoppedTimeS,
 			Completed:     r.Completed,
+			Stranded:      r.Stranded,
 		})
 	}
 	lanes := make([]string, 0, len(tot.DeniedByLane))
@@ -158,6 +164,7 @@ func WriteMetricsJSON(w io.Writer, k *Kernel, ticks uint64, dd ...DemandDelivery
 	sort.Strings(lanes)
 	doc.Totals = totalsJSON{
 		CompletedTrips:   tot.CompletedTrips,
+		StrandedTrips:    tot.StrandedTrips,
 		ActiveAtHorizon:  tot.ActiveAtHorizon,
 		VMT:              tot.VMT,
 		VHT:              tot.VHT,

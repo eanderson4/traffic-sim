@@ -651,3 +651,69 @@ func TestObsFrameRoundTrip(t *testing.T) {
 		t.Fatal("truncated obs accepted")
 	}
 }
+
+// TestObsOutageStreak pins the distinction the fidelity gates are built on:
+// the TOTAL number of lost observation frames does not invalidate a run, the
+// longest CONSECUTIVE run of them does. ADR-0008 §2 holds the last intent
+// across (cadence−1) + HoldLastTicks ticks, so isolated losses are healed and
+// the fleet stays controlled; only a streak that outlives that bridge leaves
+// vehicles coasting at Acc = 0. The first cut of this counter equated the two
+// and would have refused perfectly good bakes on a single dropped frame.
+func TestObsOutageStreak(t *testing.T) {
+	c := &Contract{}
+	c.cfg.HoldLastTicks = 2
+	a := &controller{id: "a", cadence: 1, grants: map[string]bool{"drive": true}}
+	b := &controller{id: "b", cadence: 1, grants: map[string]bool{"drive": true}}
+	c.ctrls = map[string]*controller{"a": a, "b": b}
+
+	if got, want := c.ObsBridgeTicks(), uint64(2); got != want {
+		t.Fatalf("bridge at cadence 1 = %d, want %d", got, want)
+	}
+
+	// Six losses, never two in a row: heavily lossy, still never blind.
+	for i := 0; i < 6; i++ {
+		c.noteObsErr(a)
+		c.noteObsOK(a)
+	}
+	if got := c.ObsWorstOutage(); got != 1 {
+		t.Fatalf("worst outage after 6 isolated losses = %d, want 1 — isolated losses must not accumulate into a false outage", got)
+	}
+
+	// Three in a row on the OTHER controller: past the 2-tick bridge, and it
+	// must be seen even though controller a is healthy. The maximum is over
+	// controllers, not a single global counter — one blind controller among
+	// several still means part of the fleet drove itself.
+	c.noteObsErr(b)
+	c.noteObsErr(b)
+	c.noteObsErr(b)
+	if got := c.ObsWorstOutage(); got != 3 {
+		t.Fatalf("worst outage = %d, want 3", got)
+	}
+	if c.ObsWorstOutage() <= c.ObsBridgeTicks() {
+		t.Fatalf("a 3-tick outage must exceed the 2-tick bridge")
+	}
+
+	// Recovery does not lower the high-water mark: the run still contained a
+	// blind window, and a gate reading this after the fact must still see it.
+	c.noteObsOK(b)
+	if got := c.ObsWorstOutage(); got != 3 {
+		t.Fatalf("worst outage after recovery = %d, want it to stay at 3", got)
+	}
+
+	// The bridge does NOT widen with cadence. Hold-last measures from the
+	// last fresh intent, so a controller at cadence k that loses r frames
+	// spanning its due tick has a k+r gap between fresh intents and falls
+	// out of the window as soon as r > HoldLastTicks — independent of k.
+	// (cadence−1)+HoldLastTicks is the lucky-alignment figure; a gate has to
+	// hold for the unlucky one. Pinned because an earlier cut of this
+	// accessor returned the optimistic value and would have called a real
+	// outage "absorbed" on any controller slower than cadence 1.
+	b.cadence = 5
+	if got, want := c.ObsBridgeTicks(), uint64(2); got != want {
+		t.Fatalf("bridge with a cadence-5 controller = %d, want %d — cadence must not widen it", got, want)
+	}
+	a.cadence = 5
+	if got, want := c.ObsBridgeTicks(), uint64(2); got != want {
+		t.Fatalf("bridge with all controllers at cadence 5 = %d, want %d — cadence must not widen it", got, want)
+	}
+}
