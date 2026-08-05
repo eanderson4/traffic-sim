@@ -31,14 +31,29 @@ import (
 //	v5 only (written solely while some vehicle has a running stuck timer or
 //	a discharged stop duty), appended to each vehicle record:
 //	  stuckTicks u64 | stopDone u8
-//	v6 only (written solely while Params.AdaptiveRouting is on), appended to
-//	each vehicle record after the v5 fields:
+//	v6 only (written solely while Params.AdaptiveRouting is on — from v7
+//	  this and the lane section ride the flags word instead, so a flag-off
+//	  v7 omits them), appended to each vehicle record after the v5 fields:
 //	  laneEntryTick u64
 //	v6 only, a lane section between the spawner and director sections:
 //	  nLanes u32 | per lane (network order): ttEMA f64 | ttSnap f64
 //	v3 only (written solely while the director queue is non-empty):
 //	  nDirectives u32 | per directive: tick u64 | laneIdx u32 | typeIdx u32 |
 //	  earliestTick u64 | reqIDLen u16 | reqID bytes
+//	v7 only (written solely while a commanded signal override is held or
+//	within its clearance retention, ADR-0037), after the director section:
+//	  nOverrides u32 | per override (network Signals order, each program's
+//	  history chronological — a program id may repeat when a superseded
+//	  hold is still in retention):
+//	    signalIdx u32 | phase u32 | since u64 | until u64 (exclusive) |
+//	    chainStart u64 (hold-chain first-since, the starvation bound's
+//	    anchor) | reqIDLen u16 | reqID bytes
+//	v7 also gives the header flags word its first bit: flagAdaptiveSection
+//	marks the adaptive-routing state (per-vehicle laneEntryTick AND the
+//	lane section) as present. v6 implies it (v6 was only ever written
+//	flag-on); at v7 the two states are independent — a flag-off run
+//	can hold an override — so presence can no longer ride the version
+//	number.
 //
 // Payloads run ≥92 B/vehicle measured (engine/BENCHMARKS.md); past the
 // broker's 1 MiB max_payload (~10.9k vehicles) the record plane chunks the
@@ -105,7 +120,36 @@ const (
 	// must survive a restore exactly. ttEMA is float64, no quantization.
 	// The next-hop tables and epoch stamps are NOT here: they are derived
 	// state, recomputed identically from tick and keyframed state.
-	keyframeVersion = 6
+	//
+	// v7 (ADR-0037, written ONLY while the commanded-signal-override table
+	// is non-empty — a held phase is state that decides what vehicles do,
+	// and a seek that loses it diverges; an empty table marshals
+	// byte-identical to v6-or-below as applicable) appends after the
+	// director section:
+	//
+	//	nOverrides u32 | per override (network Signals order, each
+	//	  program's history chronological — a program id may repeat while
+	//	  a superseded hold is still in clearance retention):
+	//	  signalIdx u32 | phase u32 | since u64 | until u64 |
+	//	  chainStart u64 | reqIDLen u16 | reqID bytes
+	//
+	// until is the exclusive end of the hold; the fixed-time program's
+	// resume point is derived from the tick (phaseAt), so no further state
+	// rides along. v7 also defines the header flags word's first bit
+	// (keyframeFlagAdaptive): whether the ADR-0036 adaptive-routing state —
+	// the per-vehicle laneEntryTick AND the lane section — is present. At
+	// v6 presence was implied by the version itself (v6 was written only by
+	// flag-on engines); at v7 a flag-OFF run can carry overrides, so the
+	// version number alone no longer says whether that state follows, and
+	// a flag-off run has no ttEMA for the dwell clocks to refer to — they
+	// are simply not keyframed, and a restore into a flag-ON spec seeds
+	// them at the restore tick exactly like a pre-v6 payload. Versions ≤ 6
+	// always wrote flags = 0, and readers treat a v≤6 payload exactly as
+	// before.
+	keyframeVersion = 7
+	// keyframeSignalVersion is the version the ADR-0037 commanded signal
+	// override table needs.
+	keyframeSignalVersion = 7
 	// keyframeAdaptiveVersion is the version the ADR-0036 adaptive-routing
 	// state (laneEntryTick, ttEMA) needs.
 	keyframeAdaptiveVersion = 6
@@ -120,6 +164,11 @@ const (
 	// keyframeMinVersion is the oldest readable version (v2 recordings
 	// predate the director path; their queue is empty by definition).
 	keyframeMinVersion = 2
+	// keyframeFlagAdaptive (header flags bit 0, defined at v7): the v6
+	// adaptive-routing state (per-vehicle laneEntryTick and the per-lane
+	// travel-time section) is present. Always 0 in versions ≤ 6,
+	// where presence is implied by the version (v6 ⇔ present).
+	keyframeFlagAdaptive = 1
 )
 
 // MarshalState serializes the engine's complete dynamic state at the
@@ -153,8 +202,31 @@ func (e *Engine) MarshalState() ([]byte, error) {
 	if e.Params.AdaptiveRouting {
 		version = keyframeAdaptiveVersion
 	}
+	// Commanded signal overrides (ADR-0037) need v7 while any is held (or
+	// within its clearance retention): the held phase decides what vehicles
+	// do. An empty table never reaches this and keeps the v6-and-below
+	// bytes exactly.
+	if len(e.sigOv) > 0 {
+		version = keyframeSignalVersion
+	}
+	// The flags word is 0 through v6; from v7 it carries whether the v6
+	// lane section follows (keyframeFlagAdaptive), because at v7 the
+	// version number alone no longer implies it (a flag-off run can hold an
+	// override). Writer and reader share the one condition. The
+	// adaptive-routing state — the per-vehicle dwell clock AND the lane
+	// section — rides that single condition too: a flag-off run has no
+	// ttEMA, so its dwell clocks are not state worth keyframing, and a
+	// restore whose payload lacks them seeds every clock at the restore
+	// tick (the ADR-0036 migration's "no evidence yet"), v7-flag-off
+	// included. Through v6 the condition reduces to the version check the
+	// format always used (v6 ⇔ flag on), so those bytes are unchanged.
+	adaptiveState := version >= keyframeAdaptiveVersion && e.Params.AdaptiveRouting
+	var flags uint16
+	if version >= keyframeSignalVersion && e.Params.AdaptiveRouting {
+		flags = keyframeFlagAdaptive
+	}
 	w.u16(version)
-	w.u16(0)
+	w.u16(flags)
 	w.u64(e.Tick)
 	w.u64(e.crc)
 	w.u64(e.nextID)
@@ -204,7 +276,7 @@ func (e *Engine) MarshalState() ([]byte, error) {
 				w.u8(0)
 			}
 		}
-		if version >= keyframeAdaptiveVersion {
+		if adaptiveState {
 			w.u64(v.laneEntryTick) // ADR-0036 dwell clock
 		}
 	}
@@ -227,11 +299,14 @@ func (e *Engine) MarshalState() ([]byte, error) {
 	// TSKF v6 (ADR-0036): the per-lane travel-time EMAs and their
 	// epoch-frozen routing snapshots, in network order. Placed between the
 	// spawner and director sections — the reader is gated on the same
-	// version condition, so the two never disagree. ttSnap is keyframed
+	// condition, so the two never disagree. ttSnap is keyframed
 	// for the same reason ttEMA is: it decides what vehicles do, and a
 	// table rebuilt after a restore must be the table the live engine was
-	// serving.
-	if version >= keyframeAdaptiveVersion {
+	// serving. The condition is version-AND-flag rather than version alone
+	// because at v7 (ADR-0037) a flag-off run reaches v6+ without carrying
+	// this state; for v6 itself the flag is always on, so the v6 bytes are
+	// unchanged.
+	if adaptiveState {
 		w.u32(uint32(len(e.Net.Lanes)))
 		for _, l := range e.Net.Lanes {
 			w.f64(l.ttEMA)
@@ -265,6 +340,34 @@ func (e *Engine) MarshalState() ([]byte, error) {
 			}
 		}
 	}
+	// TSKF v7 (ADR-0037): the commanded signal override table — every
+	// program's HISTORY, including ended holds still in clearance retention
+	// (they still answer sigInClearance's lookback) — in network Signals
+	// order, each program's entries chronological (the table itself is
+	// lookup-only, ADR-0005). Gated on
+	// the VERSION, same writer/reader shared-condition rule as the director
+	// section above; version ≥ 7 implies a non-empty table, so the count is
+	// never 0 in practice but is written explicitly regardless. An override
+	// is state that decides what vehicles do: a seek that lost it would
+	// resume the fixed-time program mid-hold and diverge.
+	if version >= keyframeSignalVersion {
+		n := 0
+		for _, p := range e.Net.Signals {
+			n += len(e.sigOv[p.ID])
+		}
+		w.u32(uint32(n))
+		for i, p := range e.Net.Signals {
+			for _, ov := range e.sigOv[p.ID] {
+				w.u32(uint32(i))
+				w.u32(uint32(ov.phase))
+				w.u64(ov.since)
+				w.u64(ov.until)
+				w.u64(ov.chainStart)
+				w.u16(uint16(len(ov.requestID)))
+				w.bytes([]byte(ov.requestID))
+			}
+		}
+	}
 	return w.buf, nil
 }
 
@@ -290,7 +393,14 @@ func restoreState(spec RunSpec, data []byte, checkNet func(*Network) error) (*En
 	if ver < keyframeMinVersion || ver > keyframeVersion {
 		return nil, fmt.Errorf("keyframe: unsupported version %d", ver)
 	}
-	r.u16() // flags
+	flags := r.u16()
+	// The v6 lane section's presence rode the version number through v6
+	// (v6 was written only by flag-on engines); from v7 it rides the flags
+	// word, because a flag-off run can carry ADR-0037 overrides at v7. The
+	// two formulations coincide at every version ≤ 6, where flags is
+	// always 0.
+	hasLaneSection := ver == keyframeAdaptiveVersion ||
+		(ver >= keyframeSignalVersion && flags&keyframeFlagAdaptive != 0)
 	tick := r.u64()
 	crc := r.u64()
 	nextID := r.u64()
@@ -306,19 +416,20 @@ func restoreState(spec RunSpec, data []byte, checkNet func(*Network) error) (*En
 	if err != nil {
 		return nil, err
 	}
-	// A v6 payload is written only by a flag-ON engine (ADR-0036); reading
-	// one into a flag-OFF spec would silently drop the travel-time state
-	// the run's routing depends on. Refuse the mismatch loudly instead.
-	if ver >= keyframeAdaptiveVersion && !e.Params.AdaptiveRouting {
+	// A payload carrying the ADR-0036 lane section is written only by a
+	// flag-ON engine; reading one into a flag-OFF spec would silently drop
+	// the travel-time state the run's routing depends on. Refuse the
+	// mismatch loudly instead.
+	if hasLaneSection && !e.Params.AdaptiveRouting {
 		return nil, fmt.Errorf("keyframe: v%d payload carries adaptive-routing state but the spec has AdaptiveRouting off", ver)
 	}
 	// The reverse direction is the designed migration path (ADR-0036: a
-	// pre-v6 payload into a flag-ON spec seeds every dwell clock at the
-	// restore tick), but since the default flipped ON it also fires on a
-	// plain -state-in of an old static keyframe — record it for the edge
-	// caller to surface (the sim core cannot log, ADR-0005).
-	if ver < keyframeAdaptiveVersion && e.Params.AdaptiveRouting {
-		e.RestoreNotice = fmt.Sprintf("keyframe: pre-v%d (static-routing) payload restored into an adaptive-routing spec — routing switches regime at this restore; pin adaptive_routing: false to continue bit-exactly", keyframeAdaptiveVersion)
+	// payload without the lane section into a flag-ON spec seeds every
+	// dwell clock at the restore tick), but since the default flipped ON it
+	// also fires on a plain -state-in of an old static keyframe — record it
+	// for the edge caller to surface (the sim core cannot log, ADR-0005).
+	if !hasLaneSection && e.Params.AdaptiveRouting {
+		e.RestoreNotice = fmt.Sprintf("keyframe: v%d payload without adaptive-routing lane state restored into an adaptive-routing spec — routing switches regime at this restore; pin adaptive_routing: false to continue bit-exactly", ver)
 	}
 	if checkNet != nil {
 		if err := checkNet(e.Net); err != nil {
@@ -368,12 +479,16 @@ func restoreState(spec RunSpec, data []byte, checkNet func(*Network) error) (*En
 			stuckTicks = r.u64() // ADR-0034
 			stopDone = r.u8() != 0
 		}
-		// A pre-v6 keyframe carries no dwell clock. Restoring one into a
-		// flag-ON spec with laneEntryTick = 0 would make every vehicle's
-		// first departure a capped run-long poison sample; starting the
-		// clock at the restore tick is the honest "no evidence yet".
+		// A payload without the adaptive-routing state carries no dwell
+		// clock. Restoring one into a flag-ON spec with laneEntryTick = 0
+		// would make every vehicle's first departure a capped run-long
+		// poison sample; starting the clock at the restore tick is the
+		// honest "no evidence yet". This covers pre-v6 payloads AND
+		// v7-flag-off ones (a flag-off run has no ttEMA, so its dwell
+		// clocks are not keyframed — writer and reader share the
+		// hasLaneSection condition).
 		laneEntryTick := tick
-		if ver >= keyframeAdaptiveVersion {
+		if hasLaneSection {
 			laneEntryTick = r.u64() // ADR-0036 dwell clock
 		}
 		if r.err != nil {
@@ -428,10 +543,11 @@ func restoreState(spec RunSpec, data []byte, checkNet func(*Network) error) (*En
 	}
 	// TSKF v6 (ADR-0036): the per-lane travel-time EMAs, in network order,
 	// between the spawner and director sections — writer and reader are
-	// gated on the same version condition, so the two never disagree. The
+	// gated on the same condition (hasLaneSection: the version through v6,
+	// the flags word from v7), so the two never disagree. The
 	// count must equal the lane count of the network the spec built, or
 	// this keyframe pairs with the wrong spec.
-	if ver >= keyframeAdaptiveVersion {
+	if hasLaneSection {
 		nLanes := r.u32()
 		if r.err != nil {
 			return nil, fmt.Errorf("keyframe: lane count: %w", r.err)
@@ -482,6 +598,46 @@ func restoreState(spec RunSpec, data []byte, checkNet func(*Network) error) (*En
 			d.Origin = e.Net.Lanes[d.LaneIdx].ID
 			d.TypeName = e.scen.Types[d.TypeIdx].Name
 			e.dirQueue = append(e.dirQueue, d)
+		}
+	}
+	if ver >= keyframeSignalVersion {
+		// Commanded signal overrides (ADR-0037) resume with the table — a
+		// held phase is what the vehicles around the signal are reacting
+		// to, so a seek that dropped it would resume the fixed-time program
+		// mid-hold and diverge from the recorded CRCs. Same count-check
+		// discipline as the director queue above: a short read must not
+		// restore silently as "no overrides".
+		n := r.u32()
+		if r.err != nil {
+			return nil, fmt.Errorf("keyframe: signal override count: %w", r.err)
+		}
+		for i := uint32(0); i < n; i++ {
+			sigIdx := r.u32()
+			phase := r.u32()
+			since := r.u64()
+			until := r.u64()
+			chainStart := r.u64()
+			reqID := string(r.bytesN(int(r.u16())))
+			if r.err != nil {
+				return nil, fmt.Errorf("keyframe: signal override %d: %w", i, r.err)
+			}
+			if int(sigIdx) >= len(e.Net.Signals) {
+				return nil, fmt.Errorf("keyframe: signal override %d: program index %d out of range", i, sigIdx)
+			}
+			p := e.Net.Signals[sigIdx]
+			if int(phase) >= len(p.Phases) {
+				return nil, fmt.Errorf("keyframe: signal override %d: phase %d out of range (program %s has %d)", i, phase, p.ID, len(p.Phases))
+			}
+			if until <= since {
+				return nil, fmt.Errorf("keyframe: signal override %d: empty hold [%d, %d)", i, since, until)
+			}
+			if chainStart > since {
+				return nil, fmt.Errorf("keyframe: signal override %d: chain start %d after hold start %d", i, chainStart, since)
+			}
+			if e.sigOv == nil {
+				e.sigOv = map[string][]sigOverride{}
+			}
+			e.sigOv[p.ID] = append(e.sigOv[p.ID], sigOverride{phase: int(phase), since: since, until: until, chainStart: chainStart, requestID: reqID})
 		}
 	}
 	if len(r.buf) != 0 {

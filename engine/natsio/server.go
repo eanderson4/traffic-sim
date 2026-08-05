@@ -142,10 +142,11 @@ func SubjectCtlHeartbeat(run, ctl string) string {
 }
 func SubjectCtlHeartbeatAll(run string) string { return Namespace + "." + run + ".ctl.heartbeat.>" }
 
-// Director verbs (ADR-0008 §5; ADR-0006 2026-07-20 M10 addendum):
+// Director verbs (ADR-0008 §5; ADR-0006 2026-07-20 M10 addendum; ADR-0037):
 // ts.{run}.ctl.verb.{controller_id} — request/reply, requires the director
-// grant. v1 verb vocabulary: spawn (despawn/teleport/trigger land with
-// later milestones; unknown verbs are rejected, not silently ignored).
+// grant. v1 verb vocabulary: spawn, signal_set (despawn/teleport/trigger
+// land with later milestones; unknown verbs are rejected, not silently
+// ignored).
 func SubjectCtlVerb(run, ctl string) string {
 	return Namespace + "." + run + ".ctl.verb." + ctl
 }
@@ -186,9 +187,11 @@ func SubjectLogEvent(run string) string    { return Namespace + "." + run + ".lo
 func SubjectLogAll(run string) string      { return Namespace + "." + run + ".log.>" }
 
 // SubjectLogVerb is the record-plane director-verb subject:
-// ts.{run}.log.verb — accepted spawn directives, one per message, stamped
-// with their applied_tick (replay re-enqueues from these; the demand
-// sampler never re-runs, ADR-0006 M10 addendum).
+// ts.{run}.log.verb — accepted spawn and signal_set (ADR-0037) directives,
+// one per message, stamped with their applied_tick (replay re-enqueues from
+// these; the demand sampler never re-runs, ADR-0006 M10 addendum). The two
+// kinds are told apart by the payload's verb discriminator; a pre-ADR-0037
+// recording carries no discriminator and decodes as all-spawn.
 func SubjectLogVerb(run string) string { return Namespace + "." + run + ".log.verb" }
 
 // StreamName is the per-run log stream (ADR-0006 §5: one log stream per

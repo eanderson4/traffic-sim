@@ -213,6 +213,14 @@ func (r *Recorder) LogTick(e *engine.Engine) error {
 			return err
 		}
 	}
+	// Signal verbs (ADR-0037) follow the spawn verbs within the tick's
+	// batch, in application order; the two kinds share the subject and are
+	// told apart by the payload's verb discriminator.
+	for _, s := range e.AppliedSignals() {
+		if err := r.logSignalVerb(s); err != nil {
+			return err
+		}
+	}
 	if tick%r.cfg.KeyframeEvery == 0 {
 		if err := r.logKeyframe(e); err != nil {
 			return err
@@ -446,6 +454,22 @@ func (r *Recorder) logIntentBatch(ts []engine.TickedIntent, tick uint64) error {
 // spawn, so the demand sampler never re-runs (ADR-0006 M10 addendum).
 func (r *Recorder) logVerb(s engine.TickedSpawn) error {
 	data, err := encodeLoggedVerb(s)
+	if err != nil {
+		return err
+	}
+	if err := r.publish(SubjectLogVerb(r.run), s.Tick, data, 0, 0); err != nil {
+		return err
+	}
+	r.VerbsWritten++
+	return nil
+}
+
+// logSignalVerb appends one accepted signal_set directive to the record —
+// the same subject, shape, and replay contract as logVerb (ADR-0037):
+// replay re-enqueues the command at its recorded applied_tick and the
+// kernel's override table takes the identical state.
+func (r *Recorder) logSignalVerb(s engine.TickedSignal) error {
+	data, err := encodeLoggedSignalVerb(s)
 	if err != nil {
 		return err
 	}

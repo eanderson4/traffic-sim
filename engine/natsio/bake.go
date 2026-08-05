@@ -187,6 +187,12 @@ func (b *BakeSource) Run(sink BakeSink) error {
 					b.run, d.RequestID, next, err)
 			}
 		}
+		for _, d := range rec.sverbs {
+			if err := e.EnqueueSignal(d); err != nil {
+				return fmt.Errorf("bake of run %q aborted: signal verb %q at tick %d rejected (%v) — record and spec disagree",
+					b.run, d.RequestID, next, err)
+			}
+		}
 		e.Step()
 		if rec.hasCRC && e.CRC() != rec.crc {
 			return fmt.Errorf("bake of run %q aborted: CRC divergence at tick %d: crc %016x, logged %016x",

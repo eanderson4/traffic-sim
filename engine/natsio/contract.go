@@ -208,13 +208,25 @@ type ReleaseRequest struct {
 // ContractEvent is the JSON payload of every contract event feed message
 // (ts.{run}.ctl.events.*) and of record-plane events (ts.{run}.log.event).
 type ContractEvent struct {
-	Type         string   `json:"type"` // claim | release | unclaimed | pause | resume
+	Type         string   `json:"type"` // claim | release | unclaimed | pause | resume | signal_lapse
 	Tick         uint64   `json:"tick"`
 	ControllerID string   `json:"controller_id,omitempty"`
 	VehicleIDs   []uint64 `json:"vehicle_ids,omitempty"`
 	Reason       string   `json:"reason,omitempty"` // spawn | release | disconnect
 	Demand       int      `json:"demand,omitempty"`
 	Available    int      `json:"available,omitempty"`
+	// The signal_lapse fields (ADR-0037: a held phase reached its bound and
+	// the fixed-time program resumed), present only on that type. Phase is
+	// a pointer because phase 0 is a legitimate phase index — omitempty on
+	// a plain int would silently drop it. Since is the hold CHAIN's start
+	// (the first hold of an uninterrupted same-phase run — the starvation
+	// bound is cumulative across renewals), so the event spans the whole
+	// starved interval; Until is the chain's clamped end.
+	Signal    string `json:"signal,omitempty"`     // signal program id
+	Phase     *int   `json:"phase,omitempty"`      // the held phase that lapsed
+	Since     uint64 `json:"since,omitempty"`      // tick the hold chain began
+	Until     uint64 `json:"until,omitempty"`      // tick the fixed-time program resumed
+	RequestID string `json:"request_id,omitempty"` // the verb that commanded the lapsed hold
 }
 
 // Event types and reasons.
@@ -224,6 +236,13 @@ const (
 	EventUnclaimed = "unclaimed"
 	EventPause     = "pause"
 	EventResume    = "resume"
+	// EventSignalLapse is the ADR-0037 starvation rail firing: a commanded
+	// phase hold reached its bound and the signal returned to its
+	// fixed-time program. Record-plane only (ts.{run}.log.event) — it is
+	// derived from keyframed state at a fixed tick, so replay re-derives
+	// it; like pause/resume it is dead-time metadata the replayer does not
+	// re-apply.
+	EventSignalLapse = "signal_lapse"
 
 	ReasonSpawn      = "spawn"
 	ReasonRelease    = "release"
@@ -721,12 +740,13 @@ func (c *Contract) handleRelease(e *engine.Engine, r ctlReq) {
 }
 
 // handleVerb answers one director verb (ts.{run}.ctl.verb.{id},
-// request/reply). The director grant is required; v1 implements "spawn".
-// Dedup is by the director-assigned request_id: the first-seen reply is
-// remembered and replayed (Duplicate set) for any retry, so a retried verb
-// never double-spawns. Accepted verbs are validated and buffered by the
-// kernel (engine.EnqueueSpawn) and take effect at the next tick boundary;
-// the record plane logs them with that applied_tick.
+// request/reply). The director grant is required; v1 implements "spawn"
+// and "signal_set" (ADR-0037). Dedup is by the director-assigned
+// request_id: the first-seen reply is remembered and replayed (Duplicate
+// set) for any retry, so a retried verb never double-applies. Accepted
+// verbs are validated and buffered by the kernel (engine.EnqueueSpawn /
+// engine.EnqueueSignal) and take effect at the next tick boundary; the
+// record plane logs them with that applied_tick.
 func (c *Contract) handleVerb(e *engine.Engine, r ctlReq) {
 	var reply VerbReply
 	defer func() {
@@ -753,12 +773,22 @@ func (c *Contract) handleVerb(e *engine.Engine, r ctlReq) {
 		reply.Reason = "verb requires the director grant"
 		return
 	}
-	if req.Verb != "spawn" {
-		reply.Reason = fmt.Sprintf("unsupported verb %q (v1: spawn)", req.Verb)
+	if req.Verb != "spawn" && req.Verb != "signal_set" {
+		reply.Reason = fmt.Sprintf("unsupported verb %q (v1: spawn, signal_set)", req.Verb)
 		return
 	}
 	if req.RequestID == "" {
 		reply.Reason = "missing request_id"
+		return
+	}
+	// The idempotency key is length-prefixed with a u16 in the keyframe
+	// codec (director queue since TSKF v3, signal overrides since v7):
+	// an over-long id would corrupt the keyframe — reject it here, one
+	// shared check for every verb kind, measured in BYTES. The kernel
+	// enforces the same bound at enqueue (engine.MaxRequestIDBytes), so
+	// every caller is guarded; this is the wire-facing rejection.
+	if len(req.RequestID) > engine.MaxRequestIDBytes {
+		reply.Reason = fmt.Sprintf("request_id too long: %d bytes, want ≤ %d (keyframe codec limit)", len(req.RequestID), engine.MaxRequestIDBytes)
 		return
 	}
 	if prev, dup := c.verbs[req.RequestID]; dup {
@@ -766,14 +796,31 @@ func (c *Contract) handleVerb(e *engine.Engine, r ctlReq) {
 		reply.Duplicate = true
 		return
 	}
-	err := e.EnqueueSpawn(engine.SpawnDirective{
-		RequestID:    req.RequestID,
-		Origin:       req.Origin,
-		TypeName:     req.VType,
-		EarliestTick: req.EarliestTick,
-		Destination:  req.Destination,
-		OffsetM:      req.OffsetM,
-	})
+	var err error
+	switch req.Verb {
+	case "spawn":
+		err = e.EnqueueSpawn(engine.SpawnDirective{
+			RequestID:    req.RequestID,
+			Origin:       req.Origin,
+			TypeName:     req.VType,
+			EarliestTick: req.EarliestTick,
+			Destination:  req.Destination,
+			OffsetM:      req.OffsetM,
+		})
+	case "signal_set":
+		if req.Phase == nil {
+			// Presence, not value: an omitted phase must not silently
+			// command phase 0.
+			err = fmt.Errorf("missing phase: signal_set commands a phase index (phase 0 must be written explicitly)")
+		} else {
+			err = e.EnqueueSignal(engine.SignalDirective{
+				RequestID: req.RequestID,
+				Signal:    req.Signal,
+				Phase:     *req.Phase,
+				HoldTicks: req.HoldTicks,
+			})
+		}
+	}
 	if err != nil {
 		reply.Reason = err.Error()
 	} else {

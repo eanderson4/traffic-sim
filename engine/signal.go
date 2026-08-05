@@ -37,6 +37,15 @@ import (
 // algorithms (ADR-0008 §5): a later controller replaces the fixed-time
 // derivation of the per-approach state (sigState) with commanded states —
 // the enforcement path below is unchanged.
+//
+// ADR-0037 (milestone 1) builds exactly that seam: sigPhaseAt is the ONE
+// derivation point — a commanded override (sigctl.go) in force for a
+// program returns the commanded phase, anything else the fixed-time
+// schedule — and all three enforcement predicates (sigState, sigPermissive,
+// sigInClearance) read the phase in force through it, so a held command
+// changes WHICH state string is read and nothing about how states are
+// enforced. With no override held, sigPhaseAt IS phaseAtElapsed and the
+// byte stream is the pre-ADR-0037 one.
 
 // SigState is the enforced light state of one signal-controlled approach.
 type SigState int
@@ -180,6 +189,28 @@ func mapSigChar(c byte) SigState {
 	return SigOff
 }
 
+// sigPhaseAt returns the phase index in force for program p at the given
+// tick and how many ticks ago that phase began: the commanded phase while a
+// signal_set override covers the tick (ADR-0037 — [since, until), onset at
+// the applied tick), otherwise the fixed-time derivation. This is the
+// single point where commanded control enters enforcement; with an empty
+// override table it reduces to phaseAtElapsed exactly. Deterministic:
+// table lookup by program id, then a newest-first scan of that program's
+// short history — the entries' held intervals are disjoint (a superseded
+// entry's Until truncates to the replacement tick, sigctl.go), so at most
+// one covers any tick, including the onset−1 lookbacks into a just-ended
+// hold.
+func (e *Engine) sigPhaseAt(p *SignalProgram, tick uint64) (int, uint64) {
+	if h, ok := e.sigOv[p.ID]; ok {
+		for i := len(h) - 1; i >= 0; i-- {
+			if ov := h[i]; tick >= ov.since && tick < ov.until {
+				return ov.phase, tick - ov.since
+			}
+		}
+	}
+	return p.phaseAtElapsed(tick)
+}
+
 // sigState returns the light state now in force for the approach served by
 // the internal lane l (its program's current phase, its link's char).
 func (e *Engine) sigState(l *Lane) SigState {
@@ -187,7 +218,8 @@ func (e *Engine) sigState(l *Lane) SigState {
 	if p == nil || len(p.phaseTicks) == 0 {
 		return SigOff
 	}
-	st := p.Phases[p.phaseAt(e.Tick)].State
+	idx, _ := e.sigPhaseAt(p, e.Tick)
+	st := p.Phases[idx].State
 	if l.LinkIdx >= len(st) {
 		return SigOff // link without a state char: uncontrolled
 	}
@@ -224,7 +256,8 @@ func (e *Engine) sigPermissive(l *Lane) bool {
 	if p == nil || len(p.phaseTicks) == 0 {
 		return false
 	}
-	st := p.Phases[p.phaseAt(e.Tick)].State
+	idx, _ := e.sigPhaseAt(p, e.Tick)
+	st := p.Phases[idx].State
 	if l.LinkIdx >= len(st) {
 		return false
 	}
@@ -237,25 +270,126 @@ func (e *Engine) sigPermissive(l *Lane) bool {
 // parameter (ADR-0005), never a constant.
 const clearanceSeconds = 3.0
 
-// sigInClearance reports whether the link's red phase began within the
-// clearance window directly after an amber phase — a real amber→red
+// sigSpanOnset returns the displayed phase at tick x, the onset of the
+// displayed span containing it, and whether that onset is an OVERRIDE
+// boundary (a hold's applied tick or end). While a hold covers x the span
+// is the override's. Otherwise the onset is the LATER of the fixed-time
+// onset and the most recent override end ≤ x: a lapse (or a supersession)
+// moves the displayed transition to the override's boundary, because that
+// is when the light actually changed — the schedule's historical phase
+// onset may be long past by then, and measuring the clearance window from
+// it would shorten or skip the clearance of an amber held past it (and
+// the symmetric green case). With an empty override table this is
+// phaseAtElapsed's answer exactly, and the boundary flag is false.
+//
+// The flag exists because the merge walk (sigDisplayedOnset) merges
+// state-equal spans ONLY across override boundaries: fixed-to-fixed phase
+// onsets keep the pre-ADR-0037 index-based onset even when two consecutive
+// phases show the same state for a lane (SUMO splits reds across phases),
+// so a no-verb run stays byte-identical to before — recorded CRC baselines
+// included. The legacy clearance of such programs is preserved, not
+// endorsed.
+func (e *Engine) sigSpanOnset(p *SignalProgram, x uint64) (phase int, onset uint64, overrideBoundary bool) {
+	if h, ok := e.sigOv[p.ID]; ok {
+		// Newest first: entries are chronological with increasing Untils, so
+		// the first entry ending at or before x is the most recent override
+		// boundary — the lapse the display last followed.
+		for i := len(h) - 1; i >= 0; i-- {
+			ov := h[i]
+			if x >= ov.since && x < ov.until {
+				return ov.phase, ov.since, true
+			}
+			if ov.until <= x {
+				idx, elapsed := p.phaseAtElapsed(x)
+				if elapsed > x {
+					// The fixed phase's onset wraps before tick 0 (an
+					// offset program early in the run). A hold that lapsed
+					// inside that first partial phase still moved the
+					// DISPLAY at its until — report the lapse, not the
+					// fictitious zero onset (which sigInClearance would
+					// read as "no transition", denying the clearance).
+					if ov.until > 0 {
+						return idx, ov.until, true
+					}
+					return idx, 0, false
+				}
+				fixedOnset := x - elapsed
+				if ov.until > fixedOnset {
+					return idx, ov.until, true
+				}
+				// The fixed onset is a genuine schedule transition — unless
+				// the lapse lands exactly on it, in which case the boundary
+				// is both.
+				return idx, fixedOnset, ov.until == fixedOnset
+			}
+		}
+	}
+	idx, elapsed := p.phaseAtElapsed(x)
+	if elapsed > x {
+		return idx, 0, false
+	}
+	return idx, x - elapsed, false
+}
+
+// sigPhaseState maps one phase's state char for lane l to the enforced
+// state — the same mapping sigState applies (out-of-range link: SigOff).
+// The clearance onset walk compares these, not phase indices: two
+// different phases can show the same state for an approach, and across an
+// override boundary between them the lane's display does not change.
+func sigPhaseState(l *Lane, phaseIdx int) SigState {
+	st := l.Signal.Phases[phaseIdx].State
+	if l.LinkIdx >= len(st) {
+		return SigOff
+	}
+	return mapSigChar(st[l.LinkIdx])
+}
+
+// sigDisplayedOnset returns the phase in force at the given tick and the
+// tick the DISPLAY began showing its state for lane l. Contiguous spans
+// whose DISPLAYED STATE FOR THAT LANE (sigPhaseState) is identical merge
+// across OVERRIDE boundaries (a hold's start or end): a hold commanding
+// the state the display was already in, a lapse back into it, and a
+// supersession between two same-state phases are all no display change —
+// re-onseting there would close the clearance window early and recapture
+// an amber-committed vehicle. Fixed-to-fixed boundaries never merge
+// (sigSpanOnset's flag), keeping the no-override path byte-identical. The
+// walk is bounded by the clearance window, the only consumer's lookback
+// depth.
+func (e *Engine) sigDisplayedOnset(l *Lane, tick uint64) (int, uint64) {
+	idx, onset, overrideBoundary := e.sigSpanOnset(l.Signal, tick)
+	state := sigPhaseState(l, idx)
+	for onset > 0 && overrideBoundary && tick-onset <= l.Signal.clearance {
+		prevIdx, prevOnset, prevBoundary := e.sigSpanOnset(l.Signal, onset-1)
+		if sigPhaseState(l, prevIdx) != state {
+			break
+		}
+		onset, overrideBoundary = prevOnset, prevBoundary
+	}
+	return idx, onset
+}
+
+// sigInClearance reports whether the link's red display began within the
+// clearance window directly after an amber display — a real amber→red
 // transition (never at run start, and never for green→red programs).
-// Stateless: derived from the program and the tick, so keyframe restore
-// replays it bit-exactly (no latch to persist).
+// Derived from the program, the tick, and the (keyframed) override table:
+// the onset is the DISPLAYED onset for this lane (sigDisplayedOnset) — an
+// override's applied tick while held, the override's until at a lapse,
+// merged across boundaries that do not change the lane's displayed
+// state — and the phase at onset−1 is read display-aware via sigPhaseAt,
+// so a commanded hold is answered for the ticks it covered and a lapse
+// opens the window at the moment the light actually changed. A keyframe
+// restore replays the window bit-exactly (no latch to persist).
 func (e *Engine) sigInClearance(l *Lane) bool {
 	p := l.Signal
 	if p == nil {
 		return false
 	}
-	_, elapsed := p.phaseAtElapsed(e.Tick)
-	if elapsed > p.clearance || e.Tick < elapsed {
+	_, onset := e.sigDisplayedOnset(l, e.Tick)
+	if onset == 0 || e.Tick-onset > p.clearance {
 		return false
 	}
-	onset := e.Tick - elapsed
-	if onset == 0 {
-		return false
-	}
-	prev := p.Phases[p.phaseAt(onset-1)].State
+	prevIdx, _ := e.sigPhaseAt(p, onset-1)
+	prev := p.Phases[prevIdx].State
 	if l.LinkIdx >= len(prev) {
 		return false
 	}
