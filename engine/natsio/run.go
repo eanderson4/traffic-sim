@@ -64,11 +64,16 @@ type LiveRun struct {
 	Registry *Registry
 }
 
-// RunLive executes a run over NATS: registry → recorder → bus → contract →
+// RunLive executes a run over NATS: recorder → bus → contract → registry →
 // loop. It owns e (the run-loop goroutine must be the only one Stepping it)
 // and leaves the record plane exactly reflecting what the engine applied.
-// On recorder failure the run aborts loudly: the error is returned and the
-// registry is marked aborted.
+// Construction order is the readiness contract: the registry's running
+// status is published only after the bus and contract responders exist and
+// are flushed server-side and the static record plane (tick-0 keyframe,
+// signal table) is out — registry visibility implies the run is
+// addressable. A construction failure before that point aborts with no
+// registry trace at all: never advertise a run whose responders don't
+// exist.
 //
 // Live runs require the holdlast uncontrolled-policy (ADR-0008
 // clarification: the idm harness policy exists only where no bus is
@@ -152,33 +157,22 @@ func RunLive(nc *nats.Conn, js nats.JetStreamContext, run string, spec engine.Ru
 	if err != nil {
 		return nil, err
 	}
-	// e.Tick, not 0: on a warm start the run begins at the restored tick,
-	// and the registry is the metadata plane other services read.
-	if err := reg.Start(run, spec, e.Tick); err != nil {
-		return nil, fmt.Errorf("registry start: %w", err)
-	}
 	lr := &LiveRun{Engine: e, Registry: reg}
-	finish := func(runErr error) (*LiveRun, error) {
-		if err := reg.Finish(run, runErr); err != nil && runErr == nil {
-			runErr = fmt.Errorf("registry finish: %w", err)
-		}
-		return lr, runErr
-	}
 
 	rec, err := NewRecorder(js, run, recCfg)
 	if err != nil {
-		return finish(err)
+		return nil, err
 	}
 	lr.Recorder = rec
 	bus, err := NewBus(nc, run, e)
 	if err != nil {
-		return finish(err)
+		return nil, err
 	}
 	lr.Bus = bus
 	defer bus.Close()
 	contract, err := NewContract(nc, run, contractCfg, bus, rec)
 	if err != nil {
-		return finish(err)
+		return nil, err
 	}
 	lr.Contract = contract
 	defer contract.Close()
@@ -186,7 +180,7 @@ func RunLive(nc *nats.Conn, js nats.JetStreamContext, run string, spec engine.Ru
 	// Anchor the record with the tick-0 keyframe (seek semantics: any
 	// target ≥ 0 then has a keyframe ≤ target).
 	if err := rec.LogStart(e); err != nil {
-		return finish(err)
+		return nil, err
 	}
 	// Publish the signal-program table at run start (ADR-0006 M9 addendum);
 	// the loop republishes it at the signalCatchUpEvery cadence for late
@@ -196,7 +190,26 @@ func RunLive(nc *nats.Conn, js nats.JetStreamContext, run string, spec engine.Ru
 	// A dump requested AT the starting tick (tick 0, or a warm start's own
 	// tick) has no Step to hang off — take it here.
 	if err := dumpState(); err != nil {
-		return finish(err)
+		return nil, err
+	}
+
+	// Registry start comes LAST in construction: StatusRunning is the
+	// readiness signal clients watch, so publishing it before the bus and
+	// contract responders exist (flushed server-side) and the static
+	// record plane is out invites 'nats: no responders' or a serviced-too-
+	// late hello from a well-behaved client that attaches the instant the
+	// run appears (KB: cross-topic-concerns, ADR-0026 M3 hardening notes —
+	// the M1-era load-sensitive flake family).
+	// e.Tick, not 0: on a warm start the run begins at the restored tick,
+	// and the registry is the metadata plane other services read.
+	if err := reg.Start(run, spec, e.Tick); err != nil {
+		return nil, fmt.Errorf("registry start: %w", err)
+	}
+	finish := func(runErr error) (*LiveRun, error) {
+		if err := reg.Finish(run, runErr); err != nil && runErr == nil {
+			runErr = fmt.Errorf("registry finish: %w", err)
+		}
+		return lr, runErr
 	}
 
 	// Client-attach barrier: with a start gate configured, hold tick 0
