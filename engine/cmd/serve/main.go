@@ -40,6 +40,7 @@ import (
 	"traffic-sim/engine/natsio"
 	"traffic-sim/engine/natsio/demand"
 	"traffic-sim/engine/natsio/driver"
+	"traffic-sim/engine/natsio/sigctl"
 	"traffic-sim/engine/scenario"
 )
 
@@ -76,6 +77,8 @@ func main() {
 	pace := flag.Float64("pace", 1, "wall-time pace multiplier: PaceFloor = dt/pace (1 = realtime, >1 = faster; 0 = unpaced batch mode — the attach barrier parks tick 0 until embedded clients are ready, so any pace is allowed with the driver/director attached)")
 	store := flag.String("store", "", "durable JetStream store directory (created if missing, kept on exit, refuses to append into an existing recording of the same run id); default is a temp dir deleted on exit")
 	withDriver := flag.Bool("driver", true, "run an in-process default driver replica")
+	withSigctl := flag.Bool("sigctl", false, "run the in-process reference actuated signal controller (engine/natsio/sigctl, ADR-0037 milestone 2): gap-out actuation over the signal_set verb channel; requires a network file with signal programs and centerline shapes")
+	sigctlMinQueue := flag.Int("sigctl-min-queue", 1, "with -sigctl: minimum waiting vehicles on a candidate phase's detectors before the controller switches to it (2+ keeps stragglers from interrupting the major movement at light load)")
 	capacity := flag.Int("capacity", 1000, "driver claim capacity (total across all replicas)")
 	drivers := flag.Int("drivers", 1,
 		"number of in-process default-driver replicas to shard the fleet across. "+
@@ -556,6 +559,15 @@ func main() {
 		expected = append(expected, "demand director")
 		go func() {
 			barrier <- attachDirector(ns, *run, spec.Seed, startTick, scen.Demands)
+		}()
+	}
+	// The reference actuated signal controller (ADR-0037 milestone 2):
+	// in-process like the demand director, but every command rides the
+	// signal_set verb channel — the wire path is what it exists to prove.
+	if *withSigctl {
+		expected = append(expected, "signal controller")
+		go func() {
+			barrier <- attachSigctl(ns, *run, spec.Net.Path, *sigctlMinQueue)
 		}()
 	}
 	attached, err := waitBarrier(barrier, expected, runErr, *attachTimeout)
@@ -1074,6 +1086,43 @@ func attachDirector(ns *server.Server, run string, seed, startTick uint64, dfs [
 		client:  "demand director",
 		desc:    fmt.Sprintf("%d demand file(s), run-seeded", len(dfs)),
 		cleanup: func() { dd.Close(); dnc.Close() },
+	}
+}
+
+// attachSigctl connects and attaches the embedded reference actuated
+// signal controller (ADR-0037 milestone 2). Detector geometry comes from
+// the run's network file (static scenario content); programs and presence
+// arrive over the wire. Ready is the readiness signal (subscriptions
+// flushed live), the demand director's pattern.
+func attachSigctl(ns *server.Server, run, netPath string, minQueue int) attachOutcome {
+	geom, err := sigctl.LoadGeom(netPath)
+	if err != nil {
+		return attachOutcome{client: "signal controller", err: err}
+	}
+	snc, err := nats.Connect(nats.DefaultURL, nats.InProcessServer(ns), nats.Name("sigctl"))
+	if err != nil {
+		return attachOutcome{client: "signal controller", err: err}
+	}
+	sjs, err := snc.JetStream()
+	if err != nil {
+		snc.Close()
+		return attachOutcome{client: "signal controller", err: err}
+	}
+	lg := log.New(os.Stderr, "", 0)
+	ctl, err := sigctl.Attach(snc, sjs, sigctl.Config{Run: run, SwitchMinQueue: minQueue, Log: lg}, geom)
+	if err != nil {
+		snc.Close()
+		return attachOutcome{client: "signal controller", err: err}
+	}
+	if err := ctl.Ready(); err != nil {
+		ctl.Close()
+		snc.Close()
+		return attachOutcome{client: "signal controller", err: err}
+	}
+	return attachOutcome{
+		client:  "signal controller",
+		desc:    "gap-out actuation over signal_set",
+		cleanup: func() { ctl.Close(); snc.Close() },
 	}
 }
 
