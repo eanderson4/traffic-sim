@@ -1,8 +1,8 @@
 # ADR-0037: Runtime signal control — design sketch (deferred implementation)
 
 - **Status:** ACCEPTED — milestone 1 implemented 2026-07-31 (verb channel,
-  engine override derivation, starvation rails, TSKF v7). The controller
-  side (reference actuated client) remains milestone 2, per the design.
+  engine override derivation, starvation rails, TSKF v7); milestone 2
+  implemented 2026-08-04 (reference actuated controller, bracket runner).
 - **Date:** 2026-07-30
 - **Amends:** ADR-0011 (signals), ADR-0006 §4 (contract: one new verb or
   intent class) when implemented.
@@ -666,3 +666,23 @@ Final fix round before merge:
   detectors read only the first queue positions, so a queue held
   upstream by spillback reads as a gap — shared with physical stop-line
   loops, accepted for the reference client.
+- **Recorded and deferred from the round-4 (M2 final) review** — triaged
+  under the merge-priority directive; Kimi found no blockers and
+  confirmed the earlier deferral lists are accurate: candidate demand
+  scoring includes links already green in the enforced phase, so
+  overlapping phases can turn already-served traffic into a conflicting
+  call (unnecessary walks after max-green — control efficiency, Sol);
+  detector multi-marking persists (fixture evidence: one position can
+  match 4-7 colocated stop-line detectors across phase groups —
+  candidate fix remains exclusive nearest-link assignment, Sol);
+  pace-0 walk seamlessness restated (the VerbReply echo proposal is
+  still the real fix, Sol); `-sigctl` with `-state-in` does not restore
+  controller state, so a warm continuation diverges (no config runs
+  this; replay re-enqueues recorded verbs and is unaffected — candidate
+  fix: refuse the combination at flag parse, Sol); Ready succeeds with
+  zero controllable programs when ids/geometry match nothing (Sol);
+  accepted>0 is not proof a commanded phase governed a tick (rail
+  clamps / same-boundary supersedes can zero effective holds, Sol);
+  nits: live-test divergence loop doesn't clamp superseded spans,
+  zero-length first shape segment degenerates the approach-side test,
+  hold>cadence+renew-below constraint is doc-only (Kimi).
