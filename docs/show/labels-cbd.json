@@ -1,7 +1,7 @@
 {
   "base": "Do nothing",
   "transit-5": "Free CTA transfers \u2014 shift 5% of Loop trips to transit",
-  "calm-secondary": "Slow Streets \u2014 25 km/h limit across the Loop grid",
+  "calm-secondary": "Slow Streets \u2014 25 km/h limit on Loop secondary streets",
   "retime-short": "Shorter signal cycles \u2014 34% shorter, same green share",
   "retime-long": "Longer greens \u2014 40% longer cycles on the arterials",
   "widen-secondary": "Widen the grid \u2014 one extra lane on every Loop street",
