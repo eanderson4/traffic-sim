@@ -119,5 +119,52 @@ class TestRepeatedAddLane(unittest.TestCase):
         self.assertEqual(w1["source"].get("synthetic"), "add-lane")
 
 
+class TestDonorLengthGuard(unittest.TestCase):
+    """ADR-0038 riding-along guard: a sub-5 m donor (a junction-connector
+    sliver) is never cloned; longer donors widen as before."""
+
+    def test_short_donor_skipped(self):
+        def network_with_sliver():
+            net = network()
+            # A 0.2 m sliver edge on the corridor: must not be widened.
+            sliver = lane("s1_0", "s1", 0, x=30.0, succ=["e2_0"])
+            sliver["length"] = 0.2
+            sliver["shape"] = [[30.0, 0.0], [30.0, 0.2]]
+            net["lanes"].append(sliver)
+            # A normal-length edge that DOES carry a length field.
+            for L in net["lanes"]:
+                L.setdefault("length", 100.0)
+            sliver["length"] = 0.2
+            net["lanes"].append(
+                {"id": "s1_1", "edge": "s1", "edgeIndex": 1, "width": LANE_W,
+                 "speedLimit": 22.2, "length": 0.2,
+                 "shape": [[33.2, 0.0], [33.2, 0.2]], "successors": ["e2_1"]})
+            return net, {"labels": {"kennedy": "Kennedy"},
+                         "lanes": {"e1_0": "kennedy", "e1_1": "kennedy",
+                                   "e2_0": "kennedy", "e2_1": "kennedy",
+                                   "s1_0": "kennedy", "s1_1": "kennedy"}}
+
+        d = tempfile.mkdtemp()
+        netf, corf, out = (os.path.join(d, p) for p in ("n.json", "c.json", "o.json"))
+        n, c = network_with_sliver()
+        with open(netf, "w") as f:
+            json.dump(n, f)
+        with open(corf, "w") as f:
+            json.dump(c, f)
+        r = subprocess.run([sys.executable, SCRIPT, "--network", netf,
+                            "--corridors", corf, "--out", out,
+                            "--add-lane", "kennedy"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise AssertionError(r.stdout + r.stderr)
+        with open(out) as f:
+            net = json.load(f)
+        lanes = {L["id"]: L for L in net["lanes"]}
+        self.assertNotIn("s1_1_w1", lanes)
+        self.assertIn("e1_1_w1", lanes)
+        self.assertIn("e2_1_w1", lanes)
+        self.assertIn("sliver guard", r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

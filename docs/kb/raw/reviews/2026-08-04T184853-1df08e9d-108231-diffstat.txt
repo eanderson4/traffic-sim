@@ -1,0 +1,10 @@
+ docs/kb/INDEX.md                                   |   2 +-
+ .../decisions/ADR-0037-runtime-signal-control.md   | 214 +++++
+ engine/cmd/serve/main.go                           |  49 ++
+ engine/cmd/sigctl/main.go                          |  95 +++
+ engine/natsio/sigctl/helpers_test.go               |  57 ++
+ engine/natsio/sigctl/live_run_test.go              | 118 +++
+ engine/natsio/sigctl/sigctl.go                     | 912 +++++++++++++++++++++
+ engine/natsio/sigctl/sigctl_test.go                | 453 ++++++++++
+ scripts/sigctl-bracket.py                          | 176 ++++
+ 9 files changed, 2075 insertions(+), 1 deletion(-)

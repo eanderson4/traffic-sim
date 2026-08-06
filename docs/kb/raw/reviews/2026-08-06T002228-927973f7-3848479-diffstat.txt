@@ -1,0 +1,15 @@
+ analysis/chicago-throughput/diagnosis-01.md        | 229 +++++++++++++
+ analysis/chicago-throughput/sliver-merge-03.md     | 191 +++++++++++
+ analysis/chicago-throughput/stranding-02.md        | 187 ++++++++++
+ contracts/network-format-v1.md                     |   4 +-
+ docs/chicago-throughput-log.md                     | 196 +++++++++++
+ .../ADR-0038-sliver-junction-consolidation.md      | 150 ++++++++
+ engine/clusterseam_test.go                         | 159 +++++++++
+ engine/netimport/consolidate.go                    | 259 ++++++++++++++
+ engine/netimport/consolidate_test.go               | 376 +++++++++++++++++++++
+ engine/netimport/netimport.go                      |  50 ++-
+ engine/rightofway.go                               |  49 +++
+ scripts/chicago/mknetvariant.py                    |  21 +-
+ scripts/chicago/test_mknetvariant.py               |  47 +++
+ scripts/import-city.sh                             |   2 +-
+ 14 files changed, 1889 insertions(+), 31 deletions(-)

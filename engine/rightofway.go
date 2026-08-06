@@ -86,6 +86,48 @@ func (e *Engine) rowGate(v *Vehicle) (float64, bool) {
 		// box-interior overlaps after the entry-time fixes). The wall at
 		// the lane end holds v INSIDE the box — stopping in the box is a
 		// textbook violation, but a safe one; overlapping is worse.
+		//
+		// Controlled internal→internal boundary (ADR-0038 review finding):
+		// consolidation rewires a deleted sliver's predecessors straight into
+		// the far box, so a movement that used to approach the far junction
+		// on a ROAD lane — where gateTarget ran the full gate — now crosses
+		// internal→internal. The stop-line duties apply at that seam exactly
+		// as on a road approach: sigGate for signalized far lanes (whose
+		// green path runs its own boxBlocked — signal.go's exit-room check
+		// DOES apply here), the stop-class full-stop duty for RowStop, and
+		// the approaching-foe yield for minor/permissive movements. Only the
+		// ROW path's box-occupancy/exit-room half (rowConflict's boxWalk) is
+		// omitted, deliberately: exitBlocked below owns room at a row seam,
+		// and re-running the entry-arm chain rule there would serialize
+		// discharge — the defect the in-box arm was written to avoid.
+		if next := e.pickSuccessor(lane, v); next.Internal && e.controlled(next) {
+			dist := lane.Length - v.S
+			permissive := false
+			if next.Signal != nil {
+				if w, gated := e.sigGate(v, next, dist); gated {
+					return w, true
+				}
+				permissive = e.sigPermissive(next)
+			}
+			hold := false
+			if next.Row == RowStop && !v.stopDone {
+				// Stop-class far lane: the full-stop duty the road-approach
+				// path enforces, at the seam. stopDone is consumed by the
+				// crossing itself (boundaries resets it entering any
+				// internal lane), so a hold skipped here is unrecoverable
+				// downstream — a no-foe arrival would roll the stop at speed.
+				hold = true
+				if v.V == 0 && dist <= v.Type.S0+1.0 {
+					v.stopDone = true // reached at the line: serve from the next tick
+				}
+			} else if (next.Row != RowNone || permissive) && e.foeApproachConflict(v, next) {
+				hold = true
+			}
+			if hold {
+				wall := idmAccel(v.Type, v.v0eff(lane), v.V, LeaderInfo{OK: true, Gap: dist, V: 0})
+				return wall, true
+			}
+		}
 		if e.exitBlocked(v, lane, true) {
 			wall := idmAccel(v.Type, v.v0eff(lane), v.V, LeaderInfo{OK: true, Gap: lane.Length - v.S, V: 0})
 			return wall, true
@@ -192,6 +234,9 @@ func (e *Engine) controlled(l *Lane) bool {
 // rowConflict reports whether entering the internal lane next would
 // conflict: a foe vehicle is inside the box, the exit lane has no room for
 // v to clear the box, or an approaching foe is committed to entering.
+// Its approaching-foe half is factored out as foeApproachConflict — the
+// seam gate (rowGate's internal branch) uses that half without boxWalk;
+// any yield-class change must stay in sync between the two.
 func (e *Engine) rowConflict(v *Vehicle, next *Lane) bool {
 	if e.boxBlocked(v, next) {
 		return true
@@ -451,6 +496,29 @@ func (e *Engine) junctionHold(v *Vehicle, next *Lane) bool {
 		return true
 	}
 	return e.rowConflict(v, next)
+}
+
+// foeApproachConflict is rowConflict's approaching-foe half without the
+// box-occupancy/exit-room test (boxWalk): at a controlled internal→internal
+// boundary the in-box exit walk (exitBlocked) owns room and funnel
+// arbitration, and re-running the entry-arm chain rule there would serialize
+// discharge — the defect the in-box arm was written to avoid (ADR-0038
+// review). The yield classes mirror rowConflict exactly: minor/stop (and
+// permissive green, which reaches here with RowNone) yield to every
+// conflicting approach; major checks only committed merge foes.
+func (e *Engine) foeApproachConflict(v *Vehicle, next *Lane) bool {
+	minor := next.Row != RowMajor
+	for _, f := range next.FoesCross {
+		if minor && e.foeApproachBlocks(v, f, minor) {
+			return true
+		}
+	}
+	for _, f := range next.FoesMerge {
+		if e.foeApproachBlocks(v, f, minor) {
+			return true
+		}
+	}
+	return false
 }
 
 // foeApproachBlocks reports whether the closest vehicle heading for the foe

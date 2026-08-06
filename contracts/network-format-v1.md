@@ -76,7 +76,7 @@ files, not edits.
 | `origin` | Demand portal: the spawner injects here (`Network.Origins`, file order). Set by netimport on lanes with no predecessors. |
 | `exit` | Map edge: vehicles despawn past `length`. Set by netimport on lanes with no successors. |
 | `endWall` | Dead end: virtual standing vehicle at `length` (the lanedrop merge primitive). netimport never sets it; for hand-authored files. |
-| `internal` | Junction-internal lane (intersection interior): geometry through the junction box, exactly one successor, no lateral neighbors, always `guessed: ["internal-geometry"]` (no OSM element underlies it). |
+| `internal` | Junction-internal lane (intersection interior): geometry through the junction box, no lateral neighbors, always `guessed: ["internal-geometry"]` (no OSM element underlies it). One successor as emitted by netconvert (movement per internal lane); ADR-0038 consolidation can leave **multiple** when a rewired predecessor inherits a deleted sliver's fan-out — readers must not assume one. |
 | `source.guessed` | Every default-filled / heuristic field, by name: `width` (SUMO's 3.2 m default when the attribute is absent), `internal-geometry`. |
 
 ### Right-of-way extension (optional, ADR-0010)
@@ -92,7 +92,7 @@ traversal semantics.
 | `junction` | Junction id the internal lane belongs to (from the internal edge id `:<junction>_<n>`). Groups the conflict sets. |
 | `row` | Approach class of the connection this lane serves: `"major"` (SUMO state `M` — right of way), `"minor"` (`m`, and `=` mapped conservatively), `"stop"` (`s`, and allway-stop `w` mapped to a plain stop). Omitted for signal-controlled (`tl` binding) or state-less approaches: signal-governed lanes bind a program instead (below). |
 | `foesCross` | Internal lane IDs of the same junction whose paths **cross** this one (shape polylines properly intersect — shared endpoints don't count). |
-| `foesMerge` | Internal lane IDs of the same junction **merging into the same exit lane** (shared successor; the junction-exit funnels). Merge takes precedence over crossing when both hold. |
+| `foesMerge` | Internal lane IDs of the same junction **merging into the same exit lane** (any shared successor — with multi-successor internals (ADR-0038) the test is successor-set intersection, not first-successor equality; the junction-exit funnels). Merge takes precedence over crossing when both hold. |
 
 Foe lists are symmetric (a lane lists every lane that lists it) and ordered
 by lane index. The kernel semantics — when each class must hold at the

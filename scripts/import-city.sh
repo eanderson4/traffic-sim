@@ -114,7 +114,7 @@ EXTRACT_TS=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get
 # as much as any script here, so editing a speed must move the provenance
 # string. Absent (stock netconvert defaults) it contributes nothing, which
 # is itself the distinguishing input.
-REPO_REV=$(cat "$ROOT/scripts/overpass2osm.py" "$ROOT/scripts/osm-stop-nodes.py" "$ROOT/scripts/import-city.sh" ${TYPEMAP:+"$TYPEMAP"} "$ROOT/engine/cmd/netimport/main.go" "$ROOT/engine/netimport/netimport.go" | sha256sum | cut -c1-12)
+REPO_REV=$(cat "$ROOT/scripts/overpass2osm.py" "$ROOT/scripts/osm-stop-nodes.py" "$ROOT/scripts/import-city.sh" ${TYPEMAP:+"$TYPEMAP"} "$ROOT/engine/cmd/netimport/main.go" "$ROOT/engine/netimport/netimport.go" "$ROOT/engine/netimport/consolidate.go" | sha256sum | cut -c1-12)
 (cd "$ROOT/engine" && go run ./cmd/netimport \
   -in "$NET_DIR/$NAME.net.xml" \
   -out "$SCN_DIR/$NAME.json" \
