@@ -142,6 +142,16 @@ def main():
         same = [l["shape"] for l in group if len(l["shape"]) == n]
         mid = [[sum(s[i][0] for s in same) / len(same),
                 sum(s[i][1] for s in same) / len(same)] for i in range(n)]
+        # At card scale much of an import projects to nothing: an edge whose
+        # projected extent is sub-pixel paints an invisible speck but still
+        # costs a path element — on the Chicago imports those fragments
+        # (many fully degenerate, every point on the same pixel) were most
+        # of the file, and mkquiz inlines whatever this emits.
+        pxs = [proj(p) for p in mid]
+        xs = [p[0] for p in pxs]
+        ys = [p[1] for p in pxs]
+        if max(xs) - min(xs) < 0.5 and max(ys) - min(ys) < 0.5:
+            continue
         body.append(f'<path d="{path_d(mid, proj)}" stroke="{INK_KEEP}" '
                     f'stroke-width="{round(1.5 + 1.5 * len(group), 1)}"/>')
 
@@ -202,23 +212,51 @@ def main():
         f'{total:,.0f} veh/h · {"/".join(spacings)} arrivals</text>',
         f'<circle cx="18" cy="{y0 + 26}" r="4.5" fill="none" '
         f'stroke="{INK_SINK}" stroke-width="1.8"/>',
-        f'<text x="30" y="{y0 + 29}">{len(snk)} exits'
-        + (f' ({shared} sharing a portal with an entry)' if shared else '')
-        + ' · '
-        + ("destinations declared per flow"
-           if declared else
-           "no destinations declared — trips run to the edge of the network")
-        + '</text>',
     ]
+    exits_head = (f'{len(snk)} exits'
+                  + (f' ({shared} sharing a portal with an entry)'
+                     if shared else ''))
+    dest_tail = ("destinations declared per flow"
+                 if declared else
+                 "no destinations declared — trips run to the edge of the network")
+    # One row when the line fits the ~80-character budget, two when it does
+    # not: overflowing text is not clipped by the viewBox, it runs off the
+    # edge of the card and reads as a truncated thought.
+    if len(exits_head + ' · ' + dest_tail) <= 80:
+        legend.append(f'<text x="30" y="{y0 + 29}">{exits_head} · '
+                      f'{dest_tail}</text>')
+        sig_y = 44
+        exits_rows = 1
+    else:
+        legend.append(f'<text x="30" y="{y0 + 29}">{exits_head}</text>'
+                      f'<text x="30" y="{y0 + 43}">{dest_tail}</text>')
+        sig_y = 58
+        exits_rows = 2
     if sigs:
         # Derived, never asserted: cycle length, the main-road green share
         # and whether the plans are coordinated all come out of the phase
-        # list, so re-timing the pod re-words this line by itself.
-        cyc = cycle_len(sigs[0])
-        first = next((p["duration"] for p in sigs[0]["phases"]
-                      if "G" in p["state"] or "g" in p["state"]), 0.0)
+        # list, so re-timing the pod re-words this line by itself. The green
+        # share is only printed when EVERY program agrees on it — authored
+        # pods run one uniform plan, but the imports carry dozens of
+        # distinct programs and quoting sigs[0]'s green as the network's
+        # would be a false aggregate.
+        # Rounded like offs below: identical plans whose phase durations
+        # sum in a different float order must not read as "mixed".
+        cycs = {round(cycle_len(s), 2) for s in sigs}
+        firsts = {round(next((p["duration"] for p in s["phases"]
+                              if "G" in p["state"] or "g" in p["state"]), 0.0), 2)
+                  for s in sigs}
+        cyc = next(iter(cycs)) if len(cycs) == 1 else 0.0
+        if len(cycs) == 1 and len(firsts) == 1 and cyc:
+            first = next(iter(firsts))
+            detail = (f'{cyc:g}s cycle, {first:g}s main-road green '
+                      f'({100 * first / cyc:.0f}%)')
+        elif len(cycs) == 1:
+            detail = f'{cyc:g}s cycle'
+        else:
+            detail = 'mixed programs'
         offs = {round(s.get("offset", 0), 2) for s in sigs}
-        coord = ("all four start their cycle together — uncoordinated"
+        coord = ("every junction starts its cycle together — uncoordinated"
                  if offs == {0.0} else
                  "each junction offset from the last — coordinated")
         # Two rows, because one does not fit: at 9px in a 400-wide frame the
@@ -226,11 +264,10 @@ def main():
         # 120. Overflowing text is not clipped by the viewBox — it simply
         # runs off the edge of the card and reads as a truncated thought.
         legend.append(
-            f'<circle cx="18" cy="{y0 + 44}" r="4" fill="{INK_SIG}"/>'
-            f'<text x="30" y="{y0 + 47}">{len(sigs)} fixed-time signals · '
-            f'{cyc:g}s cycle, {first:g}s main-road green '
-            f'({100 * first / cyc:.0f}%)</text>'
-            f'<text x="30" y="{y0 + 61}">{coord}</text>')
+            f'<circle cx="18" cy="{y0 + sig_y}" r="4" fill="{INK_SIG}"/>'
+            f'<text x="30" y="{y0 + sig_y + 3}">{len(sigs)} fixed-time signals · '
+            f'{detail}</text>'
+            f'<text x="30" y="{y0 + sig_y + 17}">{coord}</text>')
 
     if ratio >= 1.5 or fold(1e4) != 1e4:
         legend.append(f'<text x="{W - 12}" y="{y0 + 11}" text-anchor="end">'
@@ -238,7 +275,8 @@ def main():
 
     # Height follows the rows actually emitted rather than a constant sized
     # for the busiest scenario, so a pod with no signals gets no empty band.
-    legend_h = LEGEND_PAD + LEGEND_ROW * (4 if sigs else 2)
+    legend_h = (LEGEND_PAD
+                + LEGEND_ROW * (1 + exits_rows + (2 if sigs else 0)))
     svg = (f'<svg xmlns="http://www.w3.org/2000/svg" '
            f'viewBox="0 0 {W} {y0 + legend_h}" width="100%" role="img">'
            f'<g fill="none" stroke-linecap="round" stroke-linejoin="round">'

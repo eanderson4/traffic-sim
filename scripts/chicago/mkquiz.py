@@ -86,12 +86,20 @@ CAVEATS = {
         "The downtown grid is the part of this model that matches reality "
         "best — signal density and block spacing are imported, not assumed. "
         "There is no transit, and downtown Chicago's real transit share is "
-        "very high, so absolute car volumes are an overestimate.",
+        "very high, so absolute car volumes are an overestimate. At the "
+        "full 12,000-tick horizon the saturated grid refuses part of "
+        "demand at injection (first expiry at tick 7,327), and the loss "
+        "varies by arm — 93.6% of demand delivered in the baseline, 94.3% "
+        "in the winning arm. Pairing absorbs the shared part; a "
+        "load-dependent bias cannot be excluded.",
     "chi-kennedy":
         "Expressway mainlines run faster than the real thing (59-76 km/h "
         "against a real 25-45), so corridor speeds are optimistic. Lane "
         "widening is inconclusive here for the same reason as the full "
-        "network: the router barely uses the added lanes.",
+        "network: the router barely uses the added lanes. Every arm ran on "
+        "one driver replica; at this fleet size (~1,700 vehicles) that "
+        "stays under the 0.1% uncontrolled-coasting bar — the baseline "
+        "recording of this same scenario in that configuration logs 0.08%.",
 }
 
 # Options whose result depends on a number WE supplied rather than one the
