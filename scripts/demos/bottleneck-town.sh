@@ -62,7 +62,7 @@ bake|all)
     (cd "$ROOT/viz" && node scripts/bake-furniture.mjs "$PREFIX")
     echo
     echo "serve it:   python3 scripts/serve-baked.py --baked $WORK/baked/baked --viz viz/dist --port 8791"
-    echo "open:       http://127.0.0.1:8791/?bake=http://127.0.0.1:8791/baked/townbase/$(basename "$PREFIX")/index.json&center=-98.4840,39.6963&zoom=14.2"
+    echo "open:       http://127.0.0.1:8791/app.html?bake=http://127.0.0.1:8791/baked/townbase/$(basename "$PREFIX")/index.json&center=-98.4840,39.6963&zoom=14.2"
     echo "            (drag the replay slider to ~70% and play 90 s: ticks 6300-7200)"
     ;;
 esac

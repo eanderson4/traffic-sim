@@ -54,7 +54,7 @@ import (
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8900", "listen address for the menu + orchestration API")
 	demosPath := flag.String("demos", "data/scenarios/demos.json", "demos registry (repo-root-relative paths inside)")
-	vizDir := flag.String("viz", "viz/dist", "built viz to serve (cd viz && pnpm build): splash.html (landing, at /) + demos.html (menu) + index.html (map app)")
+	vizDir := flag.String("viz", "viz/dist", "built viz to serve (cd viz && pnpm build): index.html (landing, at /) + demos.html (menu) + app.html (map app)")
 	netcacheDir := flag.String("netcache", "data/networks/.geojson-cache", "per-demo network GeoJSON cache")
 	overlayDir := flag.String("overlaydir", "data/networks/overlays", "static overlay GeoJSON directory (zones/boundaries, WGS84) — a missing dir just 404s /overlay/*")
 	wsAddr := flag.String("ws", "127.0.0.1:8443", "engine WebSocket listen address for spawned runs; override when another process holds 8443 (clients are told via /api/demos + start URLs)")
@@ -183,8 +183,10 @@ func main() {
 		hs.Close()
 	}()
 
-	if _, err := os.Stat(filepath.Join(*vizDir, "splash.html")); err != nil {
-		log.Printf("demosrv: warning: %s/splash.html not found — build the viz first (cd viz && pnpm build)", *vizDir)
+	for _, page := range []string{"index.html", "app.html"} {
+		if _, err := os.Stat(filepath.Join(*vizDir, page)); err != nil {
+			log.Printf("demosrv: warning: %s/%s not found — build the viz first (cd viz && pnpm build)", *vizDir, page)
+		}
 	}
 	// Bind BEFORE announcing and BEFORE autostart: with -autostart the demo
 	// spawn must follow the listener actually being up (a pod whose port
@@ -438,18 +440,18 @@ func writeErr(w http.ResponseWriter, code int, err error) {
 	writeJSON(w, code, map[string]string{"error": err.Error()})
 }
 
-// handleSplash serves the built landing page (viz/splash.html →
-// dist/splash.html) at /. The demos menu keeps its own URL — /demos.html
+// handleSplash serves the built landing page (viz/index.html →
+// dist/index.html) at /. The demos menu keeps its own URL — /demos.html
 // falls through to the static FileServer below.
 func (s *server) handleSplash(w http.ResponseWriter, r *http.Request) {
-	http.ServeFile(w, r, filepath.Join(s.viz, "splash.html"))
+	http.ServeFile(w, r, filepath.Join(s.viz, "index.html"))
 }
 
 // handleApp serves the built map app; the run/network selection rides in
 // the query string (?run=&net= — viz/src/config.ts), so one built page
 // serves every demo.
 func (s *server) handleApp(w http.ResponseWriter, r *http.Request) {
-	http.ServeFile(w, r, filepath.Join(s.viz, "index.html"))
+	http.ServeFile(w, r, filepath.Join(s.viz, "app.html"))
 }
 
 func (s *server) handleDemos(w http.ResponseWriter, r *http.Request) {

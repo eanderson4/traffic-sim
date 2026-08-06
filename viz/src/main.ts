@@ -113,7 +113,7 @@ async function main(): Promise<void> {
     { color: "green", fill: theme.signalGreen, offY: SIGNAL_HEAD.lensOffsetYPx[2] },
   ];
 
-  // HUD chrome (index.html) reads these CSS variables; their :root
+  // HUD chrome (app.html) reads these CSS variables; their :root
   // defaults are the navy values, so anything before this line (and pages
   // without this script, e.g. demos.html) renders navy unchanged.
   const themeCssVars: Record<string, string> = {
@@ -130,7 +130,7 @@ async function main(): Promise<void> {
     document.documentElement.style.setProperty(k, v);
   }
 
-  // Theme toggle (HUD, top-right; index.html #theme-toggle): the label
+  // Theme toggle (HUD, top-right; app.html #theme-toggle): the label
   // shows the ACTIVE theme, clicking flips to the other one. The choice
   // persists to localStorage (config.ts THEME_STORAGE_KEY — the demos
   // menu's toggle writes the same key) and is reflected into the URL

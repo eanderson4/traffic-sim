@@ -229,7 +229,8 @@ function cls(o, isWin){
 // Composed from location.origin rather than baked in, so the page works on
 // whatever host and port is serving it.
 function bakeHref(b){
-  return location.origin + '/?bake=' + location.origin + b.bake +
+  // The map app lives at /app.html — / is the splash landing page.
+  return location.origin + '/app.html?bake=' + location.origin + b.bake +
          '&center=' + b.center + '&zoom=' + b.zoom;
 }
 function render(){

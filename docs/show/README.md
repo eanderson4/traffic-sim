@@ -130,7 +130,7 @@ skip the zooming and deep-link the opening shot instead — verified against
 this recording:
 
 ```
-.../?bake=<absolute index.json URL>&center=-87.6298,41.8790&zoom=14.5
+.../app.html?bake=<absolute index.json URL>&center=-87.6298,41.8790&zoom=14.5
 ```
 
 That opens on the Loop grid and the Jane Byrne with traffic already

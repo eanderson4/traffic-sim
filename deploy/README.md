@@ -4,9 +4,16 @@ Target: GKE cluster `carbon-dev` (project `roaring-bots`, us-central1),
 behind the existing GCE Ingress. One pod, one replica, forever — demosrv
 supervises a single active run; horizontal scaling is meaningless here.
 
-Routing: `/` serves the splash landing page (`viz/splash.html` →
-`dist/splash.html`); the demos menu stays at `/demos.html` and the map app
+Routing: `/` serves the splash landing page (`viz/index.html` →
+`dist/index.html`); the demos menu stays at `/demos.html` and the map app
 at `/app/` (all from the built viz in `/srv/viz`).
+
+Caveat (2026-08-05): the splash's featured CTA is baked-first
+(`viz/src/splash.ts` BAKED_FEATURED_URL) and targets the Cloudflare Pages
+bundle, where `/baked/*` is staged by `scripts/show/mksite.sh`. demosrv
+serves no `/baked/*` route, so on THIS deploy the featured card's link
+404s until either the bake plane is served here too or splash.ts grows a
+probe-and-fall-back. The live-run deep links (`/app/…`) are unaffected.
 
 ## GO-LIVE PRECONDITIONS — do not `kubectl apply` the Ingress until these land
 

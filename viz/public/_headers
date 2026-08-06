@@ -1,0 +1,25 @@
+# Cloudflare Pages headers for the static phantomjam deploy.
+# network.geojson files are stored brotli-compressed (Pages' 25 MiB per-file
+# cap; raw is 34.8 MB) under their original names — the browser decodes
+# Content-Encoding: br transparently, so fetch() consumers see plain JSON.
+/network.geojson
+  Content-Encoding: br
+  Content-Type: application/geo+json
+/baked/*/network.geojson
+  Content-Encoding: br
+  Content-Type: application/geo+json
+# Bake frame/lane chunks are brotli-precompressed by design (ADR-0023); the
+# viz relies on the browser decoding them, it does not decompress itself.
+/baked/*.br
+  Content-Encoding: br
+# Baked objects are content-keyed (baked/<run>/<hash12>/, ADR-0023): the
+# hash IS the version, so chunks may be cached forever.
+/baked/*
+  Cache-Control: public, max-age=31536000, immutable
+# index.json exception: the viz fetches the manifest no-cache (netload.ts's
+# manifest rule) and a stale pinned table must never survive in a browser
+# cache. Pages joins duplicate Cache-Control values with commas, so the
+# exception REMOVES the header (documented `!` syntax) rather than
+# re-declaring it; revalidation then falls to the fetch's no-cache mode.
+/baked/*/index.json
+  ! Cache-Control

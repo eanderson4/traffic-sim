@@ -1,21 +1,25 @@
-// splash.ts — controller for the landing page (splash.html). The featured
-// card is BAKED-FIRST (ADR-0023): when BAKED_FEATURED_URL names a published
-// baked replay, the CTA plays it entirely in the browser — no live run, no
-// admin gate, unlimited concurrent viewers. With it empty (no bake published
-// yet) the card falls back to the live-demosrv behavior: running deep-links
-// into the map via deepLinkURL, otherwise a POST to startPath spawns the run
-// (demos-core.ts); a 401/403 (public deploy, ADR-0020) or a registry without
-// the demo flips the card to watch-only and routes to /demos.html.
-// Everything else on the page is static.
+// splash.ts — controller for the landing page (index.html, served at /).
+// The featured card is BAKED-FIRST (ADR-0023): when BAKED_FEATURED_URL
+// names a published baked replay, the CTA plays it entirely in the browser
+// — no live run, no admin gate, unlimited concurrent viewers. With it empty
+// (no bake published yet) the card falls back to the live-demosrv behavior:
+// running deep-links into the map via deepLinkURL, otherwise a POST to
+// startPath spawns the run (demos-core.ts); a 401/403 (public deploy,
+// ADR-0020) or a registry without the demo flips the card to watch-only and
+// routes to /demos.html. Everything else on the page is static.
 
 import { deepLinkURL, startPath, type DemoInfo, type RunStatus } from "./demos-core.ts";
 
-// Published baked replay URL (phantomjam.com viz + data.phantomjam.com
-// artifact: https://phantomjam.com/?bake=<absolute index.json URL> — the
-// ONLY camera control is the manifest's own frame fit; config.ts parses
-// no center/zoom params). Fill in when the featured bake is uploaded to
-// R2; empty = live-demosrv fallback.
-const BAKED_FEATURED_URL: string = "";
+// Published baked replay URL — the map app at /app.html with ?bake= naming
+// the featured bake's manifest (the ONLY camera control is the manifest's
+// own frame fit; config.ts parses no center/zoom params in baked mode).
+// The ?bake= value has to be ABSOLUTE — the shim (baked.ts
+// resolveBakedUrl) resolves every chunk URL against it with new URL(),
+// which throws "Invalid base URL" on a root-relative base. Composed from
+// location.origin (the quiz.html bakeHref pattern) so the link works on
+// whatever host serves the page; empty = live-demosrv fallback.
+const BAKED_FEATURED_URL: string =
+  location.origin + "/app.html?bake=" + location.origin + "/baked/chishow/f941d8888b18/index.json";
 const baked = BAKED_FEATURED_URL !== "";
 
 // Fallback entry for static previews (no demosrv behind the page); when the
@@ -32,7 +36,7 @@ const LA: DemoInfo = {
 
 function must(id: string): HTMLElement {
   const el = document.getElementById(id);
-  if (!(el instanceof HTMLElement)) throw new Error(`splash: #${id} missing from splash.html`);
+  if (!(el instanceof HTMLElement)) throw new Error(`splash: #${id} missing from index.html`);
   return el;
 }
 const featured = must("featured");

@@ -1,0 +1,16 @@
+ deploy/README.md                                   |   4 +-
+ docs/kb/articles/integrations/maplibre-realtime.md |   2 +-
+ docs/show/README.md                                |   2 +-
+ engine/cmd/demosrv/main.go                         |  14 +-
+ scripts/serve-baked.py                             |   8 +-
+ scripts/show/mksite.sh                             |  77 ++++
+ viz/app.html                                       | 311 +++++++++++++
+ viz/index.html                                     | 490 +++++++++------------
+ viz/public/_headers                                |  25 ++
+ viz/public/quiz.html                               |   3 +-
+ viz/splash.html                                    | 237 ----------
+ viz/src/main.ts                                    |   4 +-
+ viz/src/splash.ts                                  |  36 +-
+ viz/src/theme.ts                                   |   4 +-
+ viz/vite.config.ts                                 |  10 +-
+ 15 files changed, 667 insertions(+), 560 deletions(-)

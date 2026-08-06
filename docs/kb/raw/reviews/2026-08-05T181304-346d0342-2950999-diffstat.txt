@@ -1,0 +1,20 @@
+ deploy/README.md                                   |  11 +-
+ docs/kb/articles/integrations/maplibre-realtime.md |   2 +-
+ docs/show/README.md                                |   2 +-
+ docs/show/bottleneck-town.md                       |   2 +-
+ docs/show/merge-options.md                         |   2 +-
+ engine/cmd/demosrv/main.go                         |  16 +-
+ scripts/chicago/mkquiz.py                          |   3 +-
+ scripts/demos/bottleneck-town.sh                   |   2 +-
+ scripts/serve-baked.py                             |  12 +-
+ scripts/show/mksite.sh                             | 102 +++++
+ viz/app.html                                       | 311 +++++++++++++
+ viz/index.html                                     | 501 +++++++++------------
+ viz/public/_headers                                |  25 +
+ viz/public/quiz.html                               |   3 +-
+ viz/splash.html                                    | 237 ----------
+ viz/src/main.ts                                    |   4 +-
+ viz/src/splash.ts                                  |  36 +-
+ viz/src/theme.ts                                   |   4 +-
+ viz/vite.config.ts                                 |  10 +-
+ 19 files changed, 721 insertions(+), 564 deletions(-)
