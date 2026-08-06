@@ -53,7 +53,24 @@ type Report struct {
 	YieldApproaches      int      `json:"yieldApproaches,omitempty"`      // minor-class internal lanes (ADR-0010)
 	StopApproaches       int      `json:"stopApproaches,omitempty"`       // stop-class internal lanes (ADR-0010)
 	ConflictPairs        int      `json:"conflictPairs,omitempty"`        // crossing+merge foe pairs compiled (ADR-0010)
-	Warnings             []string `json:"warnings,omitempty"`
+	// ConsolidatedSlivers lists the sub-threshold junction-connector road
+	// lanes deleted by ADR-0038 consolidation, in deletion order: their
+	// predecessors were rewired into the far junction's internal lanes and
+	// those internals were extended by the sliver length.
+	ConsolidatedSlivers []string `json:"consolidatedSlivers,omitempty"`
+	// SharedExtensions lists far internals extended by more than one deleted
+	// sliver outside a deletion chain (audit only, ADR-0038 review: two
+	// independent slivers feeding one internal would sum their lengths into
+	// it — never observed, counted so a real import would say so).
+	SharedExtensions []string `json:"sharedExtensions,omitempty"`
+	// UncontrolledSeamChains counts cross-junction chains of the shape
+	// internal → uncontrolled internal → controlled internal: the one
+	// boundary pattern the rowGate seam gate does not cover (ADR-0038
+	// round-3 review). Zero on the consolidated chi import; an import that
+	// produces one must surface it here rather than change gate coverage
+	// silently.
+	UncontrolledSeamChains int      `json:"uncontrolledSeamChains,omitempty"`
+	Warnings               []string `json:"warnings,omitempty"`
 }
 
 // defaultLaneWidth is SUMO's own default lane width (m), applied when a lane
@@ -334,14 +351,12 @@ func Convert(data []byte, opts Options) (*engine.NetFile, *Report, error) {
 	}
 
 	// Right-of-way pass (ADR-0010): annotate each internal lane with its
-	// junction, its approach class (from the connection state), and its
-	// conflict foes — internal lanes of the same junction whose paths cross
-	// (shape polylines properly intersect) or merge (share the successor
-	// lane; the junction-exit funnels where overlaps were observed). Merge
-	// takes precedence when both hold. Signal-controlled and state-less
+	// junction and approach class (from the connection state). Conflict foes
+	// are computed AFTER consolidation (computeConflictFoes), because the
+	// ADR-0038 pass extends internal geometry and rewires successors, and the
+	// foe tests must see the final values. Signal-controlled and state-less
 	// approaches carry no row class: their entry is governed by the light
 	// (ADR-0011), with the off/blinking fallback to free traversal.
-	byJunction := map[string][]int{} // junction id → internal lane positions, file order
 	for i := range nf.Lanes {
 		nl := &nf.Lanes[i]
 		if !nl.Internal {
@@ -355,26 +370,6 @@ func Convert(data []byte, opts Options) (*engine.NetFile, *Report, error) {
 			rep.YieldApproaches++
 		case "stop":
 			rep.StopApproaches++
-		}
-		byJunction[jid] = append(byJunction[jid], i)
-	}
-	for _, idxs := range byJunction {
-		for a := 0; a < len(idxs); a++ {
-			for b := a + 1; b < len(idxs); b++ {
-				la, lb := &nf.Lanes[idxs[a]], &nf.Lanes[idxs[b]]
-				merge := len(la.Successors) > 0 && len(lb.Successors) > 0 &&
-					la.Successors[0] == lb.Successors[0]
-				switch {
-				case merge:
-					la.FoesMerge = append(la.FoesMerge, lb.ID)
-					lb.FoesMerge = append(lb.FoesMerge, la.ID)
-					rep.ConflictPairs++
-				case polylinesCross(la.Shape, lb.Shape):
-					la.FoesCross = append(la.FoesCross, lb.ID)
-					lb.FoesCross = append(lb.FoesCross, la.ID)
-					rep.ConflictPairs++
-				}
-			}
 		}
 	}
 	// Signal pass (ADR-0011): compile static tlLogic elements into
@@ -472,6 +467,14 @@ func Convert(data []byte, opts Options) (*engine.NetFile, *Report, error) {
 			fmt.Sprintf("%d signalized junction(s) WITHOUT a usable fixed-time program — traversed unmodeled (free traversal): %s",
 				len(rep.SignalizedJunctions), strings.Join(rep.SignalizedJunctions, ", ")))
 	}
+	// ADR-0038: consolidate sliver-coupled junction clusters (delete
+	// sub-threshold connectors, rewire predecessors into the far box, extend
+	// internals), then compute conflict foes over the final geometry. The
+	// report's lane count is the EMITTED count, so the deletions come off it
+	// (the deleted ids themselves are the audit trail).
+	consolidateSlivers(nf, rep)
+	rep.Lanes -= len(rep.ConsolidatedSlivers)
+	computeConflictFoes(nf, rep)
 	return nf, rep, nil
 }
 

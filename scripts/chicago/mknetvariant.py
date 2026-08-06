@@ -65,6 +65,12 @@ import math
 import os
 import sys
 
+# ADR-0038 riding-along guard: --add-lane never clones a donor shorter than
+# this (m). Sub-threshold lanes are netconvert junction-connector slivers
+# (divided-crossing edges clamped between two junction polygons); cloning one
+# duplicates a zero-storage capacity-seal trap.
+MIN_DONOR_LENGTH_M = 5.0
+
 
 def offset_shape(shape, dist):
     """Offset a polyline by `dist` metres along its left normal.
@@ -265,8 +271,19 @@ def main():
                 by_edge[L["edge"]].append(L)
         added = []
         feeders = {}
+        skipped_short = 0
         for edge, group in sorted(by_edge.items()):
             outer = max(group, key=lambda L: L["edgeIndex"])
+            # ADR-0038 riding-along guard: never clone a sub-threshold lane.
+            # A donor shorter than one vehicle is a junction-connector sliver
+            # (netconvert clamps divided-crossing edges between two junction
+            # polygons to as little as 0.2 m); cloning it duplicates a
+            # zero-storage trap — widen1/2/gridwiden carried 7/14/881 such
+            # _w1 lanes. Toy fixtures without a length field widen as before.
+            donor_len = outer.get("length")
+            if donor_len is not None and donor_len < MIN_DONOR_LENGTH_M:
+                skipped_short += 1
+                continue
             w = outer.get("width") or 3.2
             new = json.loads(json.dumps(outer))
             new["edgeIndex"] = outer["edgeIndex"] + 1
@@ -305,7 +322,9 @@ def main():
         log.append(f"add-lane {keys}: added {len(added)} lanes over "
                    f"{len(by_edge)} edges; wired into {wired} upstream lanes "
                    f"so arrivals can enter them (turning capacity is "
-                   f"approximated, not modelled: no new junction internals)")
+                   f"approximated, not modelled: no new junction internals)"
+                   + (f"; skipped {skipped_short} sub-{MIN_DONOR_LENGTH_M:g} m "
+                      f"donor(s) (ADR-0038 sliver guard)" if skipped_short else ""))
 
     if args.name:
         net["name"] = args.name
