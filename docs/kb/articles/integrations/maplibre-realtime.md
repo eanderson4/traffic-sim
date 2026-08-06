@@ -252,7 +252,7 @@ Two live-viewing fixes:
   the movement's bound stop-line entries — lanes sharing a state char show
   the same light by construction, and netimport grids bind several fragment
   lanes per movement.
-- **Loading overlay** (`#loading` in `viz/index.html`): page load →
+- **Loading overlay** (`#loading` in `viz/app.html`): page load →
   network fetch → ws connect → first snapshot takes noticeable seconds on
   big demos (engine world build precedes the first TSSF frame) and a bare
   "connecting…" HUD read as a hang. A full-screen stage readout lifts on

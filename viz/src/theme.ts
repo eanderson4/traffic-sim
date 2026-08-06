@@ -1,6 +1,6 @@
 // theme.ts — single source of truth for the viz palette and the per-class
 // vehicle glyph table. Every color on the map (background, casing,
-// congestion ramp, signals, vehicles), the HUD chrome (index.html CSS
+// congestion ramp, signals, vehicles), the HUD chrome (app.html CSS
 // variables), the signal-head sprite, and the legend panel reads from here
 // so a visual tweak is a one-line change, and so the legend swatches can
 // never drift from what the map actually paints. Pure data + pure math:
@@ -38,7 +38,7 @@ export interface ThemeSpec {
   // Stop sign (stopsign.ts): semantic red in every theme, like the lenses.
   stopFace: string;
   stopRim: string;
-  // HUD chrome (index.html CSS variables, set by main.ts).
+  // HUD chrome (app.html CSS variables, set by main.ts).
   hudBg: string;
   hudBorder: string;
   hudText: string;

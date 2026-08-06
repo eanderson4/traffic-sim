@@ -2,7 +2,7 @@
 """Serve a baked replay (ADR-0023) and the viz from one local origin.
 
     scripts/serve-baked.py --baked data/baked --viz viz/dist --port 8790
-    # then open http://127.0.0.1:8790/?bake=/baked/<run>/<hash>/index.json
+    # then open http://127.0.0.1:8790/app.html?bake=http://127.0.0.1:8790/baked/<run>/<hash>/index.json
 
 The baked artifacts are built for static hosting on Cloudflare Pages, which
 sets two things this replaces locally:
@@ -83,8 +83,8 @@ def main():
     for label, d in (("--baked", baked), ("--viz", viz)):
         if not os.path.isdir(d):
             sys.exit(f"serve-baked: {label} {d} is not a directory")
-    if not os.path.exists(os.path.join(viz, "index.html")):
-        sys.exit(f"serve-baked: {viz}/index.html missing — build the viz "
+    if not os.path.exists(os.path.join(viz, "app.html")):
+        sys.exit(f"serve-baked: {viz}/app.html missing — build the viz "
                  f"first (cd viz && pnpm build)")
 
     Handler.roots = (("/baked/", baked), ("/", viz))
@@ -104,7 +104,11 @@ def main():
         print("serve-baked: WARNING — no <run>/<hash>/index.json under "
               f"{baked}; there is nothing to replay")
     for r in runs:
-        print(f"  replay: http://127.0.0.1:{args.port}/?bake={r}")
+        # ?bake= must be ABSOLUTE — the shim resolves every chunk URL
+        # against the manifest with new URL() (baked.ts), which throws
+        # "Invalid base URL" on a root-relative base.
+        print(f"  replay: http://127.0.0.1:{args.port}/app.html"
+                f"?bake=http://127.0.0.1:{args.port}{r}")
     print("  quiz:   http://127.0.0.1:%d/quiz.html" % args.port)
     try:
         httpd.serve_forever()

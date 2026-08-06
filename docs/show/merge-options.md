@@ -364,7 +364,7 @@ python3 scripts/serve-baked.py                 # serves data/baked + viz/dist on
 | the trap | `mergemeter` (ramp-meter) | `/baked/mergemeter/ed4d8711170e/index.json` | 96% | 0.06% |
 
 ```
-http://127.0.0.1:8790/?bake=http://127.0.0.1:8790/baked/mergejam/017140a46b75/index.json&center=-98.46977,39.49933&zoom=14.6
+http://127.0.0.1:8790/app.html?bake=http://127.0.0.1:8790/baked/mergejam/017140a46b75/index.json&center=-98.46977,39.49933&zoom=14.6
 ```
 
 `?bake=` must be an **absolute** URL — a root-relative path throws

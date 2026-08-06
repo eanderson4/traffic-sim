@@ -514,7 +514,7 @@ python3 scripts/serve-baked.py --baked data/town/baked/baked --viz viz/dist --po
 does):
 
 ```
-http://127.0.0.1:8791/?bake=http://127.0.0.1:8791/baked/townbase/b6f967b72fe4/index.json&center=-98.4840,39.6963&zoom=14.2
+http://127.0.0.1:8791/app.html?bake=http://127.0.0.1:8791/baked/townbase/b6f967b72fe4/index.json&center=-98.4840,39.6963&zoom=14.2
 ```
 
 Pass `?bake=` an **absolute** URL — a root-relative path fails with
