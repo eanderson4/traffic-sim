@@ -651,3 +651,30 @@ links it.
 decoder. In the browser that is free (the platform decodes
 `Content-Encoding: br`); a non-browser verifier needs its own, which is why
 `scripts/serve-baked.py` exists to set the header rather than decompress.
+
+## Addendum (2026-08-05): the phantomjam.com Pages deploy
+
+The first published bakes did not land on R2/`data.phantomjam.com` as
+§"Deployment contract" planned — they serve same-origin from the
+Cloudflare Pages site (`phantomjam.com/baked/<run>/<hash>/`), staged by
+`scripts/show/mksite.sh`. Two deviations from the contract as written:
+
+- **`network.geojson` is stored brotli-compressed under its original
+  name**, and the Pages `_headers` (`viz/public/_headers`) answers
+  `Content-Encoding: br` for `/baked/*/network.geojson` — the contract's
+  "br applies ONLY to chunk objects" no longer holds on this deploy. The
+  driver is Pages' 25 MiB per-file cap (chishow's network is 34.8 MB
+  raw). The compression happens at STAGING time (mksite step 4), not in
+  the bake tool: every staged `network.geojson` is compressed uniformly
+  so the header rule is truthful for the small bakes too, and browsers
+  decode transparently — `fetch()` consumers see plain JSON.
+- **Content-key exception, accepted:** the staged copy inside the
+  content-keyed `<hash12>` directory no longer hashes to the key (the
+  bake tool writes plain JSON; the staged file is its recompression).
+  The decoded content is byte-identical, so the replay semantics the key
+  protects are unchanged; a verifier must decompress before hashing.
+
+`Cache-Control: immutable` on `/baked/*` ships in the same `_headers`,
+with the manifest excepted (`/baked/*/index.json` gets no Cache-Control
+— the viz fetches it no-cache and a stale pinned table must never
+survive in a browser cache).
