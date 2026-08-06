@@ -61,8 +61,8 @@ manifest URL is the base for resolving every chunk.
 | scenario | run | index.json | opening camera | showable window |
 |---|---|---|---|---|
 | 1 — the Loop and the expressways | `chishow`, 18000 ticks | `/baked/chishow/f941d8888b18/index.json` | `&center=-87.6298,41.8790&zoom=14.5` | — |
-| 2 — Loop CBD | `cbdbase`, 7000 ticks | `/baked/cbdbase/0f56eb8c60a1/index.json` | `&center=-87.6293,41.8798&zoom=14.5` | — |
-| 3 — Kennedy corridor | `kenbase`, 12000 ticks | `/baked/kenbase/17436036ec22/index.json` | `&center=-87.7837,41.9390&zoom=13.5` | — |
+| 2 — Loop CBD | `cbdbase`, 7000 ticks | `/baked/cbdbase/7406456b6031/index.json` | `&center=-87.6293,41.8798&zoom=14.5` | **the whole run** — 7000 ticks is the fidelity-gated cut; at 12000 the grid refuses 7% of demand at injection |
+| 3 — Kennedy corridor | `kenbase`, 12000 ticks | `/baked/kenbase/03c7bc162e73/index.json` | `&center=-87.7837,41.9390&zoom=13.5` | **the whole run** — the AM peak builds throughout; the measured window is the last 8000 ticks |
 | 4 — The Merge | `mergejam`, 12000 ticks | `/baked/mergejam/017140a46b75/index.json` | `&center=-98.46977,39.49933&zoom=14.6` | **ticks 4200-10200 at 8x** = 75 s wall: the shockwave forming at the merge and walking 2 km upstream |
 | 5 — Bottleneck Town | `townbase`, 15000 ticks | `/baked/townbase/b6f967b72fe4/index.json` | `&center=-98.4840,39.6963&zoom=14.2` | **ticks 6300-7200 at 1x** = 90 s, one full 86 s cycle at every junction with queues fully developed |
 
@@ -104,14 +104,17 @@ gets held to the stricter bar.
 `Failed to construct 'URL': Invalid base URL` — the manifest URL is used as
 the base for resolving every chunk.
 
-**The shipped artifacts predate a digest fix.** External review found that
+**Some shipped artifacts predate a digest fix.** External review found that
 the bake's record digest folded every tick-group boundary message twice, so
-the `baked/{run}/{hash12}/` content key of the artifacts in `data/baked/` is
-not the one the fixed code computes. The frames themselves are unaffected —
-the bake still CRC-verified every tick against the recording — so the
-replay is correct and was re-verified end to end after the fix landed. Any
-re-bake will land under a different hash directory, which is the content key
-doing its job. Re-bake before anything is published; not before the show.
+the `baked/{run}/{hash12}/` content key the fixed code computes differs from
+the one the original bakes landed under. The frames themselves are
+unaffected — the bake still CRC-verified every tick against the recording —
+so the replays are correct. `cbdbase` and `kenbase` were re-recorded and
+re-baked under the fixed digest on 2026-08-06 (the re-records reproduced
+the originals tick for tick); `chishow`, `mergejam` and `townbase` still
+carry their pre-fix hashes and will move to a new hash directory whenever
+they are next re-baked — the content key doing its job. Re-bake before
+anything new is published from those three.
 
 **Give it a full minute to load before judging it.** The network is a 34 MB
 GeoJSON document; on a loaded machine it is ~40 s before a single lane
@@ -354,19 +357,26 @@ claimed it for every run on the page, which is false.
 - **The recordings**: yes. `chishow` logs 0.03% coasting
   ([audit.md](audit.md)) and `chishow35` 0.07%; `record-hero.sh` refuses to
   bake a run that misses either bar.
-- **The three Chicago A/B tables** (the Loop and the expressways, the CBD,
-  the Kennedy): **no, and the gap is large.** `scripts/whatif.py` passes no
-  `-drivers`, so every arm ran on ONE driver replica. Measured on the
-  `chi-loop-urban` baseline arm at 12,000 ticks with *eight* replicas:
-  **1.49%** uncontrolled coasting. On one replica it is worse — `serve`'s
-  own `-drivers` help records **35.75%** of vehicle-ticks with no controller
-  intent at ~12,000 vehicles on this network.
+- **The Loop-and-expressways A/B table**: **no, and the gap is large.**
+  `scripts/whatif.py` passes no `-drivers`, so every arm ran on ONE driver
+  replica. Measured on the `chi-loop-urban` baseline arm at 12,000 ticks
+  with *eight* replicas: **1.49%** uncontrolled coasting. On one replica it
+  is worse — `serve`'s own `-drivers` help records **35.75%** of
+  vehicle-ticks with no controller intent at ~12,000 vehicles on this
+  network.
+- **The CBD and Kennedy A/B tables**: also single-replica, but their
+  fleets (~1,000-1,700 active vehicles) sit in the regime one replica
+  drives cleanly — the 2026-08-06 re-recordings of both baselines in that
+  exact configuration (one driver, capacity 40000) log **0.08%**
+  uncontrolled coasting, under the bar. The CBD table's fidelity gap is a
+  different one, documented above: at 12,000 ticks the saturated grid
+  refuses ~7% of demand at injection, carried paired in both arms.
 
 What that does and does not mean. It does NOT mean the Chicago rankings are
 wrong: every arm ran under the same condition on the same seeds, and the
-comparison is paired. It DOES mean their absolute speeds are not a
-measurement of the scenario as written, that they would be refused outright
-by the fidelity gate this repo now applies, and that the caveat already
-attached to those rows — expressway mainlines running faster than the real
-thing — has this as one of its causes rather than being a separate quirk.
-Re-measuring them with `-drivers` is tracked.
+comparison is paired. For the full-network table it DOES mean the absolute
+speeds are not a measurement of the scenario as written, that they would be
+refused outright by the fidelity gate this repo now applies, and that the
+caveat already attached to those rows — expressway mainlines running faster
+than the real thing — has this as one of its causes rather than being a
+separate quirk. Re-measuring that table with `-drivers` is tracked.
