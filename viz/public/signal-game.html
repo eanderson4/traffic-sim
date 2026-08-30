@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Beat the Signal — Bottleneck Town</title>
+<!--
+  Host-operated dial page for the signal-timing game (docs/show/
+  signal-game-plan-2026-08-29.md, workstream A3). The guest calls numbers,
+  the host turns dials: the page downloads a dial JSON that the host scores
+  with scripts/show/score-timing.py. Self-contained by construction (mkquiz
+  precedent): no CDN, no fonts, no build step, and nothing is fetched until
+  "Refresh leaderboard" is clicked — the page itself makes zero requests at
+  load, so it works on flaky conference wifi.
+
+  The numbers on the leaderboard come from timing-game-results.json in this
+  same directory, written by score-timing.py from measured seed-42 runs —
+  never transcribed into this page by hand.
+-->
+<style>
+:root{--bg:#0d1117;--card:#161b22;--edge:#30363d;--ink:#e6edf3;--dim:#8b949e;
+--win:#3fb950;--bad:#f85149;--accent:#58a6ff;--warn:#d29922}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+font:16px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+.wrap{max-width:880px;margin:0 auto;padding:2rem 1.25rem 4rem}
+h1{font-size:1.6rem;margin:0 0 .25rem;letter-spacing:-.02em}
+h2{font-size:1.05rem;margin:0 0 .75rem}
+.sub{color:var(--dim);margin:0 0 1.5rem;font-size:.95rem}
+.card{background:var(--card);border:1px solid var(--edge);border-radius:12px;
+padding:1.1rem 1.2rem;margin:0 0 1rem}
+.card h2 .tag{font-size:.7rem;letter-spacing:.08em;color:var(--accent);
+vertical-align:middle;margin-right:.5rem}
+.rules{color:var(--dim);font-size:.92rem;margin:0}
+.rules b{color:var(--ink)}
+.rules li{margin:.3rem 0}
+.name-row{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;margin:0 0 1rem}
+.name-row label{color:var(--dim);font-size:.9rem}
+input,select{background:#0d1117;color:var(--ink);border:1px solid var(--edge);
+border-radius:8px;padding:.45rem .6rem;font:inherit;font-size:.95rem}
+input:focus,select:focus{outline:none;border-color:var(--accent)}
+input.bad{border-color:var(--bad)}
+input[type=number]{width:5.5rem}
+.dials{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+gap:.75rem;margin:.75rem 0}
+.dial label{display:block;color:var(--dim);font-size:.78rem;margin-bottom:.25rem;
+line-height:1.35}
+.readout{font-size:.9rem;color:var(--dim);margin:.25rem 0 0}
+.readout b{color:var(--ink)}
+.err{color:var(--bad);font-size:.82rem;margin:.4rem 0 0;min-height:1.2em}
+details{border:1px solid var(--edge);border-radius:10px;padding:.6rem .9rem;
+margin:.5rem 0}
+details summary{cursor:pointer;font-weight:600}
+details summary .cyc{color:var(--dim);font-weight:400;font-size:.85rem;margin-left:.5rem}
+.bar{display:flex;gap:.75rem;align-items:center;margin:.9rem 0 0;flex-wrap:wrap}
+.bar button{background:var(--accent);color:#04121f;border:0;border-radius:8px;
+padding:.6rem 1.2rem;font:inherit;font-weight:600;cursor:pointer}
+.bar button.ghost{background:transparent;color:var(--dim);
+border:1px solid var(--edge)}
+.bar button:disabled{opacity:.45;cursor:not-allowed}
+.hint{color:var(--dim);font-size:.8rem}
+table{border-collapse:collapse;width:100%;margin-top:.75rem;font-size:.95rem}
+th,td{text-align:left;padding:.45rem .6rem;border-bottom:1px solid var(--edge)}
+th{color:var(--dim);font-size:.78rem;letter-spacing:.05em;text-transform:uppercase}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+tr.best td:first-child{color:var(--win);font-weight:700}
+.kind{font-size:.72rem;letter-spacing:.06em;text-transform:uppercase;
+border:1px solid var(--edge);border-radius:999px;padding:.1rem .5rem;color:var(--dim)}
+.kind.baseline{color:var(--accent);border-color:var(--accent)}
+.lb-status{color:var(--dim);font-size:.9rem;margin:.5rem 0 0}
+.lb-src{color:var(--dim);font-size:.78rem;margin:.5rem 0 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Beat the Signal — Bottleneck Town</h1>
+<p class="sub">Retune the four traffic lights on Main Street and beat the town's
+own timing. A fictitious network, measured honestly.</p>
+
+<div class="card">
+<h2>The rules</h2>
+<ul class="rules">
+<li><b>Same network, same demand, same seed</b> (seed 42, 15,000 ticks ≈ 25 min
+of traffic). The only thing that changes between runs is the light timing.</li>
+<li>Each of the four junctions <b>J1–J4</b> runs a 4-phase cycle: Main St
+through+right, Main St protected lefts, cross street northbound, cross street
+southbound. You set the four <b>green durations</b>; amber (3 s) and all-red
+(2 s) are fixed, so <b>cycle = your greens + 20 s</b>.</li>
+<li>Round 2 adds <b>offsets</b>: how many seconds into the simulation a
+junction's first green begins. Offsets are how you build a green wave.</li>
+<li>Bounds: each green 5–90 s, each junction's cycle 40–150 s, offset below the
+cycle length. The compiler enforces the same bounds.</li>
+<li>Score: <b>mean time loss per vehicle</b> (lower is better) and trips
+completed, from the run's own metrics. The bars to beat are the shipped arms:
+<b>base</b> (86 s fixed-time), <b>retime-short</b> (66 s), and
+<b>green-wave</b> (eastbound progression).</li>
+</ul>
+</div>
+
+<div class="name-row">
+<label for="dname">Design name</label>
+<input id="dname" type="text" value="guest-r1" size="18"
+       pattern="[a-z0-9]([a-z0-9-]*[a-z0-9])?" spellcheck="false">
+<span class="hint">lowercase letters, digits, dashes — becomes the run's id</span>
+</div>
+
+<div class="card" id="round1">
+<h2><span class="tag">ROUND 1</span>One junction</h2>
+<div class="dials" style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr))">
+<div class="dial">
+<label for="r1-jid">Junction (west → east along Main St)</label>
+<select id="r1-jid">
+<option>J1</option><option>J2</option><option>J3</option><option>J4</option>
+</select>
+</div>
+</div>
+<div class="dials" id="r1-greens"></div>
+<div class="dials" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">
+<div class="dial">
+<label for="r1-offset">Offset (s; 0 = starts at sim start)</label>
+<input id="r1-offset" type="number" min="0" step="1" value="0">
+</div>
+</div>
+<p class="readout" id="r1-cycle"></p>
+<p class="err" id="r1-err"></p>
+<div class="bar">
+<button id="r1-download">Download round-1 design JSON</button>
+<span class="hint">Hand the file to the host — they run the sim, ~20 s.</span>
+</div>
+</div>
+
+<div class="card" id="round2">
+<h2><span class="tag">ROUND 2</span>The full arterial</h2>
+<div class="bar" style="margin:0 0 .5rem">
+<button class="ghost" id="copy-r1" type="button">Copy round-1 design to all four junctions</button>
+</div>
+<div id="r2-sections"></div>
+<p class="err" id="r2-err"></p>
+<div class="bar">
+<button id="r2-download">Download round-2 design JSON</button>
+<span class="hint">All four junctions, greens + offsets.</span>
+</div>
+</div>
+
+<div class="card" id="leaderboard">
+<h2>Leaderboard</h2>
+<div class="bar" style="margin:0">
+<button class="ghost" id="lb-refresh" type="button">Refresh leaderboard</button>
+<span class="hint">Reads timing-game-results.json from this directory.</span>
+</div>
+<p class="lb-status" id="lb-status">Not loaded yet — press refresh after the host scores a run.</p>
+<div id="lb-table"></div>
+<p class="lb-src" id="lb-src"></p>
+</div>
+
+</div>
+
+<script>
+"use strict";
+
+// --- the scenario constants (scripts/demos/bottleneck_town.py) -------------
+// Base arm: every junction runs greens [36, 8, 11, 11] with no offset; amber
+// 3 s and all-red 2 s follow each green, so the fixed part of a cycle is
+// 4 * (3 + 2) = 20 s and the base cycle is 86 s.
+var BASE_GREENS = [36, 8, 11, 11];
+var FIXED_S = 20;
+var JUNCTIONS = ["J1", "J2", "J3", "J4"];
+var GREEN_LABELS = [
+  "Main St — through + right, both directions (base 36 s)",
+  "Main St — protected lefts, both directions (base 8 s)",
+  "Cross street — northbound, all movements (base 11 s)",
+  "Cross street — southbound, all movements (base 11 s)"
+];
+var GREEN_MIN = 5, GREEN_MAX = 90, CYCLE_MIN = 40, CYCLE_MAX = 150;
+var NAME_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
+
+function num(v) { return (typeof v === "number" && isFinite(v)); }
+function fmt(x) { return (Math.round(x * 100) / 100).toString(); }
+function asNum(x) { var n = Math.round(x * 100) / 100; return n; }
+
+// Mirror mktimingvariant.py's validation exactly — a design the page rejects
+// would be rejected by the compiler, and vice versa.
+function validateDial(greens, offset) {
+  var errs = [];
+  for (var i = 0; i < 4; i++) {
+    if (!num(greens[i])) errs.push("green " + (i + 1) + " needs a number");
+    else if (greens[i] < GREEN_MIN || greens[i] > GREEN_MAX)
+      errs.push(GREEN_LABELS[i].split(" (base")[0] + ": " + fmt(greens[i]) +
+                " s is outside [" + GREEN_MIN + ", " + GREEN_MAX + "] s");
+  }
+  var cycle = greens.reduce(function (a, b) { return a + (num(b) ? b : 0); }, FIXED_S);
+  if (cycle < CYCLE_MIN || cycle > CYCLE_MAX)
+    errs.push("cycle " + fmt(cycle) + " s is outside [" + CYCLE_MIN + ", " +
+              CYCLE_MAX + "] s (greens + 20 s amber/all-red)");
+  if (!num(offset)) errs.push("offset needs a number (0 is fine)");
+  else if (offset < 0 || offset >= cycle)
+    errs.push("offset " + fmt(offset) + " s is outside [0, " + fmt(cycle) +
+              ") — offsets wrap at the cycle length");
+  return { errs: errs, cycle: cycle };
+}
+
+function readGreens(inputs) {
+  return inputs.map(function (el) { return parseFloat(el.value); });
+}
+
+function markInputs(inputs, greens) {
+  inputs.forEach(function (el, i) {
+    el.classList.toggle("bad", !num(greens[i]) ||
+                        greens[i] < GREEN_MIN || greens[i] > GREEN_MAX);
+  });
+}
+
+function greenInputs(container, prefix, onchange) {
+  var inputs = [];
+  GREEN_LABELS.forEach(function (label, i) {
+    var d = document.createElement("div");
+    d.className = "dial";
+    var lab = document.createElement("label");
+    lab.textContent = label;
+    lab.setAttribute("for", prefix + "-g" + i);
+    var inp = document.createElement("input");
+    inp.type = "number"; inp.min = GREEN_MIN; inp.max = GREEN_MAX; inp.step = "1";
+    inp.id = prefix + "-g" + i;
+    inp.value = BASE_GREENS[i];
+    inp.addEventListener("input", onchange);
+    d.appendChild(lab); d.appendChild(inp);
+    container.appendChild(d);
+    inputs.push(inp);
+  });
+  return inputs;
+}
+
+// --- round 1 ---------------------------------------------------------------
+var r1Greens = greenInputs(document.getElementById("r1-greens"), "r1", updateR1);
+var r1Offset = document.getElementById("r1-offset");
+var r1Jid = document.getElementById("r1-jid");
+r1Offset.addEventListener("input", updateR1);
+
+function updateR1() {
+  var g = readGreens(r1Greens);
+  var off = parseFloat(r1Offset.value);
+  markInputs(r1Greens, g);
+  r1Offset.classList.toggle("bad", !num(off) || off < 0);
+  var v = validateDial(g, num(off) ? off : NaN);
+  document.getElementById("r1-cycle").innerHTML =
+    "Cycle length at " + r1Jid.value + ": <b>" +
+    fmt(v.cycle) +
+    " s</b> (greens " + g.map(function (x) { return num(x) ? fmt(x) : "?"; }).join(" + ") +
+    " + 20 s clearance) — base runs 86 s.";
+  document.getElementById("r1-err").textContent = v.errs.join("; ");
+  return v;
+}
+
+// --- round 2 ---------------------------------------------------------------
+var r2 = {}; // jid -> {greens: [inputs], offset: input, cyc: span, errTarget shared}
+var r2Sections = document.getElementById("r2-sections");
+
+JUNCTIONS.forEach(function (jid) {
+  var det = document.createElement("details");
+  if (jid === "J1") det.open = true;
+  var sum = document.createElement("summary");
+  sum.textContent = jid;
+  var cyc = document.createElement("span");
+  cyc.className = "cyc";
+  sum.appendChild(cyc);
+  det.appendChild(sum);
+  var grid = document.createElement("div");
+  grid.className = "dials";
+  det.appendChild(grid);
+  var inputs = greenInputs(grid, "r2-" + jid, function () { updateR2J(jid); });
+  var offWrap = document.createElement("div");
+  offWrap.className = "dials";
+  offWrap.style.gridTemplateColumns = "repeat(auto-fit,minmax(150px,1fr))";
+  var offDial = document.createElement("div");
+  offDial.className = "dial";
+  var offLab = document.createElement("label");
+  offLab.textContent = "Offset (s)";
+  offLab.setAttribute("for", "r2-" + jid + "-offset");
+  var off = document.createElement("input");
+  off.type = "number"; off.min = "0"; off.step = "1"; off.value = "0";
+  off.id = "r2-" + jid + "-offset";
+  off.addEventListener("input", function () { updateR2J(jid); });
+  offDial.appendChild(offLab); offDial.appendChild(off);
+  offWrap.appendChild(offDial);
+  det.appendChild(offWrap);
+  r2Sections.appendChild(det);
+  r2[jid] = { greens: inputs, offset: off, cyc: cyc };
+});
+
+function updateR2J(jid) {
+  var s = r2[jid];
+  var g = readGreens(s.greens);
+  var off = parseFloat(s.offset.value);
+  markInputs(s.greens, g);
+  s.offset.classList.toggle("bad", !num(off) || off < 0);
+  var v = validateDial(g, num(off) ? off : NaN);
+  s.cyc.textContent = "— cycle " + fmt(v.cycle) + " s" +
+    (v.errs.length ? " (" + v.errs.length + " problem" + (v.errs.length > 1 ? "s" : "") + ")" : "");
+  return v;
+}
+
+function updateR2() {
+  var errs = [];
+  JUNCTIONS.forEach(function (jid) {
+    updateR2J(jid).errs.forEach(function (e) { errs.push(jid + ": " + e); });
+  });
+  document.getElementById("r2-err").textContent = errs.join("; ");
+  return errs;
+}
+
+document.getElementById("copy-r1").addEventListener("click", function () {
+  var g = readGreens(r1Greens);
+  var off = r1Offset.value;
+  JUNCTIONS.forEach(function (jid) {
+    r2[jid].greens.forEach(function (el, i) { el.value = r1Greens[i].value; });
+    r2[jid].offset.value = off;
+    updateR2J(jid);
+  });
+  updateR2();
+});
+
+// --- download ---------------------------------------------------------------
+function dialName() {
+  var name = document.getElementById("dname").value.trim();
+  if (!NAME_RE.test(name)) {
+    return null;
+  }
+  return name;
+}
+
+function junctionDial(greens, offset) {
+  var d = { greens: greens.map(asNum) };
+  if (num(offset) && offset !== 0) d.offset = asNum(offset); // omitted at 0, like green-wave's J1
+  return d;
+}
+
+function download(obj, filename) {
+  var blob = new Blob([JSON.stringify(obj, null, 2) + "\n"],
+                      { type: "application/json" });
+  var a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
+}
+
+document.getElementById("r1-download").addEventListener("click", function () {
+  var name = dialName();
+  var v = updateR1();
+  if (!name) { document.getElementById("r1-err").textContent =
+    "Design name must be lowercase letters, digits, dashes (e.g. guest-r1)."; return; }
+  if (v.errs.length) return;
+  var jid = r1Jid.value;
+  var obj = { name: name, junctions: {} };
+  obj.junctions[jid] = junctionDial(readGreens(r1Greens), parseFloat(r1Offset.value));
+  download(obj, name + ".json");
+});
+
+document.getElementById("r2-download").addEventListener("click", function () {
+  var name = dialName();
+  var errs = updateR2();
+  if (!name) { document.getElementById("r2-err").textContent =
+    "Design name must be lowercase letters, digits, dashes (e.g. guest-r1)."; return; }
+  if (errs.length) return;
+  var obj = { name: name, junctions: {} };
+  JUNCTIONS.forEach(function (jid) {
+    obj.junctions[jid] = junctionDial(readGreens(r2[jid].greens),
+                                      parseFloat(r2[jid].offset.value));
+  });
+  download(obj, name + ".json");
+});
+
+// --- leaderboard --------------------------------------------------------------
+document.getElementById("lb-refresh").addEventListener("click", function () {
+  var status = document.getElementById("lb-status");
+  var tableWrap = document.getElementById("lb-table");
+  var src = document.getElementById("lb-src");
+  status.textContent = "Loading…";
+  tableWrap.textContent = "";
+  src.textContent = "";
+  fetch("timing-game-results.json", { cache: "no-store" }).then(function (resp) {
+    if (resp.status === 404) {
+      status.textContent = "No scores yet — the host runs the sim, then this fills in.";
+      return null;
+    }
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    return resp.json();
+  }).then(function (data) {
+    if (!data) return;
+    var rows = (data.rows || []).slice();
+    rows.sort(function (a, b) { return a.mean_time_loss_s - b.mean_time_loss_s; });
+    if (!rows.length) {
+      status.textContent = "No scores yet — the host runs the sim, then this fills in.";
+      return;
+    }
+    status.textContent = "";
+    var t = document.createElement("table");
+    var head = document.createElement("tr");
+    ["#", "design", "kind", "mean time loss (s/veh)", "trips completed"].forEach(function (h, i) {
+      var th = document.createElement("th");
+      th.textContent = h;
+      if (i >= 3) th.className = "num";
+      head.appendChild(th);
+    });
+    t.appendChild(head);
+    rows.forEach(function (r, i) {
+      var tr = document.createElement("tr");
+      if (i === 0) tr.className = "best";
+      var cells = [String(i + 1), r.name, r.kind,
+                   Number(r.mean_time_loss_s).toFixed(1),
+                   String(r.trips_completed)];
+      cells.forEach(function (c, j) {
+        var td = document.createElement("td");
+        if (j === 2) {
+          var badge = document.createElement("span");
+          badge.className = "kind" + (c === "baseline" ? " baseline" : "");
+          badge.textContent = c;
+          td.appendChild(badge);
+        } else {
+          td.textContent = c;
+        }
+        if (j >= 3) td.className = "num";
+        tr.appendChild(td);
+      });
+      t.appendChild(tr);
+    });
+    tableWrap.appendChild(t);
+    if (data.generated_from) src.textContent = "Measured: " + data.generated_from + ".";
+  }).catch(function (e) {
+    status.textContent = "Could not load scores (" + e.message +
+      ") — the file appears only after the host scores a run.";
+  });
+});
+
+// initial paint
+updateR1();
+updateR2();
+</script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "anchor": "footprint-center",
+  "models": [
+    { "id": "sedan",      "module": "./sedan.ts",      "classes": ["car"],   "weight": 3 },
+    { "id": "hatchback",  "module": "./hatchback.ts",  "classes": ["car"],   "weight": 2 },
+    { "id": "suv",        "module": "./suv.ts",        "classes": ["car"],   "weight": 2 },
+    { "id": "pickup",     "module": "./pickup.ts",     "classes": ["car"],   "weight": 2 },
+    { "id": "minivan",    "module": "./minivan.ts",    "classes": ["car"],   "weight": 1 },
+    { "id": "coupe",      "module": "./coupe.ts",      "classes": ["car"],   "weight": 1 },
+    { "id": "box-truck",  "module": "./box-truck.ts",  "classes": ["truck"], "weight": 2 },
+    { "id": "step-van",   "module": "./step-van.ts",   "classes": ["truck"], "weight": 2 },
+    { "id": "school-bus", "module": "./school-bus.ts", "classes": ["truck"], "weight": 1 },
+    { "id": "fire-truck", "module": "./fire-truck.ts", "classes": ["truck"], "weight": 1 },
+    { "id": "semi",       "module": "./semi.ts",       "classes": ["semi"],  "weight": 1 },
+    { "id": "city-bus",   "module": "./city-bus.ts",   "classes": ["bus"],   "weight": 1 }
+  ],
+  "classDefault": { "car": "sedan", "truck": "box-truck", "semi": "semi", "bus": "city-bus" }
+}

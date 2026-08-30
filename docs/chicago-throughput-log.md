@@ -220,3 +220,118 @@ the kernel gate already EXISTS (DensityTargetPerKm covers director
 directives, scenario-declared, hashed, replay-free); M1 = hysteresis
 floor + gate accounting. Measured MFD target band: cap ≈4,500 active,
 resume ≈4,000.
+
+**MERGED 2026-08-06: ADR-0038 on main (PR #11, merge 2bc98de).** Four
+review rounds; three reachable blockers fixed (seam yield bypass, RowStop
+duty at seams, parallel-sliver double-extension); deferrals recorded in
+the commit message + ADR addenda. Round-4 Sol "blockers" triaged out per
+the bar: route-specific merge-foe evaluation matches the documented
+contract (conservative direction; contract-v2 is its own ADR) and the
+chain-ancestry guard edge is audit-counter-covered, never observed.
+
+### Iteration 3 — demand-side perimeter metering, ADR-0039 (2026-08-06, starting)
+
+- Target: cause #2, the genuine oversaturation. Design input:
+  /tmp/chidiag/metering-04.md. Headline: the kernel gate already exists
+  (DensityTargetPerKm, covers spawner AND director directives,
+  scenario-declared → ADR-0012 hashed, replay-free by construction).
+- M1 scope: resume floor (hysteresis), gate-suppression accounting
+  (DirGated; gate-held time counts toward the 600-tick expiry window —
+  honesty decision), metrics demand-block reporting, drain2-MFD-anchored
+  EXAMPLE scenario values (cap ≈2.0, resume ≈1.8 veh/km; engine default
+  stays OFF).
+- Follow-ons deferred: per-origin bounded wait parameterization,
+  per-portal ALINEA meters (spatial misallocation check first), workplace
+  parking capacity (own demand-model ADR).
+
+**ADR-0039 implemented (uncommitted):** `densityGateHold` hysteresis
+kernel-side (both spawn paths), manifest `spawner.density_resume_per_km`
+(fail-loud validation), gate accounting (`DirGated`, gate-expired split —
+gate-held time counts toward the 600-tick window per the honesty
+decision), metrics `demand.suppressed`/`gated_expired` (omitted at zero →
+gate-off byte-identical). **TSKF v8** keyframes the gate bit (writer
+ladder: v8 only when cap>0 AND gate engaged; cap=0 byte-identical; v8
+payload into a cap-less spec is a loud error; mid-band round-trip test
+proves CRC-exact continuation). Full suite green.
+
+**Smoke (chi-half-consol-base, 54k ticks, gate on):** accumulation crested
+exactly at cap 4,400; visible hysteresis cycles; accounting reconciles
+(10,698 = 8,541 spawned + 2,157 expired, 99% gate-caused, suppressed
+143,568 veh·s); stranded 788 vs 944 ungated-old-net, active-at-horizon
+2,104 vs 3,553.
+
+**Validation bracket (running):** whatif pod `chi-gate-pod` (gate vs
+nogate, both adaptive+consolidated), seeds 1000–1003, 54k ticks, warmup
+6000 → data/runs/gate-bracket.json. Then the seed-42 6h drain pair.
+
+Bracket incident log: (1) whatif `--report` is an input, `--out` is the
+output; (2) stale engine/serve predating the manifest field; (3) jobs=4 on
+16 cores → record-plane puback timeouts at tick ~45k (use jobs=2); (4)
+session restart killed detached runs mid-flight (their tick-~280 puback
+aborts were the parent dying, not a sim bug); (5) serve's "of demand never
+entered the network" fidelity warning counted gate-caused expiry → every
+metering run voided in whatif. Fixed: the warning is now gate-aware
+(fires only on the non-gate undelivered share; gate suppression prints as
+policy, ADR-0039 accounting section updated; `TestNonGateDelivery`).
+
+**Bracket result (data/runs/gate-bracket.json, seeds 1000–1003, 54k
+ticks, consolidated+adaptive):** gate 25.29 vs nogate 24.11 km/h →
+**+4.9% speed, p=0.0042, d=3.94 — UPGRADE**. Supporting: delivered 83% vs
+99% (17% held at origins), completed 5,206 vs 5,867 (−11%, deferred not
+lost), active-at-horizon 1,557 vs 2,514 (−38%), per-trip time loss
+691.9 vs 706.5 s. The 90-min window ends at the demand peak, so the drain
+pair decides whether deferred demand ultimately gets served.
+
+**Drain pair (running):** drain4 gate/nogate, seed 42, 216k ticks.
+
+**drain4 result (paired, same binary, consolidated+adaptive, seed 42,
+6 sim-hours):**
+
+| | nogate | gate | Δ |
+|---|---|---|---|
+| injected | 10,604 | 8,945 | −1,731 gate-suppressed |
+| completed | 8,982 | 7,656 | −15% |
+| stranded | 1,250 | 998 | −20% |
+| active @ horizon | 372 | 291 | −22% |
+| mean time loss | 1,749 s | 1,520 s | −13% |
+| VHT | 28.2M s | 21.6M s | −23% |
+
+**Finding (the big one):** completions fell ~1:1 with suppression. Root
+cause: gate-held time counts toward the 600-tick (60 s) expiry window, so
+"deferred" trips EXPIRE after 60 s at the gate — deletion, not deferral.
+The 600-tick window was designed for blocked origins; real perimeter
+control queues for 10–20 min. ADR-0039 decision point 3 ("gate-held time
+counts toward expiry — the honesty decision") is therefore REVISED by
+measurement: honesty belongs in reporting (suppressed-wait counted and
+surfaced), not in a 60 s delete. Iteration 3b: gate-held time runs on its
+own bounded clock (gate-hold cap ≈ 30 min); suppressed trips then enter
+during the post-peak drain instead of expiring. Expectation: completions
+recover toward nogate while keeping the −20% strands / −13% time-loss
+gains. The drain4-nogate arm stands as the control; only the gate arm
+reruns.
+
+**Iteration 3b implemented:** gate-held ticks no longer count toward the
+600-tick origin-blockage window; a separate bounded deferral clock
+(`spawner.gate_hold_max_s`, default 1800 s) expires long-held directives
+as gate-caused. Accounting: `DirGateWait{Count,Sum,Max}`, serve prints
+"gate deferral: N trips waited … mean/max". Tests incl. deferral-past-600,
+expiry exactly at the cap, mixed gate+origin blockage. Caveat recorded in
+ADR: `dirGateHeld` not in TSKF — a restore restarts the deferral clock
+(v9 material only if metering seeks ever matter).
+
+**drain5-gate (running):** seed 42, 216k ticks, deferral clock on.
+Control = drain4-nogate. Success = completions recover toward 8,982 while
+strands stay ≪1,250.
+
+**drain5 result — deferral works:** 3,922 trips waited at the gate (mean
+556 s, max 1,800 s), only 41 expired. Completed **9,060 vs 8,982 nogate
+(+0.9% — fully recovered)**, stranded 1,156 vs 1,250 (−7.5%), mean time
+loss 1,634 vs 1,749 s (−6.6%). Honest cost: 2.2M s counted origin wait.
+Aggregate traveler-hours ≈ neutral (in-network VHT −3.6%, plus origin
+wait ≈ +4%) — the metering win on this profile is robustness (accumulation
+pinned at the MFD crest) + fewer failed trips, not raw time savings.
+Cap-value sweep (1.8/2.2/2.5) is the stated tuning follow-up.
+
+NOTE: the 4-seed bracket above ran the pre-3b (60 s-deletion) binary —
+its +4.9% reflects superseded semantics. Bracket v4 rerunning against the
+deferral binary so the ADR's validation numbers match what ships.
