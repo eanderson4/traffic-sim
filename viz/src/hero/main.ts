@@ -79,7 +79,7 @@ import { THEMES, getTheme, type ThemeSpec } from "../theme.ts";
 import { BODY_PALETTE, loadFleet, tintFor, type Fleet, type FleetModel } from "../fleet3d/loader.ts";
 import { bracketAt, lerpAngle, walkPairs, type Bracket } from "./interp.ts";
 import { TimingPanel, runnerAvailable } from "./timingpanel.ts";
-import { DesignState, GameDrawer } from "./gamedrawer.ts";
+import { DesignState, GameDrawer, runSlugOf } from "./gamedrawer.ts";
 
 // --- palette (resolved once from theme.ts — pure data, no map code) ---------
 // heroPalette maps a ThemeSpec onto the hero scene: what has a token reads
@@ -1129,7 +1129,8 @@ async function main(): Promise<void> {
   const drawer = new GameDrawer({
     design,
     onEditJunction: (j) => panel.select(j),
-    currentRun: params.get("run") ?? "",
+    // the board row's slug is <slug>; ?run= may pin <slug>/<hash12>
+    currentRun: runSlugOf(params.get("run") ?? ""),
   });
   const panel = new TimingPanel({
     table: data.table,
@@ -1146,10 +1147,12 @@ async function main(): Promise<void> {
 
   // --- run-service probe (view-only mode) --------------------------------------
   // GET /api/timing/run is the timing-runner's health probe (serve-baked.py
-  // --timing-runner answers 200); on a static host (the public Pages
-  // bundle) that GET 404s/405s. One verdict, shared by the drawer and the
-  // panel's ghost Run. ?runner=0|1 forces it and skips the probe (capture
-  // hooks). Fire-and-forget: first render never waits on the probe.
+  // --timing-runner answers 200 + the JSON sentinel); the verdict is the
+  // sentinel, not the status — static hosts can 200 an HTML fallback for
+  // unmatched paths (Pages without a custom 404.html). One verdict, shared
+  // by the drawer and the panel's ghost Run. ?runner=0|1 forces it and
+  // skips the probe (capture hooks). Fire-and-forget: first render never
+  // waits on the probe.
   const applyRunnerVerdict = (live: boolean): void => {
     drawer.setRunnerAvailable(live);
     panel.setRunnerAvailable(live);
@@ -1159,7 +1162,8 @@ async function main(): Promise<void> {
     applyRunnerVerdict(runnerParam === "1");
   } else {
     fetch("/api/timing/run", { cache: "no-cache" })
-      .then((resp) => applyRunnerVerdict(runnerAvailable(resp.status)))
+      .then((resp) => (resp.ok ? resp.json().catch(() => null) : null))
+      .then((body: unknown) => applyRunnerVerdict(runnerAvailable(body)))
       .catch(() => applyRunnerVerdict(runnerAvailable(null)));
   }
   const pickTargets = rigs.map((r) => r.pick);

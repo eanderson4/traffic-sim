@@ -129,12 +129,20 @@ export function isBaseDial(greens: readonly number[], offset: number): boolean {
 export const VIEW_ONLY_NOTE =
   "View-only link — designs run on the host's machine during the show; the replay, fleet, and leaderboard all work here.";
 
-// runnerAvailable classifies the health-probe response: the timing-runner
-// answers GET /api/timing/run with 200; a static host (the public Pages
-// bundle) 404s/405s, and a network error surfaces as null — anything but
-// 200 is view-only.
-export function runnerAvailable(status: number | null): boolean {
-  return status === 200;
+// runnerAvailable classifies the health-probe body: the timing-runner
+// answers GET /api/timing/run with JSON {"ok":true,"service":"timing-runner"},
+// and the JSON SENTINEL is the verdict — never the HTTP status. Static
+// hosts can answer 200 for unmatched paths (Cloudflare Pages serves
+// index.html with 200 when the bundle has no custom 404.html), so a
+// status-only check reads a Pages fallback page as LIVE. Callers pass the
+// parsed body, or null for non-200 responses, parse failures, and network
+// errors — anything but the sentinel is view-only.
+export function runnerAvailable(body: unknown): boolean {
+  return (
+    typeof body === "object" &&
+    body !== null &&
+    (body as Record<string, unknown>)["service"] === "timing-runner"
+  );
 }
 
 // movementLabel names the k-th green phase (0-based) after the game's

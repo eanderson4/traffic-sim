@@ -100,13 +100,18 @@ test("NAME_RE: lowercase letters, digits, dashes", () => {
   assert.ok(!NAME_RE.test("has space"));
 });
 
-test("runnerAvailable: only a 200 health probe means live", () => {
-  assert.equal(runnerAvailable(200), true);
-  assert.equal(runnerAvailable(404), false); // static host
-  assert.equal(runnerAvailable(405), false); // static host, method not allowed
-  assert.equal(runnerAvailable(500), false);
-  assert.equal(runnerAvailable(302), false);
-  assert.equal(runnerAvailable(null), false); // network error
+test("runnerAvailable: the JSON sentinel is the verdict, never the status", () => {
+  // 200 + the timing-runner sentinel: live
+  assert.equal(runnerAvailable({ ok: true, service: "timing-runner" }), true);
+  // 200 with an HTML fallback page (Cloudflare Pages without a 404.html):
+  // the parse yields a string/null, NOT the sentinel — view-only
+  assert.equal(runnerAvailable("<!doctype html><title>Beat the Signal</title>"), false);
+  // 200 with JSON that lacks the sentinel
+  assert.equal(runnerAvailable({ ok: true }), false);
+  assert.equal(runnerAvailable({ service: "static" }), false);
+  // non-200 (404/405), parse failure, and network error all arrive as null
+  assert.equal(runnerAvailable(null), false);
+  assert.equal(runnerAvailable(undefined), false);
 });
 
 test("livePhaseLabel: green phase names its movement and counts down", () => {

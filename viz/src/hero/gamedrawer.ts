@@ -90,6 +90,13 @@ export function slugifyJS(s: string): string {
     .replace(/^-+|-+$/g, "");
 }
 
+// runSlugOf extracts the leaderboard slug from a ?run= param: hero URLs
+// may pin a bake as <slug>/<hash12> (post-run navigations do), but the
+// board row's slug is <slug> — comparing the whole param never matches.
+export function runSlugOf(runParam: string): string {
+  return runParam.split("/")[0] ?? "";
+}
+
 // --- the drawer ----------------------------------------------------------------
 
 export interface GameDrawerOpts {

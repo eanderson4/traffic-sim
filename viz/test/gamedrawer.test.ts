@@ -7,7 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { DesignState, buildFullRunPayload, slugifyJS } from "../src/hero/gamedrawer.ts";
+import { DesignState, buildFullRunPayload, runSlugOf, slugifyJS } from "../src/hero/gamedrawer.ts";
 import { BASE_GREENS, JUNCTIONS } from "../src/hero/timingpanel.ts";
 
 test("DesignState: every junction starts at the town's base timing, unedited", () => {
@@ -73,4 +73,12 @@ test("slugifyJS: mirrors score-timing's slug for the current-run highlight", () 
   assert.equal(slugifyJS("overlay-smoke"), "overlay-smoke");
   assert.equal(slugifyJS("Wave 2!"), "wave-2");
   assert.equal(slugifyJS("--Guest_R1--"), "guest-r1");
+});
+
+test("runSlugOf: the board slug is the part before the hash pin", () => {
+  assert.equal(runSlugOf("overlay-smoke/20506b61ee1b"), "overlay-smoke");
+  assert.equal(runSlugOf("rehearsal42"), "rehearsal42");
+  assert.equal(runSlugOf(""), "");
+  // the highlight comparison this feeds: row slug matches a pinned ?run=
+  assert.equal(slugifyJS(runSlugOf("green-wave/9da93a51331f")), slugifyJS("green-wave"));
 });

@@ -513,15 +513,22 @@ function setRunning(on) {
 
 // --- view-only mode ------------------------------------------------------------
 // GET /api/timing/run is the timing-runner's health probe (serve-baked.py
-// --timing-runner answers 200 {"ok":true,"service":"timing-runner"}); on a
-// static host (the public Pages bundle) that GET 404s/405s. Any non-200 —
-// or a network error — means view-only: the Run affordances disable (with
-// a title saying why) and the runbox carries the notice; dials, downloads,
-// the leaderboard, and the stage all keep working (they're client-side or
-// plain static fetches). ?runner=0|1 forces the verdict and skips the
-// probe (screenshots, local demos of the disabled state). Fire-and-forget:
-// first paint never waits on the probe.
+// --timing-runner answers 200 + JSON {"ok":true,"service":"timing-runner"}).
+// The verdict is the JSON SENTINEL, never the HTTP status: static hosts can
+// answer 200 for unmatched paths (Cloudflare Pages serves index.html with
+// 200 when the bundle has no custom 404.html), and a status-only check
+// would read that fallback as LIVE. Any non-200, non-JSON, or sentinel-less
+// body — or a network error — means view-only: the Run affordances disable
+// (with a title saying why) and the runbox carries the notice; dials,
+// downloads, the leaderboard, and the stage all keep working (they're
+// client-side or plain static fetches). ?runner=0|1 forces the verdict and
+// skips the probe (screenshots, local demos of the disabled state).
+// Fire-and-forget: first paint never waits on the probe.
 var runnerLive = null; // null = probe in flight (buttons enabled as today)
+
+function runnerProbeOk(body) { // mirrors timingpanel.ts's runnerAvailable
+  return !!body && typeof body === "object" && body.service === "timing-runner";
+}
 
 function setRunnerAvailable(live) {
   runnerLive = live;
@@ -841,7 +848,10 @@ if (runnerParam === "0" || runnerParam === "1") {
   setRunnerAvailable(runnerParam === "1");
 } else {
   fetch("/api/timing/run", { cache: "no-cache" }).then(function (resp) {
-    setRunnerAvailable(resp.status === 200);
+    if (!resp.ok) return null; // 404/405 static host
+    return resp.json().catch(function () { return null; }); // HTML fallback page
+  }).then(function (body) {
+    setRunnerAvailable(runnerProbeOk(body));
   }).catch(function () {
     setRunnerAvailable(false);
   });
