@@ -99,4 +99,4 @@
 <text x="30" y="211">10 portals in · 1,500 veh/h · poisson arrivals</text>
 <circle cx="18" cy="226" r="4.5" fill="none" stroke="#f778ba" stroke-width="1.8"/>
 <text x="30" y="229">10 exits (10 sharing a portal with an entry) · destinations declared per flow</text>
-<circle cx="18" cy="244" r="4" fill="#d29922"/><text x="30" y="247">4 fixed-time signals · 86s cycle, 36s main-road green (42%)</text><text x="30" y="261">all four start their cycle together — uncoordinated</text></g></svg>
+<circle cx="18" cy="244" r="4" fill="#d29922"/><text x="30" y="247">4 fixed-time signals · 86s cycle, 36s main-road green (42%)</text><text x="30" y="261">every junction starts its cycle together — uncoordinated</text></g></svg>

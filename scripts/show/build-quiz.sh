@@ -45,6 +45,22 @@ python3 scripts/show/mkopenslide.py --pod bottleneck-town \
     --peers data/pods/bottleneck-town/bypass-north \
             data/pods/bottleneck-town/connector-south
 
+# The two presentation Chicago cuts are setup-slide-only like the big one
+# (below): their quiz options are retimings, demand shifts and class-wide
+# speed caps — none of it visible in a plan view at card size — and their
+# networks (11,851 / 15,315 lanes) smear the same way. mkquiz.py's
+# all-or-none rule makes setup-only a choice, not an omission, and with no
+# option cards there is no --peers bounding box to match. --net names the
+# network file because these pods carry it under the import's name, not
+# network.json.
+python3 scripts/show/mkopenslide.py --pod chi-loop-cbd \
+    --root data/pods/chi-loop-cbd/base --net chi-loop-cbd.json \
+    --out "$DIAG"
+
+python3 scripts/show/mkopenslide.py --pod chi-kennedy \
+    --root data/pods/chi-kennedy/base --net chi-kennedy.json \
+    --out "$DIAG"
+
 # The big Chicago cut gets no per-OPTION diagrams: two of its four options
 # are signal retimings, and a plan view of a 55,555-lane import at card size
 # is a grey smear in which a widened Kennedy is invisible. mkquiz.py enforces
@@ -127,6 +143,8 @@ fi
 python3 scripts/chicago/mkquiz.py \
     docs/show/quiz/merge-pod.json \
     docs/show/quiz/bottleneck-town.json \
+    docs/show/quiz/chi-loop-cbd.json \
+    docs/show/quiz/chi-kennedy.json \
     docs/show/quiz/chi-loop-urban.json \
     --diagrams "$DIAG" --baselines docs/show/baselines.json \
     ${OMIT} \

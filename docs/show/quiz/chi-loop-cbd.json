@@ -17,7 +17,7 @@
     },
     {
       "name": "calm-secondary",
-      "label": "Slow Streets \u2014 25 km/h limit across the Loop grid",
+      "label": "Slow Streets \u2014 25 km/h limit on Loop secondary streets",
       "delta_pct": -8.750667170951472,
       "p": 1.915079996673572e-05,
       "cohen_d": -2.0585329408069724,

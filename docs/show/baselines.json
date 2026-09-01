@@ -32,6 +32,22 @@
     "ticks": 15000,
     "window": "ticks 6300-7200 at 1x = 90 s: one full 86 s cycle at every junction with the queues fully developed"
   },
+  "chi-loop-cbd": {
+    "run": "cbdbase",
+    "bake": "/baked/cbdbase/7406456b6031/index.json",
+    "center": "-87.6293,41.8798",
+    "zoom": "14.5",
+    "ticks": 7000,
+    "window": "the whole run reads; 7000 ticks is the fidelity-gated cut — at 12000 the saturated grid refuses 7% of demand at injection"
+  },
+  "chi-kennedy": {
+    "run": "kenbase",
+    "bake": "/baked/kenbase/03c7bc162e73/index.json",
+    "center": "-87.7837,41.9390",
+    "zoom": "13.5",
+    "ticks": 12000,
+    "window": "the AM peak builds through the whole run; the measured window is the last 8000 ticks"
+  },
   "chi-loop-urban": {
     "run": "chishow",
     "bake": "/baked/chishow/f941d8888b18/index.json",

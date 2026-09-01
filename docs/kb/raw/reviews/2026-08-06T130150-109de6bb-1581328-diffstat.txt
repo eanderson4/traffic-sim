@@ -1,0 +1,10 @@
+ docs/show/README.md                       |   54 +-
+ docs/show/baselines.json                  |   16 +
+ docs/show/diag/bottleneck-town__setup.svg |    2 +-
+ docs/show/diag/chi-kennedy__setup.svg     | 2398 ++++++++++++++++++++
+ docs/show/diag/chi-loop-cbd__setup.svg    | 3500 +++++++++++++++++++++++++++++
+ scripts/chicago/mkquiz.py                 |   12 +-
+ scripts/show/build-quiz.sh                |   18 +
+ scripts/show/mkopenslide.py               |   74 +-
+ viz/public/quiz.html                      |    4 +-
+ 9 files changed, 6033 insertions(+), 45 deletions(-)
