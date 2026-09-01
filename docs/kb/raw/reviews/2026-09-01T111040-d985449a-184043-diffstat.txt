@@ -1,0 +1,14 @@
+ engine/cmd/serve/main.go         |  47 ++++-
+ engine/cmd/serve/main_test.go    |  29 +++
+ engine/densitygate_test.go       | 413 +++++++++++++++++++++++++++++++++++++++
+ engine/director.go               | 125 +++++++++---
+ engine/director_test.go          |  19 +-
+ engine/engine.go                 |  22 +++
+ engine/keyframe.go               |  65 +++++-
+ engine/metrics_test.go           |   7 +-
+ engine/metricsjson.go            |  14 ++
+ engine/metricsjson_test.go       |  38 ++++
+ engine/scenario/scenario.go      |  34 ++++
+ engine/scenario/scenario_test.go |  93 +++++++++
+ engine/spawn.go                  |  70 ++++++-
+ 13 files changed, 934 insertions(+), 42 deletions(-)
