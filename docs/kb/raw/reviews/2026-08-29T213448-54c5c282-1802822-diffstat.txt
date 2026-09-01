@@ -1,0 +1,17 @@
+ .../integration-3d-hero-viz/status-2026-08-29.md   |  8 +++
+ .../2026-08-29T210332-ab9708a5-1714890-brief.md    | 20 ++++++
+ ...6-08-29T210332-ab9708a5-1714890-claude-fable.md | 41 +++++++++++
+ ...2026-08-29T210332-ab9708a5-1714890-diffstat.txt | 80 +++++++++++++++++++++
+ ...26-08-29T210332-ab9708a5-1714890-gpt-5.6-sol.md | 15 ++++
+ .../2026-08-29T211445-ae61486f-1746183-brief.md    | 20 ++++++
+ ...6-08-29T211445-ae61486f-1746183-claude-fable.md | 24 +++++++
+ ...2026-08-29T211445-ae61486f-1746183-diffstat.txt | 81 ++++++++++++++++++++++
+ ...26-08-29T211445-ae61486f-1746183-gpt-5.6-sol.md | 13 ++++
+ viz/public/404.html                                | 28 ++++++++
+ viz/public/play.html                               | 28 +++++---
+ viz/src/hero/gamedrawer.ts                         |  7 ++
+ viz/src/hero/main.ts                               | 18 +++--
+ viz/src/hero/timingpanel.ts                        | 20 ++++--
+ viz/test/gamedrawer.test.ts                        | 10 ++-
+ viz/test/timingpanel.test.ts                       | 19 +++--
+ 16 files changed, 402 insertions(+), 30 deletions(-)
