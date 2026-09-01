@@ -59,7 +59,7 @@ back to it.
 
 ## Raw Research
 
-All source-attributed research files: [raw/](raw/) — 14 topics × 4 files
+All source-attributed research files: [raw/](raw/) — 20 topics × 4 files
 (implementation, competitors, standards-and-patterns, synthesis). Every article
 links its source synthesis for traceability.
 
@@ -72,6 +72,10 @@ links its source synthesis for traceability.
 - [x] [Trajectory Datasets & Overhead Analysis](raw/domain-trajectory-datasets/synthesis.md) — real overhead traffic data (NGSIM, highD/inD/rounD drone sets, pNEUMA, I-24 MOTION, ring-road experiments); DIY capture; computing our own waves/FD from trajectories; sim validation targets for intersections and highways
 - [x] [Congestion Metrics](raw/domain-congestion-metrics/synthesis.md) — FHWA MOE set + HCM Ch.24 trajectory state machines; recommends trajectory-first metric kernel, LOS as presentation skin, CRN experiment protocol
 - [x] [Signal Control](raw/domain-signal-control/synthesis.md) — NEMA dual-ring as internal model; decisecond cabinet timing maps losslessly onto the 100 ms tick; phase changes are engine events
+- [x] [Multimodal Transit](raw/domain-multimodal-transit/synthesis.md) — transit umbrella: the only kernel-adjacent change is per-lane class masks (netimport parses allow/disallow then discards it — 73 Loop bus-lane edges compile as ordinary); TSP ~75% built on the ADR-0037 pattern; person-delay is one occupancy attribute away; CTA GTFS static + official GTFS-RT beta verified (license has a purpose clause)
+- [x] [Rail Operations](raw/domain-rail-operations/synthesis.md) — trains/El: rail dies at EXTRACT time (highway-only Overpass filters), not at the importer; long-consist spike — the 100 m leader-sight bound and front-bumper-only box occupancy need length-awareness before trains roll; interlocking = signal program + external controller (rowGate fails); Loop capacity binds at dwells + Tower 18/12, not plain blocks
+- [x] [Bus Operations](raw/domain-bus-operations/synthesis.md) — bunching needs no engine work (Newell–Potts emerges from dwell variance + IDM); dwell = external-controller intents (a dwell verb would violate ADR-0008); nine class-mask seams enumerated (the MOBIL gather dogfoods to the external driver); TSP is a client, not a kernel feature; bus class near-free but the type registry is triple-mirrored across three binaries
+- [x] [Demand Modeling](raw/domain-demand-modeling/synthesis.md) — the grammar is done, the weights are the gap (all realism upgrades are generator-side per ADR-0028); no distance deterrence anywhere in mkod — LODES is the successor spine; the missing fit-to-counts loop is the topic (GEH screenline protocol, sim halves already computed by ADR-0030); POLARIS + CMAP CT-RAMP are calibrated Chicago prior art; Kennedy gap fix = count-anchored per-portal rates
 
 ### Architecture
 - [x] [Time Model](raw/arch-time-model/synthesis.md) — tick authority vs discrete-event vs hybrid; game-server prior art; determinism/replay implications → feeds ADR-0005
@@ -86,6 +90,8 @@ links its source synthesis for traceability.
 ### Integrations
 - [x] [OSM Extraction](raw/integration-osm-extraction/synthesis.md) — own Go importer (paulmach/osm) + netconvert bootstrap/diff-test oracle; defaults-first lane inference with `guessed` flags; durable IDs over OSM provenance; ODbL recipe-not-file posture
 - [x] [MapLibre Realtime Viz](raw/integration-maplibre-realtime/synthesis.md) — three channels (load-once network / setFeatureState congestion / updateData vehicles), 4-rung escalation ladder to deck.gl, binary SoA frames over NATS; MapLibre ≥5.21.1 pinned
+- [x] [3D Hero Viz](raw/integration-3d-hero-viz/synthesis.md) — the data plane is already renderer-agnostic (baked.ts re-encodes TSRB→synthetic TSSF); a hero scene skips projection entirely (frames are local metric, north-up); the world is flat by DATA (no elevation imported); deterministic capture is solved in-repo (raw-CDP beginFrame + virtual time); three.js standalone page — deck.gl answers a different question (map-fleet escalation); quiz loop's missing half is server-side (demosrv has no mutation endpoint)
+- [x] [3D Vehicle Fleet](raw/integration-3d-vehicle-fleet/synthesis.md) — legal posture blessed by case law: GTA-style generic pastiche (Urban Gorilla + AM General Jeep-grille both won for the copyist), no badges/names/trade dress anywhere, provenance manifest in-repo; production = agent-built parametric models via headless Blender bpy (models as code, review-gate diffable), Kenney/KayKit CC0 kits as style anchors; contracts pin only a class integer → fleet ships its own manifest (class → GLB, dims, anchors)
 
 ### Decisions
 - [x] [ADR-0001](decisions/ADR-0001-go-engine.md) — Go for the engine core, TypeScript for visualization
@@ -151,4 +157,5 @@ links its source synthesis for traceability.
 *ADR-0034 ACCEPTED 2026-07-28 (gridlock escape — the fourth ADR aimed at the non-clearing Chicago network, and the one that stopped looking for a defect: the frozen lanes are 94% ordinary road, the cycle is a circular wait, and the fix is a counted escape rather than a cure)*
 *ADR-0035 PROPOSED 2026-07-29 (batched intent log + S2 record compression; written after a storage audit found 48 GiB for one 90-minute Chicago run, essentially all of it per-intent message framing that ADR-0026 had already solved one layer up — and after the same audit found the memory ceiling binds before the disk one)*
 *Index reconciled 2026-07-31 (drift audit): ADR-0023 and ADR-0025 registered in the decisions list, ADR-0024 marker flipped to accepted, mkzones path qualified as scripts/chicago/, podcast work-queue and scorecard articles linked. Known open items: ADR-0035's in-file status (PROPOSED — BLOCKED) contradicts the shipped `-log-batch`/`-store-compress` defaults; `articles/summary.md` still describes the pre-implementation project and needs a re-distill*
+*6 topics researched 2026-08-24 (multimodal transit, rail operations, bus operations, demand modeling, 3D hero viz, 3D vehicle fleet — 24 raw files, two audit rounds with all moderate+ findings fixed): the post-episode expansion set. Headlines: transit needs exactly one kernel-adjacent change (per-lane class masks — netimport parses `allow`/`disallow` then discards it; rail actually dies earlier, at the highway-only extract filter); rail long-consist spike found the 100 m sight bound + front-bumper box occupancy need length-awareness; bunching/TSP/dwell are all client-side; demand's missing piece is the fit-to-counts loop (LODES spine + GEH protocol); the 3D hero renderer is a pure consumer of the baked contract and deterministic capture is already solved in-repo; the vehicle fleet's legal posture (generic pastiche, no badges) is case-law-blessed. Articles + cross-topic concerns now stale pending a `/distill-kb` round*
 *Run `/update-kb` to check freshness*

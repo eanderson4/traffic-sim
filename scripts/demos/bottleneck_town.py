@@ -24,9 +24,12 @@ overwhelmed by raw volume.
 Junction model, and the simplifications taken deliberately:
 
   * Main Street is 2 lanes per direction (the classic American "stroad"
-    main street). Right lane = through+right, left lane = through+left.
-    No turn bays: the whole approach is 2 lanes, so the kernel's lateral
-    route guidance (routeLatDepth) has the full block to sort vehicles.
+    main street). Lanes follow the netfile.go edgeIndex contract (0 =
+    rightmost = kerb, SUMO convention). Each signalized approach flares
+    to a third KERB-side lane at the stop line — a right-turn pocket with
+    no upstream predecessor, reached by lane change via the kernel's
+    lateral route guidance (routeLatDepth). The centreline-side lane is
+    through+left, the middle lane through-only.
   * Cross streets are 1 lane per direction.
   * SPLIT PHASING on the cross streets and a PROTECTED-ONLY left phase on
     Main Street. Four green phases per cycle, each internally
@@ -39,6 +42,20 @@ Junction model, and the simplifications taken deliberately:
     movements in a phase ever cross or merge, foesCross/foesMerge are left
     empty exactly as the netimport-produced networks leave them, and the
     signal plus the kernel's box-exit check do all the adjudication.
+
+    That conflict-free claim is now true BY GEOMETRY, verified on the
+    emitted polylines (2026-08-29). It was not always: until then the lane
+    indexing was mirrored (index 0 sat at the centreline), so right turns
+    issued from the centreline-side lane across the through path beside
+    them inside `main_thru`, and the two opposed protected-left tangent
+    arcs swept through each other inside `main_left` — 64 crossing-overlap
+    episodes in an audit of the hero bake. The fix (see add_edge) put lane
+    0 at the kerb and redrew the left arcs to pass clear of each other
+    (left_link; the box is too tight for a true offside-to-offside pair,
+    so they turn early and pass right-side-to-right-side with ~4-5 m of
+    centreline clearance); the same-phase intersection check the build is
+    validated with finds no crossings left, so the foe sets stay empty for
+    the original reason, not on faith.
   * No U-turns.
 
 THE OPTIONS
@@ -218,6 +235,52 @@ def bezier_link(ps, ds, pe, de, n=8):
     return pts
 
 
+# End-tangent control distance for junction-internal left turns: the cubic
+# turns within this many metres of both ends, which is what swings the
+# apex away from the junction centre (see left_link). Capped per-turn at
+# 0.4x the entry->exit distance so short cross-street lefts stay sane.
+LEFT_HOOK_T = 2.0
+
+
+def left_link(ps, ds, pe, de, n=8):
+    """Protected-left internal path: a cubic Bezier that keeps the exact
+    end tangents (enters along the approach lane's direction, leaves along
+    the exit lane's) but turns EARLY, hooking round its own near side of
+    the box, so an opposed protected pair passes with metres of clearance
+    and no path crossing.
+
+    Why not the tangent-intersection arc (bezier_link): an opposed pair of
+    those both bow toward the junction centre and their bodies overlap
+    (~1.1 m of footprint overlap measured on the pre-2026-08-29 network,
+    ~0.02 m centreline clearance). The opposite extreme — proceed deep
+    into the box, turn late, pass offside-to-offside — is not realizable
+    in THIS box: the entry/exit lanes sit 1.75 m off the centrelines, and
+    a symmetric late-arc pair either crosses (radius under ~3.5 m, where
+    each arc's entry straight meets the other's exit straight) or passes
+    under 2.2 m apart at the apexes (radius over ~3.5 m — footprint
+    overlap again). Turning early is the arrangement the geometry admits
+    cleanly: each vehicle rounds its own near diagonal, the pair passes
+    right-side-to-right-side the way prompt simultaneous opposed lefts do
+    at real US signals, and the measured centreline clearance between the
+    emitted polylines is ~4-5 m. Endpoints are exact (the cubic starts at
+    ps, ends at pe), so the internal lane still meets its approach and
+    exit lanes precisely.
+    """
+    t = min(LEFT_HOOK_T, 0.4 * norm(sub(pe, ps)))
+    c1 = add(ps, scale(ds, t))
+    c2 = sub(pe, scale(de, t))
+    pts = []
+    for k in range(n + 1):
+        u = k / n
+        w0 = (1 - u) ** 3
+        w1 = 3 * (1 - u) ** 2 * u
+        w2 = 3 * (1 - u) * u ** 2
+        w3 = u ** 3
+        pts.append((w0 * ps[0] + w1 * c1[0] + w2 * c2[0] + w3 * pe[0],
+                    w0 * ps[1] + w1 * c1[1] + w2 * c2[1] + w3 * pe[1]))
+    return pts
+
+
 # -------------------------------------------------------------- network bits
 
 # The town is fictitious, but every consumer that puts a network on a map
@@ -278,48 +341,45 @@ def add_edge(net, eid, section, a, b, nlanes, speed, origin=False,
              exit_=False):
     """One straight edge, nlanes lanes.
 
-    KNOWN DEFECT — the lane indexing here is MIRRORED, and the fix is not a
-    one-liner. `nrm` is the LEFT normal and the offset is negative, so index
-    0 sits nearest the CENTRELINE and the highest index at the kerb. That is
-    the inverse of `engine/netfile.go`'s edgeIndex contract ("0 = rightmost",
-    SUMO convention), which the sibling merge-pod.py follows.
+    Lane indexing follows the netfile.go edgeIndex contract: 0 = RIGHTMOST
+    = kerb lane (SUMO convention), index+1 one lane to the LEFT. `nrm` is
+    the LEFT normal of the travel direction and lane i is placed
+    (nlanes-i-0.5) widths along -nrm, so index 0 is the furthest right and
+    the highest index borders the centreline — the layout every US
+    arterial driver expects, and the one the engine's lateral chaining
+    assumes (netfile.go: "left neighbor = index+1").
 
-    What it costs, confirmed on the generated network: the junction builder
-    keys off the contract (`right_lane=0`, left bay at the highest index), so
-    the right turn is issued from the lane nearest the centreline and crosses
-    the through lane beside it INSIDE the shared `main_thru` green, and the
-    two opposed protected lefts cross each other inside `main_left`. These
-    junctions ship with `foesCross`/`foesMerge` empty on the explicit grounds
-    that the phases are conflict-free by construction, so nothing arbitrates
-    those crossings. Measured impact is small — 0-1 collision observations on
-    an idle run, and every arm carries the same defect, so the A/B deltas
-    stand — but it is a latent conflict source and it is visible in the baked
-    replay: right-turners swing out of the inside lane.
+    This was not always so, and the failure mode is worth recording.
+    Until 2026-08-29 the offset was -(i+0.5)*LANE_W: index 0 sat nearest
+    the CENTRELINE and the whole network was mirrored against the
+    contract. The junction builder keys off the contract (right turn from
+    lane 0, left from the highest index), so right turns issued from the
+    centreline-side lane and crossed the through path beside them INSIDE
+    the shared `main_thru` green, left turns issued from the kerb-side
+    lane, and the engine's Left/Right lateral links pointed the wrong way
+    physically. These junctions ship with foesCross/foesMerge empty on the
+    grounds that the phases are conflict-free by construction, so nothing
+    arbitrated those crossings: an audit of the hero bake counted 64
+    crossing-overlap episodes, dominated by right-turn x same-green
+    through. The fix is the indexing below plus the matching chain()
+    alignment and the opposed-left arc geometry in build_junction; the
+    build is then validated by intersecting the same-phase internal
+    polylines, which now come back clean.
 
-    Why the obvious fix (`off = -(nlanes-i-0.5)*LANE_W`) is NOT enough, tested
-    2026-07-27: it does correct the movement assignment, but `chain()` maps
-    lane i to lane i and the flared approach has one extra lane, so every
-    chained lane acquires a 3.50 m — one full lane width — lateral jog at the
-    bay edge. The flare can only widen KERB-ward: the forward carriageway
-    runs -305.25..-301.75 about an axis at -300 and the opposing direction
-    owns the other side, so a lane added toward the centreline would overlap
-    oncoming traffic. Under a corrected index the added lane is therefore
-    necessarily kerbside — a RIGHT-turn pocket — whereas this scenario is
-    built around a LEFT-turn bay with no upstream predecessor (see the
-    Junction docstring: it is what keeps every through lane's leftmost
-    successor a through movement, which the Successors[0] routing fallback
-    depends on).
-
-    So correcting this properly means redesigning the bay and re-validating
-    that routing property, then re-running the pod. Tracked rather than
-    rushed.
+    A consequence worth knowing: with the indexing corrected, the flare's
+    added lane can only be KERB-side — the carriageway widens rightward
+    because the opposing direction owns the other side of the axis. The
+    pocket is therefore a RIGHT-turn pocket, not the left-turn bay the
+    scenario was originally built around; the protected left now shares
+    the centreline through lane. The routing property the bay existed for
+    is preserved differently: see the Leg docstring.
     """
     u = unit(sub(b, a))
     nrm = left_normal(u)
     length = norm(sub(b, a))
     ids, sp, ep = [], [], []
     for i in range(nlanes):
-        off = -(i + 0.5) * LANE_W
+        off = -(nlanes - i - 0.5) * LANE_W
         pa = add(a, scale(nrm, off))
         pb = add(b, scale(nrm, off))
         lid = f"{eid}_{i}"
@@ -340,13 +400,23 @@ def add_edge(net, eid, section, a, b, nlanes, speed, origin=False,
 
 
 def chain(net, upstream, downstream):
-    """lane i of upstream -> lane i of downstream (equal lane counts)."""
+    """lane i of upstream -> lane i+extra of downstream.
+
+    extra = len(downstream) - len(upstream): the only unequal-count link in
+    this network is the junction flare, which widens KERB-ward (the opposing
+    carriageway owns the centreline side of the axis). Under the corrected
+    indexing (0 = rightmost) the added lanes carry the LOW indices, so every
+    continuing lane keeps its exact lateral position when it is mapped i ->
+    i+extra — no lateral jog at the edge join. Equal-count links get extra=0,
+    the identity, exactly as before.
+    """
+    extra = len(downstream.ids) - len(upstream.ids)
     for i, lid in enumerate(upstream.ids):
-        j = min(i, len(downstream.ids) - 1)
+        j = min(max(i + extra, 0), len(downstream.ids) - 1)
         net.by_id[lid]["successors"].append(downstream.ids[j])
 
 
-FLARE_LEN = 180.0   # length of the left-turn bay at a signalized approach
+FLARE_LEN = 180.0   # length of the right-turn pocket at a signalized approach
 
 
 def build_piece(net, name, piece_pts, nlanes, speed, origin, exit_,
@@ -354,10 +424,12 @@ def build_piece(net, name, piece_pts, nlanes, speed, origin, exit_,
     """A run of road between two junctions: one straight edge per segment.
 
     flare_extra > 0 carves the last FLARE_LEN metres off into their own
-    edge with that many extra lanes on the LEFT — the left-turn bay. The
-    bay lane has no upstream successor on purpose: a vehicle reaches it by
-    changing lanes (routeLatDepth steers routed vehicles into it), which is
-    what keeps every through lane's leftmost successor a through movement.
+    edge with that many extra lanes on the KERB side — the right-turn
+    pocket. The pocket lane has no upstream successor on purpose: a vehicle
+    reaches it by changing lanes (routeLatDepth steers routed vehicles into
+    it), so only traffic whose destination needs it ever occupies it, and
+    every through lane's leftmost successor stays a through movement (the
+    property the Successors[0] routing fallback depends on).
     """
     pts = list(piece_pts)
     flare_pts = None
@@ -485,15 +557,24 @@ class Leg:
     """One arm of a junction.
 
     thru/left_lane/right_lane say WHICH approach lane carries which
-    movement. Getting this right is not cosmetic: pickSuccessor falls back
-    to Successors[0] — the LEFTMOST successor — whenever the route table
-    cannot resolve (which happens for every right-turn destination when the
-    vehicle is sitting in a left lane, because lane changes are not
-    successors). If the leftmost successor of a through lane is a left
-    turn, that fallback sends through traffic round the corner and parks it
-    in the protected-left queue. Every through lane here therefore has its
-    THROUGH movement leftmost, and the left turn lives in a bay lane of its
-    own whose only successor is the left turn.
+    movement, in the netfile.go edgeIndex contract: 0 = rightmost = kerb.
+    `thru` is the tuple of through-lane indices in kerb->centreline order;
+    the j-th through lane continues into outbound lane j (see
+    build_junction), which keeps every through internal path STRAIGHT when
+    the approach flares kerb-ward and the exit does not.
+
+    Getting this right is not cosmetic: pickSuccessor falls back to
+    Successors[0] — the LEFTMOST successor — whenever the route table
+    cannot resolve (which happens for every turn destination when the
+    vehicle is sitting in a lane the turn is not issued from, because lane
+    changes are not successors). If the leftmost successor of a through
+    lane is a turn, that fallback sends through traffic round the corner.
+    Every through lane here therefore has its THROUGH movement leftmost
+    (the successor sort in build_junction hoists the same-road movement),
+    and each turn lives in the lane US convention puts it in: the right
+    turn in the kerb lane — at a flared approach a pocket whose only
+    successor is the right turn, so nothing but right-turners is ever
+    routed into it — and the left in the centreline-side through lane.
     """
 
     def __init__(self, name, inbound, outbound, thru=None, left_lane=None,
@@ -502,7 +583,7 @@ class Leg:
         self.inbound = inbound     # Lanes approaching the junction (may be None)
         self.outbound = outbound   # Lanes leaving the junction (may be None)
         n = len(inbound.ids) if inbound else 0
-        self.thru = n if thru is None else thru
+        self.thru = tuple(range(n)) if thru is None else tuple(thru)
         self.left_lane = (n - 1) if left_lane is None else left_lane
         self.right_lane = right_lane
 
@@ -511,10 +592,19 @@ def build_junction(net, jid, legs, rows=None, speed=TURN_SPEED,
                    lane_rules=None):
     """Wire every non-U movement between the legs as an internal lane.
 
-    Lane assignment (index 0 = rightmost):
-      through  lane i -> outbound lane min(i, nout-1)
-      right    lane 0 -> outbound lane 0
-      left     lane K-1 -> outbound lane nout-1
+    Lane assignment (edgeIndex 0 = rightmost = kerb, netfile.go):
+      through  j-th through lane (kerb->centreline) -> outbound lane
+               min(j, nout-1); with a kerb-side flare this keeps every
+               through internal path a STRAIGHT line across the box
+      right    lane 0 (the kerb lane / pocket) -> outbound lane 0
+      left     the highest-index (centreline-side) lane -> outbound nout-1
+
+    Same-phase conflict freedom is a GEOMETRIC property of these paths,
+    checked on the emitted polylines at every build (see the module
+    docstring): right-from-kerb hugs the corner right of the through path
+    beside it, and opposed protected lefts are drawn by left_link to turn
+    early and pass each other with metres of clearance (the box is too
+    tight for a true offside-to-offside pair — see left_link).
 
     rows: optional {(from_leg, to_leg): "major"|"minor"|"stop"} for
     unsignalized junctions. Returns [(from_leg, kind, internal_lane_id)].
@@ -535,15 +625,20 @@ def build_junction(net, jid, legs, rows=None, speed=TURN_SPEED,
             if lane_rules and (a.name, b.name) in lane_rules:
                 pairs = lane_rules[(a.name, b.name)]
             elif kind == "through":
-                pairs = [(i, min(i, nout - 1)) for i in range(a.thru)]
+                pairs = [(lane, min(j, nout - 1))
+                         for j, lane in enumerate(a.thru)]
             elif kind == "right":
                 pairs = [(a.right_lane, 0)]
             else:
                 pairs = [(a.left_lane, nout - 1)]
             for fi, ti in pairs:
                 ps, pe = a.inbound.end_pts[fi], b.outbound.start_pts[ti]
-                shape = bezier_link(ps, a.inbound.dir_end, pe,
-                                    b.outbound.dir_start)
+                if kind == "left":
+                    shape = left_link(ps, a.inbound.dir_end, pe,
+                                      b.outbound.dir_start)
+                else:
+                    shape = bezier_link(ps, a.inbound.dir_end, pe,
+                                        b.outbound.dir_start)
                 lid = f"i{jid}_{a.name}{fi}_{b.name}{ti}"
                 lane = {
                     "id": lid, "section": f"j:{jid}", "edgeIndex": idx,
@@ -623,6 +718,63 @@ def merge_foes(net, made):
             continue
         for lid in ids:
             net.by_id[lid]["foesMerge"] = [x for x in ids if x != lid]
+
+
+def _seg_intersect(p1, p2, p3, p4):
+    """Proper segment intersection point, or None (touches excluded)."""
+    d = (p2[0] - p1[0]) * (p4[1] - p3[1]) - (p2[1] - p1[1]) * (p4[0] - p3[0])
+    if abs(d) < 1e-12:
+        return None
+    t = ((p3[0] - p1[0]) * (p4[1] - p3[1]) - (p3[1] - p1[1]) * (p4[0] - p3[0])) / d
+    u = ((p3[0] - p1[0]) * (p2[1] - p1[1]) - (p3[1] - p1[1]) * (p2[0] - p1[0])) / d
+    if 1e-9 < t < 1 - 1e-9 and 1e-9 < u < 1 - 1e-9:
+        return (p1[0] + t * (p2[0] - p1[0]), p1[1] + t * (p2[1] - p1[1]))
+    return None
+
+
+def polys_cross(a, b):
+    """Do two polylines properly intersect? A touch within 0.3 m of a
+    shared start point is fan-out from one approach lane, not a conflict."""
+    for i in range(len(a) - 1):
+        for j in range(len(b) - 1):
+            p = _seg_intersect(a[i], a[i + 1], b[j], b[j + 1])
+            if p is not None and (norm(sub(p, a[0])) > 0.3
+                                  or norm(sub(p, b[0])) > 0.3):
+                return True
+    return False
+
+
+def cross_foes(net, made, phase_of):
+    """Declare foesCross between same-phase internals whose paths cross.
+
+    Derived from the emitted geometry, not from a hand list. At the J1..J4
+    split/protected junctions this adds NOTHING and that is the point: the
+    phases are conflict-free because the paths were drawn that way
+    (right-from-kerb, early-hook opposed lefts), which the empty result
+    here verifies at build time. The 2-phase CS junctions are different:
+    one phase runs BOTH directions of a road with all its movements, so a
+    left across the opposing through stream is a genuine same-phase
+    crossing no signal state separates. Declaring it lets the boxBlocked
+    foe-occupancy check serialize the pair — a permitted-left yield —
+    instead of booking the overlap as a collision.
+
+    Returns the declared (a, b) pairs so protected junctions can ASSERT
+    the result is empty — an invariant violation must fail the build, not
+    quietly become a permitted-left yield.
+    """
+    pairs = []
+    ids = [lid for _leg, _kind, lid, _to in made]
+    for i in range(len(ids)):
+        for j in range(i + 1, len(ids)):
+            a, b = ids[i], ids[j]
+            if phase_of.get(a) != phase_of.get(b):
+                continue
+            la, lb = net.by_id[a], net.by_id[b]
+            if polys_cross(la["shape"], lb["shape"]):
+                la.setdefault("foesCross", []).append(b)
+                lb.setdefault("foesCross", []).append(a)
+                pairs.append((a, b))
+    return pairs
 
 
 # --------------------------------------------------------------- the town
@@ -710,7 +862,7 @@ def build_town(variant):
     if has_byp or has_con:
         cuts.append(("BW", BW, new_half + CLEAR))
         cuts.append(("BE", BE, new_half + CLEAR))
-    # one extra lane on each signalized approach: the left-turn bay
+    # one extra lane on each signalized approach: the right-turn pocket
     flare = {f"J{k+1}": 1 for k in range(4)}
     main = Road(net, "main", axis, main_lanes, MAIN_SPEED, cuts, flare=flare)
 
@@ -729,24 +881,42 @@ def build_town(variant):
         jid = f"J{k+1}"
         c = cross[k]
         legs = [
-            # main approaches are flared: lanes 0..K-1 through (lane 0 also
-            # right), lane K the left-turn bay
+            # main approaches are flared: the added KERB lane (index 0) is
+            # the right-turn pocket with no upstream predecessor, lanes
+            # 1..K are through, lane K (centreline side) also carries the
+            # protected left. Cross approaches are single-lane: every
+            # movement issues from lane 0.
             Leg("W", main.fwd_in[jid], main.rev_out[jid],
-                thru=main_lanes, left_lane=main_lanes),      # from the west
+                thru=range(1, main_lanes + 1),
+                left_lane=main_lanes),                         # from the west
             Leg("E", main.rev_in[jid], main.fwd_out[jid],
-                thru=main_lanes, left_lane=main_lanes),      # from the east
+                thru=range(1, main_lanes + 1),
+                left_lane=main_lanes),                         # from the east
             Leg("N", c.fwd_in[jid], c.rev_out[jid]),         # from the north
             Leg("S", c.rev_in[jid], c.fwd_out[jid]),         # from the south
         ]
         made = build_junction(net, jid, legs)
         groups = {g: set() for g in PHASE_ORDER}
+        phase_of = {}
         for link, (leg, kind, lid, _to) in enumerate(made):
             net.by_id[lid]["tl"] = jid
             net.by_id[lid]["tlLink"] = link
             if leg in ("W", "E"):
-                groups["main_left" if kind == "left" else "main_thru"].add(link)
+                phase_of[lid] = "main_left" if kind == "left" else "main_thru"
             else:
-                groups["cross_n" if leg == "N" else "cross_s"].add(link)
+                phase_of[lid] = "cross_n" if leg == "N" else "cross_s"
+            groups[phase_of[lid]].add(link)
+        # Split/protected phases must stay crossing-free BY GEOMETRY — a
+        # non-empty result here means the junction drawing regressed, so
+        # fail the build rather than paper it over with a declared foe.
+        foes = cross_foes(net, made, phase_of)
+        if foes:
+            raise SystemExit(
+                f"bottleneck-town: {jid} gained {len(foes)} same-phase foe "
+                f"pairs ({', '.join(a + '×' + b for a, b in foes[:3])}"
+                + ("…" if len(foes) > 3 else "") + ") — the protected "
+                "junction geometry must not cross same-phase paths; fix "
+                "the drawing, don't declare the conflict")
         offset = 0.0
         if variant == "green-wave":
             d = 0.0
@@ -788,10 +958,16 @@ def build_town(variant):
             ]
             made = build_junction(net, jid, legs)
             groups = {g: set() for g in CS_PHASE_ORDER}
+            phase_of = {}
             for link, (leg, _kind, lid, _to) in enumerate(made):
                 net.by_id[lid]["tl"] = jid
                 net.by_id[lid]["tlLink"] = link
-                groups["con" if leg in ("W", "E") else "cross"].add(link)
+                phase_of[lid] = "con" if leg in ("W", "E") else "cross"
+                groups[phase_of[lid]].add(link)
+            # 2-phase, all movements per direction: the left across the
+            # opposing through stream is a real same-phase crossing —
+            # declare it (permitted-left yield via boxBlocked)
+            cross_foes(net, made, phase_of)
             net.signals.append(signal_program(jid, CS_GREENS, 0.0, groups,
                                               len(made),
                                               order=CS_PHASE_ORDER))

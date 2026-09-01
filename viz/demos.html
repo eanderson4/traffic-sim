@@ -94,6 +94,16 @@
         padding: 4px 10px; cursor: pointer;
       }
       #theme-toggle:hover { border-color: var(--t-accent); }
+      /* Static show pages — plain links with no engine to start, so they
+         live outside the demosrv-driven card grid. */
+      #pages { max-width: 1080px; margin: 0 auto 20px; }
+      #pages ul { margin: 0; padding: 0; list-style: none; display: flex; flex-wrap: wrap; gap: 8px; }
+      #pages a {
+        display: inline-block; color: var(--t-accent); text-decoration: none;
+        border: 1px solid var(--t-chip-border); border-radius: 999px;
+        padding: 3px 12px; font-size: 11px; letter-spacing: 0.04em;
+      }
+      #pages a:hover { border-color: var(--t-accent); }
     </style>
   </head>
   <body>
@@ -103,6 +113,11 @@
     </header>
     <button id="theme-toggle" type="button" title="theme — click to switch">NAVY</button>
     <div id="notice"></div>
+    <nav id="pages" aria-label="show pages">
+      <ul>
+        <li><a href="/play.html">Beat the Signal — timing game + 3D replay</a></li>
+      </ul>
+    </nav>
     <main id="grid"></main>
     <script>
       // Theme toggle — two palettes for this page's CSS vars (navy values

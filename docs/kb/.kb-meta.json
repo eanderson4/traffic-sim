@@ -213,6 +213,96 @@
         "raw/integration-maplibre-realtime/synthesis.md"
       ],
       "research_hints": "Feeding live vehicle positions into MapLibre (GeoJSON source updates vs custom WebGL layer), congestion heatmaps on road geometry (line-color data-driven styling), update-rate limits, and the criteria for escalating to deck.gl overlay."
+    },
+    "domain-multimodal-transit": {
+      "category": "business-domains",
+      "title": "Multimodal Transit",
+      "status": "complete",
+      "researched_at": "2026-08-24",
+      "raw_files": [
+        "raw/domain-multimodal-transit/implementation.md",
+        "raw/domain-multimodal-transit/competitors.md",
+        "raw/domain-multimodal-transit/standards-and-patterns.md",
+        "raw/domain-multimodal-transit/synthesis.md"
+      ],
+      "key_files": ["docs/VISION.md", "docs/kb/decisions/ADR-0007-vehicle-model.md", "docs/kb/decisions/ADR-0008-controller-contract.md", "docs/kb/decisions/ADR-0014-observability-metrics.md", "engine/netimport/netimport.go"],
+      "complexity": "deep",
+      "research_hints": "Umbrella topic for adding transit (trains + buses; pedestrians/bikes/scooters explicitly OUT). GTFS as the unifying source of lines/stops/schedules AND the validation corpus (CTA publishes static + realtime). Person-weighted metrics (occupancy per vehicle class; person-delay vs vehicle-delay — the bus-lane story flip). Mode-share coupling to road demand programs. Stations as demand nodes. Transit priority policy (TSP, perimeter metering that exempts transit — ADR-0039 tie-in). The layer map: per-lane class masks (netimport currently FILTERS on allow/disallow and drops rail) → vehicle classes + external controllers → metrics. Mode-specific mechanics belong to domain-rail-operations / domain-bus-operations; keep this at system level."
+    },
+    "domain-rail-operations": {
+      "category": "business-domains",
+      "title": "Rail Operations (Trains/El)",
+      "status": "complete",
+      "researched_at": "2026-08-24",
+      "raw_files": [
+        "raw/domain-rail-operations/implementation.md",
+        "raw/domain-rail-operations/competitors.md",
+        "raw/domain-rail-operations/standards-and-patterns.md",
+        "raw/domain-rail-operations/synthesis.md"
+      ],
+      "key_files": ["engine/vehicle.go", "engine/spawn.go", "engine/netimport/netimport.go", "docs/kb/decisions/ADR-0007-vehicle-model.md", "docs/kb/decisions/ADR-0034-gridlock-escape.md"],
+      "complexity": "deep",
+      "research_hints": "Chicago El focus: grade-separated heavy rail on own guideway (Loop rectangle, Tower 18/12 interlockings). Fixed-block / cab signaling vs IDM-with-rail-headways approximation — what fidelity do we need? Long multi-car vehicles (~117 m 8-car L train) vs short lanes/slivers (ADR-0038 pathology) — first technical spike. Stations as dwell points; dwell vs the ADR-0034 strand escape. Rail junction/interlocking semantics vs kernel priority rowGate. Grade crossings (Metra/Yellow Line — gate = signal phase; deferrable). SUMO rail model and netconvert rail import as prior art to crib. GTFS rail for lines/schedules/validation (headways, run times vs CTA published)."
+    },
+    "domain-bus-operations": {
+      "category": "business-domains",
+      "title": "Bus Operations",
+      "status": "complete",
+      "researched_at": "2026-08-24",
+      "raw_files": [
+        "raw/domain-bus-operations/implementation.md",
+        "raw/domain-bus-operations/competitors.md",
+        "raw/domain-bus-operations/standards-and-patterns.md",
+        "raw/domain-bus-operations/synthesis.md"
+      ],
+      "key_files": ["docs/kb/decisions/ADR-0007-vehicle-model.md", "docs/kb/decisions/ADR-0037-runtime-signal-control.md", "engine/natsio/sigctl/", "docs/kb/decisions/ADR-0014-observability-metrics.md"],
+      "complexity": "deep",
+      "research_hints": "Buses interact fully with road traffic. Bus bunching / headway instability (Newell–Potts and the control literature: holding, stop-skipping, boarding-limited dynamics). Dwell-time models (function of boardings/alightings, variability). Bus lanes and queue jumps — needs per-lane class masks. TSP (transit signal priority): practice + our ADR-0037 sigctl virtual-detector pattern as the host. Schedule- vs headway-based operation. Stop spacing and the bus stop as a capacity bottleneck (bus pullouts). How SUMO/others model buses. Validation via CTA GTFS + bus tracker data."
+    },
+    "domain-demand-modeling": {
+      "category": "business-domains",
+      "title": "Demand Modeling",
+      "status": "complete",
+      "researched_at": "2026-08-24",
+      "raw_files": [
+        "raw/domain-demand-modeling/implementation.md",
+        "raw/domain-demand-modeling/competitors.md",
+        "raw/domain-demand-modeling/standards-and-patterns.md",
+        "raw/domain-demand-modeling/synthesis.md"
+      ],
+      "key_files": ["engine/natsio/demand/director.go", "engine/scenario/", "scripts/chicago/mkod.py", "scripts/chicago/buildings.py", "docs/kb/decisions/ADR-0021-od-demand-buildings.md", "docs/kb/decisions/ADR-0028-demand-profile-library.md"],
+      "complexity": "deep",
+      "research_hints": "Correctly modeling people coming from and going to locations, with weights that replicate the real world. Classic 4-step (generation/distribution/mode split/assignment) and what we keep at lane-level granularity. Trip generation rates (ITE Trip Generation, NHTS) and the building-floor-area anchoring our mkod/buildings.py already does (ADR-0021). Destination choice: gravity models, radiation model, intervening opportunities. Calibration sources: census LEHD/LODES commuting flows, CTA ridership, counts (IDOT/MS2), NGSIM for micro behavior. Temporal demand profiles (ADR-0028 profile library). OD estimation from link counts; SUMO od2trips/dfrouter/activitygen prior art; MATSim activity-based demand. What belongs in scenario grammar vs generator tooling."
+    },
+    "integration-3d-hero-viz": {
+      "category": "integrations",
+      "title": "3D Hero Viz (Intersection Renderer)",
+      "status": "complete",
+      "researched_at": "2026-08-24",
+      "raw_files": [
+        "raw/integration-3d-hero-viz/implementation.md",
+        "raw/integration-3d-hero-viz/competitors.md",
+        "raw/integration-3d-hero-viz/standards-and-patterns.md",
+        "raw/integration-3d-hero-viz/synthesis.md"
+      ],
+      "key_files": ["viz/src/baked.ts", "viz/src/tsrb.ts", "viz/src/tssg.ts", "viz/src/vehicles.ts", "viz/src/signalhead.ts", "viz/src/proj.ts", "contracts/baked-replay-v1.md", "docs/kb/decisions/ADR-0003-maplibre-vis.md", "docs/kb/decisions/ADR-0023-baked-replay-pipeline.md", "scripts/chicago/mkquiz.py"],
+      "complexity": "medium",
+      "research_hints": "Rung-2 3D renderer for baked replays: standalone three.js canvas (MapLibre stays primary for live/analytical — ADR-0003 addendum boundary). Goals: cool videos of intersections, orbit camera, modeled signal heads, per-class vehicle models, and INTERACTIVITY for the quiz game (adjust signal timing, submit-and-score loop, watch the run). Data is all in the baked artifacts (TSRB poses, TSSG signals, network geometry) — renderer is a pure consumer. Research: three.js vs deck.gl vs Babylon for this shape; camera/cinematics (deterministic camera paths for reproducible clips); headless capture pipelines (puppeteer/ffmpeg, WebGL screen recording); low-poly stylized art direction, lighting/shadows; perf budget for ~10² vehicles + one junction; input UX for timing adjustment (sliders/dials on a 3D scene)."
+    },
+    "integration-3d-vehicle-fleet": {
+      "category": "integrations",
+      "title": "3D Vehicle Fleet",
+      "status": "complete",
+      "researched_at": "2026-08-24",
+      "raw_files": [
+        "raw/integration-3d-vehicle-fleet/implementation.md",
+        "raw/integration-3d-vehicle-fleet/competitors.md",
+        "raw/integration-3d-vehicle-fleet/standards-and-patterns.md",
+        "raw/integration-3d-vehicle-fleet/synthesis.md"
+      ],
+      "key_files": ["viz/src/vehicles.ts", "viz/src/artic.ts", "viz/src/theme.ts", "viz/public/"],
+      "complexity": "medium",
+      "research_hints": "Assemble a fleet of low-poly 3D vehicle models spanning classes (sedan/SUV/truck/bus/L car) in the style of different automakers, for the 3D hero viz. Sourcing: CC0/CC-BY model repositories (what's usable, attribution requirements), parametric/procedural generation options. LEGAL: automaker trademark/trade-dress constraints on recognizable designs for a public, episode-adjacent site — where is the line (generic 'in the style of' vs badges/trade dress). Pipeline: glTF/GLB + draco/meshopt, texture atlases, instancing for fleets, LOD. Style consistency: palette/proportions guide so N models read as one world; dimensions anchored to engine class dims. Agent-parallel production: how to structure a swarm building N models with consistent style/scale/quality gates (this is the stated production plan)."
     }
   },
   "raw": {},

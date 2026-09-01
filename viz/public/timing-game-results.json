@@ -1,0 +1,29 @@
+{
+  "generated_from": "seed 42, bottleneck-town, 15000 ticks",
+  "rows": [
+    {
+      "name": "green-wave",
+      "kind": "baseline",
+      "mean_time_loss_s": 190.69,
+      "trips_completed": 433
+    },
+    {
+      "name": "rehearsal-wave",
+      "kind": "guest",
+      "mean_time_loss_s": 201.55,
+      "trips_completed": 425
+    },
+    {
+      "name": "base",
+      "kind": "baseline",
+      "mean_time_loss_s": 207.31,
+      "trips_completed": 424
+    },
+    {
+      "name": "retime-short",
+      "kind": "baseline",
+      "mean_time_loss_s": 221.01,
+      "trips_completed": 410
+    }
+  ]
+}

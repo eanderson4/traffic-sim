@@ -61,6 +61,19 @@ for r in $RUNS; do
   fi
 done
 
+# The hero 3D pages reference bakes indirectly as ?run=<slug>/<hash12> and
+# fetch them under the NESTED /baked/baked/ path (a bare slug needs a
+# directory listing, which Pages does not have — only hash-pinned refs are
+# deployable). Derive that set too, from the same built output.
+HERO_RUNS="$( { grep -rhoE '\?run=[A-Za-z0-9_-]+/[0-9a-f]{12}' "$DIST" || true; } \
+              | sort -u | sed 's|?run=||' )"
+for r in $HERO_RUNS; do
+  if [ ! -f "$BAKED/baked/$r/index.json" ]; then
+    echo "mksite: MISSING hero bake $BAKED/baked/$r/index.json — referenced via ?run=$r" >&2
+    exit 1
+  fi
+done
+
 # 3. Fresh staging dir = dist + the referenced bakes.
 echo "[mksite] staging $OUT"
 rm -rf "$OUT"
@@ -72,15 +85,24 @@ for r in $RUNS; do
   echo "[mksite] copying baked/$r"
   cp -a "$BAKED/$r" "$OUT/baked/$run/"
 done
+for r in $HERO_RUNS; do
+  run="${r%%/*}"
+  mkdir -p "$OUT/baked/baked/$run"
+  echo "[mksite] copying baked/baked/$r"
+  cp -a "$BAKED/baked/$r" "$OUT/baked/baked/$run/"
+done
 
 # 4. Brotli-compress every staged network.geojson IN PLACE (kept under its
 # original name). Two reasons: chishow's is 34.8 MB raw — over Pages'
-# 25 MiB per-file cap — and _headers marks /baked/*/network.geojson as
-# Content-Encoding: br, which is only truthful if every one of them is
-# actually brotli (a plain-JSON file under that rule fails to decode).
+# 25 MiB per-file cap — and _headers marks /network.geojson and
+# /baked/*/network.geojson as Content-Encoding: br, which is only truthful
+# if every one of them is actually brotli (a plain-JSON file under that
+# rule fails to decode). The ROOT /network.geojson (viz's ?net= default,
+# shipped from viz/public) is compressed too — it is over the cap as well.
 # Browsers decode the encoding transparently; fetch() consumers see JSON.
 echo "[mksite] brotli-compressing staged network.geojson files"
-find "$OUT/baked" -name network.geojson -print0 | while IFS= read -r -d '' f; do
+{ [ ! -f "$OUT/network.geojson" ] || printf '%s\0' "$OUT/network.geojson";
+  find "$OUT/baked" -name network.geojson -print0; } | while IFS= read -r -d '' f; do
   python3 - "$f" <<'PY'
 import sys
 try:

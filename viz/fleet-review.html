@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>traffic-sim fleet review</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="alternate icon" type="image/png" href="/favicon-32.png" />
+    <style>
+      /* Fleet review harness chrome — neutral, minimal; the models are the
+         subject. Review loop: ?model=<id>&angle=front34|side|rear34|top. */
+      html, body { margin: 0; height: 100%; background: #20263e; overflow: hidden; }
+      #view { display: block; width: 100vw; height: 100vh; }
+      .hud {
+        position: absolute; z-index: 1;
+        font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: #e6e9f4; background: rgba(24, 28, 46, 0.85);
+        border: 1px solid #56608a; border-radius: 4px; padding: 6px 10px;
+        white-space: pre; pointer-events: none;
+      }
+      #status { top: 10px; left: 10px; }
+      #info { top: 40px; left: 10px; white-space: pre; font-variant-numeric: tabular-nums; }
+      #info .bad { color: #e5484d; }
+      #errors { bottom: 10px; left: 10px; color: #e5484d; white-space: pre-wrap; max-width: 70vw; }
+      #errors:empty, #info:empty { display: none; }
+      .bare .hud { display: none !important; }
+      #loading {
+        position: absolute; inset: 0; z-index: 2;
+        display: flex; align-items: center; justify-content: center;
+        background: rgba(24, 28, 46, 0.94); color: #e6e9f4;
+        font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+    <div id="status" class="hud">loading…</div>
+    <div id="info" class="hud"></div>
+    <div id="errors" class="hud"></div>
+    <div id="loading">loading fleet…</div>
+    <script type="module" src="/src/fleet3d/review.ts"></script>
+  </body>
+</html>

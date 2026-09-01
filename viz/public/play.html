@@ -1,0 +1,861 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Beat the Signal — play along</title>
+<!--
+  Unified "Beat the Signal" page for the 2026-08-29 recording (docs/show/
+  signal-game-plan-2026-08-29.md): the dial page (signal-game.html), the
+  scoring run, and the 3D hero replay in ONE experience. Left column is the
+  design panel (round 1 / round 2 dials, byte-compatible with what
+  signal-game.html downloads — the same functions are copied verbatim);
+  right column is the 3D stage (hero.html in an iframe, base timing by
+  default, the guest's own bake after a run).
+
+  "Run my design" POSTs the dial JSON to /api/timing/run (same origin):
+    200 {"ok":true,"name","slug","mean_time_loss_s","trips_completed",
+         "rank","of","pace","bake":{"run","hash"},
+         "hero_url":"/hero.html?run=<slug>&view=junction","log_tail":"..."}
+    409 {"ok":false,"error":"another run is in progress"}
+    400/500 {"ok":false,"error":"..."}
+  The run takes ~20 s up to a few minutes on a loaded box; the page shows an
+  honest spinner + elapsed counter + rotating status lines while it waits.
+
+  Self-contained by construction (mkquiz precedent): no CDN, no fonts, no
+  build step. The only fetches are same-origin: /timing-game-results.json
+  (leaderboard, on load and after each run), /api/timing/run, and the
+  iframe's own hero.html assets.
+-->
+<style>
+:root{--bg:#0d1117;--card:#161b22;--edge:#30363d;--ink:#e6edf3;--dim:#8b949e;
+--win:#3fb950;--bad:#f85149;--accent:#58a6ff;--warn:#d29922}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+font:16px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+.wrap{max-width:1520px;margin:0 auto;padding:2rem 1.25rem 4rem}
+h1{font-size:1.6rem;margin:0 0 .25rem;letter-spacing:-.02em}
+h2{font-size:1.05rem;margin:0 0 .75rem}
+.sub{color:var(--dim);margin:0 0 .4rem;font-size:.95rem;max-width:70rem}
+.sub b{color:var(--ink)}
+.links{margin:0 0 1.5rem;font-size:.9rem}
+.links a{color:var(--accent);text-decoration:none}
+.links a:hover{text-decoration:underline}
+.cols{display:grid;grid-template-columns:minmax(380px,500px) minmax(0,1fr);
+gap:1rem;align-items:start}
+@media (max-width:1000px){.cols{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--edge);border-radius:12px;
+padding:1.1rem 1.2rem;margin:0 0 1rem}
+.card h2 .tag{font-size:.7rem;letter-spacing:.08em;color:var(--accent);
+vertical-align:middle;margin-right:.5rem}
+.name-row{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;margin:0 0 1rem}
+.name-row label{color:var(--dim);font-size:.9rem}
+input,select{background:#0d1117;color:var(--ink);border:1px solid var(--edge);
+border-radius:8px;padding:.45rem .6rem;font:inherit;font-size:.95rem}
+input:focus,select:focus{outline:none;border-color:var(--accent)}
+input.bad{border-color:var(--bad)}
+input[type=number]{width:5.5rem}
+.dials{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+gap:.75rem;margin:.75rem 0}
+.dial label{display:block;color:var(--dim);font-size:.78rem;margin-bottom:.25rem;
+line-height:1.35}
+.readout{font-size:.9rem;color:var(--dim);margin:.25rem 0 0}
+.readout b{color:var(--ink)}
+.err{color:var(--bad);font-size:.82rem;margin:.4rem 0 0;min-height:1.2em}
+.notice{color:var(--warn);font-size:.9rem;margin:.4rem 0 0;min-height:1.2em}
+details{border:1px solid var(--edge);border-radius:10px;padding:.6rem .9rem;
+margin:.5rem 0}
+details summary{cursor:pointer;font-weight:600}
+details summary .cyc{color:var(--dim);font-weight:400;font-size:.85rem;margin-left:.5rem}
+/* brief highlight when the 3D stage reports a junction click
+   (hero:select-junction — hero.html's overlay API) */
+@keyframes cardFlash{0%,100%{box-shadow:0 0 0 0 rgba(88,166,255,0)}
+30%{box-shadow:0 0 0 2px var(--accent)}}
+details.flash{animation:cardFlash .9s ease-in-out 2}
+.bar{display:flex;gap:.75rem;align-items:center;margin:.9rem 0 0;flex-wrap:wrap}
+.bar button{background:var(--accent);color:#04121f;border:0;border-radius:8px;
+padding:.6rem 1.2rem;font:inherit;font-weight:600;cursor:pointer}
+.bar button.ghost{background:transparent;color:var(--dim);
+border:1px solid var(--edge)}
+.bar button:disabled{opacity:.45;cursor:not-allowed}
+.hint{color:var(--dim);font-size:.8rem}
+.kind{font-size:.72rem;letter-spacing:.06em;text-transform:uppercase;
+border:1px solid var(--edge);border-radius:999px;padding:.1rem .5rem;color:var(--dim)}
+.kind.baseline{color:var(--accent);border-color:var(--accent)}
+.lb-status{color:var(--dim);font-size:.9rem;margin:.5rem 0 0}
+.lb-src{color:var(--dim);font-size:.78rem;margin:.5rem 0 0}
+[hidden]{display:none}
+
+/* --- the 3D stage (right column) -------------------------------------- */
+@media (min-width:1001px){.stage{position:sticky;top:1rem}}
+.viewbar{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin:0 0 .6rem}
+.vbtn{background:transparent;color:var(--dim);border:1px solid var(--edge);
+border-radius:8px;padding:.35rem .9rem;font:inherit;font-size:.85rem;cursor:pointer}
+.vbtn.active{background:var(--accent);color:#04121f;border-color:var(--accent);
+font-weight:600}
+.vbtn:disabled{opacity:.45;cursor:not-allowed}
+iframe#stage{width:100%;height:72vh;min-height:520px;display:block;
+border:1px solid var(--edge);border-radius:10px;background:#05080d}
+
+/* --- the run box (spinner + elapsed + rotating lines) ------------------ */
+.runline-wrap{display:flex;align-items:center;gap:.5rem}
+.spin{display:inline-block;width:14px;height:14px;flex:0 0 auto;
+border:2px solid var(--dim);border-top-color:var(--accent);border-radius:50%;
+animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.elapsed{margin-left:auto;color:var(--dim);font-variant-numeric:tabular-nums;
+font-size:.9rem}
+
+/* --- the reveal --------------------------------------------------------- */
+.reveal .bignum{font-size:2.4rem;font-weight:800;letter-spacing:-.02em;
+line-height:1.1;margin-top:.25rem}
+.reveal .bignum .unit{display:block;font-size:.9rem;font-weight:400;
+color:var(--dim);letter-spacing:0;margin-top:.2rem}
+.reveal-sub{color:var(--dim);margin:.5rem 0 .25rem}
+.reveal-sub b{color:var(--ink)}
+.beat{color:var(--win);font-size:1.35rem;font-weight:800;letter-spacing:-.01em;
+margin:.5rem 0 .25rem}
+.pace-note{color:var(--dim);font-size:.8rem;margin:.25rem 0}
+.logdetails pre{white-space:pre-wrap;font-size:.75rem;color:var(--dim);
+max-height:12rem;overflow:auto;margin:.5rem 0 0}
+
+/* --- leaderboard bars (reveal + persistent board share this style) ------ */
+.lbars{margin-top:.75rem}
+.lrow{display:grid;grid-template-columns:minmax(8rem,12.5rem) minmax(0,1fr)
+minmax(6.5rem,auto);gap:.7rem;align-items:center;padding:.3rem 0;
+border-bottom:1px solid var(--edge)}
+.lrow:last-child{border-bottom:0}
+.lname{font-size:.9rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lrow.guest .lname{color:var(--accent)}
+.lrow.you .lname{font-weight:700}
+.lrank{color:var(--dim);font-variant-numeric:tabular-nums}
+.track{background:#0d1117;border:1px solid var(--edge);border-radius:6px;
+height:1rem;overflow:hidden}
+.fill{height:100%;width:0;background:var(--dim);
+transition:width .9s cubic-bezier(.25,.7,.25,1)}
+.fill.guest{background:var(--accent)}
+@keyframes pulseFill{0%,100%{filter:brightness(1)}50%{filter:brightness(1.75)}}
+.fill.pulse{animation:pulseFill 1.1s ease-in-out 3}
+.lval{text-align:right;font-size:.85rem;font-variant-numeric:tabular-nums;
+line-height:1.25}
+.lval .ltrips{color:var(--dim);font-size:.78rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Beat the Signal — play along</h1>
+<p class="sub">Retune the four traffic lights on Main Street in Bottleneck
+Town, run the simulation from this page, then watch your design fight the
+traffic in the 3D stage. <b>Same network, same demand, same seed</b> (seed 42,
+15,000 ticks ≈ 25 min of traffic) — the only thing that changes between runs
+is the light timing.</p>
+<p class="links"><a href="/signal-game.html">classic dial page</a> ·
+<a href="/fleet-review.html">the fleet</a></p>
+
+<div class="cols">
+<div class="col-left">
+
+<div class="name-row">
+<label for="dname">Design name</label>
+<input id="dname" type="text" value="guest-r1" size="18"
+       pattern="[a-z0-9]([a-z0-9-]*[a-z0-9])?" spellcheck="false">
+<span class="hint">lowercase letters, digits, dashes — becomes the run's id</span>
+</div>
+
+<div class="card" id="round1">
+<h2><span class="tag">ROUND 1</span>One junction</h2>
+<div class="dials" style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr))">
+<div class="dial">
+<label for="r1-jid">Junction (west → east along Main St)</label>
+<select id="r1-jid">
+<option>J1</option><option>J2</option><option>J3</option><option>J4</option>
+</select>
+</div>
+</div>
+<div class="dials" id="r1-greens"></div>
+<div class="dials" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">
+<div class="dial">
+<label for="r1-offset">Offset (s; 0 = starts at sim start)</label>
+<input id="r1-offset" type="number" min="0" step="1" value="0">
+</div>
+</div>
+<p class="readout" id="r1-cycle"></p>
+<p class="hint">Bounds: each green 5–90 s · cycle = greens + 20 s clearance,
+40–150 s total · offset wraps at the cycle length.</p>
+<p class="err" id="r1-err"></p>
+<div class="bar">
+<button class="run-btn" data-round="r1" type="button">Run my design</button>
+<button class="ghost" id="r1-download" type="button">Download round-1 design JSON</button>
+</div>
+</div>
+
+<div class="card" id="round2">
+<h2><span class="tag">ROUND 2</span>The full arterial</h2>
+<div class="bar" style="margin:0 0 .5rem">
+<button class="ghost" id="copy-r1" type="button">Copy round-1 design to all four junctions</button>
+</div>
+<div id="r2-sections"></div>
+<p class="hint">All four junctions, greens + offsets. Offsets are how you
+build a green wave — the pre-authored <b>green-wave</b> baseline is the bar
+to beat. Bounds same as round 1.</p>
+<p class="err" id="r2-err"></p>
+<div class="bar">
+<button class="run-btn" data-round="r2" type="button">Run my design</button>
+<button class="ghost" id="r2-download" type="button">Download round-2 design JSON</button>
+</div>
+</div>
+
+<div class="card" id="runbox" hidden>
+<div class="runline-wrap">
+<span class="spin" id="runspin"></span>
+<span id="runline">compiling your timing…</span>
+<span class="elapsed" id="elapsed">0 s</span>
+</div>
+<p class="hint" id="runcap">usually ~20 seconds; up to a few minutes if the
+box is busy — the simulation retries on its own</p>
+<p class="err" id="runerr"></p>
+</div>
+
+<div class="card reveal" id="reveal" hidden>
+<h2><span class="tag">RESULT</span><span id="reveal-name"></span></h2>
+<div class="bignum"><span id="reveal-loss"></span>
+<span class="unit">s/veh mean time loss</span></div>
+<p class="reveal-sub"><span id="reveal-trips"></span> trips completed ·
+<b id="reveal-rank"></b></p>
+<p class="beat" id="reveal-beat" hidden>You beat the green wave.</p>
+<p class="pace-note" id="reveal-pace" hidden></p>
+<div id="reveal-bars" class="lbars"></div>
+<p class="lb-src" id="reveal-bake"></p>
+<details class="logdetails" id="reveal-log-wrap" hidden>
+<summary>run log tail</summary>
+<pre id="reveal-log"></pre>
+</details>
+</div>
+
+<div class="card" id="leaderboard">
+<h2>Leaderboard</h2>
+<p class="lb-status" id="lb-status">Loading…</p>
+<div id="lb-bars" class="lbars"></div>
+<p class="lb-src" id="lb-src"></p>
+</div>
+
+</div>
+<div class="col-right">
+
+<div class="card stage">
+<div class="viewbar">
+<span class="hint">3D stage:</span>
+<button class="vbtn active" id="view-base" type="button">Base timing</button>
+<button class="vbtn" id="view-yours" type="button" disabled>Your design</button>
+</div>
+<iframe id="stage" src="/hero.html?run=bthero42/f7d90093b24e&view=junction"
+        title="3D replay of the baked run"></iframe>
+<p class="hint" style="margin:.6rem 0 0">drag to orbit · 1/2/3 camera presets · space play/pause</p>
+</div>
+
+</div>
+</div>
+
+</div>
+
+<script>
+"use strict";
+
+// --- the scenario constants (scripts/demos/bottleneck_town.py) -------------
+// Base arm: every junction runs greens [36, 8, 11, 11] with no offset; amber
+// 3 s and all-red 2 s follow each green, so the fixed part of a cycle is
+// 4 * (3 + 2) = 20 s and the base cycle is 86 s.
+var BASE_GREENS = [36, 8, 11, 11];
+var FIXED_S = 20;
+var JUNCTIONS = ["J1", "J2", "J3", "J4"];
+var GREEN_LABELS = [
+  "Main St — through + right, both directions (base 36 s)",
+  "Main St — protected lefts, both directions (base 8 s)",
+  "Cross street — northbound, all movements (base 11 s)",
+  "Cross street — southbound, all movements (base 11 s)"
+];
+var GREEN_MIN = 5, GREEN_MAX = 90, CYCLE_MIN = 40, CYCLE_MAX = 150;
+var NAME_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
+
+function num(v) { return (typeof v === "number" && isFinite(v)); }
+function fmt(x) { return (Math.round(x * 100) / 100).toString(); }
+function asNum(x) { var n = Math.round(x * 100) / 100; return n; }
+
+// Mirror mktimingvariant.py's validation exactly — a design the page rejects
+// would be rejected by the compiler, and vice versa.
+function validateDial(greens, offset) {
+  var errs = [];
+  for (var i = 0; i < 4; i++) {
+    if (!num(greens[i])) errs.push("green " + (i + 1) + " needs a number");
+    else if (greens[i] < GREEN_MIN || greens[i] > GREEN_MAX)
+      errs.push(GREEN_LABELS[i].split(" (base")[0] + ": " + fmt(greens[i]) +
+                " s is outside [" + GREEN_MIN + ", " + GREEN_MAX + "] s");
+  }
+  var cycle = greens.reduce(function (a, b) { return a + (num(b) ? b : 0); }, FIXED_S);
+  if (cycle < CYCLE_MIN || cycle > CYCLE_MAX)
+    errs.push("cycle " + fmt(cycle) + " s is outside [" + CYCLE_MIN + ", " +
+              CYCLE_MAX + "] s (greens + 20 s amber/all-red)");
+  if (!num(offset)) errs.push("offset needs a number (0 is fine)");
+  else if (offset < 0 || offset >= cycle)
+    errs.push("offset " + fmt(offset) + " s is outside [0, " + fmt(cycle) +
+              ") — offsets wrap at the cycle length");
+  return { errs: errs, cycle: cycle };
+}
+
+function readGreens(inputs) {
+  return inputs.map(function (el) { return parseFloat(el.value); });
+}
+
+function markInputs(inputs, greens) {
+  inputs.forEach(function (el, i) {
+    el.classList.toggle("bad", !num(greens[i]) ||
+                        greens[i] < GREEN_MIN || greens[i] > GREEN_MAX);
+  });
+}
+
+function greenInputs(container, prefix, onchange) {
+  var inputs = [];
+  GREEN_LABELS.forEach(function (label, i) {
+    var d = document.createElement("div");
+    d.className = "dial";
+    var lab = document.createElement("label");
+    lab.textContent = label;
+    lab.setAttribute("for", prefix + "-g" + i);
+    var inp = document.createElement("input");
+    inp.type = "number"; inp.min = GREEN_MIN; inp.max = GREEN_MAX; inp.step = "1";
+    inp.id = prefix + "-g" + i;
+    inp.value = BASE_GREENS[i];
+    inp.placeholder = String(BASE_GREENS[i]); // base values as placeholders/defaults
+    inp.addEventListener("input", onchange);
+    d.appendChild(lab); d.appendChild(inp);
+    container.appendChild(d);
+    inputs.push(inp);
+  });
+  return inputs;
+}
+
+// --- round 1 ---------------------------------------------------------------
+var r1Greens = greenInputs(document.getElementById("r1-greens"), "r1", updateR1);
+var r1Offset = document.getElementById("r1-offset");
+var r1Jid = document.getElementById("r1-jid");
+r1Offset.addEventListener("input", updateR1);
+
+function updateR1() {
+  var g = readGreens(r1Greens);
+  var off = parseFloat(r1Offset.value);
+  markInputs(r1Greens, g);
+  r1Offset.classList.toggle("bad", !num(off) || off < 0);
+  var v = validateDial(g, num(off) ? off : NaN);
+  document.getElementById("r1-cycle").innerHTML =
+    "Cycle length at " + r1Jid.value + ": <b>" +
+    fmt(v.cycle) +
+    " s</b> (greens " + g.map(function (x) { return num(x) ? fmt(x) : "?"; }).join(" + ") +
+    " + 20 s clearance) — base runs 86 s.";
+  document.getElementById("r1-err").textContent = v.errs.join("; ");
+  return v;
+}
+
+// --- round 2 ---------------------------------------------------------------
+var r2 = {}; // jid -> {greens: [inputs], offset: input, cyc: span, errTarget shared}
+var r2Sections = document.getElementById("r2-sections");
+
+JUNCTIONS.forEach(function (jid) {
+  var det = document.createElement("details");
+  if (jid === "J1") det.open = true;
+  var sum = document.createElement("summary");
+  sum.textContent = jid;
+  var cyc = document.createElement("span");
+  cyc.className = "cyc";
+  sum.appendChild(cyc);
+  det.appendChild(sum);
+  var grid = document.createElement("div");
+  grid.className = "dials";
+  det.appendChild(grid);
+  var inputs = greenInputs(grid, "r2-" + jid, function () { updateR2J(jid); });
+  var offWrap = document.createElement("div");
+  offWrap.className = "dials";
+  offWrap.style.gridTemplateColumns = "repeat(auto-fit,minmax(150px,1fr))";
+  var offDial = document.createElement("div");
+  offDial.className = "dial";
+  var offLab = document.createElement("label");
+  offLab.textContent = "Offset (s)";
+  offLab.setAttribute("for", "r2-" + jid + "-offset");
+  var off = document.createElement("input");
+  off.type = "number"; off.min = "0"; off.step = "1"; off.value = "0";
+  off.id = "r2-" + jid + "-offset";
+  off.addEventListener("input", function () { updateR2J(jid); });
+  offDial.appendChild(offLab); offDial.appendChild(off);
+  offWrap.appendChild(offDial);
+  det.appendChild(offWrap);
+  r2Sections.appendChild(det);
+  r2[jid] = { greens: inputs, offset: off, cyc: cyc, det: det };
+});
+
+function updateR2J(jid) {
+  var s = r2[jid];
+  var g = readGreens(s.greens);
+  var off = parseFloat(s.offset.value);
+  markInputs(s.greens, g);
+  s.offset.classList.toggle("bad", !num(off) || off < 0);
+  var v = validateDial(g, num(off) ? off : NaN);
+  s.cyc.textContent = "— cycle " + fmt(v.cycle) + " s" +
+    (v.errs.length ? " (" + v.errs.length + " problem" + (v.errs.length > 1 ? "s" : "") + ")" : "");
+  return v;
+}
+
+function updateR2() {
+  var errs = [];
+  JUNCTIONS.forEach(function (jid) {
+    updateR2J(jid).errs.forEach(function (e) { errs.push(jid + ": " + e); });
+  });
+  document.getElementById("r2-err").textContent = errs.join("; ");
+  return errs;
+}
+
+document.getElementById("copy-r1").addEventListener("click", function () {
+  var g = readGreens(r1Greens);
+  var off = r1Offset.value;
+  JUNCTIONS.forEach(function (jid) {
+    r2[jid].greens.forEach(function (el, i) { el.value = r1Greens[i].value; });
+    r2[jid].offset.value = off;
+    updateR2J(jid);
+  });
+  updateR2();
+});
+
+// --- dial JSON (byte-compatible with signal-game.html's downloads) ---------
+function dialName() {
+  var name = document.getElementById("dname").value.trim();
+  if (!NAME_RE.test(name)) {
+    return null;
+  }
+  return name;
+}
+
+function junctionDial(greens, offset) {
+  var d = { greens: greens.map(asNum) };
+  if (num(offset) && offset !== 0) d.offset = asNum(offset); // omitted at 0, like green-wave's J1
+  return d;
+}
+
+function download(obj, filename) {
+  var blob = new Blob([JSON.stringify(obj, null, 2) + "\n"],
+                      { type: "application/json" });
+  var a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
+}
+
+document.getElementById("r1-download").addEventListener("click", function () {
+  var name = dialName();
+  var v = updateR1();
+  if (!name) { document.getElementById("r1-err").textContent =
+    "Design name must be lowercase letters, digits, dashes (e.g. guest-r1)."; return; }
+  if (v.errs.length) return;
+  var jid = r1Jid.value;
+  var obj = { name: name, junctions: {} };
+  obj.junctions[jid] = junctionDial(readGreens(r1Greens), parseFloat(r1Offset.value));
+  download(obj, name + ".json");
+});
+
+document.getElementById("r2-download").addEventListener("click", function () {
+  var name = dialName();
+  var errs = updateR2();
+  if (!name) { document.getElementById("r2-err").textContent =
+    "Design name must be lowercase letters, digits, dashes (e.g. guest-r1)."; return; }
+  if (errs.length) return;
+  var obj = { name: name, junctions: {} };
+  JUNCTIONS.forEach(function (jid) {
+    obj.junctions[jid] = junctionDial(readGreens(r2[jid].greens),
+                                      parseFloat(r2[jid].offset.value));
+  });
+  download(obj, name + ".json");
+});
+
+// --- the one step: run the design -------------------------------------------
+// One shared run state machine for both rounds. Each round card has its own
+// "Run my design" button (data-round); Enter in the name field runs whichever
+// round was touched last (focus/click inside a round card marks it active,
+// round 1 by default) — on camera you work inside one round at a time.
+var BASE_STAGE_URL = "/hero.html?run=bthero42/f7d90093b24e&view=junction";
+var running = false;
+var activeRound = "r1";
+var yourDesignUrl = null;   // hero_url of the last completed run, speed=2
+var lastRunName = null, lastRunSlug = null;
+
+// What the guest reads while the box works. The lines rotate on a timer —
+// they are moods, not measured progress (the endpoint gives no intermediate
+// events); the elapsed counter is the honest part.
+var RUN_LINES = [
+  "compiling your timing…",
+  "simulating 25 minutes of traffic…",
+  "baking the 3D replay…",
+  "scoring against the baselines…"
+];
+var runT0 = 0, elapsedTimer = null, lineTimer = null, lineIdx = 0;
+
+function el(id) { return document.getElementById(id); }
+
+function slugifyJS(s) { // mirrors score-timing.py's slugify for row matching
+  return s.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+function setRunning(on) {
+  running = on;
+  var btns = document.querySelectorAll(".run-btn");
+  for (var i = 0; i < btns.length; i++) btns[i].disabled = on || runnerLive === false;
+}
+
+// --- view-only mode ------------------------------------------------------------
+// GET /api/timing/run is the timing-runner's health probe (serve-baked.py
+// --timing-runner answers 200 + JSON {"ok":true,"service":"timing-runner"}).
+// The verdict is the JSON SENTINEL, never the HTTP status: static hosts can
+// answer 200 for unmatched paths (Cloudflare Pages serves index.html with
+// 200 when the bundle has no custom 404.html), and a status-only check
+// would read that fallback as LIVE. Any non-200, non-JSON, or sentinel-less
+// body — or a network error — means view-only: the Run affordances disable
+// (with a title saying why) and the runbox carries the notice; dials,
+// downloads, the leaderboard, and the stage all keep working (they're
+// client-side or plain static fetches). ?runner=0|1 forces the verdict and
+// skips the probe (screenshots, local demos of the disabled state).
+// Fire-and-forget: first paint never waits on the probe.
+var runnerLive = null; // null = probe in flight (buttons enabled as today)
+
+function runnerProbeOk(body) { // mirrors timingpanel.ts's runnerAvailable
+  return !!body && typeof body === "object" && body.service === "timing-runner";
+}
+
+function setRunnerAvailable(live) {
+  runnerLive = live;
+  if (live) return; // everything already works
+  var btns = document.querySelectorAll(".run-btn");
+  for (var i = 0; i < btns.length; i++) {
+    btns[i].disabled = true;
+    btns[i].title = "view-only link — the run service isn't on this host";
+  }
+  el("runbox").hidden = false;
+  el("runspin").style.display = "none";
+  el("runline").textContent = "";
+  el("elapsed").textContent = "";
+  el("runcap").style.display = "none";
+  var e = el("runerr");
+  e.className = "notice";
+  e.textContent = "View-only link — designs run on the host's machine during " +
+    "the show; the replay, fleet, and leaderboard all work here.";
+}
+
+function beginRunUI() {
+  el("runbox").hidden = false;
+  el("runspin").style.display = "";
+  el("runcap").style.display = "";
+  el("runline").textContent = RUN_LINES[0];
+  el("elapsed").textContent = "0 s";
+  var e = el("runerr");
+  e.textContent = ""; e.className = "err";
+  lineIdx = 0;
+  runT0 = Date.now();
+  elapsedTimer = setInterval(function () {
+    el("elapsed").textContent = Math.floor((Date.now() - runT0) / 1000) + " s";
+  }, 1000);
+  lineTimer = setInterval(function () {
+    lineIdx = (lineIdx + 1) % RUN_LINES.length;
+    el("runline").textContent = RUN_LINES[lineIdx];
+  }, 4000);
+  el("runbox").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function endRunUI() {
+  if (elapsedTimer) clearInterval(elapsedTimer);
+  if (lineTimer) clearInterval(lineTimer);
+  elapsedTimer = lineTimer = null;
+}
+
+function failRun(msg, isConflict) {
+  endRunUI();
+  setRunning(false);
+  el("runspin").style.display = "none";
+  el("runcap").style.display = "none";
+  el("runline").textContent = "";
+  el("elapsed").textContent = "";
+  var e = el("runerr");
+  e.className = isConflict ? "notice" : "err";
+  e.textContent = msg; // dials stay editable; the button is back
+}
+
+function startRun(round) {
+  if (running || runnerLive === false) return;
+  var errEl = el(round === "r1" ? "r1-err" : "r2-err");
+  var name = dialName();
+  if (!name) { errEl.textContent =
+    "Design name must be lowercase letters, digits, dashes (e.g. guest-r1)."; return; }
+  // Same assembly as the download handlers above — the POST body is exactly
+  // what signal-game.html would have written to the file.
+  var obj = { name: name, junctions: {} };
+  if (round === "r1") {
+    var v = updateR1();
+    if (v.errs.length) return;
+    obj.junctions[r1Jid.value] =
+      junctionDial(readGreens(r1Greens), parseFloat(r1Offset.value));
+  } else {
+    var errs = updateR2();
+    if (errs.length) return;
+    JUNCTIONS.forEach(function (jid) {
+      obj.junctions[jid] = junctionDial(readGreens(r2[jid].greens),
+                                        parseFloat(r2[jid].offset.value));
+    });
+  }
+  postRun(JSON.stringify(obj, null, 2) + "\n");
+}
+
+function postRun(body) {
+  setRunning(true);
+  beginRunUI();
+  fetch("/api/timing/run", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: body
+  }).then(function (resp) {
+    // Error responses may not parse as JSON — keep the status either way.
+    return resp.json().catch(function () { return null; })
+      .then(function (data) { return { status: resp.status, data: data }; });
+  }).then(function (r) {
+    if (r.status === 200 && r.data && r.data.ok) { onReveal(r.data); return; }
+    if (r.status === 409) {
+      failRun("a run is already in progress — give it a moment and try again", true);
+      return;
+    }
+    failRun((r.data && r.data.error) ? String(r.data.error)
+                                     : "the run service answered HTTP " + r.status,
+            false);
+  }).catch(function (e) {
+    failRun("could not reach the run service (" + e.message + ")", false);
+  });
+}
+
+function withSpeed(url, speed) {
+  if (!url) return null;
+  return url + (url.indexOf("?") === -1 ? "?" : "&") + "speed=" + speed;
+}
+
+function setStage(url, which) {
+  el("stage").src = url;
+  el("view-base").classList.toggle("active", which === "base");
+  el("view-yours").classList.toggle("active", which === "yours");
+}
+
+function onReveal(data) {
+  endRunUI();
+  setRunning(false);
+  el("runbox").hidden = true;
+
+  lastRunName = String(data.name || "");
+  lastRunSlug = String(data.slug || slugifyJS(lastRunName));
+
+  el("reveal").hidden = false;
+  el("reveal-name").textContent = lastRunName;
+  var loss = Number(data.mean_time_loss_s);
+  el("reveal-loss").textContent = isFinite(loss) ? loss.toFixed(1) : "?";
+  el("reveal-trips").textContent = String(data.trips_completed);
+  el("reveal-rank").textContent = "rank " + data.rank + " of " + data.of;
+  el("reveal-beat").hidden = !(Number(data.rank) === 1);
+  var pace = Number(data.pace) || 0;
+  el("reveal-pace").hidden = !(pace > 0);
+  if (pace > 0) el("reveal-pace").textContent =
+    "measured at pace " + pace + " (the box was busy) — same seed, same demand, same window";
+  var bake = data.bake || {};
+  el("reveal-bake").textContent = (bake.run && bake.hash)
+    ? "bake: " + bake.run + "/" + bake.hash : "";
+  var log = String(data.log_tail || "").trim();
+  el("reveal-log-wrap").hidden = !log;
+  el("reveal-log").textContent = log;
+
+  // The payoff: switch the stage to the guest's own bake, 2x speed.
+  yourDesignUrl = withSpeed(String(data.hero_url || ""), "2");
+  if (yourDesignUrl) {
+    el("view-yours").disabled = false;
+    setStage(yourDesignUrl, "yours");
+  }
+
+  // Fresh board AFTER the run returns — the backend rewrote it with this
+  // design in it. The reveal's chart and the persistent board both re-render
+  // from the same fetch, your row pulsing briefly in each.
+  fetchBoard().then(function (board) {
+    if (!board || !(board.rows || []).length) return;
+    renderBars(el("reveal-bars"), board.rows, true);
+    renderBars(el("lb-bars"), board.rows, true);
+    el("lb-status").textContent = "";
+    if (board.generated_from)
+      el("lb-src").textContent = "Measured: " + board.generated_from + ".";
+  }).catch(function () { /* the numbers above still stand on their own */ });
+
+  el("reveal").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+// --- leaderboard bars --------------------------------------------------------
+// One renderer for the reveal chart and the persistent board. Rows sorted
+// best-first (lowest time loss wins); bars scale to the WORST row, so the
+// leader has the shortest bar — the bar is the loss. Widths are applied a
+// frame after insertion so the CSS transition sweeps them in.
+function renderBars(container, rows, markYou) {
+  container.textContent = "";
+  var sorted = rows.slice().sort(function (a, b) {
+    return Number(a.mean_time_loss_s) - Number(b.mean_time_loss_s);
+  });
+  var worst = 0;
+  sorted.forEach(function (r) {
+    worst = Math.max(worst, Number(r.mean_time_loss_s) || 0);
+  });
+  if (worst <= 0) worst = 1;
+  var fills = [];
+  sorted.forEach(function (r, i) {
+    var guest = r.kind !== "baseline";
+    var you = !!(markYou && lastRunSlug &&
+      (String(r.name) === lastRunName ||
+       slugifyJS(String(r.name)) === lastRunSlug));
+    var row = document.createElement("div");
+    row.className = "lrow" + (guest ? " guest" : "") + (you ? " you" : "");
+
+    var nameCell = document.createElement("div");
+    nameCell.className = "lname";
+    var rank = document.createElement("span");
+    rank.className = "lrank";
+    rank.textContent = (i + 1) + ".";
+    nameCell.appendChild(rank);
+    nameCell.appendChild(document.createTextNode(" " + String(r.name) + " "));
+    var chip = document.createElement("span");
+    chip.className = "kind" + (guest ? "" : " baseline");
+    chip.textContent = String(r.kind || (guest ? "guest" : "baseline"));
+    nameCell.appendChild(chip);
+    row.appendChild(nameCell);
+
+    var track = document.createElement("div");
+    track.className = "track";
+    var fill = document.createElement("div");
+    fill.className = "fill" + (guest ? " guest" : "") + (you ? " pulse" : "");
+    track.appendChild(fill);
+    row.appendChild(track);
+
+    var val = document.createElement("div");
+    val.className = "lval";
+    var loss = Number(r.mean_time_loss_s);
+    var b = document.createElement("b");
+    b.textContent = (isFinite(loss) ? loss.toFixed(1) : "?") + " s/veh";
+    val.appendChild(b);
+    val.appendChild(document.createElement("br"));
+    var trips = document.createElement("span");
+    trips.className = "ltrips";
+    trips.textContent = String(r.trips_completed) + " trips";
+    val.appendChild(trips);
+    row.appendChild(val);
+
+    container.appendChild(row);
+    fills.push({ el: fill, pct: Math.max(2, ((isFinite(loss) ? loss : 0) / worst) * 100) });
+  });
+  requestAnimationFrame(function () {
+    requestAnimationFrame(function () {
+      fills.forEach(function (f) { f.el.style.width = f.pct + "%"; });
+    });
+  });
+}
+
+function fetchBoard() {
+  return fetch("/timing-game-results.json", { cache: "no-cache" }).then(function (resp) {
+    if (resp.status === 404) return null; // no runs scored yet
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    return resp.json();
+  });
+}
+
+function loadLeaderboard() {
+  var status = el("lb-status");
+  status.textContent = "Loading…";
+  fetchBoard().then(function (data) {
+    if (!data || !(data.rows || []).length) {
+      status.textContent = "No scores yet — run a design and this fills in.";
+      return;
+    }
+    status.textContent = "";
+    renderBars(el("lb-bars"), data.rows, false);
+    if (data.generated_from)
+      el("lb-src").textContent = "Measured: " + data.generated_from + ".";
+  }).catch(function (e) {
+    status.textContent = "Could not load scores (" + e.message + ").";
+  });
+}
+
+// --- wiring -------------------------------------------------------------------
+el("view-base").addEventListener("click", function () {
+  setStage(BASE_STAGE_URL, "base");
+});
+el("view-yours").addEventListener("click", function () {
+  if (yourDesignUrl) setStage(yourDesignUrl, "yours");
+});
+
+var runBtns = document.querySelectorAll(".run-btn");
+for (var i = 0; i < runBtns.length; i++) {
+  runBtns[i].addEventListener("click", function () {
+    startRun(this.getAttribute("data-round"));
+  });
+}
+
+// Enter in the name field runs the active round (the card last focused or
+// clicked into; round 1 until then).
+["round1", "round2"].forEach(function (id, i) {
+  var card = document.getElementById(id);
+  var rd = i === 0 ? "r1" : "r2";
+  card.addEventListener("focusin", function () { activeRound = rd; });
+  card.addEventListener("pointerdown", function () { activeRound = rd; });
+});
+document.getElementById("dname").addEventListener("keydown", function (ev) {
+  if (ev.key === "Enter") { ev.preventDefault(); startRun(activeRound); }
+});
+
+// --- hero overlay API: a signal-head click in the 3D stage focuses the ------
+// matching round-2 dials here (hero.html posts hero:select-junction to its
+// parent frame; hero:deselect needs no UI response). The stage keeps its own
+// in-iframe timing panel — both run paths are legitimate.
+var flashTimer = null;
+window.addEventListener("message", function (ev) {
+  if (ev.origin !== location.origin) return;
+  var d = ev.data;
+  if (!d || typeof d !== "object" || d.type !== "hero:select-junction") return;
+  var jid = String(d.junction || "");
+  var s = r2[jid];
+  if (!s) return;
+  activeRound = "r2";
+  JUNCTIONS.forEach(function (j) { r2[j].det.open = (j === jid); });
+  s.det.classList.remove("flash");
+  void s.det.offsetWidth; // restart the animation on a repeated click
+  s.det.classList.add("flash");
+  // no scrollIntoView: scrolling the host page under the mouse is janky
+  if (flashTimer) clearTimeout(flashTimer);
+  flashTimer = setTimeout(function () { s.det.classList.remove("flash"); }, 2000);
+});
+
+// initial paint
+updateR1();
+updateR2();
+loadLeaderboard();
+
+// runner probe (view-only mode, see above): ?runner=0|1 forces the verdict
+var runnerParam = new URLSearchParams(location.search).get("runner");
+if (runnerParam === "0" || runnerParam === "1") {
+  setRunnerAvailable(runnerParam === "1");
+} else {
+  fetch("/api/timing/run", { cache: "no-cache" }).then(function (resp) {
+    if (!resp.ok) return null; // 404/405 static host
+    return resp.json().catch(function () { return null; }); // HTML fallback page
+  }).then(function (body) {
+    setRunnerAvailable(runnerProbeOk(body));
+  }).catch(function () {
+    setRunnerAvailable(false);
+  });
+}
+</script>
+</body>
+</html>

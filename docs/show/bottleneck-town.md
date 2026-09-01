@@ -48,7 +48,8 @@ so an option cannot win by moving less traffic.
 * **Main Street** — 2 lanes per direction, 50 km/h, sagging 300 m south
   through the middle of the map: the old road bends round the town site.
   Four signalized junctions on the straight middle section, 480 / 520 /
-  450 m apart. Each approach flares to a left-turn bay at the stop line.
+  450 m apart. Each approach flares to a kerb-side right-turn pocket at
+  the stop line (the protected left shares the centreline through lane).
 * **Cross streets** — 1 lane per direction, 40 km/h, a portal north and
   south of every junction.
 * **Signals** — one 86 s fixed-time program per junction, four green
@@ -65,7 +66,10 @@ so an option cannot win by moving less traffic.
   Street mean **no two movements in a phase ever cross or merge**, so
   `foesCross`/`foesMerge` stay empty at the signalized junctions exactly as
   the netimport-produced networks leave them, and the signal plus the
-  kernel's box-exit check do all the adjudication. In the baseline every
+  kernel's box-exit check do all the adjudication. Since the lane-order
+  fix of 2026-08-29 (below) that claim is verified geometrically at build
+  time: the generator intersects every same-phase pair of internal-lane
+  polylines and finds nothing to declare. In the baseline every
   junction runs offset 0 — the lights all change together, which is what
   an uncoordinated small town looks like.
 * **Demand** — 480 veh/h in at the west portal, 420 at the east, 75 at each
@@ -230,42 +234,71 @@ current; only the per-road breakdown is missing.
 | lane 3 (left-turn bay) | 0.9% | 0.7% |
 
 An added lane carrying 28.8% of Main Street's vehicle-distance where an
-evenly used third lane would be 33% is a real widening.
+evenly used third lane would be 33% is a real widening. (These shares were
+measured on the pre-2026-08-29 build, so the lane labels follow the old
+mirrored numbering — lane 0 was the median side then; under the corrected
+indexing below the same physical lanes are numbered from the kerb.)
 
-**Known defect in the lane numbering, and it is worse than a label.**
+**The lane-numbering defect — found 2026-07-27, fixed 2026-08-29.**
 `engine/netfile.go` defines `edgeIndex` 0 as the *rightmost* lane (SUMO
-convention), but this generator lays its lanes out along the left normal, so
-index 0 is the lane nearest the centreline and the highest index is the kerb.
-The labels above follow the network as generated, not the convention.
+convention), but this generator originally laid its lanes out along the
+left normal, so index 0 sat nearest the centreline and the highest index
+at the kerb — the network was mirrored against the contract. The junction
+builder keys off the contract (`right_lane=0`, left from the highest
+index), so the right turn issued from the centreline-side lane and crossed
+the through path beside it inside the shared `main_thru` green, and the
+two opposed protected lefts' tangent arcs swept through each other inside
+`main_left` (~0.02 m centreline clearance). These junctions shipped with
+`foesCross`/`foesMerge` empty precisely because the phases were supposed
+to be conflict-free by construction, so **nothing arbitrated those
+crossings** — an exhaustive audit of the hero bake counted **64
+crossing-overlap episodes**, dominated by right-turn × same-green through,
+and the replay showed right-turners swinging out of the inside lane.
 
-The junction builder keys off the convention — `right_lane=0`, left bay at
-the highest index — so mirrored, **the right turn is issued from the lane
-nearest the centreline and crosses the through lane beside it inside the
-shared `main_thru` green**, and the two opposed protected lefts cross each
-other inside `main_left`. These junctions ship with `foesCross`/`foesMerge`
-empty precisely because the phases are supposed to be conflict-free by
-construction (see "The town" above), so **nothing arbitrates those
-crossings**. External review confirmed both geometrically on the generated
-network.
+What it did and did not cost: measured impact was 0-1 collision
+observations on an idle run, and every arm carried the identical defect,
+so the paired A/B deltas in the Results table stand.
 
-What it does and does not cost: measured impact is 0-1 collision observations
-on an idle run, and every arm carries the identical defect, so the A/B deltas
-in the Results table stand. But it is a latent conflict source at higher
-demand or under box spillback, and it is *visible* in the baked replay —
-right-turners swing out of the inside lane across the outside one.
+The fix, in the generator:
 
-It is not fixed here because the obvious fix is not sufficient, which was
-tested rather than assumed. Flipping the offset does correct the movement
-assignment, but `chain()` maps lane *i* to lane *i* while the flared approach
-carries one extra lane, so every chained lane picks up a 3.50 m — one full
-lane width — lateral jog at the bay edge. The flare can only widen kerb-ward
-(the opposing carriageway owns the other side of the axis), so under a
-corrected index the added lane is necessarily a kerbside *right*-turn pocket,
-whereas this scenario is built around a left-turn bay with no upstream
-predecessor — the property that keeps every through lane's leftmost successor
-a through movement, which the `Successors[0]` routing fallback depends on.
-Correcting it properly means redesigning the bay, re-validating that routing
-property, and re-running the pod.
+* **Lane indexing corrected** — lane 0 is now the kerb lane, the highest
+  index borders the centreline, matching `netfile.go` and the engine's
+  lateral chaining ("left neighbor = index+1", which was physically
+  inverted before).
+* **The flare is a right-turn pocket, not a left-turn bay.** The
+  carriageway can only widen kerb-ward (the opposing direction owns the
+  other side of the axis), so under the corrected index the added lane is
+  necessarily kerb-side. Right turns issue from the pocket and hug the
+  corner right of the through path beside them — no crossing. The
+  protected left now shares the centreline through lane; the routing
+  property the bay protected (every through lane's leftmost successor is
+  the through movement, for the `Successors[0]` fallback) is kept by the
+  successor sort, and `routeLatDepth` steering puts left-turners in the
+  centreline lane and right-turners in the pocket.
+* **Opposed left arcs redrawn.** The tangent-intersection arcs both bowed
+  to the junction centre and overlapped (~1.1 m of footprint overlap).
+  The box is too tight for a textbook offside-to-offside pair — below the
+  radius where the paths stop crossing each other's exit straights, the
+  apexes pass under a vehicle width apart — so the lefts now turn EARLY
+  on a cubic that keeps the exact end tangents, passing
+  right-side-to-right-side with **3.6 m centreline clearance**.
+* **Foe sets derived from geometry at build time.** The generator now
+  intersects every same-phase pair of internal polylines and declares
+  `foesCross` only where a crossing exists. At J1..J4 that adds nothing —
+  the phases are verifiably conflict-free, not just assumed so. The
+  off-menu connector-south arm's 2-phase CS junctions are different: one
+  phase runs both directions of a road with all movements, so the left
+  across the opposing through stream is a genuine same-phase crossing,
+  and it is now declared (16 pairs across the four junctions) — a
+  permitted-left yield instead of an unarbitrated overlap.
+
+All six arms were regenerated on 2026-08-29 with the fix, the timing-game
+leaderboard was re-measured from scratch at seed 42 (see
+`viz/public/timing-game-results.json` — the ranking held), and the hero
+replays were re-baked. The A/B tables below remain the pre-fix
+measurements; the defect was symmetric across arms and the paired design
+means the deltas stand, but absolute speeds from a re-run will differ
+slightly.
 
 ## Results
 

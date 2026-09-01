@@ -44,6 +44,15 @@ export interface SignalHead {
   bar: readonly [number, number, number, number] | null;
   program: SigProgram; // derivation input for headStatesAtTick
   linkIdx: number; // representative link of the cluster (all members derive identically)
+  // Raw stop-line centroid WITHOUT the display setback, and the cluster's
+  // mean entry bearing as a unit vector — the hero track's mast-arm rig
+  // hangs heads over their lanes, which the set-back x/y can't locate.
+  // Optional: furniture.ts' baked heads carry no geometry (and the hero
+  // page doesn't consume them), so only signalHeads populates these.
+  cx?: number;
+  cy?: number;
+  dirX?: number;
+  dirY?: number;
 }
 
 // HEAD_SETBACK_M pulls the head out of the junction box toward its
@@ -192,6 +201,9 @@ export function signalHeads(
         bar: stopBar(c),
         program: p,
         linkIdx: c.rep,
+        cx: c.sx / c.n,
+        cy: c.sy / c.n,
+        ...(bl > 1e-6 ? { dirX: c.bx / bl, dirY: c.by / bl } : {}),
       });
     }
   }

@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>traffic-sim hero — 3D baked replay</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="alternate icon" type="image/png" href="/favicon-32.png" />
+    <style>
+      /* Hero track chrome — every color is a --t-* custom property so
+         hero/main.ts can re-skin the whole page from theme.ts
+         (?theme=navy|paper; main.ts sets all vars at startup, same pattern
+         as the 2D app). The :root literals are the navy defaults so the
+         page still renders sanely before/without JS. */
+      :root {
+        --t-bg: #0e1d5c;
+        --t-hud-bg: rgba(14, 29, 92, 0.82);
+        --t-hud-border: #2e5bff;
+        --t-text: #d6e1ff;
+        --t-text-dim: #9fb2e8;
+        --t-overlay: rgba(14, 29, 92, 0.94);
+        --t-edge: rgba(46, 91, 255, 0.55);
+        --t-line: rgba(46, 91, 255, 0.35);
+        --t-sep: rgba(46, 91, 255, 0.2);
+        --t-hover: rgba(46, 91, 255, 0.25);
+        --t-row-hover: rgba(46, 91, 255, 0.18);
+        --t-accent: #2e5bff;
+        --t-marker: #7aa2ff;
+        --t-btn-bg: #d6e1ff;
+        --t-btn-ink: #0e1d5c;
+        --t-btn-hover: #ffffff;
+        --t-input-bg: rgba(10, 18, 48, 0.8);
+        --t-track-bg: rgba(10, 18, 48, 0.8);
+        --t-baseline: #4a5c96;
+        --t-warn: #e8b43a;
+        --t-bad: #e5484d;
+        --t-good: #2ecc71;
+        --t-on: #1e9e6a;
+      }
+      html, body { margin: 0; height: 100%; background: var(--t-bg); overflow: hidden; }
+      #view { display: block; width: 100vw; height: 100vh; }
+      .hud {
+        position: absolute;
+        z-index: 1;
+        font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: var(--t-text);
+        background: var(--t-hud-bg);
+        border: 1px solid var(--t-hud-border);
+        border-radius: 4px;
+        padding: 6px 10px;
+        white-space: pre;
+      }
+      #status { top: 10px; left: 10px; pointer-events: none; max-width: calc(100vw - 20px); white-space: normal; }
+      /* Playback bar — bottom-centre, interactive. */
+      #controls {
+        bottom: 10px; left: 50%; transform: translateX(-50%);
+        display: flex; align-items: center; gap: 8px;
+        pointer-events: auto; user-select: none; white-space: nowrap;
+        width: min(860px, calc(100vw - 20px));
+      }
+      #controls .rp-btn {
+        font: inherit; color: inherit; background: none;
+        padding: 1px 8px; border: 1px solid var(--t-edge); border-radius: 3px; cursor: pointer;
+      }
+      #controls .rp-btn:hover { background: var(--t-hover); }
+      #controls .rp-btn.on { color: var(--t-on); border-color: var(--t-on); }
+      #scrub { flex: 1 1 auto; min-width: 80px; accent-color: var(--t-accent); }
+      #speed { font: inherit; color: inherit; background: var(--t-hud-bg); border: 1px solid var(--t-edge); border-radius: 3px; }
+      #readout { font-variant-numeric: tabular-nums; }
+      #fleetnote {
+        bottom: 52px; left: 50%; transform: translateX(-50%);
+        color: var(--t-warn); pointer-events: none; white-space: normal; max-width: calc(100vw - 20px);
+      }
+      #fleetnote:empty { display: none; }
+      /* ?bare=1: clean canvas for captures. */
+      .bare .hud { display: none !important; }
+      /* Junction timing panel ("Beat the Signal" overlay, hero/timingpanel.ts).
+         Same HUD tokens; top-right so it clears the status line and the
+         playback bar. Hidden in bare mode via the .hud rule above. */
+      #tpanel {
+        top: 10px; right: 10px; width: 300px;
+        white-space: normal; padding: 10px 12px; pointer-events: auto;
+      }
+      #tpanel .tp-head { display: flex; justify-content: space-between; align-items: center; font-weight: 700; letter-spacing: 0.04em; }
+      #tpanel .tp-x {
+        font: inherit; color: var(--t-text-dim); background: none;
+        border: 1px solid transparent; border-radius: 3px; cursor: pointer; padding: 0 6px;
+      }
+      #tpanel .tp-x:hover { color: var(--t-text); border-color: var(--t-edge); }
+      #tpanel .tp-live { color: var(--t-text-dim); margin: 4px 0 2px; min-height: 1.5em; }
+      #tpanel .tp-row { display: flex; align-items: center; gap: 8px; margin-top: 7px; }
+      #tpanel .tp-row label { flex: 1 1 auto; color: var(--t-text-dim); font-size: 11px; line-height: 1.3; }
+      #tpanel .tp-row input {
+        flex: 0 0 64px; width: 64px; box-sizing: border-box; font: inherit; color: var(--t-text);
+        background: var(--t-input-bg); border: 1px solid var(--t-edge); border-radius: 3px; padding: 2px 6px;
+      }
+      #tpanel .tp-row input[type="text"] { flex: 1 1 auto; width: auto; }
+      #tpanel .tp-row input:focus { outline: none; border-color: var(--t-text-dim); }
+      #tpanel .tp-row input.bad { border-color: var(--t-bad); }
+      #tpanel .tp-cycle { margin-top: 8px; color: var(--t-text-dim); }
+      #tpanel .tp-note { color: var(--t-text-dim); font-size: 11px; margin-top: 6px; }
+      #tpanel .tp-err { color: var(--t-bad); margin-top: 6px; min-height: 1.2em; white-space: pre-wrap; }
+      #tpanel .tp-err.notice { color: var(--t-warn); }
+      #tpanel .tp-bar { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+      #tpanel .tp-run {
+        font: inherit; font-weight: 700; color: var(--t-btn-ink); background: var(--t-btn-bg);
+        border: 0; border-radius: 3px; padding: 4px 10px; cursor: pointer;
+      }
+      #tpanel .tp-run:hover { background: var(--t-btn-hover); }
+      #tpanel .tp-run:disabled { opacity: 0.45; cursor: default; }
+      #tpanel .tp-spin {
+        width: 12px; height: 12px; border: 2px solid var(--t-line);
+        border-top-color: var(--t-text); border-radius: 50%; animation: spin 0.9s linear infinite;
+      }
+      #tpanel .tp-elapsed { color: var(--t-text-dim); font-variant-numeric: tabular-nums; }
+      #tpanel .tp-cap { color: var(--t-text-dim); font-size: 11px; margin-top: 6px; }
+      #tpanel .tp-run.ghost {
+        background: transparent; color: var(--t-text-dim); font-weight: 400;
+        border: 1px solid var(--t-edge);
+      }
+      #tpanel .tp-run.ghost:hover { color: var(--t-text); background: var(--t-hover); }
+      /* The game drawer slides over the right edge — when it's open the
+         timing panel docks to its left instead of underneath it. */
+      body.gd-open #tpanel { right: 396px; }
+
+      /* --- the game drawer ("Beat the Signal", hero/gamedrawer.ts) --------
+         Right-edge slide-over: the sim view IS the game. The tab rides the
+         right edge while closed; both hide in bare mode. */
+      #gtab {
+        position: absolute; z-index: 1; top: 50%; right: 0; transform: translateY(-50%);
+        font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        letter-spacing: 0.12em; color: var(--t-text);
+        background: var(--t-hud-bg); border: 1px solid var(--t-hud-border); border-right: 0;
+        border-radius: 4px 0 0 4px; padding: 12px 5px; cursor: pointer;
+        writing-mode: vertical-rl;
+      }
+      #gtab:hover { background: var(--t-hover); }
+      .bare #gtab, .bare #gdrawer { display: none !important; }
+      #gdrawer {
+        position: absolute; z-index: 1; top: 0; right: 0; height: 100%;
+        width: 380px; max-width: 92vw; box-sizing: border-box; overflow-y: auto;
+        background: var(--t-overlay); border-left: 1px solid var(--t-hud-border);
+        color: var(--t-text); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        padding: 14px 16px 24px;
+        transform: translateX(102%); transition: transform 0.25s ease;
+      }
+      #gdrawer.open { transform: translateX(0); }
+      #gdrawer .gd-head { display: flex; justify-content: space-between; align-items: center; }
+      #gdrawer .gd-title { font-size: 14px; font-weight: 700; letter-spacing: 0.05em; }
+      #gdrawer .gd-x {
+        font: inherit; color: var(--t-text-dim); background: none;
+        border: 1px solid transparent; border-radius: 3px; cursor: pointer; padding: 0 7px;
+      }
+      #gdrawer .gd-x:hover { color: var(--t-text); border-color: var(--t-edge); }
+      #gdrawer .gd-sub { color: var(--t-text-dim); margin: 4px 0 0; }
+      #gdrawer .gd-sec { margin-top: 14px; border-top: 1px solid var(--t-line); padding-top: 10px; }
+      #gdrawer .gd-sectitle { color: var(--t-text-dim); font-size: 11px; letter-spacing: 0.12em; margin-bottom: 8px; }
+      #gdrawer .gd-hint { color: var(--t-text-dim); font-size: 11px; margin-top: 5px; }
+      #gdrawer .gd-namerow { display: flex; align-items: center; gap: 8px; }
+      #gdrawer .gd-namerow label { flex: 0 0 auto; color: var(--t-text-dim); }
+      #gdrawer .gd-namerow input {
+        flex: 1 1 auto; min-width: 0; font: inherit; color: var(--t-text);
+        background: var(--t-input-bg); border: 1px solid var(--t-edge);
+        border-radius: 3px; padding: 3px 7px;
+      }
+      #gdrawer .gd-namerow input:focus { outline: none; border-color: var(--t-text-dim); }
+      #gdrawer .gd-row {
+        display: flex; align-items: center; gap: 8px; margin-top: 6px; padding: 6px 8px;
+        border: 1px solid var(--t-line); border-radius: 4px; cursor: pointer;
+      }
+      #gdrawer .gd-row:hover { background: var(--t-row-hover); }
+      #gdrawer .gd-row .gd-jid { font-weight: 700; flex: 0 0 auto; }
+      #gdrawer .gd-row .gd-vals { flex: 1 1 auto; color: var(--t-text-dim); font-size: 11px; }
+      #gdrawer .gd-row .gd-edited {
+        flex: 0 0 auto; color: var(--t-warn); border: 1px solid var(--t-warn); border-radius: 999px;
+        font-size: 10px; padding: 0 6px; letter-spacing: 0.06em;
+      }
+      @keyframes gdFlash {
+        0%, 100% { box-shadow: 0 0 0 0 var(--t-marker); } /* zero spread: invisible */
+        30% { box-shadow: 0 0 0 2px var(--t-marker); }
+      }
+      #gdrawer .gd-row.flash { animation: gdFlash 0.9s ease-in-out 2; }
+      #gdrawer .gd-runbar { display: flex; align-items: center; gap: 8px; }
+      #gdrawer .gd-run {
+        font: inherit; font-weight: 700; color: var(--t-btn-ink); background: var(--t-btn-bg);
+        border: 0; border-radius: 3px; padding: 6px 14px; cursor: pointer;
+      }
+      #gdrawer .gd-run:hover { background: var(--t-btn-hover); }
+      #gdrawer .gd-run:disabled { opacity: 0.45; cursor: default; }
+      #gdrawer .gd-spin {
+        width: 12px; height: 12px; border: 2px solid var(--t-line);
+        border-top-color: var(--t-text); border-radius: 50%; animation: spin 0.9s linear infinite;
+      }
+      #gdrawer .gd-elapsed { color: var(--t-text-dim); font-variant-numeric: tabular-nums; }
+      #gdrawer .gd-cap { color: var(--t-text-dim); font-size: 11px; margin-top: 6px; }
+      #gdrawer .gd-err { color: var(--t-bad); margin-top: 6px; min-height: 1.2em; white-space: pre-wrap; }
+      #gdrawer .gd-err.notice { color: var(--t-warn); }
+      #gdrawer .gd-reveal {
+        margin-top: 10px; padding: 10px 12px; border: 1px solid var(--t-edge); border-radius: 6px;
+      }
+      #gdrawer .gd-reveal .gd-big { font-size: 26px; font-weight: 800; letter-spacing: -0.02em; line-height: 1.1; }
+      #gdrawer .gd-reveal .gd-unit { display: block; font-size: 11px; font-weight: 400; color: var(--t-text-dim); margin-top: 2px; }
+      #gdrawer .gd-reveal .gd-rsub { color: var(--t-text-dim); margin-top: 5px; }
+      #gdrawer .gd-reveal .gd-beat { color: var(--t-good); font-size: 15px; font-weight: 800; margin-top: 5px; }
+      #gdrawer .gd-lb-status { color: var(--t-text-dim); margin: 0; }
+      #gdrawer .gd-lrow {
+        display: grid; grid-template-columns: minmax(6rem, 9rem) minmax(0, 1fr) auto;
+        gap: 7px; align-items: center; padding: 3px 0;
+        border-bottom: 1px solid var(--t-sep);
+      }
+      #gdrawer .gd-lrow:last-child { border-bottom: 0; }
+      #gdrawer .gd-lname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--t-text-dim); }
+      #gdrawer .gd-lrow.guest .gd-lname { color: var(--t-text); }
+      #gdrawer .gd-lrow.you .gd-lname { color: var(--t-marker); font-weight: 700; }
+      #gdrawer .gd-track {
+        background: var(--t-track-bg); border: 1px solid var(--t-line);
+        border-radius: 3px; height: 10px; overflow: hidden;
+      }
+      #gdrawer .gd-fill { height: 100%; width: 0; background: var(--t-baseline); transition: width 0.7s cubic-bezier(0.25, 0.7, 0.25, 1); }
+      #gdrawer .gd-fill.guest { background: var(--t-accent); }
+      #gdrawer .gd-lrow.you { border-left: 2px solid var(--t-marker); padding-left: 5px; }
+      #gdrawer .gd-lrow.you .gd-fill { background: var(--t-marker); }
+      #gdrawer .gd-lval { color: var(--t-text-dim); font-variant-numeric: tabular-nums; font-size: 11px; text-align: right; }
+      #loading {
+        position: absolute; inset: 0; z-index: 2;
+        display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+        background: var(--t-overlay); color: var(--t-text);
+        font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      #loading .spin {
+        width: 26px; height: 26px;
+        border: 3px solid var(--t-line); border-top-color: var(--t-text);
+        border-radius: 50%; animation: spin 0.9s linear infinite;
+      }
+      #loading .err { color: var(--t-bad); max-width: 80vw; white-space: pre-wrap; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+    <div id="status" class="hud">loading…</div>
+    <div id="controls" class="hud">
+      <button id="play" class="rp-btn on" type="button">⏸ pause</button>
+      <input id="scrub" type="range" min="0" max="0" step="1" value="0" />
+      <select id="speed">
+        <option value="0.25">0.25×</option>
+        <option value="0.5">0.5×</option>
+        <option value="1" selected>1×</option>
+        <option value="2">2×</option>
+        <option value="4">4×</option>
+        <option value="8">8×</option>
+      </select>
+      <span id="readout">—</span>
+    </div>
+    <div id="fleetnote" class="hud"></div>
+    <div id="loading"><div class="spin"></div><div id="loading-msg">loading…</div></div>
+    <script type="module" src="/src/hero/main.ts"></script>
+  </body>
+</html>
